@@ -604,27 +604,43 @@ def resolve_output_path(
     suffix: str,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-    module: str = "crispyx",
 ) -> Path:
-    """Construct an informative output path for an intermediate ``.h5ad`` file."""
+    """Construct an informative output path for an intermediate ``.h5ad`` file.
+
+    Output names follow the pattern ``{stem}_cx_{suffix}.h5ad`` where *stem*
+    is the input file's stem (or ``data_name`` when provided).  The ``_cx_``
+    token sits between the input identity and the processing step so that:
+
+    * filenames sort naturally by input first, then by operation;
+    * the producing tool is unambiguously marked without cluttering the start
+      of the filename.
+    """
 
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
+
     if data_name:
-        # Preserve any existing module prefix supplied by the caller.
-        base = data_name
-        if module and not base.startswith(f"{module}_"):
-            base = f"{module}_{base}"
-
-        # If the provided name does not already encode the suffix, append it to avoid
-        # different intermediates overwriting each other when the same ``data_name``
-        # is reused across pipeline steps.
-        if not base.endswith(f"_{suffix}"):
-            base = f"{base}_{suffix}"
-
+        # If the provided name already encodes ``_cx_{suffix}``, use it as-is.
+        # If it ends with ``_{suffix}`` (old-style, no cx marker), insert _cx.
+        # Otherwise append ``_cx_{suffix}``.
+        _cx_suffix = f"_cx_{suffix}"
+        if data_name.endswith(_cx_suffix):
+            base = data_name
+        elif data_name.endswith(f"_{suffix}"):
+            base = data_name[: -len(f"_{suffix}")] + _cx_suffix
+        else:
+            base = f"{data_name}{_cx_suffix}"
         return output_dir / f"{base}.h5ad"
 
-    return output_dir / f"{module}_{suffix}.h5ad"
+    stem = input_path.stem
+    if not stem:
+        logger.warning(
+            "resolve_output_path: input_path %r has no stem; "
+            "output will be '_cx_%s.h5ad'",
+            str(input_path),
+            suffix,
+        )
+    return output_dir / f"{stem}_cx_{suffix}.h5ad"
 
 
 def ensure_gene_symbol_column(
@@ -1227,7 +1243,7 @@ def normalize_total_log1p(
     if log1p:
         ops.append("log1p")
     if verbose:
-        print(f"Generating preprocessed dataset (streaming, {'+'.join(ops)}): {output_path}")
+        print(f"[cx] pp.normalize_total_log1p: Saving → {output_path}")
     
     # First pass: count non-zeros and get metadata
     backed = read_backed(source_path)
@@ -1347,7 +1363,7 @@ def normalize_total_log1p(
             backed.file.close()
     
     if verbose:
-        print(f"  ✓ Preprocessed dataset written: {n_obs} cells × {n_vars} genes")
+        print(f"[cx] pp.normalize_total_log1p: Done  {n_obs} cells × {n_vars} genes")
     
     return AnnData(output_path)
 
@@ -1407,7 +1423,7 @@ def convert_to_csc(
     # Fast path: input is already CSC — return it directly.
     if get_matrix_storage_format(source_path) == "csc":
         if verbose:
-            print(f"File is already CSC, skipping conversion: {source_path}")
+            print(f"[cx] pp.convert_to_csc: Already CSC, returning source unchanged")
         return AnnData(source_path)
 
     # Resolve output path.
@@ -1422,7 +1438,7 @@ def convert_to_csc(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if verbose:
-        print(f"Converting to CSC (two-pass streaming): {source_path} → {output_path}")
+        print(f"[cx] pp.convert_to_csc: {source_path} → {output_path}")
 
     # ------------------------------------------------------------------ Pass 1
     # Read all rows in chunks; count non-zeros per *column*; collect metadata.
@@ -1538,10 +1554,7 @@ def convert_to_csc(
         grp.create_dataset("indptr", data=indptr)
 
     if verbose:
-        print(
-            f"  ✓ CSC file written: {n_obs} cells × {n_vars} genes,"
-            f" {total_nnz:,} non-zeros"
-        )
+        print(f"[cx] pp.convert_to_csc: Done  {n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
 
@@ -1597,7 +1610,7 @@ def convert_to_csr(
     fmt = get_matrix_storage_format(source_path)
     if fmt == "csr":
         if verbose:
-            print(f"File is already CSR, skipping conversion: {source_path}")
+            print(f"[cx] pp.convert_to_csr: Already CSR, returning source unchanged")
         return AnnData(source_path)
 
     # Resolve output path.
@@ -1614,7 +1627,7 @@ def convert_to_csr(
     source_is_csc = fmt == "csc"
 
     if verbose:
-        print(f"Converting {fmt}→CSR (two-pass streaming): {source_path} → {output_path}")
+        print(f"[cx] pp.convert_to_csr: {source_path} → {output_path}")
 
     # Choose the optimal reading axis based on source format.
     # CSC: column-chunks (axis=1) are fast, row-chunks are O(total_nnz).
@@ -1778,10 +1791,7 @@ def convert_to_csr(
         grp.create_dataset("indptr", data=indptr)
 
     if verbose:
-        print(
-            f"  ✓ CSR file written: {n_obs} cells × {n_vars} genes,"
-            f" {total_nnz:,} non-zeros"
-        )
+        print(f"[cx] pp.convert_to_csr: Done  {n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
 

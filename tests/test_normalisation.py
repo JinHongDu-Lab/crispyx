@@ -97,7 +97,7 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "crispyx_t_test.h5ad"
+    output_path = tmp_path / "small_norm_cx_t_test.h5ad"
     assert output_path.exists()
 
     # Use the same normalized adata for expected values
@@ -163,7 +163,7 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "crispyx_avg_log_effects.h5ad"
+    output_path = tmp_path / "small_cx_avg_log_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -201,7 +201,7 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "crispyx_pseudobulk_effects.h5ad"
+    output_path = tmp_path / "small_cx_pseudobulk_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -256,7 +256,7 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "crispyx_wilcoxon.h5ad"
+    output_path = tmp_path / "small_log_norm_cx_wilcoxon.h5ad"
     assert output_path.exists()
 
     log_data = np.asarray(norm_adata.X.toarray())

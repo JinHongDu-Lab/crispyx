@@ -122,12 +122,12 @@ def test_convert_to_csr_already_csr(tmp_path):
 
 
 def test_convert_to_csr_default_output_path(tmp_path):
-    """Without an explicit output_path, a 'crispyx_csr'-named file is created next to the source."""
+    """Without an explicit output_path, a '{stem}_cx_csr'-named file is created next to the source."""
     src, _ = _make_csc_h5ad(tmp_path)
 
     result = convert_to_csr(src, verbose=False)
 
-    expected = tmp_path / "crispyx_csr.h5ad"
+    expected = tmp_path / "csc_cx_csr.h5ad"
     assert expected.exists(), f"Expected output file not found: {expected}"
 
 

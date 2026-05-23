@@ -44,10 +44,13 @@ def compute_average_log_expression(
     chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
+    verbose: int | bool = False,
 ) -> AnnData:
     """Compute average log-normalised expression per perturbation relative to control."""
 
     path = resolve_data_path(data)
+    if int(verbose) >= 1:
+        print(f"[cx] pb.compute_average_log_expression: Reading {path}")
     backed = read_backed(path)
     try:
         # Calculate adaptive chunk_size if not provided
@@ -101,6 +104,9 @@ def compute_average_log_expression(
         output_path = resolve_output_path(
             path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name
         )
+        if int(verbose) >= 1:
+            print(f"[cx] pb.compute_average_log_expression: 0 perturbations × {gene_symbols.shape[0]} genes")
+            print(f"[cx] pb.compute_average_log_expression: Saving → {output_path}")
         adata.write(output_path)
         return AnnData(output_path)
 
@@ -113,6 +119,9 @@ def compute_average_log_expression(
     adata.layers["perturbation_mean"] = np.vstack(pert_means)
     adata.uns["control_mean"] = control_mean
     output_path = resolve_output_path(path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name)
+    if int(verbose) >= 1:
+        print(f"[cx] pb.compute_average_log_expression: {len(candidates)} perturbations × {len(gene_symbols)} genes")
+        print(f"[cx] pb.compute_average_log_expression: Saving → {output_path}")
     adata.write(output_path)
     return AnnData(output_path)
 
@@ -128,6 +137,7 @@ def compute_pseudobulk_expression(
     chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
+    verbose: int | bool = False,
 ) -> AnnData:
     """Compute pseudo-bulk log-fold changes relative to control."""
 
@@ -135,6 +145,8 @@ def compute_pseudobulk_expression(
         raise ValueError("baseline_count must be positive")
 
     path = resolve_data_path(data)
+    if int(verbose) >= 1:
+        print(f"[cx] pb.compute_pseudobulk_expression: Reading {path}")
     backed = read_backed(path)
     try:
         # Calculate adaptive chunk_size if not provided
@@ -189,6 +201,9 @@ def compute_pseudobulk_expression(
         output_path = resolve_output_path(
             path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name
         )
+        if int(verbose) >= 1:
+            print(f"[cx] pb.compute_pseudobulk_expression: 0 perturbations × {gene_symbols.shape[0]} genes")
+            print(f"[cx] pb.compute_pseudobulk_expression: Saving → {output_path}")
         adata.write(output_path)
         return AnnData(output_path)
 
@@ -202,6 +217,9 @@ def compute_pseudobulk_expression(
     adata.uns["control_bulk"] = control_bulk
     adata.uns["baseline_count"] = float(baseline_count)
     output_path = resolve_output_path(path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name)
+    if int(verbose) >= 1:
+        print(f"[cx] pb.compute_pseudobulk_expression: {len(candidates)} perturbations × {len(gene_symbols)} genes")
+        print(f"[cx] pb.compute_pseudobulk_expression: Saving → {output_path}")
     adata.write(output_path)
     return AnnData(output_path)
 

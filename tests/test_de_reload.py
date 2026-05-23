@@ -208,7 +208,7 @@ class TestWilcoxonAutoReload:
             min_pct_both=0.0,
             min_mean_ctrl=0.0,
         )
-        output_path = tmp_path / "crispyx_wilcoxon.h5ad"
+        output_path = tmp_path / "data_cx_wilcoxon.h5ad"
         assert output_path.exists()
 
         mtime_before = output_path.stat().st_mtime
@@ -257,7 +257,7 @@ class TestWilcoxonAutoReload:
             min_mean_ctrl=0.0,
         )
         wilcoxon_test(path, **_run_kwargs)
-        output_path = tmp_path / "crispyx_wilcoxon.h5ad"
+        output_path = tmp_path / "data_cx_wilcoxon.h5ad"
         mtime_before = output_path.stat().st_mtime
         time.sleep(0.05)
 
@@ -277,7 +277,7 @@ class TestTTestAutoReload:
             min_pct_both=0.0,
             min_mean_ctrl=0.0,
         )
-        output_path = tmp_path / "crispyx_t_test.h5ad"
+        output_path = tmp_path / "data_cx_t_test.h5ad"
         assert output_path.exists()
 
         mtime_before = output_path.stat().st_mtime
@@ -306,7 +306,7 @@ class TestTTestAutoReload:
             min_mean_ctrl=0.0,
         )
         t_test(path, **_run_kwargs)
-        output_path = tmp_path / "crispyx_t_test.h5ad"
+        output_path = tmp_path / "data_cx_t_test.h5ad"
         mtime_before = output_path.stat().st_mtime
         time.sleep(0.05)
 
@@ -342,7 +342,7 @@ class TestNbGlmAutoReload:
             min_mean_ctrl=0.0,
             n_jobs=1,
         )
-        output_path = tmp_path / "crispyx_nb_glm.h5ad"
+        output_path = tmp_path / "data_cx_nb_glm.h5ad"
         assert output_path.exists()
 
         mtime_before = output_path.stat().st_mtime
@@ -373,7 +373,7 @@ class TestNbGlmAutoReload:
             n_jobs=1,
         )
         nb_glm_test(path, **_run_kwargs)
-        output_path = tmp_path / "crispyx_nb_glm.h5ad"
+        output_path = tmp_path / "data_cx_nb_glm.h5ad"
         mtime_before = output_path.stat().st_mtime
         time.sleep(0.05)
 

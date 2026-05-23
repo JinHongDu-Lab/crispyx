@@ -69,7 +69,7 @@ def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
 
     assert summary["rows"] == 2
     assert summary["columns"] == 4
-    assert summary["result_path"] == "crispyx_summary_test_avg_log_effects.h5ad"
+    assert summary["result_path"] == "summary_test_cx_avg_log_effects.h5ad"
 
     result.close()
 

@@ -22,7 +22,7 @@ run without materialising the full matrix — even the largest screens can be
 processed with modest resources.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
-workflows can migrate with minimal changes. See the :doc:`tutorial <crispyx_tutorial>`
+workflows can migrate with minimal changes. See the :doc:`tutorial <notebooks/crispyx_tutorial>`
 for an end-to-end walkthrough.
 
 Key features
@@ -45,7 +45,7 @@ Key features
 
    installation
    usage
-   crispyx_tutorial
+   notebooks/crispyx_tutorial
 
 .. toctree::
    :maxdepth: 2

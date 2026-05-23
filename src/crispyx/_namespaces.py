@@ -241,6 +241,7 @@ class _PreprocessingNamespace:
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+        verbose: int | bool = False,
     ):
         path = resolve_data_path(data)
         result = quality_control_summary(
@@ -255,6 +256,7 @@ class _PreprocessingNamespace:
             output_dir=output_dir,
             data_name=data_name,
             cache_mode=cache_mode,
+            verbose=verbose,
         )
         return result.filtered
 
@@ -522,6 +524,7 @@ class _PseudobulkNamespace:
         chunk_size: int = 2048,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
+        verbose: int | bool = False,
     ):
         path = resolve_data_path(data)
         return compute_average_log_expression(
@@ -533,6 +536,7 @@ class _PseudobulkNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            verbose=verbose,
         )
 
     def pseudobulk(
@@ -547,6 +551,7 @@ class _PseudobulkNamespace:
         chunk_size: int = 2048,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
+        verbose: int | bool = False,
     ):
         path = resolve_data_path(data)
         return compute_pseudobulk_expression(
@@ -559,6 +564,7 @@ class _PseudobulkNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            verbose=verbose,
         )
 
 

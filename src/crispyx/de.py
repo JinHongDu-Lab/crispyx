@@ -795,8 +795,8 @@ def _try_load_existing_de_result(
         method_name, output_path,
     )
     if verbose:
-        print(f"[crispyx] Loading existing result: {output_path}")
-        print("[crispyx] Pass force=True to rerun the analysis.")
+        print(f"[cx] Loading existing result: {output_path}")
+        print("[cx] Pass force=True to rerun the analysis.")
     return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
 
 
@@ -813,7 +813,7 @@ def _print_de_summary(
         _mean = int(sum(n_tested_list) / len(n_tested_list))
         _pct = 100.0 * _mean / n_genes if n_genes else 0
         print(
-            f"[crispyx] {method_name}: {n_completed}/{n_groups} perturbations "
+            f"[cx] {method_name}: {n_completed}/{n_groups} perturbations "
             f"complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)"
         )
 
@@ -828,7 +828,7 @@ def _print_de_perturbation_verbose(
     if int(verbose) >= 2:
         _pct = 100.0 * n_tested / n_genes if n_genes else 0
         print(
-            f"[crispyx] {label}: {n_tested}/{n_genes} genes tested "
+            f"[cx] {label}: {n_tested}/{n_genes} genes tested "
             f"({_pct:.0f}%), {n_genes - n_tested} filtered"
         )
 
@@ -1106,6 +1106,8 @@ def t_test(
         "min_mean_ctrl": float(min_mean_ctrl),
         "min_mean_pert": float(min_mean_pert),
     }
+    if int(verbose) >= 1:
+        print(f"[cx] t_test: Saving \u2192 {output_path}")
     adata.write(output_path)
 
     candidate_indices = {label: i for i, label in enumerate(candidates)}
@@ -3545,6 +3547,8 @@ def nb_glm_test(
         adata.uns["profiling"] = "NA"
 
     # output_path already resolved earlier for checkpoint
+    if int(verbose) >= 1:
+        print(f"[cx] nb_glm_test: Saving \u2192 {output_path}")
     adata.write(output_path)
     
     # Clean up checkpoint file on successful completion
@@ -3956,7 +3960,7 @@ def _wilcoxon_test_streaming(
 
     logger.info(f"Completed all {n_batches} group batches")
     if int(verbose) >= 1:
-        print(f"[crispyx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
+        print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
 
     # Build RankGenesGroupsResult by reading back from h5ad.
     # Uses _build_result_from_h5ad which skips loading for very large results
@@ -4528,7 +4532,7 @@ def wilcoxon_test(
                             _print_de_perturbation_verbose(verbose, _label, int(_valid_gene_counts[_gi]), n_genes)
                     _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
                     _pct = 100.0 * _mean / n_genes if n_genes else 0
-                    print(f"[crispyx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
+                    print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
         finally:
             backed.file.close()
 
@@ -4538,6 +4542,8 @@ def wilcoxon_test(
 
         # Write h5ad directly from memmaps via h5py (avoids triple allocation:
         # memmap + np.array copy + AnnData that previously caused OOM)
+        if int(verbose) >= 1:
+            print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
         _write_wilcoxon_result_h5ad(
             output_path,
             effect_matrix=effect_matrix,
@@ -5044,28 +5050,18 @@ def shrink_lfc(
     if data_name is None:
         # Append _shrunk to the stem
         stem = path.stem
-        # Remove crispyx_ prefix if present for cleaner naming
-        if stem.startswith("crispyx_"):
-            stem = stem[8:]
         if stem.endswith("_shrunk"):
             # Already shrunk, use as-is
             data_name = stem
         else:
             data_name = f"{stem}_shrunk"
-    
-    # Use the data_name directly as output filename
+
     if output_dir is None:
         output_dir = path.parent
     else:
         output_dir = Path(output_dir)
-    
-    # Ensure crispyx prefix
-    if not data_name.startswith("crispyx_"):
-        output_filename = f"crispyx_{data_name}.h5ad"
-    else:
-        output_filename = f"{data_name}.h5ad"
-    
-    output_path = output_dir / output_filename
+
+    output_path = output_dir / f"{data_name}.h5ad"
     adata.write(output_path)
     
     # Build result object

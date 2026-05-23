@@ -1465,6 +1465,7 @@ def quality_control_summary(
     cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
     delta_threshold: float = 0.3,
     force_streaming: bool = False,
+    verbose: int | bool = False,
 ) -> QualityControlResult:
     """Run QC with automatic strategy selection for optimal performance.
     
@@ -1519,6 +1520,8 @@ def quality_control_summary(
         is None), and QC statistics.
     """
     path = resolve_data_path(data)
+    if int(verbose) >= 1:
+        print(f"[cx] qc.quality_control: Reading {path}")
     
     # Read metadata and resolve control label
     backed = read_backed(path)
@@ -1575,6 +1578,8 @@ def quality_control_summary(
     # Handle output_dir=None: return masks only without writing output
     if output_dir is None:
         logger.info("output_dir is None, returning QC masks without writing filtered h5ad")
+        if int(verbose) >= 1:
+            print("[cx] qc.quality_control: output_dir=None — returning masks only (no file written)")
         return _qc_masks_only(
             path,
             min_genes=min_genes,
@@ -1591,6 +1596,8 @@ def quality_control_summary(
     filtered_path = resolve_output_path(
         path, suffix="filtered", output_dir=output_dir, data_name=data_name
     )
+    if int(verbose) >= 1:
+        print(f"[cx] qc.quality_control: Saving → {filtered_path}")
     
     # Common kwargs for all strategies
     common_kwargs = {
@@ -1614,25 +1621,43 @@ def quality_control_summary(
         logger.info(
             f"Using in-memory QC (estimated: {estimated_memory_gb:.1f}GB, threshold: {_in_memory_threshold_gb:.1f}GB)"
         )
-        return _qc_in_memory(path, **common_kwargs)
+        if int(verbose) >= 1:
+            print(f"[cx] qc.quality_control: Strategy — in-memory ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
+        result = _qc_in_memory(path, **common_kwargs)
     
     elif storage_format == 'csc':
         # Option B: Column-oriented for large CSC
         logger.info(
             f"Using column-oriented streaming QC (CSC format, {file_size_gb:.2f}GB)"
         )
-        return _qc_column_oriented(path, chunk_size=chunk_size, **common_kwargs)
+        if int(verbose) >= 1:
+            print(f"[cx] qc.quality_control: Strategy — column-streaming ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
+        result = _qc_column_oriented(path, chunk_size=chunk_size, **common_kwargs)
     
     else:
         # Row-oriented streaming for large CSR/dense
         logger.info(
             f"Using row-oriented streaming QC ({storage_format} format, {file_size_gb:.2f}GB)"
         )
-        return _qc_row_oriented(
+        if int(verbose) >= 1:
+            print(f"[cx] qc.quality_control: Strategy — row-streaming ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
+        result = _qc_row_oriented(
             path,
             chunk_size=chunk_size,
             cache_mode=cache_mode,
             delta_threshold=delta_threshold,
             **common_kwargs,
         )
+
+    if int(verbose) >= 1:
+        n_obs_in = int(result.cell_mask.sum())
+        n_vars_in = int(result.gene_mask.sum())
+        pct_cells = 100 * n_obs_in / n_obs if n_obs else 0
+        pct_genes = 100 * n_vars_in / n_vars if n_vars else 0
+        print(
+            f"[cx] qc.quality_control: Done  "
+            f"{n_obs_in}/{n_obs} cells kept ({pct_cells:.0f}%), "
+            f"{n_vars_in}/{n_vars} genes kept ({pct_genes:.0f}%)"
+        )
+    return result
 
