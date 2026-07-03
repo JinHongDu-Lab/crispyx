@@ -21,8 +21,10 @@ SLURM_SCRIPT="$PROJECT_ROOT/benchmarking/singularity/slurm_rerun_scanpy.sh"
 # Default config files - only large datasets where Scanpy typically fails
 # Small datasets usually complete in benchmark, so skip by default
 DEFAULT_CONFIGS=(
-    "Feng-ts.yaml"
-    # "Replogle-GW-k562.yaml"
+    # "Feng-ts.yaml"
+    # "Feng-gwsf.yaml"
+    # "Feng-gwsnf.yaml"
+    "Replogle-GW-k562.yaml"
     # "Replogle-E-k562.yaml"
     # "Replogle-E-rpe1.yaml"
     # "Huang-HCT116.yaml"
