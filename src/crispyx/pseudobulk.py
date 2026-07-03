@@ -42,8 +42,9 @@ def compute_average_log_expression(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     chunk_size: int | None = None,
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = False,
 ) -> AnnData:
     """Compute average log-normalised expression per perturbation relative to control."""
@@ -102,7 +103,8 @@ def compute_average_log_expression(
             var=pd.DataFrame(index=gene_symbols),
         )
         output_path = resolve_output_path(
-            path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name
+            path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name,
+            output_path=output_path,
         )
         if int(verbose) >= 1:
             print(f"[cx] pb.compute_average_log_expression: 0 perturbations × {gene_symbols.shape[0]} genes")
@@ -118,7 +120,10 @@ def compute_average_log_expression(
     adata = ad.AnnData(effect_matrix_np, obs=obs, var=var)
     adata.layers["perturbation_mean"] = np.vstack(pert_means)
     adata.uns["control_mean"] = control_mean
-    output_path = resolve_output_path(path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name)
+    output_path = resolve_output_path(
+        path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
+    )
     if int(verbose) >= 1:
         print(f"[cx] pb.compute_average_log_expression: {len(candidates)} perturbations × {len(gene_symbols)} genes")
         print(f"[cx] pb.compute_average_log_expression: Saving → {output_path}")
@@ -135,8 +140,9 @@ def compute_pseudobulk_expression(
     perturbations: Iterable[str] | None = None,
     baseline_count: float = 1.0,
     chunk_size: int | None = None,
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = False,
 ) -> AnnData:
     """Compute pseudo-bulk log-fold changes relative to control."""
@@ -199,7 +205,8 @@ def compute_pseudobulk_expression(
         adata.uns["control_bulk"] = control_bulk
         adata.uns["baseline_count"] = float(baseline_count)
         output_path = resolve_output_path(
-            path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name
+            path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name,
+            output_path=output_path,
         )
         if int(verbose) >= 1:
             print(f"[cx] pb.compute_pseudobulk_expression: 0 perturbations × {gene_symbols.shape[0]} genes")
@@ -216,7 +223,10 @@ def compute_pseudobulk_expression(
     adata.layers["perturbation_bulk"] = np.vstack(pert_bulks)
     adata.uns["control_bulk"] = control_bulk
     adata.uns["baseline_count"] = float(baseline_count)
-    output_path = resolve_output_path(path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name)
+    output_path = resolve_output_path(
+        path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
+    )
     if int(verbose) >= 1:
         print(f"[cx] pb.compute_pseudobulk_expression: {len(candidates)} perturbations × {len(gene_symbols)} genes")
         print(f"[cx] pb.compute_pseudobulk_expression: Saving → {output_path}")
