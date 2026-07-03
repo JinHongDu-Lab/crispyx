@@ -36,6 +36,43 @@ When should I use CSC vs CSR format?
 The benchmark pipeline handles this automatically, but manual workflows
 should convert before calling DE functions.
 
+QC or normalisation is extremely slow on a CSC file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Cell-(row-)streaming operations — quality control and
+:func:`crispyx.normalize_total_log1p` — read the matrix one block of cells at a
+time. On a **CSC** file a row slice must scan the column pointers across every
+gene, making each chunk ``O(total_nnz)`` and the whole pass up to ~100x slower
+than the equivalent CSR streaming. Gene-(column-)streaming operations such as
+the Wilcoxon test are naturally fast on CSC and slow on CSR — the penalty is
+symmetric.
+
+crispyx mitigates this for you:
+
+* **Quality control** automatically dispatches CSC inputs to a
+  column-oriented path (including the masks-only ``output_dir=None`` call), so
+  no action is needed.
+* :func:`crispyx.normalize_total_log1p` exposes ``format_mismatch_policy``:
+
+  .. code-block:: python
+
+     # Default: proceed but log one actionable warning.
+     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="warn")
+
+     # Transparently stream via a temporary CSR copy (bounded memory);
+     # the temp file is removed before returning.
+     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
+
+     # Proceed silently (you have already accounted for the cost).
+     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="off")
+
+For a file you will reuse across several cell-streaming steps, convert it once
+up front instead:
+
+.. code-block:: python
+
+   cx.data.convert_to_csr(csc_path, output_path=csr_path)  # bounded-memory, two-pass
+
 ``tomllib`` / ``tomli`` import errors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

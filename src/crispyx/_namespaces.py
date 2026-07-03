@@ -238,8 +238,9 @@ class _PreprocessingNamespace:
         control_label: str | None = None,
         gene_name_column: str | None = None,
         chunk_size: int = 2048,
-        output_dir: str | Path | None = None,
         data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
         cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
         verbose: int | bool = False,
     ):
@@ -255,6 +256,7 @@ class _PreprocessingNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            output_path=output_path,
             cache_mode=cache_mode,
             verbose=verbose,
         )
@@ -353,6 +355,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 4096,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
+        format_mismatch_policy: str = "warn",
         verbose: bool = True,
     ) -> AnnData:
         """Stream normalize and/or log-transform an h5ad file.
@@ -375,6 +378,10 @@ class _PreprocessingNamespace:
             Output directory. Defaults to input file's directory.
         data_name
             Custom output name suffix.
+        format_mismatch_policy
+            How to handle a CSC source (slow for cell-streaming): 'warn'
+            (default), 'convert' (transparently stream via a temporary CSR
+            copy), or 'off'.
         verbose
             Print progress.
 
@@ -392,6 +399,7 @@ class _PreprocessingNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            format_mismatch_policy=format_mismatch_policy,
             verbose=verbose,
         )
 
@@ -522,8 +530,9 @@ class _PseudobulkNamespace:
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
         chunk_size: int = 2048,
-        output_dir: str | Path | None = None,
         data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
         verbose: int | bool = False,
     ):
         path = resolve_data_path(data)
@@ -536,6 +545,7 @@ class _PseudobulkNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            output_path=output_path,
             verbose=verbose,
         )
 
@@ -549,8 +559,9 @@ class _PseudobulkNamespace:
         perturbations: Iterable[str] | None = None,
         baseline_count: float = 1.0,
         chunk_size: int = 2048,
-        output_dir: str | Path | None = None,
         data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
         verbose: int | bool = False,
     ):
         path = resolve_data_path(data)
@@ -564,6 +575,7 @@ class _PseudobulkNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            output_path=output_path,
             verbose=verbose,
         )
 
@@ -696,6 +708,7 @@ class _ToolsNamespace:
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
                 "n_jobs",
                 "checkpoint_interval",
+                "batch_column",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:

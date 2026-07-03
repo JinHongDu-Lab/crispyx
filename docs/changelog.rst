@@ -1,6 +1,24 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **Format-aware masks-only QC (CSC fix)** – ``quality_control_summary`` with
+  ``output_dir=None`` (masks only) now routes CSC inputs through a
+  column-oriented counting path instead of row-slicing a backed CSC matrix,
+  which was ``O(total_nnz)`` per chunk (~100x slower at genome scale). Output
+  masks and statistics are byte-identical to the CSR path.
+
+* **``normalize_total_log1p`` gains ``format_mismatch_policy``** – controls how a
+  CSC source (slow for cell-streaming) is handled: ``"warn"`` (default, one
+  actionable log message), ``"convert"`` (transparently stream via a
+  bounded-memory temporary CSR copy, removed before returning), or ``"off"``.
+
+* **Slow-axis guardrail** – ``iter_matrix_chunks`` now emits a single warning
+  when a backed matrix is streamed against its slow axis (CSC by rows or CSR by
+  columns), pointing to ``convert_to_csr`` / ``convert_to_csc``.
+
 Version 0.0.4
 -------------
 

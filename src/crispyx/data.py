@@ -602,8 +602,9 @@ def resolve_output_path(
     input_path: str | Path,
     *,
     suffix: str,
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
 ) -> Path:
     """Construct an informative output path for an intermediate ``.h5ad`` file.
 
@@ -614,7 +615,16 @@ def resolve_output_path(
     * filenames sort naturally by input first, then by operation;
     * the producing tool is unambiguously marked without cluttering the start
       of the filename.
+
+    When ``output_path`` is provided it is returned directly, bypassing all
+    name computation.  This lets callers enforce an exact output filename.
+
+    .. deprecated::
+        ``output_dir`` is kept for backward compatibility and will be removed
+        in the next major version.  Use ``output_path`` instead.
     """
+    if output_path is not None:
+        return Path(output_path)
 
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
@@ -755,6 +765,38 @@ def read_h5ad_ondisk(
     return adata_ro
 
 
+_SLOW_AXIS_WARNED: set[tuple[str, int]] = set()
+
+
+def _detect_backed_sparse_format(X: Any) -> str | None:
+    """Return 'csr'/'csc' for a backed sparse matrix, else None.
+
+    Works across anndata versions where backed sparse datasets expose either
+    a ``format`` or ``format_str`` attribute.
+    """
+    for attr in ("format", "format_str"):
+        fmt = getattr(X, attr, None)
+        if isinstance(fmt, str) and fmt in ("csr", "csc"):
+            return fmt
+    return None
+
+
+def _warn_slow_axis(fmt: str, axis: int) -> None:
+    """Emit a one-time warning when a backed matrix is accessed off its fast axis."""
+    key = (fmt, axis)
+    if key in _SLOW_AXIS_WARNED:
+        return
+    _SLOW_AXIS_WARNED.add(key)
+    access = "row (axis=0)" if axis == 0 else "column (axis=1)"
+    remedy = "convert_to_csr" if fmt == "csc" else "convert_to_csc"
+    logger.warning(
+        "Backed X is stored as %s but is being streamed by %s slices, which is "
+        "O(total_nnz) per chunk and can be ~100x slower. Consider running "
+        "cx.data.%s(path) once to store the matrix on its fast axis.",
+        fmt.upper(), access, remedy,
+    )
+
+
 def iter_matrix_chunks(
     adata: ad.AnnData | ad._core.anndata.AnnDataMixin,
     *,
@@ -766,6 +808,9 @@ def iter_matrix_chunks(
 
     if axis not in (0, 1):
         raise ValueError("axis must be 0 (rows) or 1 (columns)")
+    fmt = _detect_backed_sparse_format(adata.X)
+    if (fmt == "csc" and axis == 0) or (fmt == "csr" and axis == 1):
+        _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
     for start in range(0, length, chunk_size):
@@ -1160,6 +1205,7 @@ def normalize_total_log1p(
     chunk_size: int = 4096,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
+    format_mismatch_policy: Literal["warn", "convert", "off"] = "warn",
     verbose: bool = True,
 ) -> "AnnData":
     """Stream normalize and/or log-transform an h5ad file without loading it fully into memory.
@@ -1190,6 +1236,14 @@ def normalize_total_log1p(
         Directory for output file. Defaults to input file's directory.
     data_name
         Custom name for output file. If None, uses "normalized" suffix.
+    format_mismatch_policy
+        How to handle a source stored as CSC, whose row-(cell-)streaming here is
+        O(total_nnz) per chunk and can be ~100x slower than CSR:
+        - ``"warn"`` (default): proceed but log a single actionable warning.
+        - ``"convert"``: transparently convert the source to CSR in a temporary
+          file (bounded-memory two-pass streaming) and stream from that; the
+          temporary file is removed before returning.
+        - ``"off"``: proceed silently with no warning.
     verbose
         Print progress information.
     
@@ -1211,13 +1265,74 @@ def normalize_total_log1p(
     
     >>> # Use explicit output path
     >>> adata_norm = cx.pp.normalize_total_log1p(adata_ro, "results/normalized.h5ad")
+
+    >>> # Auto-convert a CSC source to CSR for fast cell-streaming
+    >>> adata_norm = cx.pp.normalize_total_log1p(csc_path, format_mismatch_policy="convert")
     """
     if not normalize and not log1p:
         raise ValueError("At least one of normalize or log1p must be True")
-    
+    if format_mismatch_policy not in ("warn", "convert", "off"):
+        raise ValueError(
+            "format_mismatch_policy must be 'warn', 'convert', or 'off', "
+            f"got {format_mismatch_policy!r}"
+        )
+
     # Resolve input path from various input types
     source_path = resolve_data_path(data, require_exists=True)
-    
+
+    # Cell-(row-)streaming below is pathologically slow on CSC. Handle the
+    # format mismatch up-front according to policy.
+    _tmp_converted: Path | None = None
+    if get_matrix_storage_format(source_path) == "csc":
+        if format_mismatch_policy == "convert":
+            import tempfile
+            fd, tmp_name = tempfile.mkstemp(suffix=".csr.h5ad", prefix="cx_norm_")
+            _os.close(fd)
+            _tmp_converted = Path(tmp_name)
+            logger.info(
+                "Source X is CSC; converting to CSR in a temporary file for "
+                "efficient cell-streaming normalization (%s).", _tmp_converted,
+            )
+            convert_to_csr(source_path, output_path=str(_tmp_converted), verbose=False)
+            source_path = _tmp_converted
+        elif format_mismatch_policy == "off":
+            # Silence the low-level per-iterator guardrail warning.
+            _SLOW_AXIS_WARNED.add(("csc", 0))
+        else:  # "warn"
+            _warn_slow_axis("csc", 0)
+            # Avoid a duplicate warning from the low-level iterator guardrail.
+            _SLOW_AXIS_WARNED.add(("csc", 0))
+
+    try:
+        return _normalize_total_log1p_impl(
+            source_path,
+            output_path,
+            normalize=normalize,
+            log1p=log1p,
+            target_sum=target_sum,
+            chunk_size=chunk_size,
+            output_dir=output_dir,
+            data_name=data_name,
+            verbose=verbose,
+        )
+    finally:
+        if _tmp_converted is not None and _tmp_converted.exists():
+            _tmp_converted.unlink()
+
+
+def _normalize_total_log1p_impl(
+    source_path: Path,
+    output_path: str | Path | None,
+    *,
+    normalize: bool,
+    log1p: bool,
+    target_sum: float,
+    chunk_size: int,
+    output_dir: str | Path | None,
+    data_name: str | None,
+    verbose: bool,
+) -> "AnnData":
+    """Core streaming normalize/log1p implementation (source already resolved)."""
     # Resolve output path
     if output_path is not None:
         output_path = Path(output_path)

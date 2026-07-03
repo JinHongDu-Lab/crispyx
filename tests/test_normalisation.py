@@ -479,3 +479,73 @@ def test_deseq2_size_factors_streaming_parity(tmp_path):
     sf_streaming = sf_streaming / scale_factor
 
     np.testing.assert_allclose(sf_streaming, sf_dense, rtol=1e-10, atol=1e-12)
+
+
+def _write_fmt(path, X, fmt):
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(X.shape[0])])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(X.shape[1])])
+    Xf = X.tocsr() if fmt == "csr" else X.tocsc()
+    ad.AnnData(X=Xf, obs=obs, var=var).write_h5ad(path)
+
+
+def test_normalize_csc_format_mismatch_policy(tmp_path, caplog):
+    """normalize_total_log1p on CSC: convert/warn/off parity and warning behavior."""
+    import logging
+    import tempfile
+
+    import crispyx.data as cxd
+    from crispyx.data import normalize_total_log1p
+
+    rng = np.random.default_rng(3)
+    n, g = 200, 30
+    X = sp.random(n, g, density=0.2, random_state=3,
+                  data_rvs=lambda s: rng.integers(1, 12, s)).tocsr()
+    X.data = X.data.astype(np.float32)
+    csr_p = tmp_path / "csr.h5ad"
+    csc_p = tmp_path / "csc.h5ad"
+    _write_fmt(csr_p, X, "csr")
+    _write_fmt(csc_p, X, "csc")
+
+    def load(p):
+        return ad.read_h5ad(p).X.toarray()
+
+    # Reference output from the CSR source.
+    normalize_total_log1p(csr_p, tmp_path / "ref.h5ad", verbose=False)
+    ref = load(tmp_path / "ref.h5ad")
+
+    # convert policy: identical output, no slow-axis warning, temp cleaned up.
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        normalize_total_log1p(csc_p, tmp_path / "conv.h5ad",
+                              format_mismatch_policy="convert", verbose=False)
+    assert np.allclose(ref, load(tmp_path / "conv.h5ad"), atol=1e-5)
+    assert not [r for r in caplog.records if "slower" in r.getMessage()]
+    assert not list(Path(tempfile.gettempdir()).glob("cx_norm_*"))
+
+    # warn policy: exactly one warning, output still correct.
+    caplog.clear()
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        normalize_total_log1p(csc_p, tmp_path / "warn.h5ad",
+                              format_mismatch_policy="warn", verbose=False)
+    assert len([r for r in caplog.records if "slower" in r.getMessage()]) == 1
+    assert np.allclose(ref, load(tmp_path / "warn.h5ad"), atol=1e-5)
+
+    # off policy: no warning.
+    caplog.clear()
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        normalize_total_log1p(csc_p, tmp_path / "off.h5ad",
+                              format_mismatch_policy="off", verbose=False)
+    assert not [r for r in caplog.records if "slower" in r.getMessage()]
+
+
+def test_normalize_invalid_policy_raises(tmp_path):
+    from crispyx.data import normalize_total_log1p
+
+    X = sp.random(20, 10, density=0.3, random_state=0).tocsr()
+    X.data = X.data.astype(np.float32)
+    p = tmp_path / "x.h5ad"
+    _write_fmt(p, X, "csr")
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        normalize_total_log1p(p, tmp_path / "o.h5ad", format_mismatch_policy="bogus")

@@ -422,5 +422,78 @@ def test_qc_strategy_selection_thresholds():
         "10 GB file should still be in-memory even on 500 GB node"
 
 
+def _make_synthetic_h5ad(dir_path, fmt, seed=0):
+    """Write a small synthetic h5ad in the requested storage format ('csr'/'csc')."""
+    import anndata as ad
+    import pandas as pd
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(seed)
+    n, g = 400, 60
+    X = sp.random(n, g, density=0.15, random_state=seed,
+                  data_rvs=lambda s: rng.integers(1, 10, s)).tocsr()
+    X.data = X.data.astype(np.float32)
+    obs_pert = np.array(["NTC"] * 80 + list(np.repeat([f"P{i}" for i in range(16)], 20)))
+    rng.shuffle(obs_pert)
+    obs = pd.DataFrame({"perturbation": pd.Categorical(obs_pert)})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(g)])
+    Xf = X.tocsr() if fmt == "csr" else X.tocsc()
+    path = Path(dir_path) / f"{fmt}.h5ad"
+    ad.AnnData(X=Xf, obs=obs, var=var).write_h5ad(path)
+    return path
+
+
+def test_masks_only_csc_matches_csr(tmp_output_dir):
+    """Masks-only QC (output_dir=None) must give identical results for CSC and CSR.
+
+    Regression test for the CSC row-slicing performance fix: the masks-only
+    path now uses column-oriented counting for CSC inputs, and must remain
+    numerically identical to the CSR row-oriented path.
+    """
+    from crispyx.data import get_matrix_storage_format
+    from crispyx.qc import quality_control_summary
+
+    csr_p = _make_synthetic_h5ad(tmp_output_dir, "csr")
+    csc_p = _make_synthetic_h5ad(tmp_output_dir, "csc")
+    assert get_matrix_storage_format(csr_p) == "csr"
+    assert get_matrix_storage_format(csc_p) == "csc"
+
+    kw = dict(perturbation_column="perturbation", control_label="NTC",
+              min_genes=3, min_cells_per_perturbation=10, min_cells_per_gene=5,
+              output_dir=None)
+    r_csr = quality_control_summary(csr_p, **kw)
+    r_csc = quality_control_summary(csc_p, **kw)
+
+    assert np.array_equal(r_csr.cell_mask, r_csc.cell_mask)
+    assert np.array_equal(r_csr.gene_mask, r_csc.gene_mask)
+    assert np.array_equal(r_csr.cell_gene_counts, r_csc.cell_gene_counts)
+    assert np.array_equal(r_csr.gene_cell_counts, r_csc.gene_cell_counts)
+    assert r_csr.perturbation_keep == r_csc.perturbation_keep
+
+
+def test_iter_matrix_chunks_slow_axis_warns_once(tmp_output_dir, caplog):
+    """Streaming a backed CSC matrix by rows should warn exactly once."""
+    import logging
+
+    import crispyx.data as cxd
+    from crispyx.data import iter_matrix_chunks, read_backed
+
+    csc_p = _make_synthetic_h5ad(tmp_output_dir, "csc")
+    cxd._SLOW_AXIS_WARNED.clear()
+
+    backed = read_backed(csc_p)
+    try:
+        with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+            for _ in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=False):
+                pass
+            for _ in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=False):
+                pass
+    finally:
+        backed.file.close()
+
+    slow_warnings = [r for r in caplog.records if "slower" in r.getMessage()]
+    assert len(slow_warnings) == 1, f"expected exactly one slow-axis warning, got {len(slow_warnings)}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1325,6 +1325,127 @@ def _qc_row_oriented(
     )
 
 
+def _qc_masks_only_column_oriented(
+    path: str | Path,
+    *,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
+    perturbation_column: str,
+    control_label: str,
+    chunk_size: int,
+) -> QualityControlResult:
+    """Column-oriented masks-only QC for large CSC datasets.
+
+    Mirrors :func:`_qc_column_oriented` but skips writing a filtered h5ad.
+    Iterating by column chunks is O(1) memory relative to data size and
+    avoids the pathological ``O(total_nnz)``-per-chunk cost of row-slicing a
+    backed CSC matrix (which makes the row-oriented masks path ~100x slower
+    at genome scale).
+
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_genes
+        Minimum genes per cell.
+    min_cells_per_perturbation
+        Minimum cells per perturbation.
+    min_cells_per_gene
+        Minimum cells expressing each gene.
+    perturbation_column
+        Column in obs containing perturbation labels.
+    control_label
+        Control label (already resolved).
+    chunk_size
+        Number of columns to process per chunk.
+
+    Returns
+    -------
+    QualityControlResult
+        QC result with masks but filtered=None (no output file).
+    """
+    logger.debug("Computing QC masks only via column-oriented path (large CSC dataset)")
+
+    # Read metadata
+    backed = read_backed(path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+    finally:
+        backed.file.close()
+
+    # Pass 1: Iterate by columns (fast for CSC) to compute both metrics.
+    genes_per_cell = np.zeros(n_obs, dtype=np.int64)
+    cells_per_gene_all = np.zeros(n_vars, dtype=np.int64)
+
+    backed = read_backed(path)
+    try:
+        for col_start in range(0, n_vars, chunk_size):
+            col_end = min(col_start + chunk_size, n_vars)
+            # Column slice is O(1) for CSC.
+            block = backed.X[:, col_start:col_end]
+            if sp.issparse(block):
+                genes_per_cell += np.asarray(block.getnnz(axis=1)).ravel()
+                cells_per_gene_all[col_start:col_end] = np.asarray(block.getnnz(axis=0)).ravel()
+            else:
+                genes_per_cell += np.count_nonzero(block, axis=1)
+                cells_per_gene_all[col_start:col_end] = np.count_nonzero(block, axis=0)
+    finally:
+        backed.file.close()
+
+    gene_counts_per_cell = genes_per_cell
+
+    # Cell filtering
+    cell_mask = genes_per_cell >= min_genes
+
+    # Perturbation filtering (metadata only)
+    label_series = pd.Series(labels)
+    counts = label_series[cell_mask].value_counts()
+    count_per_cell = label_series.map(counts).fillna(0).to_numpy()
+    is_control = labels == control_label
+    has_enough = count_per_cell >= min_cells_per_perturbation
+    combined_cell_mask = (is_control | has_enough) & cell_mask
+
+    # Recompute cells_per_gene for filtered cells if perturbation filtering
+    # removed any cells (column-oriented pass, fast for CSC).
+    removed_cells = cell_mask & ~combined_cell_mask
+    if removed_cells.any():
+        backed = read_backed(path)
+        try:
+            for col_start in range(0, n_vars, chunk_size):
+                col_end = min(col_start + chunk_size, n_vars)
+                block = backed.X[:, col_start:col_end]
+                selected = block[removed_cells]
+                if sp.issparse(selected):
+                    cells_per_gene_all[col_start:col_end] -= np.asarray(selected.getnnz(axis=0)).ravel()
+                else:
+                    cells_per_gene_all[col_start:col_end] -= np.count_nonzero(selected, axis=0)
+        finally:
+            backed.file.close()
+
+    gene_cell_counts = cells_per_gene_all
+    gene_mask = gene_cell_counts >= min_cells_per_gene
+
+    # Build perturbation_keep dict
+    filtered_labels = labels[combined_cell_mask]
+    unique_labels = np.unique(filtered_labels)
+    label_counts = pd.Series(filtered_labels).value_counts()
+    perturbation_keep = {
+        label: (label == control_label) or (label_counts.get(label, 0) >= min_cells_per_perturbation)
+        for label in unique_labels
+    }
+
+    return QualityControlResult(
+        cell_mask=combined_cell_mask,
+        gene_mask=gene_mask,
+        perturbation_keep=perturbation_keep,
+        filtered=None,  # No output file
+        cell_gene_counts=gene_counts_per_cell,
+        gene_cell_counts=gene_cell_counts,
+    )
+
+
 def _qc_masks_only(
     path: str | Path,
     *,
@@ -1336,6 +1457,7 @@ def _qc_masks_only(
     gene_name_column: str | None,
     chunk_size: int,
     delta_threshold: float = 0.3,
+    storage_format: str = 'csr',
 ) -> QualityControlResult:
     """Compute QC masks without writing output file.
     
@@ -1365,6 +1487,10 @@ def _qc_masks_only(
         Number of cells to process per chunk.
     delta_threshold
         Threshold for delta adjustment.
+    storage_format
+        On-disk storage format of ``X`` ('csr', 'csc', or 'dense'). When
+        'csc', a column-oriented counting path is used to avoid the
+        pathological cost of row-slicing a backed CSC matrix.
         
     Returns
     -------
@@ -1372,7 +1498,21 @@ def _qc_masks_only(
         QC result with masks but filtered=None (no output file).
     """
     logger.debug("Computing QC masks only (no output file)")
-    
+
+    # For large CSC inputs, row-slicing a backed matrix is O(total_nnz) per
+    # chunk (~100x slower at genome scale). Use the column-oriented path,
+    # which is the natural fast axis for CSC.
+    if storage_format == 'csc':
+        return _qc_masks_only_column_oriented(
+            path,
+            min_genes=min_genes,
+            min_cells_per_perturbation=min_cells_per_perturbation,
+            min_cells_per_gene=min_cells_per_gene,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            chunk_size=chunk_size,
+        )
+
     # Read metadata
     backed = read_backed(path)
     try:
@@ -1460,8 +1600,9 @@ def quality_control_summary(
     gene_name_column: str | None = None,
     chunk_size: int | None = None,
     memory_limit_gb: float | None = None,
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
     delta_threshold: float = 0.3,
     force_streaming: bool = False,
@@ -1496,11 +1637,16 @@ def quality_control_summary(
     memory_limit_gb
         Optional memory limit in GB for strategy selection and chunk size.
         If None, auto-detected from system memory.
+    data_name
+        Base name for output files.
+    output_path
+        Exact path for the output h5ad file. When provided, ``output_dir``
+        and ``data_name`` are ignored.
     output_dir
         Directory for output files. If None, returns QC masks without writing
         a filtered h5ad file (QualityControlResult.filtered will be None).
-    data_name
-        Base name for output files.
+        Deprecated; use ``output_path`` instead. Will be removed in the
+        next major version.
     cache_mode
         Cache strategy for row-oriented streaming: 'memory' (fast, high RAM),
         'memmap' (low RAM, disk-based), or 'none' (no caching, requires
@@ -1575,11 +1721,11 @@ def quality_control_summary(
             n_obs, n_vars, available_memory_gb=memory_limit_gb
         )
     
-    # Handle output_dir=None: return masks only without writing output
-    if output_dir is None:
+    # Handle output_dir=None and output_path=None: return masks only without writing output
+    if output_dir is None and output_path is None:
         logger.info("output_dir is None, returning QC masks without writing filtered h5ad")
         if int(verbose) >= 1:
-            print("[cx] qc.quality_control: output_dir=None — returning masks only (no file written)")
+            print("[cx] qc.quality_control: output_dir=None and output_path=None — returning masks only (no file written)")
         return _qc_masks_only(
             path,
             min_genes=min_genes,
@@ -1590,11 +1736,13 @@ def quality_control_summary(
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
             delta_threshold=delta_threshold,
+            storage_format=storage_format,
         )
     
     # Resolve output path
     filtered_path = resolve_output_path(
-        path, suffix="filtered", output_dir=output_dir, data_name=data_name
+        path, suffix="filtered", output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
     )
     if int(verbose) >= 1:
         print(f"[cx] qc.quality_control: Saving → {filtered_path}")
