@@ -1,8 +1,29 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.0.5
+-------------
+
+*Released 2026-07-03.*
+
+* **Batch-stratified (van Elteren) Wilcoxon test** – ``wilcoxon_test`` now
+  accepts a ``batch_column`` parameter.  When provided, cells are ranked
+  *within each batch* separately and the per-stratum U statistics are combined
+  with unit weights (equivalent to a van Elteren test), removing rank
+  inflation caused by batch effects.  Low-expression filtering, log-fold
+  changes, and ``pts`` remain pooled across all cells; only the rank test is
+  stratified.  Perturbations that share no batch with any control cell are
+  marked untestable (NaN p-values).  Diagnostic metadata
+  (``stratified_n_batches``, ``stratified_n_control_batches``,
+  ``stratified_n_untestable_perturbations``, etc.) are stored in
+  ``adata.uns``.
+
+* **``output_path`` parameter for pseudo-bulk functions** –
+  ``compute_average_log_expression`` and ``compute_pseudobulk_expression``
+  now accept an explicit ``output_path`` argument, consistent with all other
+  crispyx functions.  The old ``output_dir`` kwarg is retained for backward
+  compatibility but is deprecated and will be removed in the next major
+  version.
 
 * **Format-aware masks-only QC (CSC fix)** – ``quality_control_summary`` with
   ``output_dir=None`` (masks only) now routes CSC inputs through a

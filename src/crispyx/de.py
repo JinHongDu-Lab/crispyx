@@ -367,7 +367,7 @@ def _load_existing_nb_glm_result(
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
-        result=adata,
+        result=AnnData(output_path),
     )
 
 

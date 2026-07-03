@@ -260,9 +260,40 @@ The canonical names (``perturbation_column`` and ``control_label``) remain the
 primary names and are not deprecated. Supplying both a canonical name and its
 alias at the same time raises ``TypeError``.
 
+Batch-stratified Wilcoxon (van Elteren test)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When cells come from multiple batches (e.g. 10x lanes, gem-groups, or
+experimental replicates), a pooled Wilcoxon test can suffer from rank
+inflation: cells from a high-count batch will systematically receive higher
+ranks, creating spurious hits correlated with batch rather than perturbation.
+
+Pass ``batch_column`` to perform a **batch-stratified (van Elteren) Wilcoxon**
+test instead: cells are ranked *within each batch separately* and the
+per-stratum U statistics are summed, removing batch-driven rank inflation.
+
+.. code-block:: python
+
+   result = cx.tl.wilcoxon_test(
+       adata_csc,
+       perturbation_column="perturbation",
+       batch_column="batch",          # column in adata.obs
+   )
+
+Key properties:
+
+* Low-expression filtering, log-fold changes, and ``pts`` remain pooled across
+  all cells — only the rank test is stratified.
+* Perturbations that share no batch with any control cell are automatically
+  marked untestable (NaN p-values) and logged.
+* Diagnostic metadata stored in ``uns``: ``stratified_n_batches``,
+  ``stratified_n_control_batches``, ``stratified_n_untestable_perturbations``,
+  ``stratified_min_shared_batches_per_perturbation``, and
+  ``stratified_median_shared_batches_per_perturbation``.
+* The output file receives the suffix ``_cx_wilcoxon_stratified.h5ad`` to
+  distinguish it from the pooled result.
 
 
-crispyx provides Scanpy-style plotting helpers under ``cx.pl`` that work with
 on-disk results. The plotting functions materialise only the metadata needed
 for plotting, keeping the expression matrix on disk.
 

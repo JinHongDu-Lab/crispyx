@@ -14,9 +14,9 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 
 ## Features
 
-- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; all without loading the full matrix into memory
+- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
 - **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk count matrices for effect size estimation
-- **Differential expression** – t-test, Wilcoxon rank-sum, and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
 - **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
 - **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns

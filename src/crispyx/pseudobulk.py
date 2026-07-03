@@ -47,7 +47,52 @@ def compute_average_log_expression(
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = False,
 ) -> AnnData:
-    """Compute average log-normalised expression per perturbation relative to control."""
+    """Compute average log-normalised expression per perturbation relative to control.
+
+    For each perturbation group, computes the per-gene mean of log1p-normalised
+    expression and stores the difference relative to the control group as the
+    effect size.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, or a backed/in-memory AnnData object.
+    perturbation_column
+        Column in ``adata.obs`` that identifies perturbation groups.
+    control_label
+        Label of the control group.  If ``None``, inferred from common
+        patterns (``'non-targeting'``, ``'control'``, etc.).
+    gene_name_column
+        Column in ``adata.var`` with gene symbols.  If ``None``, uses
+        ``adata.var_names``.
+    perturbations
+        Subset of perturbation labels to include.  If ``None``, all
+        non-control groups are processed.
+    chunk_size
+        Number of cells to process per chunk.  If ``None``, auto-determined
+        from dataset shape.
+    data_name
+        Custom stem for the output filename.  If ``None``, the input file
+        stem is used with a ``_cx_avg_log_effects`` suffix.
+    output_path
+        Exact path for the output h5ad file.  When provided, ``output_dir``
+        and ``data_name`` are ignored.
+    output_dir
+        Directory for the output file.  Defaults to the input file's
+        directory.  *Deprecated* – use ``output_path`` instead.  Will be
+        removed in the next major version.
+    verbose
+        Verbosity level.  ``0`` / ``False`` is silent; ``1`` / ``True``
+        prints a summary line.
+
+    Returns
+    -------
+    AnnData
+        On-disk AnnData where ``X`` contains the effect-size matrix
+        (perturbation mean minus control mean in log-normalised space),
+        ``layers['perturbation_mean']`` contains per-perturbation means,
+        and ``uns['control_mean']`` contains the control mean vector.
+    """
 
     path = resolve_data_path(data)
     if int(verbose) >= 1:
@@ -145,7 +190,57 @@ def compute_pseudobulk_expression(
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = False,
 ) -> AnnData:
-    """Compute pseudo-bulk log-fold changes relative to control."""
+    """Compute pseudo-bulk log-fold changes relative to control.
+
+    Aggregates normalised counts per perturbation group into a pseudo-bulk
+    profile (sum divided by cell count), applies log1p scaling with a
+    ``baseline_count`` offset, and stores the difference relative to the
+    control group as the log-fold change effect size.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, or a backed/in-memory AnnData object.
+    perturbation_column
+        Column in ``adata.obs`` that identifies perturbation groups.
+    control_label
+        Label of the control group.  If ``None``, inferred from common
+        patterns (``'non-targeting'``, ``'control'``, etc.).
+    gene_name_column
+        Column in ``adata.var`` with gene symbols.  If ``None``, uses
+        ``adata.var_names``.
+    perturbations
+        Subset of perturbation labels to include.  If ``None``, all
+        non-control groups are processed.
+    baseline_count
+        Pseudo-count added before log transformation
+        (``log1p(baseline_count * mean_counts)``).  Default ``1.0``.
+    chunk_size
+        Number of cells to process per chunk.  If ``None``, auto-determined
+        from dataset shape.
+    data_name
+        Custom stem for the output filename.  If ``None``, the input file
+        stem is used with a ``_cx_pseudobulk_effects`` suffix.
+    output_path
+        Exact path for the output h5ad file.  When provided, ``output_dir``
+        and ``data_name`` are ignored.
+    output_dir
+        Directory for the output file.  Defaults to the input file's
+        directory.  *Deprecated* – use ``output_path`` instead.  Will be
+        removed in the next major version.
+    verbose
+        Verbosity level.  ``0`` / ``False`` is silent; ``1`` / ``True``
+        prints a summary line.
+
+    Returns
+    -------
+    AnnData
+        On-disk AnnData where ``X`` contains the pseudo-bulk log-fold change
+        matrix (perturbation pseudo-bulk minus control pseudo-bulk),
+        ``layers['perturbation_bulk']`` contains per-perturbation pseudo-bulk
+        vectors, ``uns['control_bulk']`` the control pseudo-bulk vector, and
+        ``uns['baseline_count']`` the scaling offset used.
+    """
 
     if baseline_count <= 0:
         raise ValueError("baseline_count must be positive")
