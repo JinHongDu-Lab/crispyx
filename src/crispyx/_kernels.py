@@ -1786,6 +1786,209 @@ def _wilcoxon_batch_perts_presorted_numba(
         )
 
 
+@nb.njit(parallel=False, cache=True)
+def _wilcoxon_stratified_single_pert(
+    ctrl_flat: np.ndarray,
+    ctrl_starts: np.ndarray,
+    ctrl_n_nonzero: np.ndarray,
+    ctrl_n_zeros: np.ndarray,
+    ctrl_tie_sums: np.ndarray,
+    all_pert_stacked: np.ndarray,
+    seg_offsets: np.ndarray,
+    seg_batch: np.ndarray,
+    seg_lo: int,
+    seg_hi: int,
+    valid_genes: np.ndarray,
+    tie_correct: bool,
+    u_stat_out: np.ndarray,
+    z_score_out: np.ndarray,
+    pvalue_out: np.ndarray,
+    effect_out: np.ndarray,
+) -> None:
+    """Batch-stratified (van Elteren) Wilcoxon rank-sum for a single perturbation.
+
+    Ranks perturbation vs control **within each batch (stratum)** separately,
+    then combines the per-stratum rank statistics.  For each stratum ``b`` with
+    ``n1`` perturbation and ``n0`` control cells (``N = n1 + n0``):
+
+    * ``R_b`` : rank sum of the perturbation cells (ranked within the stratum)
+    * ``E_b = n1 * (N + 1) / 2`` : expected rank sum under H0
+    * ``Var_b = c_b * n1 * n0 * (N + 1) / 12`` : variance with tie correction
+      factor ``c_b``
+
+    The strata are combined with unit weights (equivalent to summing the
+    Mann-Whitney ``U`` statistics across strata)::
+
+        Z = sum_b (R_b - E_b) / sqrt(sum_b Var_b)
+
+    which is the stratified Wilcoxon / van Elteren test.  Strata where either
+    ``n1`` or ``n0`` is zero contribute nothing (they carry no information about
+    the comparison).  The combined common-language effect size is
+    ``sum_b U_b / sum_b (n1_b * n0_b) - 0.5``.
+
+    Notes
+    -----
+    Reuses :func:`_rank_sum_pert_bsearch_numba` for the per-stratum rank sum,
+    so the pre-sorted control non-zeros are looked up per ``(batch, gene)`` via
+    ``ctrl_starts`` / ``ctrl_n_nonzero`` instead of the single pooled control.
+    """
+    n_genes = all_pert_stacked.shape[1]
+    sqrt2 = math.sqrt(2.0)
+
+    for g in range(n_genes):
+        if not valid_genes[g]:
+            u_stat_out[g] = 0.0
+            z_score_out[g] = 0.0
+            pvalue_out[g] = 1.0
+            effect_out[g] = 0.0
+            continue
+
+        num = 0.0        # sum_b (R_b - E_b)
+        var = 0.0        # sum_b Var_b
+        u_sum = 0.0      # sum_b U_b
+        n1n0_sum = 0.0   # sum_b n1_b * n0_b
+
+        for s in range(seg_lo, seg_hi):
+            b = seg_batch[s]
+            r0 = seg_offsets[s]
+            r1 = seg_offsets[s + 1]
+            n1 = r1 - r0
+            if n1 == 0:
+                continue
+
+            n_ctrl_nz_b = ctrl_n_nonzero[b, g]
+            n_ctrl_z_b = ctrl_n_zeros[b, g]
+            n0 = n_ctrl_nz_b + n_ctrl_z_b
+            if n0 == 0:
+                continue
+
+            N = n1 + n0
+
+            # Count pert zeros and gather pert non-zeros for this gene/stratum.
+            n_pert_zeros = 0
+            for i in range(r0, r1):
+                if all_pert_stacked[i, g] == 0.0:
+                    n_pert_zeros += 1
+            n_pert_nz = n1 - n_pert_zeros
+            pert_nonzero = np.empty(n_pert_nz, dtype=np.float64)
+            idx = 0
+            for i in range(r0, r1):
+                v = all_pert_stacked[i, g]
+                if v != 0.0:
+                    pert_nonzero[idx] = v
+                    idx += 1
+            pert_sorted = np.sort(pert_nonzero)
+
+            n_zeros = n_ctrl_z_b + n_pert_zeros
+            start = ctrl_starts[b, g]
+            ctrl_sorted = ctrl_flat[start : start + n_ctrl_nz_b]
+
+            rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
+                ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[b, g]
+            )
+            if not tie_correct:
+                tie_corr = 1.0
+
+            n1f = float(n1)
+            n0f = float(n0)
+            nf = float(N)
+            zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
+            rank_sum = float(n_pert_zeros) * zero_avg_rank + rank_sum_nz
+
+            expected_b = n1f * (nf + 1.0) / 2.0
+            var_b = tie_corr * n1f * n0f * (nf + 1.0) / 12.0
+            u_b = rank_sum - n1f * (n1f + 1.0) / 2.0
+
+            num += rank_sum - expected_b
+            var += var_b
+            u_sum += u_b
+            n1n0_sum += n1f * n0f
+
+        if var > 0.0:
+            z = num / math.sqrt(var)
+            pval = math.erfc(abs(z) / sqrt2)
+        else:
+            z = 0.0
+            pval = 1.0
+
+        if n1n0_sum > 0.0:
+            effect = u_sum / n1n0_sum - 0.5
+        else:
+            effect = 0.0
+
+        u_stat_out[g] = u_sum
+        z_score_out[g] = z
+        pvalue_out[g] = pval
+        effect_out[g] = effect
+
+
+@nb.njit(parallel=True, cache=True)
+def _wilcoxon_stratified_batch_perts_numba(
+    ctrl_flat: np.ndarray,
+    ctrl_starts: np.ndarray,
+    ctrl_n_nonzero: np.ndarray,
+    ctrl_n_zeros: np.ndarray,
+    ctrl_tie_sums: np.ndarray,
+    all_pert_stacked: np.ndarray,
+    seg_offsets: np.ndarray,
+    seg_batch: np.ndarray,
+    pert_ptr: np.ndarray,
+    valid_masks: np.ndarray,
+    tie_correct: bool,
+    u_stat_out: np.ndarray,
+    z_score_out: np.ndarray,
+    pvalue_out: np.ndarray,
+    effect_out: np.ndarray,
+) -> None:
+    """Batch-stratified Wilcoxon test: single ``prange`` over perturbations.
+
+    Parameters
+    ----------
+    ctrl_flat : (sum_ctrl_nnz,)
+        Sorted control non-zeros for every ``(batch, gene)`` cell, concatenated
+        in ``(batch, gene)`` order.
+    ctrl_starts, ctrl_n_nonzero, ctrl_n_zeros, ctrl_tie_sums : (n_batches, n_valid_genes)
+        Per ``(batch, gene)`` global start offset into ``ctrl_flat``, number of
+        non-zero / zero control values, and the ``sum(t^3 - t)`` tie sum of the
+        control non-zeros.
+    all_pert_stacked : (total_pert_cells, n_valid_genes)
+        Dense perturbation expression, rows concatenated in
+        ``(perturbation, batch)`` order.
+    seg_offsets : (n_segments + 1,)
+        Row offsets into ``all_pert_stacked`` delimiting each
+        ``(perturbation, batch)`` segment.
+    seg_batch : (n_segments,)
+        Batch index for each segment.
+    pert_ptr : (n_perts + 1,)
+        Segment range ``[pert_ptr[p], pert_ptr[p + 1])`` belonging to
+        perturbation ``p``.
+    valid_masks : (n_perts, n_valid_genes)
+    tie_correct : bool
+    u_stat_out, z_score_out, pvalue_out, effect_out : (n_perts, n_valid_genes)
+    """
+    n_perts = pert_ptr.shape[0] - 1
+
+    for p_idx in nb.prange(n_perts):
+        _wilcoxon_stratified_single_pert(
+            ctrl_flat,
+            ctrl_starts,
+            ctrl_n_nonzero,
+            ctrl_n_zeros,
+            ctrl_tie_sums,
+            all_pert_stacked,
+            seg_offsets,
+            seg_batch,
+            pert_ptr[p_idx],
+            pert_ptr[p_idx + 1],
+            valid_masks[p_idx],
+            tie_correct,
+            u_stat_out[p_idx],
+            z_score_out[p_idx],
+            pvalue_out[p_idx],
+            effect_out[p_idx],
+        )
+
+
 @nb.njit(parallel=True, cache=True)
 def _irls_batch_numba(
     Y: np.ndarray,

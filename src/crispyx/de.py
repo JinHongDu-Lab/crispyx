@@ -77,6 +77,7 @@ from ._kernels import (
     _compute_ctrl_tie_sums,
     _wilcoxon_presorted_ctrl_numba,
     _wilcoxon_batch_perts_presorted_numba,
+    _wilcoxon_stratified_batch_perts_numba,
     _ZERO_PARTITION_THRESHOLD,
 )
 from ._checkpoint import (
@@ -441,6 +442,8 @@ def _write_wilcoxon_result_h5ad(
     control_label: str,
     tie_correct: bool,
     corr_method: str,
+    batch_column: str | None = None,
+    stratified_diagnostics: dict[str, object] | None = None,
 ) -> None:
     """Write wilcoxon result arrays directly to h5ad via h5py.
 
@@ -493,6 +496,14 @@ def _write_wilcoxon_result_h5ad(
         uns_grp.attrs["perturbation_column"] = perturbation_column
         uns_grp.attrs["tie_correct"] = tie_correct
         uns_grp.attrs["pvalue_correction"] = corr_method
+        if batch_column is not None:
+            uns_grp.attrs["batch_column"] = batch_column
+            uns_grp.attrs["stratified"] = True
+        else:
+            uns_grp.attrs["stratified"] = False
+        if stratified_diagnostics:
+            for key, value in stratified_diagnostics.items():
+                uns_grp.attrs[key] = value
 
 
 def _build_result_from_h5ad(
@@ -779,6 +790,63 @@ def _resolve_de_aliases(
     return perturbation_column, control_label, min_pct_ctrl, min_pct_pert
 
 
+def _decode_h5_scalar(value):
+    """Decode small HDF5 scalar/attribute values for metadata comparison."""
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode()
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode()
+    return value
+
+
+def _read_result_uns_metadata(output_path: Path) -> dict[str, object]:
+    """Read scalar ``uns`` metadata from an existing h5ad result."""
+    metadata: dict[str, object] = {}
+    try:
+        with h5py.File(output_path, "r") as hf:
+            if "uns" not in hf:
+                return metadata
+            uns = hf["uns"]
+            for key, value in uns.attrs.items():
+                metadata[str(key)] = _decode_h5_scalar(value)
+            for key, obj in uns.items():
+                if isinstance(obj, h5py.Dataset) and obj.shape == ():
+                    metadata[str(key)] = _decode_h5_scalar(obj[()])
+    except OSError:
+        return metadata
+    return metadata
+
+
+def _metadata_bool(value: object | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def _metadata_matches(
+    actual: dict[str, object],
+    expected: Mapping[str, object | None],
+) -> tuple[bool, str | None]:
+    """Return whether cached result metadata matches the requested analysis."""
+    for key, expected_value in expected.items():
+        actual_value = actual.get(key)
+        if isinstance(expected_value, bool):
+            if _metadata_bool(actual_value) != expected_value:
+                return False, key
+            continue
+        if expected_value is None:
+            if actual_value not in (None, "", b""):
+                return False, key
+            continue
+        if str(actual_value) != str(expected_value):
+            return False, key
+    return True, None
+
+
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
@@ -786,10 +854,25 @@ def _try_load_existing_de_result(
     verbose: int | bool,
     method_name: str,
     memory_limit_gb: float | None,
+    expected_metadata: Mapping[str, object | None] | None = None,
 ) -> "RankGenesGroupsResult | None":
     """Return the loaded result if it already exists and ``force=False``, else ``None``."""
     if not (output_path.exists() and not force):
         return None
+    if expected_metadata is not None:
+        metadata = _read_result_uns_metadata(output_path)
+        matches, mismatch_key = _metadata_matches(metadata, expected_metadata)
+        if not matches:
+            logger.info(
+                "Existing %s result at %s does not match requested metadata (%s); rerunning.",
+                method_name, output_path, mismatch_key,
+            )
+            if verbose:
+                print(
+                    f"[cx] Existing result does not match requested {method_name} "
+                    f"metadata ({mismatch_key}); rerunning."
+                )
+            return None
     logger.info(
         "Found existing %s result at %s. Loading instead of rerunning.",
         method_name, output_path,
@@ -849,8 +932,9 @@ def t_test(
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     cell_chunk_size: int | None = None,
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
     verbose: int | bool = False,
     resume: bool = False,
@@ -920,10 +1004,15 @@ def t_test(
         controls streaming along the cell axis and is distinct from any future
         perturbation_chunk_size option that would batch perturbations. Data must
         already be normalized/log-transformed before chunking.
-    output_dir
-        Directory for output h5ad file. Defaults to input file's directory.
     data_name
         Custom name for output file. If None, uses "t_test" suffix.
+    output_path
+        Exact path for the output h5ad file. When provided, ``output_dir``
+        and ``data_name`` are ignored.
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+        Deprecated; use ``output_path`` instead. Will be removed in the
+        next major version.
     n_jobs
         Number of parallel workers for computing statistics across perturbations.
         If None, uses all available cores. If 1, runs sequentially.
@@ -968,7 +1057,10 @@ def t_test(
     )
 
     path = resolve_data_path(data)
-    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
+    output_path = resolve_output_path(
+        path, suffix="t_test", output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
+    )
 
     if (r := _try_load_existing_de_result(
         output_path, force=force, verbose=verbose,
@@ -1433,8 +1525,9 @@ def nb_glm_test(
     lfc_base: Literal["log2", "ln"] = "log2",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     se_method: Literal["sandwich", "fisher"] = "sandwich",
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     scanpy_format: bool = False,
     verbose: int | bool = False,
     profiling: bool = False,
@@ -1608,10 +1701,15 @@ def nb_glm_test(
           More robust to model misspecification.
         - ``"fisher"``: Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
           Matches PyDESeq2's approach for better p-value parity.
-    output_dir
-        Directory for output h5ad file. Defaults to input file's directory.
     data_name
         Custom name for output file. If None, uses "nb_glm" suffix.
+    output_path
+        Exact path for the output h5ad file. When provided, ``output_dir``
+        and ``data_name`` are ignored.
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+        Deprecated; use ``output_path`` instead. Will be removed in the
+        next major version.
     scanpy_format
         If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
         in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
@@ -1729,7 +1827,8 @@ def nb_glm_test(
     # Use the original (pre-sort) path for output_path resolution so the location
     # is predictable for the caller regardless of internal sorting.
     _candidate_output_path = resolve_output_path(
-        path, suffix="nb_glm", output_dir=output_dir, data_name=data_name
+        path, suffix="nb_glm", output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
     )
     if (r := _try_load_existing_de_result(
         _candidate_output_path, force=force, verbose=verbose,
@@ -2653,6 +2752,7 @@ def nb_glm_test(
         suffix="nb_glm",
         output_dir=output_dir,
         data_name=data_name,
+        output_path=output_path,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
@@ -3989,6 +4089,510 @@ def _wilcoxon_test_streaming(
     return result
 
 
+def _wilcoxon_test_stratified(
+    path: Path,
+    *,
+    gene_symbols,
+    perturbation_column: str,
+    control_label: str,
+    batch_column: str,
+    candidates: list[str],
+    n_genes: int,
+    chunk_size: int,
+    min_cells_expressed: int,
+    min_pct_ctrl: float,
+    min_pct_pert: float,
+    min_mean_ctrl: float,
+    min_mean_pert: float,
+    tie_correct: bool,
+    corr_method: str,
+    output_path: Path,
+    checkpoint_path: Path,
+    checkpoint_interval: int | None,
+    scanpy_format: bool,
+    verbose: int | bool,
+    resume: bool,
+    memory_limit_gb: float | None,
+) -> RankGenesGroupsResult:
+    """Batch-stratified (van Elteren) Wilcoxon rank-sum test.
+
+    Cells are ranked against the control **within each batch** and the
+    per-stratum rank statistics are combined with unit weights.  The
+    low-expression filter, log-fold changes and ``pts`` are computed on the
+    pooled populations (batch-agnostic); only the rank test is stratified.
+
+    Mirrors the standard single-pass memmap path but partitions the control and
+    perturbation cells by ``batch_column`` and calls the stratified kernel.
+    """
+    n_groups = len(candidates)
+
+    # Resume logic: read checkpoint to get last completed gene chunk
+    last_completed_chunk = -1
+    if resume and checkpoint_path.exists():
+        checkpoint = _read_checkpoint(checkpoint_path)
+        if checkpoint is not None:
+            last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
+            logger.info(f"Resuming from gene chunk {last_completed_chunk + 1}")
+
+    n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
+    eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        def _create_memmap(name: str, dtype: np.dtype, *, fill: float | int = 0):
+            p = tmpdir_path / f"{name}.dat"
+            mmap = np.memmap(p, dtype=dtype, mode="w+", shape=(n_groups, n_genes))
+            if fill != 0:
+                mmap[:] = fill
+            else:
+                mmap.fill(0)
+            return mmap
+
+        effect_matrix = _create_memmap("effect", np.float64)
+        u_matrix = _create_memmap("u_stat", np.float64)
+        pvalue_matrix = _create_memmap("pvalue", np.float64, fill=1.0)
+        z_matrix = _create_memmap("z_score", np.float64)
+        lfc_matrix = _create_memmap("logfoldchange", np.float64)
+        pts_matrix = _create_memmap("pts", np.float32)
+        pts_rest_matrix = _create_memmap("pts_rest", np.float32)
+
+        backed = read_backed(path)
+        try:
+            labels = backed.obs[perturbation_column].astype(str).to_numpy()
+            control_mask = labels == control_label
+            control_n = int(control_mask.sum())
+
+            # ----- Batch codes (0..n_batches-1; NaN/unknown -> -1) -----
+            batch_values = np.asarray(backed.obs[batch_column].to_numpy())
+            batch_codes, _batch_uniques = pd.factorize(batch_values, sort=True)
+            batch_codes = batch_codes.astype(np.int64)
+            n_batches = len(_batch_uniques)
+            n_excluded = int((batch_codes < 0).sum())
+            if n_excluded > 0:
+                warnings.warn(
+                    f"{n_excluded} cells have a missing '{batch_column}' value and are "
+                    "excluded from the batch-stratified Wilcoxon test.",
+                    stacklevel=2,
+                )
+            if n_batches < 1:
+                raise ValueError(
+                    f"Batch column '{batch_column}' contains no usable batches."
+                )
+
+            # ----- Control cells ordered by batch (contiguous per-batch ranges) -----
+            control_idx = np.where(control_mask)[0]
+            control_batch = batch_codes[control_idx]
+            _ckeep = control_batch >= 0
+            control_idx = control_idx[_ckeep]
+            control_batch = control_batch[_ckeep]
+            _corder = np.argsort(control_batch, kind="stable")
+            control_idx_sorted = control_idx[_corder]
+            control_batch_sorted = control_batch[_corder]
+            _b_arange = np.arange(n_batches)
+            ctrl_batch_start = np.searchsorted(control_batch_sorted, _b_arange, side="left")
+            ctrl_batch_end = np.searchsorted(control_batch_sorted, _b_arange, side="right")
+            control_batch_counts = np.bincount(control_batch, minlength=n_batches)
+            batches_with_control = control_batch_counts > 0
+
+            # ----- Perturbation cells grouped into (pert, batch) segments -----
+            pert_idx = {label: np.where(labels == label)[0] for label in candidates}
+            seg_offsets = [0]
+            seg_batch: list[int] = []
+            pert_ptr = [0]
+            all_pert_flat_idx_list = []
+            pert_total_batch_counts = np.zeros(n_groups, dtype=np.int64)
+            pert_shared_batch_counts = np.zeros(n_groups, dtype=np.int64)
+            pert_cells_without_control_batch = np.zeros(n_groups, dtype=np.int64)
+            running = 0
+            for p_i, label in enumerate(candidates):
+                p_cells = pert_idx[label]
+                p_b = batch_codes[p_cells]
+                _pkeep = p_b >= 0
+                p_cells = p_cells[_pkeep]
+                p_b = p_b[_pkeep]
+                if p_b.size:
+                    p_batch_counts = np.bincount(p_b, minlength=n_batches)
+                    p_batches = p_batch_counts > 0
+                    shared_batches = p_batches & batches_with_control
+                    pert_total_batch_counts[p_i] = int(p_batches.sum())
+                    pert_shared_batch_counts[p_i] = int(shared_batches.sum())
+                    pert_cells_without_control_batch[p_i] = int(
+                        p_batch_counts[~batches_with_control].sum()
+                    )
+                _porder = np.argsort(p_b, kind="stable")
+                p_cells = p_cells[_porder]
+                p_b = p_b[_porder]
+                all_pert_flat_idx_list.append(p_cells)
+                if p_b.size:
+                    change = np.where(np.diff(p_b) != 0)[0] + 1
+                    starts = np.concatenate(([0], change))
+                    ends = np.concatenate((change, [p_b.size]))
+                    for st, en in zip(starts, ends):
+                        running += int(en - st)
+                        seg_batch.append(int(p_b[st]))
+                        seg_offsets.append(running)
+                pert_ptr.append(len(seg_batch))
+
+            all_pert_flat_idx = (
+                np.concatenate(all_pert_flat_idx_list)
+                if all_pert_flat_idx_list
+                else np.empty(0, dtype=np.int64)
+            )
+            seg_offsets = np.asarray(seg_offsets, dtype=np.int64)
+            seg_batch_arr = np.asarray(seg_batch, dtype=np.int64)
+            pert_ptr = np.asarray(pert_ptr, dtype=np.int64)
+            untestable_pert_mask = pert_shared_batch_counts == 0
+            n_untestable_perts = int(untestable_pert_mask.sum())
+            if n_untestable_perts:
+                example_idx = np.where(untestable_pert_mask)[0][:5]
+                examples = [str(candidates[i]) for i in example_idx]
+                warnings.warn(
+                    f"{n_untestable_perts} perturbation(s) have no batches "
+                    "containing both perturbation and control cells; stratified "
+                    "Wilcoxon rank statistics for these perturbations will be "
+                    f"set to NaN. Examples: {examples}",
+                    stacklevel=2,
+                )
+
+            # Pooled control cell count per candidate (for LFC/pts, batch-agnostic)
+            control_idx_all = np.where(control_mask)[0]
+
+            dtype_checked = False
+
+            def _check_not_count_like(chunk: sp.spmatrix) -> None:
+                if np.issubdtype(chunk.dtype, np.integer):
+                    raise ValueError(
+                        "Detected integer count data in wilcoxon_test. "
+                        "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                    )
+                if np.issubdtype(chunk.dtype, np.floating):
+                    non_zero = chunk.data[chunk.data > 0]
+                    is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                    if is_count_like:
+                        raise ValueError(
+                            "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
+                            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                        )
+
+            current_chunk = 0
+            n_chunks_processed = 0
+            _track_gene_counts = int(verbose) >= 1
+            if _track_gene_counts:
+                _valid_gene_counts = np.zeros(n_groups, dtype=np.int32)
+
+            def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
+                checkpoint_data = {
+                    "total_gene_chunks": n_gene_chunks,
+                    "last_gene_chunk": chunk_idx,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "method": "wilcoxon",
+                    "control_label": control_label,
+                    "batch_column": batch_column,
+                }
+                _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+
+            with _create_progress_context(
+                n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose
+            ) as pbar:
+                for slc, block in iter_matrix_chunks(
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    if current_chunk <= last_completed_chunk:
+                        current_chunk += 1
+                        pbar.update(1)
+                        continue
+
+                    if not dtype_checked:
+                        if not sp.issparse(block):
+                            raise ValueError(
+                                "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+                            )
+                        _check_not_count_like(block)
+                        dtype_checked = True
+
+                    csr_block = sp.csr_matrix(block)
+                    n_chunk_genes = csr_block.shape[1]
+
+                    # ----- Pooled control stats (LFC / pts) -----
+                    control_values = csr_block[control_mask, :]
+                    control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
+                    control_mean = (
+                        np.asarray(control_values.mean(axis=0)).ravel()
+                        if control_values.nnz
+                        else np.zeros(n_chunk_genes, dtype=np.float64)
+                    )
+                    control_mean_expm1 = np.expm1(control_mean) + 1e-9
+                    control_pts = np.divide(
+                        control_expr,
+                        control_n,
+                        out=np.zeros_like(control_expr, dtype=float),
+                        where=control_n > 0,
+                    )
+
+                    # ----- Pooled perturbation stats -----
+                    pert_expr_counts = []
+                    pert_means = []
+                    pert_n_cells = []
+                    for label in candidates:
+                        group_values = csr_block[pert_idx[label], :]
+                        pert_n_cells.append(group_values.shape[0])
+                        pert_expr_counts.append(np.asarray(group_values.getnnz(axis=0)).ravel())
+                        group_mean = (
+                            np.asarray(group_values.mean(axis=0)).ravel()
+                            if group_values.nnz
+                            else np.zeros(n_chunk_genes, dtype=np.float64)
+                        )
+                        pert_means.append(group_mean)
+
+                    # ----- Per-condition low-expression filter (pooled) -----
+                    valid_masks = []
+                    low_both_masks = []
+                    for idx, label in enumerate(candidates):
+                        group_expr = pert_expr_counts[idx]
+                        group_mean = pert_means[idx]
+                        total_expr = control_expr + group_expr
+                        valid = total_expr >= min_cells_expressed
+                        low_both = _low_expr_in_both_mask(
+                            pert_expr_counts=group_expr,
+                            control_expr_counts=control_expr,
+                            pert_mean=group_mean,
+                            control_mean=control_mean,
+                            n_pert_cells=pert_n_cells[idx],
+                            n_control_cells=control_n,
+                            min_pct_ctrl=min_pct_ctrl,
+                            min_pct_pert=min_pct_pert,
+                            min_mean_ctrl=min_mean_ctrl,
+                            min_mean_pert=min_mean_pert,
+                        )
+                        low_both_masks.append(low_both)
+                        valid_masks.append(valid & ~low_both)
+
+                    rank_valid_masks = [
+                        np.zeros_like(valid, dtype=bool)
+                        if untestable_pert_mask[idx]
+                        else valid
+                        for idx, valid in enumerate(valid_masks)
+                    ]
+
+                    if _track_gene_counts:
+                        for _vi in range(len(rank_valid_masks)):
+                            _valid_gene_counts[_vi] += int(rank_valid_masks[_vi].sum())
+
+                    any_valid = np.zeros(n_chunk_genes, dtype=bool)
+                    for valid in rank_valid_masks:
+                        any_valid |= valid
+                    valid_gene_indices = np.where(any_valid)[0]
+                    n_valid_genes = len(valid_gene_indices)
+
+                    chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                    chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                    chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
+                    chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                    chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                    chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
+                    chunk_pts_rest = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
+
+                    if n_valid_genes > 0:
+                        all_valid_dense = csr_block[:, valid_gene_indices].toarray()
+                        control_dense = all_valid_dense[control_idx_sorted, :]
+
+                        # Pre-sort control non-zeros per (batch, gene).
+                        ctrl_flats = []
+                        ctrl_starts = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                        ctrl_nnz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                        ctrl_nz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                        ctrl_tie = np.zeros((n_batches, n_valid_genes), dtype=np.float64)
+                        base = 0
+                        for b in range(n_batches):
+                            rows = control_dense[ctrl_batch_start[b]:ctrl_batch_end[b], :]
+                            if rows.shape[0] == 0:
+                                # No control cells in this batch: leave zeros.
+                                continue
+                            flat_b, off_b, nnz_b, nz_b = _presort_control_nonzeros(rows)
+                            tie_b = _compute_ctrl_tie_sums(flat_b, off_b, nnz_b)
+                            ctrl_starts[b] = off_b[:-1] + base
+                            ctrl_nnz[b] = nnz_b
+                            ctrl_nz[b] = nz_b
+                            ctrl_tie[b] = tie_b
+                            ctrl_flats.append(flat_b)
+                            base += flat_b.shape[0]
+                        ctrl_flat = (
+                            np.concatenate(ctrl_flats)
+                            if ctrl_flats
+                            else np.empty(0, dtype=np.float64)
+                        )
+
+                        all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
+                        valid_masks_2d = np.array(
+                            [vm[valid_gene_indices] for vm in rank_valid_masks]
+                        )
+
+                        valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                        valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                        valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
+                        valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+
+                        _wilcoxon_stratified_batch_perts_numba(
+                            ctrl_flat,
+                            ctrl_starts,
+                            ctrl_nnz,
+                            ctrl_nz,
+                            ctrl_tie,
+                            all_pert_stacked,
+                            seg_offsets,
+                            seg_batch_arr,
+                            pert_ptr,
+                            valid_masks_2d,
+                            tie_correct,
+                            valid_u,
+                            valid_z,
+                            valid_p,
+                            valid_effect,
+                        )
+
+                        chunk_u[:, valid_gene_indices] = valid_u
+                        chunk_z[:, valid_gene_indices] = valid_z
+                        chunk_p[:, valid_gene_indices] = valid_p
+                        chunk_effect[:, valid_gene_indices] = valid_effect
+
+                    # ----- LFC / pts (pooled, batch-agnostic) -----
+                    all_expr = np.array(pert_expr_counts)
+                    all_means = np.array(pert_means)
+                    all_n = np.array(pert_n_cells, dtype=np.float64)
+                    valid_arr = np.array(valid_masks)
+
+                    n_col = all_n[:, np.newaxis]
+                    raw_pts = np.where(n_col > 0, all_expr / n_col, 0.0)
+                    chunk_pts[:] = np.where(valid_arr, raw_pts, 0.0).astype(np.float32)
+                    chunk_pts_rest[:] = np.where(
+                        valid_arr, control_pts[np.newaxis, :], 0.0
+                    ).astype(np.float32)
+
+                    raw_lfc = np.log2(
+                        (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                    )
+                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, 0.0)
+
+                    low_both_arr = np.array(low_both_masks)
+                    if low_both_arr.any():
+                        chunk_u[low_both_arr] = np.nan
+                        chunk_z[low_both_arr] = np.nan
+                        chunk_p[low_both_arr] = np.nan
+                        chunk_effect[low_both_arr] = np.nan
+                        chunk_lfc[low_both_arr] = np.nan
+                    if n_untestable_perts:
+                        chunk_u[untestable_pert_mask, :] = np.nan
+                        chunk_z[untestable_pert_mask, :] = np.nan
+                        chunk_p[untestable_pert_mask, :] = np.nan
+                        chunk_effect[untestable_pert_mask, :] = np.nan
+
+                    u_matrix[:, slc] = chunk_u
+                    pvalue_matrix[:, slc] = chunk_p
+                    effect_matrix[:, slc] = chunk_effect
+                    z_matrix[:, slc] = chunk_z
+                    lfc_matrix[:, slc] = chunk_lfc
+                    pts_matrix[:, slc] = chunk_pts
+                    pts_rest_matrix[:, slc] = chunk_pts_rest
+
+                    del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
+                    del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
+                    del pert_n_cells, valid_masks, rank_valid_masks, low_both_masks, low_both_arr
+                    if n_valid_genes > 0:
+                        del all_valid_dense, control_dense, ctrl_flats, ctrl_flat
+                        del ctrl_starts, ctrl_nnz, ctrl_nz, ctrl_tie
+                        del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
+                        del valid_masks_2d
+                    _release_chunk_memory()
+
+                    n_chunks_processed += 1
+                    pbar.update(1)
+                    if n_chunks_processed % eff_checkpoint_interval == 0:
+                        _save_wilcoxon_checkpoint(current_chunk)
+                    current_chunk += 1
+
+                _save_wilcoxon_checkpoint(current_chunk - 1)
+                logger.info(f"Completed {n_chunks_processed} gene chunks (stratified)")
+                if _track_gene_counts:
+                    if int(verbose) >= 2:
+                        for _gi, _label in enumerate(candidates):
+                            _print_de_perturbation_verbose(
+                                verbose, _label, int(_valid_gene_counts[_gi]), n_genes
+                            )
+                    _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
+                    _pct = 100.0 * _mean / n_genes if n_genes else 0
+                    print(
+                        f"[cx] Wilcoxon DE (batch-stratified by '{batch_column}', "
+                        f"{n_batches} batches): {n_groups} perturbations complete, "
+                        f"mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)"
+                    )
+        finally:
+            backed.file.close()
+
+        gene_symbols = pd.Index(gene_symbols).astype(str)
+        pvalue_adj_matrix = _create_memmap("pvalue_adj", np.float64)
+        _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
+
+        if int(verbose) >= 1:
+            print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
+        stratified_diagnostics = {
+            "stratified_n_batches": int(n_batches),
+            "stratified_n_control_batches": int(batches_with_control.sum()),
+            "stratified_n_untestable_perturbations": int(n_untestable_perts),
+            "stratified_min_shared_batches_per_perturbation": (
+                int(pert_shared_batch_counts.min()) if n_groups else 0
+            ),
+            "stratified_median_shared_batches_per_perturbation": (
+                float(np.median(pert_shared_batch_counts)) if n_groups else 0.0
+            ),
+            "stratified_perturbation_cells_without_control_batch": int(
+                pert_cells_without_control_batch.sum()
+            ),
+        }
+        _write_wilcoxon_result_h5ad(
+            output_path,
+            effect_matrix=effect_matrix,
+            z_matrix=z_matrix,
+            pvalue_matrix=pvalue_matrix,
+            pvalue_adj_matrix=pvalue_adj_matrix,
+            lfc_matrix=lfc_matrix,
+            u_matrix=u_matrix,
+            pts_matrix=pts_matrix,
+            pts_rest_matrix=pts_rest_matrix,
+            candidates=candidates,
+            gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            tie_correct=tie_correct,
+            corr_method=corr_method,
+            batch_column=batch_column,
+            stratified_diagnostics=stratified_diagnostics,
+        )
+
+    _release_chunk_memory()
+    result = _build_result_from_h5ad(
+        output_path,
+        candidates=candidates,
+        gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        tie_correct=tie_correct,
+        corr_method=corr_method,
+        memory_limit_gb=memory_limit_gb,
+    )
+
+    if scanpy_format and result.statistics.size > 0:
+        _write_rank_genes_groups_hdf5(output_path, result)
+
+    if checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+        except Exception:
+            pass
+
+    return result
+
+
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -3998,6 +4602,7 @@ def wilcoxon_test(
     reference: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
+    batch_column: str | None = None,
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
@@ -4007,8 +4612,9 @@ def wilcoxon_test(
     chunk_size: int | None = None,
     tie_correct: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
-    output_dir: str | Path | None = None,
     data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
     verbose: int | bool = False,
     resume: bool = False,
@@ -4044,6 +4650,16 @@ def wilcoxon_test(
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
+    batch_column
+        Column in ``adata.obs`` identifying the batch / stratum of each cell
+        (e.g. 10x lane / gem-group). When provided, a **batch-stratified**
+        (van Elteren) Wilcoxon test is performed: cells are ranked *within each
+        batch* separately and the per-stratum rank statistics are combined with
+        unit weights (equivalent to summing the Mann-Whitney ``U`` statistics
+        across strata). This removes rank inflation caused by batch effects. The
+        low-expression filter, log-fold changes and ``pts`` remain pooled across
+        all cells; only the rank test is stratified. When ``None`` (default) the
+        standard pooled Wilcoxon test is used.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
         Genes below this threshold are assigned p-value=1 and effect_size=0.
@@ -4073,19 +4689,25 @@ def wilcoxon_test(
         more accurate p-values when ties are present in the data.
     corr_method
         Method for p-value correction: "benjamini-hochberg" or "bonferroni".
-    output_dir
-        Directory for output h5ad file. Defaults to input file's directory.
     data_name
         Custom name for output file. If None, uses "wilcoxon" suffix.
+    output_path
+        Exact path for the output h5ad file. When provided, ``output_dir``
+        and ``data_name`` are ignored.
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+        Deprecated; use ``output_path`` instead. Will be removed in the
+        next major version.
     n_jobs
         Number of parallel workers for computing statistics across perturbations.
         If None, uses all available cores. If 1, runs sequentially.
     verbose
         If True, show a progress bar for gene chunk processing. Requires tqdm.
     resume
-        If True, attempt to resume from a previous interrupted run. Reads the
-        checkpoint file to determine which gene chunks have already been
-        completed and skips them.
+        If True and a completed output already exists, load that output as usual.
+        Resuming an interrupted Wilcoxon run from a progress checkpoint is
+        currently disabled because partial chunk arrays are stored in temporary
+        files during execution.
     checkpoint_interval
         Number of gene chunks between checkpoint saves. If None, auto-determined
         based on dataset size. The checkpoint file `<output>.progress.json` is
@@ -4125,13 +4747,11 @@ def wilcoxon_test(
     )
 
     path = resolve_data_path(data)
-    output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
-
-    if (r := _try_load_existing_de_result(
-        output_path, force=force, verbose=verbose,
-        method_name="wilcoxon", memory_limit_gb=memory_limit_gb,
-    )):
-        return r
+    output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
+    output_path = resolve_output_path(
+        path, suffix=output_suffix, output_dir=output_dir, data_name=data_name,
+        output_path=output_path,
+    )
 
     backed = read_backed(path)
     try:
@@ -4139,6 +4759,10 @@ def wilcoxon_test(
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        if batch_column is not None and batch_column not in backed.obs.columns:
+            raise KeyError(
+                f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_label = resolve_control_label(labels, control_label)
@@ -4171,10 +4795,68 @@ def wilcoxon_test(
         backed.file.close()
 
     n_groups = len(candidates)
+
+    expected_metadata = {
+        "method": "wilcoxon",
+        "perturbation_column": perturbation_column,
+        "control_label": control_label,
+        "tie_correct": bool(tie_correct),
+        "pvalue_correction": corr_method,
+        "batch_column": batch_column,
+        "stratified": batch_column is not None,
+    }
+    if (r := _try_load_existing_de_result(
+        output_path, force=force, verbose=verbose,
+        method_name="wilcoxon", memory_limit_gb=memory_limit_gb,
+        expected_metadata=expected_metadata,
+    )):
+        return r
     
     # Determine output path and checkpoint path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
+
+    if resume and checkpoint_path.exists():
+        raise NotImplementedError(
+            "Resuming interrupted wilcoxon_test runs from a progress checkpoint "
+            "is currently disabled because partial Wilcoxon result arrays are "
+            "stored in temporary files during execution. Delete the progress "
+            "file and rerun, or rerun with force=True after removing the "
+            "incomplete output."
+        )
+
+    # =========================================================================
+    # Batch-stratified (van Elteren) dispatch
+    # =========================================================================
+    # When a batch column is supplied the rank statistics are computed
+    # within-batch and combined.  This uses a dedicated standard (memmap) path;
+    # the group-batch streaming optimisation is not applied (result arrays are
+    # memmapped to disk, so RAM stays bounded regardless of n_groups).
+    if batch_column is not None:
+        return _wilcoxon_test_stratified(
+            path,
+            gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            batch_column=batch_column,
+            candidates=candidates,
+            n_genes=n_genes,
+            chunk_size=chunk_size,
+            min_cells_expressed=min_cells_expressed,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
+            tie_correct=tie_correct,
+            corr_method=corr_method,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            checkpoint_interval=checkpoint_interval,
+            scanpy_format=scanpy_format,
+            verbose=verbose,
+            resume=resume,
+            memory_limit_gb=memory_limit_gb,
+        )
 
     # =========================================================================
     # Adaptive dispatch: use group-batch streaming for large datasets
