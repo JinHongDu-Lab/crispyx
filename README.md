@@ -15,7 +15,7 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 ## Features
 
 - **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
-- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk count matrices for effect size estimation
+- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk count matrices for effect size estimation, with optional batch correction (`batch_column`) that combines within-batch effects using a disk-backed, bounded-memory accumulator
 - **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
 - **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
@@ -50,7 +50,7 @@ print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
 ```
 
-For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Usage Guide](docs/usage.rst) and the [tutorial notebook](docs/crispyx_tutorial.ipynb).
+For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Usage Guide](docs/usage.rst) and the [tutorial notebook](docs/notebooks/crispyx_tutorial.ipynb).
 
 ## Performance
 

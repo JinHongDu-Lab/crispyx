@@ -94,6 +94,75 @@ operate with minimal boilerplate on well-annotated datasets. Passing a
 manually, and the returned wrappers expose ``.obs``/``.var`` tables with
 ``.load()`` helpers for materialising the full metadata only when requested.
 
+Batch-corrected effect sizes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When cells originate from multiple batches (e.g. 10x lanes, gem-groups, or
+experimental replicates), pooling all cells can confound the effect size: if a
+perturbation and the control are unevenly represented across batches, a
+batch-specific expression profile leaks into the estimated effect.
+
+Pass ``batch_column`` to either estimator to compute the effect *within each
+batch* and combine the per-batch differences with harmonic-count weights
+``w_b = n_pert_b · n_ctrl_b / (n_pert_b + n_ctrl_b)``:
+
+.. code-block:: python
+
+   adata_pb = cx.pb.pseudobulk(
+       adata_ro,
+       perturbation_column="perturbation",
+       batch_column="batch",          # column in adata.obs
+   )
+
+Key properties:
+
+* Batches where a perturbation has no cells (or no control cells) are skipped
+  for that perturbation. A perturbation that shares no batch with the control
+  raises a ``ValueError``.
+* ``layers['perturbation_mean']`` / ``layers['perturbation_bulk']`` hold the
+  **batch-corrected** per-perturbation expression (the harmonic-weighted
+  average of the within-batch means), and a new
+  ``layers['control_mean_matched']`` / ``layers['control_bulk_matched']`` holds
+  the per-perturbation weight-matched control reference, so the identity
+  ``X = perturbation_mean − control_mean_matched`` holds exactly.
+  ``uns['control_mean']`` / ``uns['control_bulk']`` retain the pooled control
+  reference.
+* The batch column name and the batch labels encountered are recorded in
+  ``uns['batch_column']`` and ``uns['batch_ids']``.
+* When ``batch_column`` is ``None`` (default), the pooled behaviour is
+  unchanged (pooled ``perturbation_mean``, no ``*_matched`` layer).
+* **Bounded memory.** The correction keeps the streaming, single-pass design:
+  the only quantity that grows with the number of batches -- the
+  per-``(perturbation, batch)`` sum accumulator -- is spilled to a disk-backed
+  ``numpy.memmap`` and the scatter-add is vectorised. Peak RAM stays
+  ``O(chunk × n_genes + n_batches × n_genes + n_perturbations × n_genes)``
+  regardless of the number of gem-groups, so genome-wide screens with hundreds
+  of batches do not blow up memory.
+
+Memory budget and chunk size
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Like the differential-expression functions, both pseudo-bulk estimators
+stream cells in chunks. The cell ``chunk_size`` defaults to ``None`` and is
+then auto-selected from the dataset shape and the available memory. Pass
+``memory_limit_gb`` to cap the budget in SLURM / cgroup-constrained
+environments (the value is forwarded to the chunk-size heuristic exactly as in
+``cx.tl.t_test`` / ``cx.tl.nb_glm_test``):
+
+.. code-block:: python
+
+   adata_pb = cx.pb.average_log_expression(
+       adata_ro,
+       perturbation_column="perturbation",
+       batch_column="batch",
+       memory_limit_gb=128,   # cap the streaming chunk budget
+   )
+
+``memory_limit_gb`` and ``chunk_size`` only affect performance/peak memory —
+the computed values are identical regardless of the chosen chunk size. Passing
+an explicit ``chunk_size`` overrides the auto-selection (and ignores
+``memory_limit_gb``).
+
 Dimension Reduction
 -------------------
 

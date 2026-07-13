@@ -1,6 +1,49 @@
 Changelog
 =========
 
+Version 0.0.6
+-------------
+
+*Released 2026-07-13.*
+
+* **Batch-corrected pseudo-bulk effect sizes** –
+  ``compute_average_log_expression`` / ``cx.pb.average_log_expression`` and
+  ``compute_pseudobulk_expression`` / ``cx.pb.pseudobulk`` now accept a
+  ``batch_column`` parameter.  When provided, effects are computed *within
+  each batch* and combined across batches with harmonic-count weights
+  (``w_b = n_pert_b * n_ctrl_b / (n_pert_b + n_ctrl_b)``), removing
+  batch-driven confounding when a perturbation and the control are unevenly
+  represented across batches.  Batches where a perturbation has no cells (or no
+  control cells) are skipped; a perturbation that shares no batch with the
+  control raises ``ValueError``.  The batch column name and encountered batch
+  labels are recorded in ``uns['batch_column']`` and ``uns['batch_ids']``.
+  When ``batch_column`` is ``None`` (default), behaviour is unchanged.
+
+* **Batch-corrected per-perturbation mean layers** – when ``batch_column`` is
+  set, ``layers['perturbation_mean']`` / ``layers['perturbation_bulk']`` hold
+  the **batch-corrected** per-perturbation expression (harmonic-weighted average
+  of the within-batch means) instead of the pooled mean, and a new
+  ``layers['control_mean_matched']`` / ``layers['control_bulk_matched']`` holds
+  the per-perturbation weight-matched control reference, so
+  ``X = perturbation_mean − control_mean_matched`` holds exactly.
+  ``uns['control_mean']`` / ``uns['control_bulk']`` still carry the pooled
+  control reference.  When ``batch_column`` is ``None`` (default), the pooled
+  ``perturbation_mean`` is kept and no ``*_matched`` layer is written.
+
+* **Bounded-memory batch path** – the per-``(perturbation, batch)`` sum
+  accumulator -- the only quantity that grows with the number of batches -- is
+  spilled to a disk-backed ``np.memmap`` and the streaming scatter-add is
+  vectorised, so peak RAM stays ``O(chunk x n_genes + n_batches x n_genes +
+  n_perturbations x n_genes)`` regardless of the number of gem-groups.
+
+* **Memory budget for pseudo-bulk estimators** – ``cx.pb.average_log_expression``
+  and ``cx.pb.pseudobulk`` now accept a ``memory_limit_gb`` argument and their
+  namespace ``chunk_size`` default is ``None`` (auto-selected), matching the
+  differential-expression functions.  The cell chunk size is auto-determined
+  from the dataset shape and ``min(system memory, memory_limit_gb)``; passing an
+  explicit ``chunk_size`` overrides it.  Only performance / peak memory is
+  affected — computed values are identical regardless of the chunk size.
+
 Version 0.0.5
 -------------
 
