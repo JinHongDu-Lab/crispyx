@@ -1,6 +1,25 @@
 Changelog
 =========
 
+Version 0.0.7
+-------------
+
+*Released 2026-07-14.*
+
+* **Compatibility with anndata >= 0.13 / pandas >= 3.0** – the lightweight
+  HDF5 metadata readers used by ``load_obs`` / ``load_var`` /
+  ``standardise_gene_names`` / ``normalise_perturbation_labels`` /
+  ``detect_perturbation_column`` / ``detect_gene_symbol_column`` /
+  ``infer_columns`` and by the automatic DE-result reload path now understand
+  the ``nullable-string-array`` group encoding.  With pandas >= 3.0, string
+  index and columns default to the nullable ``StringDtype``, which anndata
+  >= 0.13 writes to ``.h5ad`` as a group (``values`` + ``mask``) rather than a
+  flat dataset; the readers previously assumed a flat dataset and raised
+  ``TypeError: Accessing a group is done with bytes or str``.  Nullable
+  integer/boolean columns and categorical categories stored in this encoding
+  are handled as well.  Files written by older anndata / pandas versions
+  continue to read unchanged.
+
 Version 0.0.6
 -------------
 

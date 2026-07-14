@@ -3334,6 +3334,40 @@ def get_perturbation_slice(
 # Feature 1 — Backed metadata helpers (load/write obs and var without X)
 # =============================================================================
 
+def _decode_h5_str_array(arr: np.ndarray) -> np.ndarray:
+    """Decode a byte/object string array to Python ``str`` values."""
+    if arr.dtype.kind in ("S", "O"):
+        return np.array(
+            [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else x for x in arr]
+        )
+    return arr
+
+
+def _read_h5_1d(item: "h5py.Dataset | h5py.Group") -> np.ndarray:
+    """Read a 1-D AnnData element as a decoded numpy array.
+
+    Handles plain datasets as well as the ``nullable-string-array`` /
+    ``nullable-integer`` / ``nullable-boolean`` group encodings, where the data
+    lives in a ``values`` dataset alongside a boolean ``mask``. anndata >= 0.13
+    uses these group encodings by default for pandas >= 3.0 string/nullable
+    columns and index, whereas older versions wrote flat datasets.
+    """
+    if isinstance(item, h5py.Group):
+        if "values" not in item:
+            raise TypeError(
+                "Cannot read HDF5 group with encoding "
+                f"{str(item.attrs.get('encoding-type', ''))!r} as a 1-D array."
+            )
+        values = _decode_h5_str_array(item["values"][()])
+        if "mask" in item:
+            mask = np.asarray(item["mask"][()], dtype=bool)
+            if mask.any():
+                values = values.astype(object)
+                values[mask] = None
+        return values
+    return _decode_h5_str_array(item[()])
+
+
 def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
     """Read an AnnData-encoded HDF5 group as a pandas DataFrame."""
     _idx_raw = grp.attrs.get("_index", "_index")
@@ -3341,10 +3375,7 @@ def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
     _col_raw = grp.attrs.get("column-order", [])
     column_order = [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in _col_raw]
 
-    raw_index = grp[index_key][()]
-    if raw_index.dtype.kind in ("S", "O"):
-        raw_index = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in raw_index])
-    index = pd.Index(raw_index)
+    index = pd.Index(_read_h5_1d(grp[index_key]))
 
     all_keys = [k for k in grp.keys() if k != index_key]
     ordered_keys = [k for k in column_order if k in grp] + [
@@ -3357,20 +3388,17 @@ def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
         if isinstance(item, h5py.Group):
             enc = str(item.attrs.get("encoding-type", ""))
             if enc == "categorical":
-                cats_raw = item["categories"][()]
-                if cats_raw.dtype.kind in ("S", "O"):
-                    cats_raw = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in cats_raw])
-                cats = pd.Index(cats_raw)
+                cats = pd.Index(_read_h5_1d(item["categories"]))
                 codes = item["codes"][()].astype(np.intp)
                 ordered = bool(item.attrs.get("ordered", False))
                 columns[key] = pd.Categorical.from_codes(
                     codes, categories=cats, ordered=ordered
                 )
+            elif "values" in item:
+                # nullable-string / nullable-integer / nullable-boolean array
+                columns[key] = _read_h5_1d(item)
         else:
-            val = item[()]
-            if val.dtype.kind in ("S", "O"):
-                val = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in val])
-            columns[key] = val
+            columns[key] = _read_h5_1d(item)
 
     return pd.DataFrame(columns, index=index)
 

@@ -86,6 +86,10 @@ cd crispyx
 pip install -e ".[test,benchmark,docs]"
 ```
 
+crispyx supports Python 3.10–3.12 and is compatible with recent releases of the
+scientific stack, including `anndata >= 0.13` and `pandas >= 3.0` (where string
+metadata is stored on disk using the nullable-string encoding).
+
 ## Benchmarking
 
 ```bash

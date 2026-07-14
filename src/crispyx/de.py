@@ -48,6 +48,7 @@ from .data import (
     resolve_data_path,
     resolve_output_path,
     sort_by_perturbation,
+    _read_h5_1d,
 )
 from .glm import (
     NBGLMFitter,
@@ -690,14 +691,14 @@ def _load_completed_de_result(
         idx_key = obs_grp.attrs.get("_index", "_index")
         if isinstance(idx_key, (bytes, np.bytes_)):
             idx_key = idx_key.decode()
-        candidates: list[str] = [_decode(s) for s in hf[f"obs/{idx_key}"][:]]
+        candidates: list[str] = [_decode(s) for s in _read_h5_1d(obs_grp[idx_key])]
 
         # var index → gene symbols
         var_grp = hf["var"]
         var_idx_key = var_grp.attrs.get("_index", "_index")
         if isinstance(var_idx_key, (bytes, np.bytes_)):
             var_idx_key = var_idx_key.decode()
-        gene_symbols = pd.Index([_decode(s) for s in hf[f"var/{var_idx_key}"][:]])
+        gene_symbols = pd.Index([_decode(s) for s in _read_h5_1d(var_grp[var_idx_key])])
 
         # uns metadata — wilcoxon writes to group attrs; anndata (nb_glm, t_test)
         # writes scalar datasets inside the uns group.
