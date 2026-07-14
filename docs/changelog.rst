@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Version 0.0.8
+-------------
+
+*Released 2026-07-14.*
+
+* **Fix ``write_obs`` / ``write_var`` row-count check under the
+  ``nullable-string-array`` encoding** – the shape guard read ``len()`` of the
+  index element, which for the group encoding used by anndata >= 0.13 /
+  pandas >= 3.0 counts the group's ``values`` / ``mask`` members (always 2)
+  rather than the number of rows.  This made valid writes raise
+  ``ValueError: DataFrame has N rows but the file has 2 cells`` (or ``genes``)
+  and caused genuine shape mismatches to go undetected.  The check now resolves
+  the index element correctly for both flat-dataset and group encodings, and
+  honours the ``_index`` attribute for renamed indices.  ``standardise_gene_names``
+  with ``inplace=True`` is fixed as a consequence.
+
 Version 0.0.7
 -------------
 

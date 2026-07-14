@@ -3368,6 +3368,22 @@ def _read_h5_1d(item: "h5py.Dataset | h5py.Group") -> np.ndarray:
     return _decode_h5_str_array(item[()])
 
 
+def _h5_index_length(grp: "h5py.Group") -> int:
+    """Return the number of rows in an AnnData obs/var group.
+
+    Resolves the index element (honouring the ``_index`` attribute) and reads
+    its length, handling both flat datasets and ``nullable-*`` group encodings
+    (where ``len(group)`` would incorrectly count the ``values``/``mask``
+    members rather than the rows).
+    """
+    _idx_raw = grp.attrs.get("_index", "_index")
+    index_key = _idx_raw.decode("utf-8") if isinstance(_idx_raw, bytes) else str(_idx_raw)
+    item = grp[index_key]
+    if isinstance(item, h5py.Group):
+        return int(item["values"].shape[0])
+    return int(item.shape[0])
+
+
 def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
     """Read an AnnData-encoded HDF5 group as a pandas DataFrame."""
     _idx_raw = grp.attrs.get("_index", "_index")
@@ -3501,7 +3517,7 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     """
     path = Path(path)
     with h5py.File(path, "r+") as f:
-        old_n = len(f["obs"]["_index"])
+        old_n = _h5_index_length(f["obs"])
         if len(df) != old_n:
             raise ValueError(
                 f"DataFrame has {len(df)} rows but the file has {old_n} cells."
@@ -3529,7 +3545,7 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     """
     path = Path(path)
     with h5py.File(path, "r+") as f:
-        old_n = len(f["var"]["_index"])
+        old_n = _h5_index_length(f["var"])
         if len(df) != old_n:
             raise ValueError(
                 f"DataFrame has {len(df)} rows but the file has {old_n} genes."
