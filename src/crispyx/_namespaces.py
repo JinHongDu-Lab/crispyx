@@ -8,6 +8,7 @@ from typing import Iterable, Literal
 import anndata as ad
 import numpy as np
 
+from .batch import BatchReducer, batch_process
 from .data import (
     AnnData,
     compute_overlap,
@@ -640,6 +641,62 @@ class _ToolsNamespace:
             neighbors_key=neighbors_key,
             random_state=random_state,
             copy=copy,
+        )
+
+    def batch_process(
+        self,
+        data: str | Path | ad.AnnData,
+        reducer: BatchReducer,
+        *,
+        perturbation_column: str | None = None,
+        groupby: str | None = None,
+        control_label: str | None = None,
+        reference: str | None = None,
+        gene_name_column: str | None = None,
+        perturbations: Iterable[str] | None = None,
+        batch_column: str,
+        mode: Literal["group", "comparison"] = "group",
+        statistic_name: str,
+        chunk_size: int | None = None,
+        cell_chunk_size: int | None = None,
+        data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,
+        verbose: int | bool = False,
+        memory_limit_gb: float | None = None,
+        force: bool = False,
+    ) -> AnnData:
+        """Compute a streaming gene-wise statistic within biological batches.
+
+        ``data`` must be an h5ad path or backed AnnData. ``reducer`` must be a
+        :class:`crispyx.BatchReducer` that consumes dense cell chunks and
+        finalizes to one value per gene.
+
+        The grouping arguments match differential expression:
+        ``groupby`` aliases ``perturbation_column`` and ``reference`` aliases
+        ``control_label``. See :func:`crispyx.batch.batch_process` for complete
+        input requirements and reducer examples.
+        """
+        return batch_process(
+            data,
+            reducer,
+            perturbation_column=perturbation_column,
+            groupby=groupby,
+            control_label=control_label,
+            reference=reference,
+            gene_name_column=gene_name_column,
+            perturbations=perturbations,
+            batch_column=batch_column,
+            mode=mode,
+            statistic_name=statistic_name,
+            chunk_size=chunk_size,
+            cell_chunk_size=cell_chunk_size,
+            data_name=data_name,
+            output_path=output_path,
+            output_dir=output_dir,
+            verbose=verbose,
+            memory_limit_gb=memory_limit_gb,
+            force=force,
         )
 
     def rank_genes_groups(

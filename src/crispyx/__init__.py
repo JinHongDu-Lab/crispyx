@@ -26,6 +26,7 @@ except PackageNotFoundError:
 # Public API re-exports
 # ---------------------------------------------------------------------------
 
+from .batch import BatchReducer, BatchStatistic, batch_process
 from .data import (
     AnnData,
     OverlapResult,
@@ -120,6 +121,10 @@ __all__ = [
     # Pseudo-bulk
     "compute_average_log_expression",
     "compute_pseudobulk_expression",
+    # Generic batch statistics
+    "BatchReducer",
+    "BatchStatistic",
+    "batch_process",
     # Differential expression
     "RankGenesGroupsResult",
     "t_test",
@@ -165,4 +170,3 @@ __all__ = [
     "plot_qc_summary",
     "plot_overlap_heatmap",
 ]
-

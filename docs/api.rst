@@ -74,6 +74,14 @@ Pseudo-bulk aggregation
    :undoc-members:
    :show-inheritance:
 
+Generic batch statistics
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: crispyx.batch
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Differential expression
 ~~~~~~~~~~~~~~~~~~~~~~~
 

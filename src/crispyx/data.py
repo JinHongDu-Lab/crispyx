@@ -1239,11 +1239,12 @@ def normalize_total_log1p(
     format_mismatch_policy
         How to handle a source stored as CSC, whose row-(cell-)streaming here is
         O(total_nnz) per chunk and can be ~100x slower than CSR:
-        - ``"warn"`` (default): proceed but log a single actionable warning.
-        - ``"convert"``: transparently convert the source to CSR in a temporary
+
+        * ``"warn"`` (default): proceed but log a single actionable warning.
+        * ``"convert"``: transparently convert the source to CSR in a temporary
           file (bounded-memory two-pass streaming) and stream from that; the
           temporary file is removed before returning.
-        - ``"off"``: proceed silently with no warning.
+        * ``"off"``: proceed silently with no warning.
     verbose
         Print progress information.
     
