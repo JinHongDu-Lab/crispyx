@@ -63,7 +63,7 @@ estimates toward zero.
 Results summary
 ---------------
 
-See `benchmarking/benchmark_summary.md <https://github.com/jaydu1/crispyx/blob/main/benchmarking/benchmark_summary.md>`_
+See `benchmarking/benchmark_summary.md <https://github.com/jinhongdu-lab/crispyx/blob/main/benchmarking/benchmark_summary.md>`_
 for a human-readable summary of performance and accuracy results across all 12
 benchmark datasets, including runtime tables, memory tables, and accuracy metrics.
 

@@ -54,7 +54,7 @@ Benchmarked across 12 public CRISPR screen datasets (21K–1.97M cells):
 
 ## Links
 
-- GitHub: https://github.com/jaydu1/crispyx
+- GitHub: https://github.com/jinhongdu-lab/crispyx
 - PyPI: https://pypi.org/project/crispyx
 - Documentation: https://crispyx.readthedocs.io
 - Installation: https://crispyx.readthedocs.io/en/latest/installation.html

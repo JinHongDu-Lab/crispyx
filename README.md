@@ -3,20 +3,20 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/projects/crispyx)
-[![Tests](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/project/crispyx)
+[![Tests](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml)
 
 ## Motivation
 
-Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, which can require 30–100+ GB of RAM and makes many screens impractical to analyse on commodity hardware or shared HPC nodes with per-job memory limits.
+Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, requiring large RAM allocations and often making routine workflows impractical on laptops or shared compute nodes.
 
-**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix in memory, so even the largest screens can be processed with modest resources.
+**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix.
 
 ## Features
 
 - **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
-- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk count matrices for effect size estimation, with optional batch correction (`batch_column`) that combines within-batch effects using a disk-backed, bounded-memory accumulator
-- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk count matrices for effect size estimation, with optional batch correction (`batch_column`) that combines within-batch effects using inverse-variance meta-analysis
+- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support for NB-GLM and configurable worker memory limits
 - **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
 - **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
@@ -81,7 +81,7 @@ pip install crispyx
 For development (editable install with all extras):
 
 ```bash
-git clone https://github.com/jaydu1/crispyx.git
+git clone https://github.com/jinhongdu-lab/crispyx.git
 cd crispyx
 pip install -e ".[test,benchmark,docs]"
 ```
@@ -118,4 +118,4 @@ crispyx builds on the foundational work of [Scanpy](https://scanpy.readthedocs.i
 
 ## Contributing
 
-Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jaydu1/crispyx/issues) or submit a pull request.
+Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jinhongdu-lab/crispyx/issues) or submit a pull request.

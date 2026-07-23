@@ -72,10 +72,10 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jaydu1/crispyx"
+Homepage = "https://github.com/jinhongdu-lab/crispyx"
 Documentation = "https://crispyx.readthedocs.io"
-Repository = "https://github.com/jaydu1/crispyx"
-"Bug Tracker" = "https://github.com/jaydu1/crispyx/issues"
+Repository = "https://github.com/jinhongdu-lab/crispyx"
+"Bug Tracker" = "https://github.com/jinhongdu-lab/crispyx/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

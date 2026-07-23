@@ -6,8 +6,8 @@ authors:
     given-names: Jin-Hong
 version: 0.0.8
 date-released: 2026-07-14
-url: "https://github.com/jaydu1/crispyx"
-repository-code: "https://github.com/jaydu1/crispyx"
+url: "https://github.com/jinhongdu-lab/crispyx"
+repository-code: "https://github.com/jinhongdu-lab/crispyx"
 license: MIT
 abstract: >
   crispyx is a Python package for memory-efficient, streaming analysis of

@@ -63,7 +63,7 @@ html_theme = "sphinx_rtd_theme"
 html_static_path: list[str] = []
 html_context = {
     "display_github": True,
-    "github_user": "jaydu1",
+    "github_user": "jinhongdu-lab",
     "github_repo": "crispyx",
     "github_version": "main",
     "conf_py_path": "/docs/",

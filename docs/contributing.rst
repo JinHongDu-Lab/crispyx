@@ -83,7 +83,7 @@ Reporting issues
 ----------------
 
 Please use the `GitHub issue tracker
-<https://github.com/jaydu1/crispyx/issues>`_ to report bugs or request
+<https://github.com/jinhongdu-lab/crispyx/issues>`_ to report bugs or request
 features. Include:
 
 * A minimal reproducible example
