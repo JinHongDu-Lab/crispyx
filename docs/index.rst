@@ -52,6 +52,7 @@ Key features
    :caption: Reference
 
    api
+   notebooks/batch_statistics_tutorial
    benchmarking
    comparison
    faq
