@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.0.8"
+version = "0.0.9"
 description = "Memory-efficient streaming analysis of large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files"
 readme = "README.md"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 authors = [{name = "Jin-Hong Du"}]
 requires-python = ">=3.10"
 keywords = [
@@ -25,7 +25,6 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

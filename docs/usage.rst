@@ -78,10 +78,53 @@ automatically and logged for reproducibility. Likewise, omitting
 Individual helpers such as :func:`crispyx.pp.filter_cells` are also
 available for customised pipelines.
 
-Effect size estimation
-----------------------
+Batch-level pseudo-bulk profiles
+--------------------------------
 
-Two complementary estimators are exposed through :mod:`crispyx.pb`:
+Use :func:`crispyx.pb.aggregate` to retain an absolute profile for every
+observed combination of grouping columns.  Grouping by perturbation and batch
+creates repeated measurements suitable for downstream replicate-aware
+analyses:
+
+.. code-block:: python
+
+   profiles = cx.pb.aggregate(
+       "screen.h5ad",
+       groupby=["perturbation", "batch"],
+       method="mean_log1p",
+       min_cells=5,
+       output_path="pseudobulk/screen_by_batch.h5ad",
+   )
+
+``method="mean_log1p"`` computes the mean of per-cell log1p values. Raw count
+input is log-transformed automatically; continuous non-negative input is
+treated as already transformed. ``method="sum"`` is stricter and accepts only
+finite, non-negative integer counts, typically supplied with
+``layer="counts"``. Set ``bootstrap_size=N`` to sample exactly ``N`` cells once
+with replacement from every retained group. The output records grouping and
+cell-count columns in ``obs`` and full aggregation provenance under
+``uns['crispyx_pseudobulk']``.
+
+Within-batch effects can be calculated from the saved profiles without
+re-reading the single-cell matrix:
+
+.. code-block:: python
+
+   effects = cx.pb.effects(
+       profiles,
+       groupby="perturbation",
+       batch_column="batch",
+       reference="control",
+   )
+
+The default retains one target-minus-control row per perturbation and batch.
+Pass ``aggregate_batches=True`` to combine those effects with harmonic-count
+weights. Cell-level input is also accepted and is aggregated internally.
+
+Effect size estimation (legacy API)
+-----------------------------------
+
+Two earlier effect estimators remain available for compatibility:
 
 * :func:`crispyx.pb.average_log_expression`
 * :func:`crispyx.pb.pseudobulk`

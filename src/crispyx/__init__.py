@@ -76,7 +76,10 @@ from .plotting import (
     rank_genes_groups_df,
 )
 from .pseudobulk import (
+    PseudobulkMethod,
+    aggregate_pseudobulk,
     compute_average_log_expression,
+    compute_pseudobulk_effects,
     compute_pseudobulk_expression,
 )
 from .qc import (
@@ -119,7 +122,10 @@ __all__ = [
     "filter_perturbations_by_cell_count",
     "quality_control_summary",
     # Pseudo-bulk
+    "PseudobulkMethod",
+    "aggregate_pseudobulk",
     "compute_average_log_expression",
+    "compute_pseudobulk_effects",
     "compute_pseudobulk_expression",
     # Generic batch statistics
     "BatchReducer",

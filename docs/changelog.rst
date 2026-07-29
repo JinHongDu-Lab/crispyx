@@ -1,6 +1,41 @@
 Changelog
 =========
 
+Version 0.0.9
+-------------
+
+*Released 2026-07-29.*
+
+* **License change** – crispyx 0.0.9 and later is distributed under a Modified
+  MIT License, which adds two attribution conditions for commercial use. All MIT
+  freedoms are retained and no fee or royalty is imposed. Versions up to and
+  including 0.0.8 remain under the unmodified MIT License; that grant is
+  perpetual and is not withdrawn. See ``LICENSE`` for the terms.
+* **Generic streaming batch statistics** – ``batch_process`` /
+  ``cx.tl.batch_process`` applies a user-supplied mergeable reducer within
+  experimental batches without loading the complete cell-by-gene matrix. A
+  ``BatchReducer`` provides ``initialize`` / ``update`` / ``finalize`` callbacks
+  for per-group statistics, plus an optional ``compare`` callback for
+  group-versus-reference contrasts in ``mode="comparison"``. Finalized batch
+  statistics are combined as ``sum(weight * values) / sum(weight)``, and only
+  batches containing both the group and the reference contribute to a contrast.
+  Argument names follow the differential-expression API (``groupby`` aliases
+  ``perturbation_column``; ``reference`` aliases ``control_label``).
+* **Batch-level absolute pseudo-bulk profiles** – ``aggregate_pseudobulk`` /
+  ``cx.pb.aggregate`` groups by one or more observation columns and retains one
+  profile for every observed combination. It supports strict raw-count sums,
+  mean log1p expression, a five-cell default threshold, deterministic
+  one-resample bootstrapping, source-layer selection, and versioned provenance
+  metadata.
+* **Explicit pseudo-bulk effects** – ``compute_pseudobulk_effects`` /
+  ``cx.pb.effects`` consumes a saved crispyx pseudo-bulk artifact directly or
+  aggregates cell-level input first. It returns within-batch target-minus-
+  reference effects by default and can explicitly combine batches using the
+  existing harmonic-count weighting.
+* Tuple-level differential-expression results were intentionally not added;
+  ``wilcoxon_test(batch_column=...)`` remains the batch-stratified test over all
+  cells and batches.
+
 Version 0.0.8
 -------------
 

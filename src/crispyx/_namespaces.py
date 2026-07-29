@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Sequence
 
 import anndata as ad
 import numpy as np
@@ -45,7 +45,10 @@ from .plotting import (
     rank_genes_groups_df,
 )
 from .pseudobulk import (
+    PseudobulkMethod,
+    aggregate_pseudobulk,
     compute_average_log_expression,
+    compute_pseudobulk_effects,
     compute_pseudobulk_expression,
 )
 from .qc import (
@@ -521,6 +524,102 @@ class _PreprocessingNamespace:
 
 class _PseudobulkNamespace:
     """Pseudo-bulk estimators (``cx.pb``)."""
+
+    def aggregate(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        groupby: str | Sequence[str],
+        method: PseudobulkMethod = "mean_log1p",
+        layer: str | None = None,
+        gene_name_column: str | None = None,
+        perturbations: Iterable[str] | None = None,
+        min_cells: int = 5,
+        bootstrap_size: int | None = None,
+        random_state: int = 0,
+        chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
+        data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,
+        verbose: int | bool = False,
+        force: bool = False,
+    ) -> AnnData:
+        """Aggregate absolute profiles for observed combinations in ``groupby``.
+
+        See :func:`crispyx.pseudobulk.aggregate_pseudobulk` for the input
+        contracts, bootstrap behavior, and output schema.
+        """
+        return aggregate_pseudobulk(
+            data,
+            groupby=groupby,
+            method=method,
+            layer=layer,
+            gene_name_column=gene_name_column,
+            perturbations=perturbations,
+            min_cells=min_cells,
+            bootstrap_size=bootstrap_size,
+            random_state=random_state,
+            chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
+            data_name=data_name,
+            output_path=output_path,
+            output_dir=output_dir,
+            verbose=verbose,
+            force=force,
+        )
+
+    def effects(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        perturbation_column: str | None = None,
+        groupby: str | None = None,
+        batch_column: str | None = None,
+        control_label: str | None = None,
+        reference: str | None = None,
+        aggregate_batches: bool = False,
+        method: PseudobulkMethod = "mean_log1p",
+        layer: str | None = None,
+        gene_name_column: str | None = None,
+        perturbations: Iterable[str] | None = None,
+        min_cells: int = 5,
+        bootstrap_size: int | None = None,
+        random_state: int = 0,
+        chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
+        bulk_output_path: str | Path | None = None,
+        data_name: str | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,
+        verbose: int | bool = False,
+        force: bool = False,
+    ) -> AnnData:
+        """Compute within-batch target-minus-reference pseudobulk effects."""
+        return compute_pseudobulk_effects(
+            data,
+            perturbation_column=perturbation_column,
+            groupby=groupby,
+            batch_column=batch_column,
+            control_label=control_label,
+            reference=reference,
+            aggregate_batches=aggregate_batches,
+            method=method,
+            layer=layer,
+            gene_name_column=gene_name_column,
+            perturbations=perturbations,
+            min_cells=min_cells,
+            bootstrap_size=bootstrap_size,
+            random_state=random_state,
+            chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
+            bulk_output_path=bulk_output_path,
+            data_name=data_name,
+            output_path=output_path,
+            output_dir=output_dir,
+            verbose=verbose,
+            force=force,
+        )
 
     def average_log_expression(
         self,

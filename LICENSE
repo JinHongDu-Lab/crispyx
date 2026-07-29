@@ -1,6 +1,6 @@
-MIT License
+Modified MIT License
 
-Copyright (c) 2025 Du Jinhong
+Copyright (c) 2025-2026 Jin-Hong Du
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -12,6 +12,55 @@ furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
+--------------------------------------------------------------------------------
+ADDITIONAL ATTRIBUTION CONDITIONS
+--------------------------------------------------------------------------------
+
+The only modifications to the MIT License are the two attribution conditions
+below. They impose no fee, no royalty, and no reporting obligation, and they do
+not restrict who may use the Software or for what purpose.
+
+For the purposes of these conditions, "Commercial Use" means use of the
+Software, or of any derivative work thereof, in the internal operations of a
+for-profit entity, or in the research, development, production, or delivery of
+any product or service that is sold, licensed, or offered for a fee.
+
+1.  ACKNOWLEDGEMENT IN COMMERCIAL USE
+
+    Should the Software or any derivative work thereof be put to Commercial
+    Use, you shall acknowledge crispyx and its author in the documentation,
+    release notes, "About" screen, methods section, or equivalent accompanying
+    materials of the product or service concerned. The following form is
+    sufficient:
+
+        This product uses crispyx (https://github.com/jaydu1/crispyx),
+        copyright (c) Jin-Hong Du.
+
+2.  PROMINENT ATTRIBUTION AT SCALE
+
+    Should the Software or any derivative work thereof be put to Commercial
+    Use by an organisation that meets any one of the following criteria, you
+    shall additionally display "crispyx" prominently on the user interface,
+    product documentation, public product description, or public research and
+    development pages of the product, service, or programme concerned:
+
+      (a) more than 1 million US dollars (or the equivalent in other
+          currencies) in annual revenue; or
+
+      (b) more than 5 million US dollars (or the equivalent in other
+          currencies) in cumulative capital raised, whether by equity, grant,
+          or other funding; or
+
+      (c) more than 25 employees.
+
+    Criteria (b) and (c) are included because organisations engaged in
+    pre-clinical research, which are the principal users of this Software,
+    commonly operate for many years with substantial resources and no product
+    revenue. Revenue alone is therefore not a meaningful measure of scale in
+    this field.
+
+--------------------------------------------------------------------------------
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -19,3 +68,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+NOTE ON EARLIER VERSIONS
+--------------------------------------------------------------------------------
+
+Versions of crispyx up to and including 0.0.8 were released under the
+unmodified MIT License. That grant is perpetual and irrevocable and is not
+withdrawn by this document. The attribution conditions above apply to crispyx
+version 0.0.9 and later.

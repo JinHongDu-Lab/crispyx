@@ -56,7 +56,7 @@ Data loading and utilities
    :members:
    :undoc-members:
    :show-inheritance:
-   :no-index:
+   :noindex:
 
 Quality control
 ~~~~~~~~~~~~~~~

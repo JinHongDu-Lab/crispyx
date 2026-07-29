@@ -9,9 +9,9 @@ crispyx
    :target: https://www.python.org/downloads/
    :alt: Python 3.10+
 
-.. image:: https://img.shields.io/badge/License-MIT-yellow.svg
-   :target: https://opensource.org/licenses/MIT
-   :alt: License: MIT
+.. image:: https://img.shields.io/badge/License-Modified%20MIT-yellow.svg
+   :target: https://github.com/jaydu1/crispyx/blob/main/LICENSE
+   :alt: License: Modified MIT
 
 Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 of cells and tens of thousands of genes. Standard single-cell toolkits load the
