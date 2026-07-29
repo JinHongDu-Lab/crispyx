@@ -233,3 +233,38 @@ def test_matching_profile_result_reloads(tmp_path):
     )
     second.close()
     assert output.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize(
+    "groupby", [["perturbation", "batch"], ["batch", "perturbation"]]
+)
+def test_perturbations_filter_is_independent_of_groupby_order(tmp_path, groupby):
+    """A requested label matches any grouping column, preserving other combinations."""
+    path, _, _ = _write_screen(tmp_path)
+    result = cx.pb.aggregate(
+        path,
+        groupby=groupby,
+        perturbations=["A"],
+        min_cells=1,
+        output_path=tmp_path / f"filtered_{'_'.join(groupby)}.h5ad",
+        force=True,
+    )
+    _, obs, _ = _materialise(result)
+    result.close()
+
+    # Every batch is retained for the requested perturbation, and nothing else.
+    assert set(obs["perturbation"].astype(str)) == {"A"}
+    assert sorted(obs["batch"].astype(str)) == ["b1", "b2"]
+
+
+def test_unknown_perturbation_still_raises(tmp_path):
+    path, _, _ = _write_screen(tmp_path)
+    with pytest.raises(ValueError, match="Requested perturbation"):
+        cx.pb.aggregate(
+            path,
+            groupby=["perturbation", "batch"],
+            perturbations=["missing"],
+            min_cells=1,
+            output_path=tmp_path / "missing.h5ad",
+            force=True,
+        )

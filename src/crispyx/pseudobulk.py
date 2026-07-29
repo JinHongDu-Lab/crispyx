@@ -806,7 +806,12 @@ def aggregate_pseudobulk(
         Column in ``adata.var`` containing gene symbols. Uses ``var_names``
         when omitted.
     perturbations
-        Optional ordered subset of values from the first grouping column.
+        Optional subset of grouping values to retain. A profile is kept when any
+        of its ``groupby`` values matches, so the argument selects on whichever
+        column holds the labels regardless of its position, and every observed
+        combination of the remaining columns is preserved. With
+        ``groupby=["perturbation", "batch"]``, ``perturbations=["KO_A"]``
+        therefore returns one profile per batch for ``KO_A``.
     min_cells
         Minimum number of source cells required for an observed group.
         Defaults to 5.
@@ -889,15 +894,18 @@ def aggregate_pseudobulk(
             raw_codes[raw_codes >= 0], minlength=len(raw_keys)
         ).astype(np.int64)
         requested = None if perturbations is None else {str(x) for x in perturbations}
+        # Match a requested label against any grouping column, not just the first,
+        # so that `groupby=["batch", "perturbation"]` filters on the perturbation
+        # and every combination containing it is preserved.
         keep_raw = [
             index
             for index, key in enumerate(raw_keys)
             if raw_counts[index] >= min_cells
-            and (requested is None or key[0] in requested)
+            and (requested is None or not requested.isdisjoint(key))
         ]
         if requested is not None:
-            observed_first = {key[0] for key in raw_keys}
-            missing = sorted(requested - observed_first)
+            observed_values = {value for key in raw_keys for value in key}
+            missing = sorted(requested - observed_values)
             if missing:
                 raise ValueError(f"Requested perturbation(s) not found: {missing[:5]}")
         keys = [raw_keys[index] for index in keep_raw]

@@ -361,3 +361,56 @@ def test_missing_batch_labels_are_excluded_and_callback_errors_have_context(tmp_
                 output_path=tmp_path / "failing.h5ad",
                 force=True,
             )
+
+
+def test_cache_is_invalidated_when_the_source_file_changes(tmp_path):
+    """Regenerating the input in place must not return the previous result."""
+    path, X, *_ = _write_data(tmp_path)
+    kwargs = dict(
+        groupby="perturbation",
+        batch_column="batch",
+        statistic_name="std",
+        output_path=tmp_path / "cached_source.h5ad",
+    )
+    first = cx.batch_process(path, _moment_reducer(), force=True, **kwargs)
+    before = np.asarray(first.backed.X[:]).copy()
+    first.close()
+
+    # Same path, same groups and batches, different values.
+    obs = pd.DataFrame(
+        {
+            "perturbation": np.repeat(["ctrl", "A", "B"], X.shape[0] // 3),
+            "batch": np.tile(["b1", "b2", "b3"], X.shape[0] // 3),
+        },
+        index=[f"cell_{i}" for i in range(X.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])])
+    ad.AnnData(sp.csr_matrix(X * 10.0), obs=obs, var=var).write(path)
+
+    second = cx.batch_process(path, _moment_reducer(), **kwargs)
+    after = np.asarray(second.backed.X[:]).copy()
+    second.close()
+
+    assert not np.allclose(before, after)
+
+    # An untouched source must still reload from cache.
+    mtime = kwargs["output_path"].stat().st_mtime_ns
+    time.sleep(0.01)
+    third = cx.batch_process(path, _moment_reducer(), **kwargs)
+    third.close()
+    assert kwargs["output_path"].stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("mode", ["group", "comparison"])
+def test_non_reducer_raises_type_error_in_both_modes(tmp_path, mode):
+    path, *_ = _write_data(tmp_path)
+    with pytest.raises(TypeError, match="reducer must be a BatchReducer instance"):
+        cx.batch_process(
+            path,
+            object(),
+            groupby="perturbation",
+            batch_column="batch",
+            mode=mode,
+            statistic_name="std",
+            output_path=tmp_path / "not_a_reducer.h5ad",
+        )

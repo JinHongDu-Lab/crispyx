@@ -292,6 +292,8 @@ def batch_process(
             statistic_name="mean_difference",
         )
     """
+    if not isinstance(reducer, BatchReducer):
+        raise TypeError("reducer must be a BatchReducer instance")
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
@@ -307,8 +309,6 @@ def batch_process(
         )
     if mode == "comparison" and reducer.compare is None:
         raise TypeError("reducer.compare is required when mode='comparison'.")
-    if not isinstance(reducer, BatchReducer):
-        raise TypeError("reducer must be a BatchReducer instance")
 
     statistic_name = _safe_statistic_name(statistic_name)
     path = resolve_data_path(data)
@@ -415,6 +415,10 @@ def batch_process(
             "batch_column": batch_column,
             "groups": groups,
             "batch_ids": batch_ids,
+            # Identify the input itself, so that regenerating the source in place
+            # invalidates the cache instead of silently returning stale values.
+            "source_path": str(path.resolve()),
+            "source_mtime_ns": int(path.stat().st_mtime_ns),
         }
         if resolved_output.exists() and not force:
             existing = ad.read_h5ad(resolved_output, backed="r")
