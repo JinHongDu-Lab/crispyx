@@ -3,14 +3,14 @@
 [![License: Modified MIT](https://img.shields.io/badge/License-Modified%20MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/projects/crispyx)
-[![Tests](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/project/crispyx)
+[![Tests](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml)
 
 ## Motivation
 
-Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, which can require 30–100+ GB of RAM and makes many screens impractical to analyse on commodity hardware or shared HPC nodes with per-job memory limits.
+Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, requiring large RAM allocations and often making routine workflows impractical on laptops or shared compute nodes.
 
-**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix in memory, so even the largest screens can be processed with modest resources.
+**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix.
 
 ## Features
 
@@ -83,7 +83,7 @@ pip install crispyx
 For development (editable install with all extras):
 
 ```bash
-git clone https://github.com/jaydu1/crispyx.git
+git clone https://github.com/jinhongdu-lab/crispyx.git
 cd crispyx
 pip install -e ".[test,benchmark,docs]"
 ```

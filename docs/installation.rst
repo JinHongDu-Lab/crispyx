@@ -23,7 +23,7 @@ Clone the repository and install in editable mode:
 
 .. code-block:: bash
 
-   git clone https://github.com/jaydu1/crispyx.git
+   git clone https://github.com/jinhongdu-lab/crispyx.git
    cd crispyx
    pip install -e .
 
