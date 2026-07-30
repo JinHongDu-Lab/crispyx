@@ -20,13 +20,18 @@ Version 0.0.9
   statistics are combined as ``sum(weight * values) / sum(weight)``, and only
   batches containing both the group and the reference contribute to a contrast.
   Argument names follow the differential-expression API (``groupby`` aliases
-  ``perturbation_column``; ``reference`` aliases ``control_label``).
+  ``perturbation_column``; ``reference`` aliases ``control_label``). Cached
+  results are keyed on the input path and modification time, so regenerating a
+  source file invalidates its cached statistic; ``force=True`` remains necessary
+  when a reducer's implementation changes without changing ``statistic_name``.
 * **Batch-level absolute pseudo-bulk profiles** – ``aggregate_pseudobulk`` /
   ``cx.pb.aggregate`` groups by one or more observation columns and retains one
   profile for every observed combination. It supports strict raw-count sums,
   mean log1p expression, a five-cell default threshold, deterministic
   one-resample bootstrapping, source-layer selection, and versioned provenance
-  metadata.
+  metadata. ``perturbations`` keeps a profile when any of its grouping values
+  matches, so it selects on whichever column holds the labels regardless of its
+  position in ``groupby`` and preserves every combination of the others.
 * **Explicit pseudo-bulk effects** – ``compute_pseudobulk_effects`` /
   ``cx.pb.effects`` consumes a saved crispyx pseudo-bulk artifact directly or
   aggregates cell-level input first. It returns within-batch target-minus-

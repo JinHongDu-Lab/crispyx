@@ -32,8 +32,23 @@ from .data import (
 class BatchStatistic:
     """A finalized within-batch statistic and its aggregation weight.
 
-    ``values`` must contain one value per gene in the current gene chunk.
-    ``weight`` may be a non-negative scalar or one non-negative value per gene.
+    Parameters
+    ----------
+    values
+        One value per gene in the current gene chunk, so shape ``(width,)``.
+        Converted to ``float64``.
+    weight
+        How much this batch counts when the per-batch statistics are combined.
+        Either a scalar applied to every gene, or one value per gene with shape
+        ``(width,)``. Must be finite and non-negative; a weight of zero drops
+        the batch for the genes concerned.
+
+    Notes
+    -----
+    Batches are combined per gene as ``sum(weight * values) / sum(weight)``. The
+    weight is therefore what makes a cross-batch average cell-count weighted
+    rather than a plain mean of batch means. Genes whose weights sum to zero are
+    reported as ``NaN``.
     """
 
     values: ArrayLike
@@ -44,11 +59,84 @@ class BatchStatistic:
 class BatchReducer:
     """Callbacks defining a mergeable streaming statistic.
 
-    ``initialize`` receives the number of genes in the current chunk. ``update``
-    receives ``(state, cells_by_genes_block)`` and may mutate the state in place
-    or return a replacement. ``finalize`` produces a :class:`BatchStatistic` for
-    group mode. ``compare`` receives target and reference states and is required
-    in comparison mode.
+    A reducer must supply three callbacks, plus a fourth required only for
+    ``mode="comparison"``:
+
+    * ``initialize(width)`` → a fresh state object.
+    * ``update(state, block)`` → ``None``, or a replacement state.
+    * ``finalize(state)`` → :class:`BatchStatistic`, or a plain array.
+    * ``compare(group_state, reference_state)`` → :class:`BatchStatistic`, or a
+      plain array. Optional; omit it for ``mode="group"``.
+
+    crispyx streams the matrix one gene chunk at a time and, inside a gene
+    chunk, one cell chunk at a time. The callbacks therefore only ever see a
+    slice of the data and must carry whatever running state the statistic needs.
+
+    Shapes and types
+    ----------------
+    ``width`` : ``int``
+        Number of genes in the current gene chunk. Equal to the run's
+        ``chunk_size`` except for the last chunk, which may be shorter, so size
+        state from ``width`` rather than assuming it is constant.
+    ``block`` : ``np.ndarray``, shape ``(n_cells, width)``
+        Dense array holding just the cells of one ``(group, batch)`` combination
+        that fall inside the current cell chunk. Sparse input is densified
+        first. ``n_cells`` is at least 1 and differs between calls; the dtype
+        follows the stored matrix, so cast explicitly if the statistic needs
+        ``float64``.
+    ``state`` : any object
+        Created fresh for each gene chunk and never shared across gene chunks.
+        Within one gene chunk, one state is held per ``(group, batch)`` and is
+        updated by every cell chunk containing that combination. ``update`` may
+        mutate it in place and return ``None``, or return a replacement.
+    ``finalize`` / ``compare`` return value
+        One value per gene, so shape ``(width,)``. Returning a bare array is
+        equivalent to ``BatchStatistic(values, weight=1.0)``.
+
+    Examples
+    --------
+    A within-batch mean, weighted across batches by cell count::
+
+        import numpy as np
+        import crispyx as cx
+
+        def initialize(width):
+            # One accumulator per gene in this chunk, plus a scalar cell count.
+            return {"total": np.zeros(width, dtype=np.float64), "n": 0}
+
+        def update(state, block):
+            # block is (n_cells, width); summing over cells leaves (width,).
+            state["total"] += block.sum(axis=0)
+            state["n"] += block.shape[0]
+            # Returning None keeps the state that was mutated above.
+
+        def finalize(state):
+            # values must be (width,); the weight makes the cross-batch
+            # average cell-count weighted.
+            return cx.BatchStatistic(state["total"] / state["n"], weight=state["n"])
+
+        reducer = cx.BatchReducer(initialize, update, finalize)
+
+    Adding ``compare`` enables ``mode="comparison"``. It receives the two states
+    accumulated independently for the group and for the reference within the
+    same batch::
+
+        def compare(group_state, reference_state):
+            difference = (
+                group_state["total"] / group_state["n"]
+                - reference_state["total"] / reference_state["n"]
+            )
+            n_group, n_reference = group_state["n"], reference_state["n"]
+            weight = n_group * n_reference / (n_group + n_reference)
+            return cx.BatchStatistic(difference, weight=weight)
+
+        reducer = cx.BatchReducer(initialize, update, finalize, compare)
+
+    Notes
+    -----
+    The statistic must be expressible through state that merges across cell
+    chunks. One that needs all of a group's cells at once, such as an exact
+    median, cannot be written this way.
     """
 
     initialize: Callable[[int], Any]
@@ -213,8 +301,11 @@ def batch_process(
     memory_limit_gb
         Soft memory budget used for automatic chunk sizing.
     force
-        Recompute even when a matching output already exists. Use this when a
-        reducer's implementation changes without changing ``statistic_name``.
+        Recompute even when a matching output already exists. Edits to the input
+        file are detected automatically through its path and modification time,
+        so a regenerated source invalidates a cached result on its own. Use
+        ``force`` when a reducer's implementation changes without changing
+        ``statistic_name``, since the reducer itself cannot be fingerprinted.
 
     Returns
     -------

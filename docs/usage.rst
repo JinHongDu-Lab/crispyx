@@ -105,6 +105,13 @@ with replacement from every retained group. The output records grouping and
 cell-count columns in ``obs`` and full aggregation provenance under
 ``uns['crispyx_pseudobulk']``.
 
+``perturbations`` restricts which profiles are returned. A profile is kept when
+any of its grouping values matches, so the argument selects on whichever column
+holds the labels irrespective of its position in ``groupby``, and every observed
+combination of the remaining columns is preserved. With
+``groupby=["perturbation", "batch"]``, passing ``perturbations=["KO_A"]`` returns
+one profile per batch for ``KO_A``.
+
 Within-batch effects can be calculated from the saved profiles without
 re-reading the single-cell matrix:
 
