@@ -1411,10 +1411,14 @@ def compute_pseudobulk_effects(
         return _run_from_bulk(temporary_bulk)
 
 
+# docs/api.rst documents this module with ``automodule :members:``, which follows
+# ``__all__``. compute_average_log_expression and compute_pseudobulk_expression are
+# deliberately absent: they remain importable for backward compatibility but must not
+# appear in the rendered API, so that only compute_expression_effects is discoverable.
 __all__ = [
+    "ExpressionEffectMethod",
     "PseudobulkMethod",
     "aggregate_pseudobulk",
-    "compute_average_log_expression",
+    "compute_expression_effects",
     "compute_pseudobulk_effects",
-    "compute_pseudobulk_expression",
 ]
