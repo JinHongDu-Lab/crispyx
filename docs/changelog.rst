@@ -4,14 +4,14 @@ Changelog
 Version 0.0.9
 -------------
 
-*Released 2026-07-29.*
+*Unreleased.* Set the release date when the version is published.
 
 * **License change** – crispyx 0.0.9 and later is distributed under a Modified
   MIT License, which adds two attribution conditions for commercial use. All MIT
   freedoms are retained and no fee or royalty is imposed. Versions up to and
   including 0.0.8 remain under the unmodified MIT License; that grant is
   perpetual and is not withdrawn. See ``LICENSE`` for the terms.
-* **Unified expression effects** – ``compute_normalized_effects`` /
+* **Unified normalized effects** – ``compute_normalized_effects`` /
   ``cx.pb.normalized_effects`` replaces the two earlier one-command estimators with a
   single function selected by ``method``. ``method="mean_log1p"`` averages per-cell
   ``log1p`` values (mean of logs); ``method="log_mean"`` averages normalised counts and
