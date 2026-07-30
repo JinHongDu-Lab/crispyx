@@ -30,7 +30,7 @@ Quick start
        min_cells_per_perturbation=15,
        min_cells_per_gene=10,
    )
-   adata_pb = cx.pb.expression_effects(
+   adata_pb = cx.pb.normalized_effects(
        adata_ro,
        groupby="perturbation",
    )
@@ -131,7 +131,7 @@ weights. Cell-level input is also accepted and is aggregated internally.
 Normalised effect sizes in one pass
 -----------------------------------
 
-:func:`crispyx.pb.expression_effects` goes from a cell-level file to an effect size
+:func:`crispyx.pb.normalized_effects` goes from a cell-level file to an effect size
 in a single streaming pass. Unlike :func:`crispyx.pb.effects`, which contrasts on
 whatever scale its input already carries, this function **normalises library size
 itself** -- so do not pre-normalise as well.
@@ -143,14 +143,14 @@ different answers whenever expression varies within a group.
 .. code-block:: python
 
    # mean of per-cell log1p values
-   effects = cx.pb.expression_effects(
+   effects = cx.pb.normalized_effects(
        adata_ro,
        groupby="perturbation",
        method="mean_log1p",
    )
 
    # log of the mean of normalised counts
-   effects = cx.pb.expression_effects(
+   effects = cx.pb.normalized_effects(
        adata_ro,
        groupby="perturbation",
        method="log_mean",
@@ -176,7 +176,7 @@ batch* and combine the per-batch differences with harmonic-count weights
 
 .. code-block:: python
 
-   effects = cx.pb.expression_effects(
+   effects = cx.pb.normalized_effects(
        adata_ro,
        groupby="perturbation",
        method="log_mean",
@@ -219,7 +219,7 @@ environments (the value is forwarded to the chunk-size heuristic exactly as in
 
 .. code-block:: python
 
-   adata_pb = cx.pb.expression_effects(
+   adata_pb = cx.pb.normalized_effects(
        adata_ro,
        groupby="perturbation",
        batch_column="batch",

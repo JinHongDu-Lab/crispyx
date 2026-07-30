@@ -1,4 +1,4 @@
-"""Tests for the unified normalising effect estimator, ``compute_expression_effects``."""
+"""Tests for the normalising effect estimator, ``compute_normalized_effects``."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _materialise(result: cx.AnnData):
 @pytest.mark.parametrize("batch_column", [None, "batch"])
 def test_effects_shape_layers_and_metadata(tmp_path, method, batch_column):
     path, _, _ = _write_screen(tmp_path)
-    result = cx.pb.expression_effects(
+    result = cx.pb.normalized_effects(
         path,
         groupby="perturbation",
         reference="control",
@@ -91,12 +91,12 @@ def test_mean_of_logs_and_log_of_mean_are_different_estimators(tmp_path):
     path, _, _ = _write_screen(tmp_path)
     common = dict(groupby="perturbation", reference="control")
     mean_log = np.asarray(
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, method="mean_log1p", output_path=tmp_path / "a.h5ad", **common
         ).backed.X[:]
     )
     log_mean = np.asarray(
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, method="log_mean", output_path=tmp_path / "b.h5ad", **common
         ).backed.X[:]
     )
@@ -108,12 +108,12 @@ def test_batch_correction_differs_from_pooling(tmp_path):
     path, _, _ = _write_screen(tmp_path)
     common = dict(groupby="perturbation", reference="control", method="mean_log1p")
     pooled = np.asarray(
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, output_path=tmp_path / "pooled.h5ad", **common
         ).backed.X[:]
     )
     corrected = np.asarray(
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, batch_column="batch", output_path=tmp_path / "corr.h5ad", **common
         ).backed.X[:]
     )
@@ -123,7 +123,7 @@ def test_batch_correction_differs_from_pooling(tmp_path):
 def test_matches_a_direct_harmonic_weighted_calculation(tmp_path):
     """The batch-corrected effect equals an independent per-batch computation."""
     path, counts, obs = _write_screen(tmp_path)
-    result = cx.pb.expression_effects(
+    result = cx.pb.normalized_effects(
         path,
         groupby="perturbation",
         reference="control",
@@ -157,7 +157,7 @@ def test_matches_a_direct_harmonic_weighted_calculation(tmp_path):
 def test_empty_selection_still_records_metadata(tmp_path):
     """An empty result must not omit uns keys a caller reads unconditionally."""
     path, _, _ = _write_screen(tmp_path)
-    result = cx.pb.expression_effects(
+    result = cx.pb.normalized_effects(
         path,
         groupby="perturbation",
         reference="control",
@@ -178,20 +178,20 @@ def test_argument_guards(tmp_path):
     common = dict(output_path=tmp_path / "bad.h5ad")
 
     with pytest.raises(ValueError, match="method must be 'mean_log1p' or 'log_mean'"):
-        cx.pb.expression_effects(path, groupby="perturbation", method="sum", **common)
+        cx.pb.normalized_effects(path, groupby="perturbation", method="sum", **common)
 
     with pytest.raises(ValueError, match="baseline_count must be positive"):
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, groupby="perturbation", method="log_mean", baseline_count=0, **common
         )
 
     with pytest.raises(TypeError, match="aliases for the same parameter"):
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, groupby="perturbation", perturbation_column="perturbation", **common
         )
 
     with pytest.raises(TypeError, match="aliases for the same parameter"):
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, groupby="perturbation", reference="control",
             control_label="control", **common,
         )
@@ -199,7 +199,7 @@ def test_argument_guards(tmp_path):
 
 def test_layout_is_not_public_api():
     """The output-naming switch is an implementation detail of the aliases."""
-    parameters = inspect.signature(cx.compute_expression_effects).parameters
+    parameters = inspect.signature(cx.compute_normalized_effects).parameters
     assert "layout" not in parameters
     assert "_layout" not in parameters
 
@@ -233,7 +233,7 @@ def test_deprecated_aliases_warn_and_keep_their_original_names(
     assert reference_uns in legacy_uns
 
     # The values must be identical to the replacement call.
-    current = cx.pb.expression_effects(
+    current = cx.pb.normalized_effects(
         path,
         groupby="perturbation",
         reference="control",
@@ -249,7 +249,7 @@ def test_deprecated_aliases_warn_and_keep_their_original_names(
     )
 
 
-def test_effects_warns_on_raw_counts_but_expression_effects_does_not(tmp_path):
+def test_effects_warns_on_raw_counts_but_normalized_effects_does_not(tmp_path):
     """cx.pb.effects never normalises, so raw-count input must be flagged."""
     path, counts, obs = _write_screen(tmp_path)
 
@@ -284,9 +284,9 @@ def test_effects_warns_on_raw_counts_but_expression_effects_does_not(tmp_path):
             bulk_output_path=tmp_path / "norm_bulk.h5ad",
         )
 
-    # expression_effects normalises internally, so raw counts are expected there.
+    # normalized_effects normalises internally, so raw counts are expected there.
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
-        cx.pb.expression_effects(
+        cx.pb.normalized_effects(
             path, groupby="perturbation", output_path=tmp_path / "ee.h5ad"
         )

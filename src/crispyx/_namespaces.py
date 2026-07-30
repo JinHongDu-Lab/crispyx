@@ -45,11 +45,11 @@ from .plotting import (
     rank_genes_groups_df,
 )
 from .pseudobulk import (
-    ExpressionEffectMethod,
+    NormalizedEffectMethod,
     PseudobulkMethod,
     aggregate_pseudobulk,
     compute_average_log_expression,
-    compute_expression_effects,
+    compute_normalized_effects,
     compute_pseudobulk_effects,
     compute_pseudobulk_expression,
 )
@@ -623,7 +623,7 @@ class _PseudobulkNamespace:
             force=force,
         )
 
-    def expression_effects(
+    def normalized_effects(
         self,
         data: str | Path | ad.AnnData,
         *,
@@ -631,7 +631,7 @@ class _PseudobulkNamespace:
         groupby: str | None = None,
         control_label: str | None = None,
         reference: str | None = None,
-        method: ExpressionEffectMethod = "mean_log1p",
+        method: NormalizedEffectMethod = "mean_log1p",
         baseline_count: float = 1.0,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
@@ -645,9 +645,9 @@ class _PseudobulkNamespace:
     ):
         """Library-size-normalised target-minus-reference effects, in one pass.
 
-        See :func:`crispyx.compute_expression_effects`.
+        See :func:`crispyx.compute_normalized_effects`.
         """
-        return compute_expression_effects(
+        return compute_normalized_effects(
             resolve_data_path(data),
             perturbation_column=perturbation_column,
             groupby=groupby,

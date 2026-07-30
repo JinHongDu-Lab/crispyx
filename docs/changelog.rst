@@ -11,8 +11,8 @@ Version 0.0.9
   freedoms are retained and no fee or royalty is imposed. Versions up to and
   including 0.0.8 remain under the unmodified MIT License; that grant is
   perpetual and is not withdrawn. See ``LICENSE`` for the terms.
-* **Unified expression effects** – ``compute_expression_effects`` /
-  ``cx.pb.expression_effects`` replaces the two earlier one-command estimators with a
+* **Unified expression effects** – ``compute_normalized_effects`` /
+  ``cx.pb.normalized_effects`` replaces the two earlier one-command estimators with a
   single function selected by ``method``. ``method="mean_log1p"`` averages per-cell
   ``log1p`` values (mean of logs); ``method="log_mean"`` averages normalised counts and
   then applies ``log1p(baseline_count * mean)`` (log of mean). Both normalise library
@@ -28,7 +28,7 @@ Version 0.0.9
 
   Note that ``cx.pb.effects`` deliberately does **not** normalise: it computes a contrast
   on whatever scale its input already carries. Normalise beforehand with
-  ``cx.pp.normalize_total_log1p``, or use ``cx.pb.expression_effects`` to have it done in
+  ``cx.pp.normalize_total_log1p``, or use ``cx.pb.normalized_effects`` to have it done in
   one pass.
 * **Generic streaming batch statistics** – ``batch_process`` /
   ``cx.tl.batch_process`` applies a user-supplied mergeable reducer within

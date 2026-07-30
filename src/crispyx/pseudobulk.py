@@ -29,19 +29,19 @@ from .data import (
 
 
 PseudobulkMethod = Literal["mean_log1p", "sum", "log_mean"]
-# The subset compute_expression_effects accepts. "sum" belongs to aggregate_pseudobulk,
+# The subset compute_normalized_effects accepts. "sum" belongs to aggregate_pseudobulk,
 # so keeping the public hint narrow stops a type checker from waving it through.
-ExpressionEffectMethod = Literal["mean_log1p", "log_mean"]
+NormalizedEffectMethod = Literal["mean_log1p", "log_mean"]
 
-# Output naming. "modern" is what compute_expression_effects returns; the two
+# Output naming. "modern" is what compute_normalized_effects returns; the two
 # deprecated wrappers request their historical names so existing code keeps working.
-_EXPRESSION_LAYOUTS = {
+_NORMALIZED_LAYOUTS = {
     "modern": {
         "profile_layer": "perturbation_profile",
         "matched_layer": "control_profile_matched",
         "reference_uns": "control_profile",
-        "suffix": "expression_effects",
-        "log_name": "pb.expression_effects",
+        "suffix": "normalized_effects",
+        "log_name": "pb.normalized_effects",
     },
     "mean_log1p": {
         "profile_layer": "perturbation_mean",
@@ -281,7 +281,7 @@ def _streaming_batch_corrected(
     )
 
 
-def _expression_effects_impl(
+def _normalized_effects_impl(
     data: str | Path | AnnData | ad.AnnData,
     *,
     layout: str,
@@ -289,7 +289,7 @@ def _expression_effects_impl(
     groupby: str | None = None,
     control_label: str | None = None,
     reference: str | None = None,
-    method: ExpressionEffectMethod = "mean_log1p",
+    method: NormalizedEffectMethod = "mean_log1p",
     baseline_count: float = 1.0,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -387,7 +387,7 @@ def _expression_effects_impl(
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        fn_name="compute_expression_effects",
+        fn_name="compute_normalized_effects",
     )
     if method not in ("mean_log1p", "log_mean"):
         raise ValueError(
@@ -396,7 +396,7 @@ def _expression_effects_impl(
         )
     if baseline_count <= 0:
         raise ValueError("baseline_count must be positive")
-    naming = _EXPRESSION_LAYOUTS[layout]
+    naming = _NORMALIZED_LAYOUTS[layout]
     log_name = naming["log_name"]
 
     # The two methods differ only in where the log is applied.
@@ -557,14 +557,14 @@ def _expression_effects_impl(
     return AnnData(resolved_output)
 
 
-def compute_expression_effects(
+def compute_normalized_effects(
     data: str | Path | AnnData | ad.AnnData,
     *,
     perturbation_column: str | None = None,
     groupby: str | None = None,
     control_label: str | None = None,
     reference: str | None = None,
-    method: ExpressionEffectMethod = "mean_log1p",
+    method: NormalizedEffectMethod = "mean_log1p",
     baseline_count: float = 1.0,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -659,7 +659,7 @@ def compute_expression_effects(
         saved :func:`aggregate_pseudobulk` artifact.
     aggregate_pseudobulk : absolute profiles rather than a contrast.
     """
-    return _expression_effects_impl(
+    return _normalized_effects_impl(
         data,
         layout="modern",
         perturbation_column=perturbation_column,
@@ -695,7 +695,7 @@ def compute_average_log_expression(
     output_dir: str | Path | None = None,
     verbose: int | bool = False,
 ) -> AnnData:
-    """Deprecated alias for ``compute_expression_effects(method="mean_log1p")``.
+    """Deprecated alias for ``compute_normalized_effects(method="mean_log1p")``.
 
     Retained for backward compatibility, including its original layer and ``uns``
     names. The output additionally carries ``uns['method']``, which earlier releases
@@ -703,12 +703,12 @@ def compute_average_log_expression(
     """
     warnings.warn(
         "compute_average_log_expression() is deprecated and will be removed in "
-        "crispyx 0.1.0. Use compute_expression_effects(..., method='mean_log1p') "
-        "(cx.pb.expression_effects) instead.",
+        "crispyx 0.1.0. Use compute_normalized_effects(..., method='mean_log1p') "
+        "(cx.pb.normalized_effects) instead.",
         DeprecationWarning,
         stacklevel=2,
     )
-    return _expression_effects_impl(
+    return _normalized_effects_impl(
         data,
         layout="mean_log1p",
         perturbation_column=perturbation_column,
@@ -742,7 +742,7 @@ def compute_pseudobulk_expression(
     output_dir: str | Path | None = None,
     verbose: int | bool = False,
 ) -> AnnData:
-    """Deprecated alias for ``compute_expression_effects(method="log_mean")``.
+    """Deprecated alias for ``compute_normalized_effects(method="log_mean")``.
 
     Retained for backward compatibility, including its original layer and ``uns``
     names. The output additionally carries ``uns['method']``, which earlier releases
@@ -750,12 +750,12 @@ def compute_pseudobulk_expression(
     """
     warnings.warn(
         "compute_pseudobulk_expression() is deprecated and will be removed in "
-        "crispyx 0.1.0. Use compute_expression_effects(..., method='log_mean') "
-        "(cx.pb.expression_effects) instead.",
+        "crispyx 0.1.0. Use compute_normalized_effects(..., method='log_mean') "
+        "(cx.pb.normalized_effects) instead.",
         DeprecationWarning,
         stacklevel=2,
     )
-    return _expression_effects_impl(
+    return _normalized_effects_impl(
         data,
         layout="log_mean",
         perturbation_column=perturbation_column,
@@ -1194,7 +1194,7 @@ def compute_pseudobulk_effects(
                     "The input to compute_pseudobulk_effects() looks like raw counts, "
                     "and this function does not normalise library size, so the effect "
                     "will be confounded by sequencing depth. Normalise first with "
-                    "cx.pp.normalize_total_log1p(), or use cx.pb.expression_effects(), "
+                    "cx.pp.normalize_total_log1p(), or use cx.pb.normalized_effects(), "
                     "which normalises internally.",
                     UserWarning,
                     stacklevel=3,
@@ -1430,11 +1430,11 @@ def compute_pseudobulk_effects(
 # docs/api.rst documents this module with ``automodule :members:``, which follows
 # ``__all__``. compute_average_log_expression and compute_pseudobulk_expression are
 # deliberately absent: they remain importable for backward compatibility but must not
-# appear in the rendered API, so that only compute_expression_effects is discoverable.
+# appear in the rendered API, so that only compute_normalized_effects is discoverable.
 __all__ = [
-    "ExpressionEffectMethod",
+    "NormalizedEffectMethod",
     "PseudobulkMethod",
     "aggregate_pseudobulk",
-    "compute_expression_effects",
+    "compute_normalized_effects",
     "compute_pseudobulk_effects",
 ]
