@@ -1183,6 +1183,22 @@ def compute_pseudobulk_effects(
         bulk = read_backed(bulk_path)
         try:
             marker = bulk.uns.get("crispyx_pseudobulk", {})
+            # This function contrasts on whatever scale it is given and never
+            # normalises library size. Raw counts therefore produce an effect that
+            # is confounded by sequencing depth -- a plausible-looking but wrong
+            # answer, with nothing to signal it. aggregate_pseudobulk records the
+            # scale it detected, so the mistake is detectable here for both a saved
+            # artifact and cell-level input aggregated a moment ago.
+            if str(marker.get("input_scale", "")) == "counts":
+                warnings.warn(
+                    "The input to compute_pseudobulk_effects() looks like raw counts, "
+                    "and this function does not normalise library size, so the effect "
+                    "will be confounded by sequencing depth. Normalise first with "
+                    "cx.pp.normalize_total_log1p(), or use cx.pb.expression_effects(), "
+                    "which normalises internally.",
+                    UserWarning,
+                    stacklevel=3,
+                )
             marker_groupby = [str(x) for x in np.asarray(marker.get("groupby", [])).tolist()]
             if perturbation_column not in bulk.obs.columns:
                 raise KeyError(

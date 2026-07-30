@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 from pathlib import Path
 
 import anndata as ad
@@ -246,3 +247,46 @@ def test_deprecated_aliases_warn_and_keep_their_original_names(
     np.testing.assert_allclose(
         legacy_layers[profile_layer], current_layers["perturbation_profile"], atol=1e-12
     )
+
+
+def test_effects_warns_on_raw_counts_but_expression_effects_does_not(tmp_path):
+    """cx.pb.effects never normalises, so raw-count input must be flagged."""
+    path, counts, obs = _write_screen(tmp_path)
+
+    with pytest.warns(UserWarning, match="looks like raw counts"):
+        cx.pb.effects(
+            path,
+            groupby="perturbation",
+            batch_column="batch",
+            reference="control",
+            aggregate_batches=True,
+            output_path=tmp_path / "raw_effects.h5ad",
+            bulk_output_path=tmp_path / "raw_bulk.h5ad",
+        )
+
+    # Pre-normalised input is on the scale the function expects: stay silent.
+    library = counts.sum(axis=1, keepdims=True)
+    normalised = tmp_path / "normalised.h5ad"
+    ad.AnnData(
+        sp.csr_matrix(np.log1p(counts / library * 1e4)),
+        obs=obs,
+        var=pd.DataFrame(index=[f"g{i}" for i in range(counts.shape[1])]),
+    ).write(normalised)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        cx.pb.effects(
+            normalised,
+            groupby="perturbation",
+            batch_column="batch",
+            reference="control",
+            aggregate_batches=True,
+            output_path=tmp_path / "norm_effects.h5ad",
+            bulk_output_path=tmp_path / "norm_bulk.h5ad",
+        )
+
+    # expression_effects normalises internally, so raw counts are expected there.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        cx.pb.expression_effects(
+            path, groupby="perturbation", output_path=tmp_path / "ee.h5ad"
+        )
