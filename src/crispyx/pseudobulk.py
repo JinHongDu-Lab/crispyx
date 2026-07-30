@@ -29,6 +29,9 @@ from .data import (
 
 
 PseudobulkMethod = Literal["mean_log1p", "sum", "log_mean"]
+# The subset compute_expression_effects accepts. "sum" belongs to aggregate_pseudobulk,
+# so keeping the public hint narrow stops a type checker from waving it through.
+ExpressionEffectMethod = Literal["mean_log1p", "log_mean"]
 
 # Output naming. "modern" is what compute_expression_effects returns; the two
 # deprecated wrappers request their historical names so existing code keeps working.
@@ -278,14 +281,15 @@ def _streaming_batch_corrected(
     )
 
 
-def compute_expression_effects(
+def _expression_effects_impl(
     data: str | Path | AnnData | ad.AnnData,
     *,
+    layout: str,
     perturbation_column: str | None = None,
     groupby: str | None = None,
     control_label: str | None = None,
     reference: str | None = None,
-    method: PseudobulkMethod = "mean_log1p",
+    method: ExpressionEffectMethod = "mean_log1p",
     baseline_count: float = 1.0,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -296,9 +300,8 @@ def compute_expression_effects(
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
     verbose: int | bool = False,
-    _layout: str = "modern",
 ) -> AnnData:
-    """Compute library-size-normalised target-minus-reference effects from cells.
+    """Shared implementation. ``layout`` picks the output naming scheme.
 
     This is the one-command path from a cell-level ``.h5ad`` to an effect size: it
     normalises each cell's counts, aggregates per perturbation, and subtracts the
@@ -393,8 +396,8 @@ def compute_expression_effects(
         )
     if baseline_count <= 0:
         raise ValueError("baseline_count must be positive")
-    layout = _EXPRESSION_LAYOUTS[_layout]
-    log_name = layout["log_name"]
+    naming = _EXPRESSION_LAYOUTS[layout]
+    log_name = naming["log_name"]
 
     # The two methods differ only in where the log is applied.
     if method == "mean_log1p":
@@ -511,7 +514,7 @@ def compute_expression_effects(
 
     resolved_output = resolve_output_path(
         path,
-        suffix=layout["suffix"],
+        suffix=naming["suffix"],
         output_dir=output_dir,
         data_name=data_name,
         output_path=output_path,
@@ -522,7 +525,8 @@ def compute_expression_effects(
             obs=pd.DataFrame(index=pd.Index([], name="perturbation")),
             var=pd.DataFrame(index=gene_symbols),
         )
-        adata.uns[layout["reference_uns"]] = control_profile
+        adata.uns[naming["reference_uns"]] = control_profile
+        adata.uns["method"] = str(method)
         if method == "log_mean":
             adata.uns["baseline_count"] = float(baseline_count)
         if int(verbose) >= 1:
@@ -537,13 +541,13 @@ def compute_expression_effects(
     adata = ad.AnnData(
         np.vstack(effect_matrix), obs=obs, var=pd.DataFrame(index=gene_symbols)
     )
-    adata.layers[layout["profile_layer"]] = np.vstack(pert_profiles)
-    adata.uns[layout["reference_uns"]] = control_profile
+    adata.layers[naming["profile_layer"]] = np.vstack(pert_profiles)
+    adata.uns[naming["reference_uns"]] = control_profile
     adata.uns["method"] = str(method)
     if method == "log_mean":
         adata.uns["baseline_count"] = float(baseline_count)
     if use_batch:
-        adata.layers[layout["matched_layer"]] = np.asarray(matched_profile)
+        adata.layers[naming["matched_layer"]] = np.asarray(matched_profile)
         adata.uns["batch_column"] = str(batch_column)
         adata.uns["batch_ids"] = np.asarray(batch_ids, dtype=object)
     if int(verbose) >= 1:
@@ -551,6 +555,129 @@ def compute_expression_effects(
         print(f"[cx] {log_name}: Saving → {resolved_output}")
     adata.write(resolved_output)
     return AnnData(resolved_output)
+
+
+def compute_expression_effects(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
+    control_label: str | None = None,
+    reference: str | None = None,
+    method: ExpressionEffectMethod = "mean_log1p",
+    baseline_count: float = 1.0,
+    gene_name_column: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    batch_column: str | None = None,
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
+    data_name: str | None = None,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    verbose: int | bool = False,
+) -> AnnData:
+    """Compute library-size-normalised target-minus-reference effects from cells.
+
+    This is the one-command path from a cell-level ``.h5ad`` to an effect size: it
+    normalises each cell's counts, aggregates per perturbation, and subtracts the
+    reference, in a single streaming pass over the matrix.
+
+    Unlike :func:`compute_pseudobulk_effects`, which works on whatever scale its
+    input already carries, this function **normalises library size itself**. Do not
+    pre-normalise the input as well.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, or a backed AnnData object.
+    perturbation_column
+        Column in ``adata.obs`` identifying perturbation groups.
+    groupby
+        Scanpy-compatible alias for ``perturbation_column``.
+    control_label
+        Label of the reference group. Inferred from common patterns when omitted.
+    reference
+        Scanpy-compatible alias for ``control_label``.
+    method
+        Which scale the averaging happens on. Both normalise library size first:
+
+        * ``"mean_log1p"`` averages per-cell ``log1p`` values (mean of logs).
+        * ``"log_mean"`` averages normalised counts, then takes
+          ``log1p(baseline_count * mean)`` (log of mean).
+
+        These are different estimators, not different spellings: averaging before
+        or after the log gives different answers whenever expression varies within
+        a group. ``"sum"`` is not accepted here; it belongs to
+        :func:`aggregate_pseudobulk`.
+    baseline_count
+        Scaling applied inside the log for ``method="log_mean"``. Ignored by
+        ``"mean_log1p"``. Must be positive.
+    gene_name_column
+        Column in ``adata.var`` with gene symbols. Uses ``var_names`` when omitted.
+    perturbations
+        Subset of perturbation labels to score. All non-reference groups when
+        omitted.
+    batch_column
+        Column in ``adata.obs`` identifying each cell's batch. When given, effects
+        are computed within each batch and combined with harmonic target/reference
+        cell-count weights, ``w_b = n_tb * n_rb / (n_tb + n_rb)``, which removes
+        batch-driven confounding. Batches without reference cells support no
+        contrast and are skipped. When omitted, a single pooled effect is computed.
+        There is no flag to disable the correction: supplying the column is the
+        request for it.
+    chunk_size
+        Cells streamed per chunk. Auto-selected when omitted.
+    memory_limit_gb
+        Soft memory budget used to size the chunk. Only the chunk size is affected;
+        results are identical regardless.
+    data_name
+        Custom stem for the output filename.
+    output_path
+        Exact output h5ad path. Takes precedence over ``output_dir`` / ``data_name``.
+    output_dir
+        Deprecated output directory override; use ``output_path``.
+    verbose
+        ``1`` / ``True`` prints a summary line.
+
+    Returns
+    -------
+    AnnData
+        On-disk result with perturbations in observations and the effect in ``X``.
+        ``layers['perturbation_profile']`` holds the per-perturbation profile,
+        ``uns['control_profile']`` the pooled reference profile, and
+        ``uns['method']`` the estimator used. With ``batch_column``, ``X`` is the
+        batch-corrected effect, ``layers['perturbation_profile']`` its
+        batch-corrected profile, and ``layers['control_profile_matched']`` the
+        weight-matched reference, so that
+        ``X == perturbation_profile - control_profile_matched`` exactly.
+        ``uns['batch_column']`` and ``uns['batch_ids']`` record the stratification.
+        ``method="log_mean"`` additionally records ``uns['baseline_count']``.
+
+    See Also
+    --------
+    compute_pseudobulk_effects : contrast on the input's own scale; also accepts a
+        saved :func:`aggregate_pseudobulk` artifact.
+    aggregate_pseudobulk : absolute profiles rather than a contrast.
+    """
+    return _expression_effects_impl(
+        data,
+        layout="modern",
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        method=method,
+        baseline_count=baseline_count,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        batch_column=batch_column,
+        chunk_size=chunk_size,
+        memory_limit_gb=memory_limit_gb,
+        data_name=data_name,
+        output_path=output_path,
+        output_dir=output_dir,
+        verbose=verbose,
+    )
 
 
 def compute_average_log_expression(
@@ -571,7 +698,8 @@ def compute_average_log_expression(
     """Deprecated alias for ``compute_expression_effects(method="mean_log1p")``.
 
     Retained for backward compatibility, including its original layer and ``uns``
-    names. Scheduled for removal in 0.1.0.
+    names. The output additionally carries ``uns['method']``, which earlier releases
+    did not write; nothing else changes. Scheduled for removal in 0.1.0.
     """
     warnings.warn(
         "compute_average_log_expression() is deprecated and will be removed in "
@@ -580,8 +708,9 @@ def compute_average_log_expression(
         DeprecationWarning,
         stacklevel=2,
     )
-    return compute_expression_effects(
+    return _expression_effects_impl(
         data,
+        layout="mean_log1p",
         perturbation_column=perturbation_column,
         control_label=control_label,
         method="mean_log1p",
@@ -594,7 +723,6 @@ def compute_average_log_expression(
         output_path=output_path,
         output_dir=output_dir,
         verbose=verbose,
-        _layout="mean_log1p",
     )
 
 
@@ -617,7 +745,8 @@ def compute_pseudobulk_expression(
     """Deprecated alias for ``compute_expression_effects(method="log_mean")``.
 
     Retained for backward compatibility, including its original layer and ``uns``
-    names. Scheduled for removal in 0.1.0.
+    names. The output additionally carries ``uns['method']``, which earlier releases
+    did not write; nothing else changes. Scheduled for removal in 0.1.0.
     """
     warnings.warn(
         "compute_pseudobulk_expression() is deprecated and will be removed in "
@@ -626,8 +755,9 @@ def compute_pseudobulk_expression(
         DeprecationWarning,
         stacklevel=2,
     )
-    return compute_expression_effects(
+    return _expression_effects_impl(
         data,
+        layout="log_mean",
         perturbation_column=perturbation_column,
         control_label=control_label,
         method="log_mean",
@@ -641,7 +771,6 @@ def compute_pseudobulk_expression(
         output_path=output_path,
         output_dir=output_dir,
         verbose=verbose,
-        _layout="log_mean",
     )
 
 

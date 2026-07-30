@@ -54,7 +54,7 @@ For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, p
 
 ## Performance
 
-Benchmarked across 12 CRISPR screen datasets (21k–1.97M cells), crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both speed and memory:
+Benchmarked across 12 CRISPR screen datasets (21k–1.97M cells), crispyx (v0.0.1) consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both speed and memory:
 
 | Metric | crispyx vs Scanpy | crispyx vs Pertpy/PyDESeq2 |
 |---|---|---|
@@ -124,8 +124,5 @@ Suggestions, bug reports, and contributions are welcome! Please open an [issue](
 
 ## License
 
-crispyx **0.0.9 and later** is released under a [Modified MIT License](LICENSE) — every MIT freedom, with no fee or royalty, plus two attribution conditions that apply to commercial use. See the [LICENSE](LICENSE) for the terms.
-
-crispyx **0.0.8 and earlier** remains under the unmodified MIT License.
-
+crispyx **0.0.9 and later** is released under a [Modified MIT License](LICENSE) — every MIT freedom, with no fee or royalty, plus two attribution conditions that apply to commercial use. See the [LICENSE](LICENSE) for the terms. crispyx **0.0.8 and earlier** remains under the unmodified MIT License.
 If you use crispyx in research, please cite it — see [CITATION.cff](CITATION.cff).

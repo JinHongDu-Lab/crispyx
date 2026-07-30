@@ -45,6 +45,7 @@ from .plotting import (
     rank_genes_groups_df,
 )
 from .pseudobulk import (
+    ExpressionEffectMethod,
     PseudobulkMethod,
     aggregate_pseudobulk,
     compute_average_log_expression,
@@ -630,7 +631,7 @@ class _PseudobulkNamespace:
         groupby: str | None = None,
         control_label: str | None = None,
         reference: str | None = None,
-        method: PseudobulkMethod = "mean_log1p",
+        method: ExpressionEffectMethod = "mean_log1p",
         baseline_count: float = 1.0,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
