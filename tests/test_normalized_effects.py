@@ -41,7 +41,8 @@ def _materialise(result: cx.AnnData):
     return (
         np.asarray(backed.X[:]),
         backed.obs.copy(),
-        {k: np.asarray(v[:]) for k, v in backed.layers.items()},
+        # AnnData 0.13 exposes X as layers[None]; only collect named layers.
+        {k: np.asarray(v[:]) for k, v in backed.layers.items() if k is not None},
         dict(backed.uns),
     )
 
