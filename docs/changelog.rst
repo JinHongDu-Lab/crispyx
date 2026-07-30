@@ -4,7 +4,7 @@ Changelog
 Version 0.0.9
 -------------
 
-*Unreleased.* Set the release date when the version is published.
+*Released 2026-07-30.*
 
 * **License change** – crispyx 0.0.9 and later is distributed under a Modified
   MIT License, which adds two attribution conditions for commercial use. All MIT
