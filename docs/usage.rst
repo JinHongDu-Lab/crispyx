@@ -30,9 +30,9 @@ Quick start
        min_cells_per_perturbation=15,
        min_cells_per_gene=10,
    )
-   adata_pb = cx.pb.average_log_expression(
+   adata_pb = cx.pb.expression_effects(
        adata_ro,
-       perturbation_column="perturbation",
+       groupby="perturbation",
    )
    adata_ro = cx.tl.rank_genes_groups(
        adata_ro,
@@ -128,21 +128,39 @@ The default retains one target-minus-control row per perturbation and batch.
 Pass ``aggregate_batches=True`` to combine those effects with harmonic-count
 weights. Cell-level input is also accepted and is aggregated internally.
 
-Effect size estimation (legacy API)
+Normalised effect sizes in one pass
 -----------------------------------
 
-Two earlier effect estimators remain available for compatibility:
+:func:`crispyx.pb.expression_effects` goes from a cell-level file to an effect size
+in a single streaming pass. Unlike :func:`crispyx.pb.effects`, which contrasts on
+whatever scale its input already carries, this function **normalises library size
+itself** -- so do not pre-normalise as well.
 
-* :func:`crispyx.pb.average_log_expression`
-* :func:`crispyx.pb.pseudobulk`
+``method`` selects which scale the averaging happens on. These are different
+estimators, not different spellings: averaging before or after the log gives
+different answers whenever expression varies within a group.
 
-Each operates on the filtered dataset and produces an AnnData artifact
-containing the effect sizes per perturbation. The control label inference and
-gene name fallbacks described above apply here as well, so these functions can
-operate with minimal boilerplate on well-annotated datasets. Passing a
-``cx.AnnData`` instance from the QC step avoids reopening the file path
-manually, and the returned wrappers expose ``.obs``/``.var`` tables with
-``.load()`` helpers for materialising the full metadata only when requested.
+.. code-block:: python
+
+   # mean of per-cell log1p values
+   effects = cx.pb.expression_effects(
+       adata_ro,
+       groupby="perturbation",
+       method="mean_log1p",
+   )
+
+   # log of the mean of normalised counts
+   effects = cx.pb.expression_effects(
+       adata_ro,
+       groupby="perturbation",
+       method="log_mean",
+       baseline_count=1e4,
+   )
+
+The effect is in ``X``, the per-perturbation profile in
+``layers['perturbation_profile']``, and the pooled reference in
+``uns['control_profile']``. Control-label inference and gene-name fallbacks apply
+here as elsewhere, so a well-annotated dataset needs little boilerplate.
 
 Batch-corrected effect sizes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -152,15 +170,16 @@ experimental replicates), pooling all cells can confound the effect size: if a
 perturbation and the control are unevenly represented across batches, a
 batch-specific expression profile leaks into the estimated effect.
 
-Pass ``batch_column`` to either estimator to compute the effect *within each
+Pass ``batch_column`` to compute the effect *within each
 batch* and combine the per-batch differences with harmonic-count weights
 ``w_b = n_pert_b · n_ctrl_b / (n_pert_b + n_ctrl_b)``:
 
 .. code-block:: python
 
-   adata_pb = cx.pb.pseudobulk(
+   effects = cx.pb.expression_effects(
        adata_ro,
-       perturbation_column="perturbation",
+       groupby="perturbation",
+       method="log_mean",
        batch_column="batch",          # column in adata.obs
    )
 
@@ -169,18 +188,17 @@ Key properties:
 * Batches where a perturbation has no cells (or no control cells) are skipped
   for that perturbation. A perturbation that shares no batch with the control
   raises a ``ValueError``.
-* ``layers['perturbation_mean']`` / ``layers['perturbation_bulk']`` hold the
-  **batch-corrected** per-perturbation expression (the harmonic-weighted
-  average of the within-batch means), and a new
-  ``layers['control_mean_matched']`` / ``layers['control_bulk_matched']`` holds
-  the per-perturbation weight-matched control reference, so the identity
-  ``X = perturbation_mean − control_mean_matched`` holds exactly.
-  ``uns['control_mean']`` / ``uns['control_bulk']`` retain the pooled control
-  reference.
+* ``layers['perturbation_profile']`` holds the **batch-corrected**
+  per-perturbation expression (the harmonic-weighted average of the within-batch
+  means), and ``layers['control_profile_matched']`` holds the per-perturbation
+  weight-matched control reference, so the identity
+  ``X = perturbation_profile − control_profile_matched`` holds exactly.
+  ``uns['control_profile']`` retains the pooled control reference.
 * The batch column name and the batch labels encountered are recorded in
   ``uns['batch_column']`` and ``uns['batch_ids']``.
-* When ``batch_column`` is ``None`` (default), the pooled behaviour is
-  unchanged (pooled ``perturbation_mean``, no ``*_matched`` layer).
+* When ``batch_column`` is ``None`` (default), a single pooled effect is
+  computed and no ``*_matched`` layer is written. Supplying the column is itself
+  the request for batch correction; there is no separate flag.
 * **Bounded memory.** The correction keeps the streaming, single-pass design:
   the only quantity that grows with the number of batches -- the
   per-``(perturbation, batch)`` sum accumulator -- is spilled to a disk-backed
@@ -192,7 +210,7 @@ Key properties:
 Memory budget and chunk size
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Like the differential-expression functions, both pseudo-bulk estimators
+Like the differential-expression functions, the pseudo-bulk estimators
 stream cells in chunks. The cell ``chunk_size`` defaults to ``None`` and is
 then auto-selected from the dataset shape and the available memory. Pass
 ``memory_limit_gb`` to cap the budget in SLURM / cgroup-constrained
@@ -201,9 +219,9 @@ environments (the value is forwarded to the chunk-size heuristic exactly as in
 
 .. code-block:: python
 
-   adata_pb = cx.pb.average_log_expression(
+   adata_pb = cx.pb.expression_effects(
        adata_ro,
-       perturbation_column="perturbation",
+       groupby="perturbation",
        batch_column="batch",
        memory_limit_gb=128,   # cap the streaming chunk budget
    )

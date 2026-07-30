@@ -11,6 +11,25 @@ Version 0.0.9
   freedoms are retained and no fee or royalty is imposed. Versions up to and
   including 0.0.8 remain under the unmodified MIT License; that grant is
   perpetual and is not withdrawn. See ``LICENSE`` for the terms.
+* **Unified expression effects** – ``compute_expression_effects`` /
+  ``cx.pb.expression_effects`` replaces the two earlier one-command estimators with a
+  single function selected by ``method``. ``method="mean_log1p"`` averages per-cell
+  ``log1p`` values (mean of logs); ``method="log_mean"`` averages normalised counts and
+  then applies ``log1p(baseline_count * mean)`` (log of mean). Both normalise library
+  size themselves, and both return the effect in ``X`` with
+  ``layers['perturbation_profile']``, plus
+  ``layers['control_profile_matched']`` when ``batch_column`` is given, so that
+  ``X == perturbation_profile - control_profile_matched`` exactly. Supplying
+  ``batch_column`` is itself the request for batch correction; there is no flag.
+
+  ``compute_average_log_expression`` and ``compute_pseudobulk_expression`` remain as
+  deprecated aliases with their original layer and ``uns`` names, and now emit a
+  ``DeprecationWarning``. They will be removed in 0.1.0.
+
+  Note that ``cx.pb.effects`` deliberately does **not** normalise: it computes a contrast
+  on whatever scale its input already carries. Normalise beforehand with
+  ``cx.pp.normalize_total_log1p``, or use ``cx.pb.expression_effects`` to have it done in
+  one pass.
 * **Generic streaming batch statistics** – ``batch_process`` /
   ``cx.tl.batch_process`` applies a user-supplied mergeable reducer within
   experimental batches without loading the complete cell-by-gene matrix. A

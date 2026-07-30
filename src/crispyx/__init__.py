@@ -79,6 +79,7 @@ from .pseudobulk import (
     PseudobulkMethod,
     aggregate_pseudobulk,
     compute_average_log_expression,
+    compute_expression_effects,
     compute_pseudobulk_effects,
     compute_pseudobulk_expression,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "PseudobulkMethod",
     "aggregate_pseudobulk",
     "compute_average_log_expression",
+    "compute_expression_effects",
     "compute_pseudobulk_effects",
     "compute_pseudobulk_expression",
     # Generic batch statistics
