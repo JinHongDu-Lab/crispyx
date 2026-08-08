@@ -60,7 +60,9 @@ crispyx mitigates this for you:
      cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="warn")
 
      # Transparently stream via a temporary CSR copy (bounded memory);
-     # the temp file is removed before returning.
+     # the temp file is removed before returning. This temporarily needs
+     # ~2x the source file's size in free disk space (source + temp copy
+     # coexist); crispyx warns automatically if that looks tight.
      cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
 
      # Proceed silently (you have already accounted for the cost).
@@ -72,6 +74,8 @@ up front instead:
 .. code-block:: python
 
    cx.data.convert_to_csr(csc_path, output_path=csr_path)  # bounded-memory, two-pass
+   # Also needs ~2x the source file's size in free disk space during
+   # conversion; check up front with cx.estimate_disk_usage("convert_to_csr", csc_path).
 
 ``tomllib`` / ``tomli`` import errors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

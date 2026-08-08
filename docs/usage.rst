@@ -206,6 +206,11 @@ Key properties:
   ``O(chunk × n_genes + n_batches × n_genes + n_perturbations × n_genes)``
   regardless of the number of gem-groups, so genome-wide screens with hundreds
   of batches do not blow up memory.
+* **Disk usage.** The memmap above trades RAM for disk: its footprint is
+  ``n_pairs × n_genes × 8`` bytes in ``$TMPDIR``, where ``n_pairs`` is the
+  number of observed ``(perturbation, batch)`` combinations. crispyx warns
+  automatically if free space on that filesystem looks tight before the
+  accumulator is created; see :ref:`disk-space` to check usage up front.
 
 Memory budget and chunk size
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -230,6 +235,47 @@ environments (the value is forwarded to the chunk-size heuristic exactly as in
 the computed values are identical regardless of the chosen chunk size. Passing
 an explicit ``chunk_size`` overrides the auto-selection (and ignores
 ``memory_limit_gb``).
+
+.. _disk-space:
+
+Disk space
+----------
+
+crispyx's memory savings come from streaming, but several operations trade
+RAM for **disk**: the per-``(perturbation, batch)`` accumulator described
+above, the intermediate result arrays used by ``cx.tl.t_test`` /
+``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test`` / ``cx.tl.batch_process``, and
+whole-file CSR↔CSC conversions. crispyx warns automatically -- without
+blocking the call -- if free space on the relevant filesystem looks tight or
+the write is unusually large. There is no configurable disk budget analogous
+to ``memory_limit_gb``: the check is a feasibility heads-up, not a resource
+allocator, so it always reads the real filesystem via ``shutil.disk_usage``.
+
+To check disk usage *before* committing to a run, call
+``cx.estimate_disk_usage`` with the function you intend to run, its input
+file, and the same keyword arguments you plan to pass:
+
+.. code-block:: python
+
+   import crispyx as cx
+
+   cx.estimate_disk_usage(
+       "compute_normalized_effects", "screen.h5ad",
+       perturbation_column="guide_target", batch_column="gem_group",
+   )
+   # {'tempdir': 4.1 GB required, 812.3 GB free at /tmp [OK],
+   #  'output': 0.3 GB required, 812.3 GB free at /tmp [OK]}
+
+The result is keyed by filesystem location: ``"tempdir"`` for disk-backed
+intermediate accumulators (usually ``$TMPDIR``), ``"output"`` for the final
+result file. Point ``$TMPDIR`` at a larger volume if the default location is
+too small; crispyx respects it since ``tempfile.*`` reads it automatically,
+with no code change needed. Whole-file conversions
+(:func:`crispyx.convert_to_csc`, :func:`crispyx.convert_to_csr`, and
+``normalize_total_log1p(..., format_mismatch_policy="convert")``) temporarily
+need roughly 2× the source file's size, since the source and destination
+coexist until the caller deletes the source -- see :ref:`the CSC conversion
+note below <csc-disk-note>`.
 
 Dimension Reduction
 -------------------
@@ -300,6 +346,8 @@ appear faster than it is. Benchmark results include sub-columns
 ``csc_conversion_seconds``, ``wilcoxon_seconds``, and ``was_already_csc``
 for fine-grained breakdown.
 
+.. _csc-disk-note:
+
 .. note::
 
    For small datasets (files < ~12.5 GB), the CSC conversion overhead is
@@ -307,6 +355,12 @@ for fine-grained breakdown.
    by process startup (2–3 s). For large screens (Feng-gwsf 15 GB, Feng-gwsnf
    27 GB) the CSC conversion itself takes ~60–120 s but eliminates the ~18×
    repeated full-file scans that CSR imposes.
+
+   Because the source and destination coexist during conversion, this
+   temporarily requires roughly 2× the source file's size in free disk space
+   (e.g. ~54 GB for a 27 GB screen). crispyx warns automatically if the
+   output filesystem looks too tight; check up front with
+   ``cx.estimate_disk_usage("convert_to_csc", path)`` (see :ref:`disk-space`).
 
 CSR preprocessing for NB-GLM
 -----------------------------

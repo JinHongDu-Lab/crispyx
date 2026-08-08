@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
     AnnData,
     _ensure_csr,
@@ -160,7 +161,13 @@ class _MemmapChunkCache:
         
         # Create temp directory for memmap files
         self._cache_dir = Path(tempfile.mkdtemp(prefix="crispyx_qc_cache_"))
-        
+        warn_if_disk_space_low(
+            estimate_bytes(estimated_nnz, itemsize=np.dtype(data_dtype).itemsize)
+            + estimate_bytes(estimated_nnz, itemsize=4),
+            self._cache_dir,
+            context="qc memmap chunk cache",
+        )
+
         # Pre-allocate memory-mapped arrays
         self._data_mmap = np.memmap(
             self._cache_dir / "data.mmap",

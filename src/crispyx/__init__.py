@@ -55,6 +55,7 @@ from .de import (
     t_test,
     wilcoxon_test,
 )
+from ._preflight import estimate_disk_usage
 from .profiling import (
     Profiler,
     MemoryProfiler,
@@ -159,6 +160,8 @@ __all__ = [
     "infer_columns",
     "OverlapResult",
     "compute_overlap",
+    # Disk-usage estimation
+    "estimate_disk_usage",
     # Profiling
     "Profiler",
     "MemoryProfiler",

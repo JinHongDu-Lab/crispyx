@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from ._disk import estimate_bytes, estimate_conversion_bytes, estimate_sparse_output_bytes, warn_if_disk_space_low
+
 logger = logging.getLogger(__name__)
 
 
@@ -1051,6 +1053,10 @@ def write_filtered_subset(
             data_dtype_local = np.float32
         data_dtype = data_dtype_local
 
+    warn_if_disk_space_low(
+        estimate_sparse_output_bytes(total_nnz), output_path,
+        context="write_filtered_subset",
+    )
     placeholder = sp.csr_matrix((n_obs, n_vars), dtype=data_dtype)
     adata = ad.AnnData(placeholder, obs=obs, var=var)
     adata.write(output_path)
@@ -1243,7 +1249,10 @@ def normalize_total_log1p(
         * ``"warn"`` (default): proceed but log a single actionable warning.
         * ``"convert"``: transparently convert the source to CSR in a temporary
           file (bounded-memory two-pass streaming) and stream from that; the
-          temporary file is removed before returning.
+          temporary file is removed before returning.  This calls
+          :func:`convert_to_csr` internally, which temporarily needs ~2x the
+          source file's size in free disk space and warns automatically if
+          that looks tight.
         * ``"off"``: proceed silently with no warning.
     verbose
         Print progress information.
@@ -1505,6 +1514,12 @@ def convert_to_csc(
     (the output buffers) plus one row-chunk working buffer.  The result is written
     to disk in a single sequential write which is as fast as possible on HDD/SSD.
 
+    Peak *disk* usage is not similarly bounded: the source and destination
+    files coexist until the caller deletes the source, so this temporarily
+    requires roughly 2x the source file's size in free disk space (e.g. ~54 GB
+    for a 27 GB screen).  A warning is emitted automatically if the output
+    filesystem looks too tight for that.
+
     If the input file is already CSC, no file is written; the function returns a
     backed AnnData pointing to the original file.
 
@@ -1552,6 +1567,10 @@ def convert_to_csc(
         )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    warn_if_disk_space_low(
+        estimate_conversion_bytes(source_path), output_path,
+        context="pp.convert_to_csc",
+    )
 
     if verbose:
         print(f"[cx] pp.convert_to_csc: {source_path} → {output_path}")
@@ -1694,6 +1713,13 @@ def convert_to_csr(
     source file so peak memory is bounded by ``total_nnz × (sizeof(float32) +
     sizeof(col_dtype))`` bytes (the output buffers) plus one chunk working buffer.
 
+    Peak *disk* usage is not similarly bounded: the source and destination
+    files coexist until the caller deletes the source, so this temporarily
+    requires roughly 2x the source file's size in free disk space.  A warning
+    is emitted automatically if the output filesystem looks too tight for that.
+    This also applies to :func:`normalize_total_log1p`'s
+    ``format_mismatch_policy="convert"``, which calls this function internally.
+
     If the input file is already CSR, no file is written; the function returns a
     backed AnnData pointing to the original file.
 
@@ -1739,6 +1765,10 @@ def convert_to_csr(
         )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    warn_if_disk_space_low(
+        estimate_conversion_bytes(source_path), output_path,
+        context="pp.convert_to_csr",
+    )
 
     source_is_csc = fmt == "csc"
 
@@ -1910,6 +1940,34 @@ def convert_to_csr(
         print(f"[cx] pp.convert_to_csr: Done  {n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Disk-usage resolvers for crispyx.estimate_disk_usage() (see _preflight.py).
+# ---------------------------------------------------------------------------
+
+
+def _estimate_shape_for_conversion(path: str | Path, **_ignored) -> dict[str, float]:
+    """Shared resolver for :func:`convert_to_csc` and :func:`convert_to_csr`.
+
+    Neither function has any groups to resolve -- the estimate is just the
+    same ``estimate_conversion_bytes`` call used by their automatic warning.
+    """
+    return {"output": estimate_conversion_bytes(path)}
+
+
+def _estimate_shape_for_normalize_total_log1p(
+    path: str | Path, *, format_mismatch_policy: str = "warn", **_ignored,
+) -> dict[str, float]:
+    """Disk-usage resolver for :func:`normalize_total_log1p`.
+
+    Only the ``format_mismatch_policy="convert"`` branch touches disk beyond
+    the (nnz-bounded, not separately estimated here) streamed output: it
+    calls :func:`convert_to_csr` into a temporary file first.
+    """
+    if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csc":
+        return {"tempdir": estimate_conversion_bytes(path)}
+    return {}
 
 
 def calculate_optimal_chunk_size(
@@ -3028,9 +3086,13 @@ def sort_by_perturbation(
     
     # Create output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+    warn_if_disk_space_low(
+        1.1 * float(path.stat().st_size), output_path,
+        context="sort_by_perturbation",
+    )
+
     logger.info(f"  Reordering {n_cells:,} cells into {len(label_order)} contiguous groups...")
-    
+
     # Check if source is dense or sparse
     storage_format = get_matrix_storage_format(path)
     is_dense = storage_format == "dense"

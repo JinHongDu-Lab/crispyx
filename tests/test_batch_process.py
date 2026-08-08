@@ -414,3 +414,25 @@ def test_non_reducer_raises_type_error_in_both_modes(tmp_path, mode):
             statistic_name="std",
             output_path=tmp_path / "not_a_reducer.h5ad",
         )
+
+
+def test_warns_when_disk_space_low(tmp_path, monkeypatch):
+    """A near-full disk should warn but not block batch_process from completing."""
+    import shutil
+    import types
+
+    path, *_ = _write_data(tmp_path)
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda p: types.SimpleNamespace(total=1000, used=999, free=1),
+    )
+    with pytest.warns(UserWarning, match="tl.batch_process"):
+        result = cx.batch_process(
+            path,
+            _moment_reducer(),
+            groupby="perturbation",
+            batch_column="batch",
+            statistic_name="std_low_disk",
+            output_path=tmp_path / "low_disk.h5ad",
+        )
+    assert result.backed.n_obs > 0

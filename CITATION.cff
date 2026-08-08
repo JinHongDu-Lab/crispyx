@@ -4,8 +4,8 @@ title: "crispyx: Streaming analysis of large-scale CRISPR and Perturb-seq screen
 authors:
   - family-names: Du
     given-names: Jin-Hong
-version: 0.0.9
-date-released: 2026-07-14
+version: 0.0.10
+date-released: 2026-08-08
 url: "https://github.com/jinhongdu-lab/crispyx"
 repository-code: "https://github.com/jinhongdu-lab/crispyx"
 license: MIT

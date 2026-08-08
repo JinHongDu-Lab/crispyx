@@ -10,7 +10,8 @@ crispyx vs Scanpy
 **Summary:** crispyx produces identical results to Scanpy for t-test and
 Wilcoxon differential expression (Pearson *r* > 0.9999), but uses 2–43×
 less time and 2–6× less memory by streaming from disk instead of loading the
-full count matrix into RAM.
+full count matrix into RAM. These figures assume adequate scratch disk; see
+:ref:`disk-space` in the usage guide.
 
 When to use crispyx instead of Scanpy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sparse
 
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from .data import (
     AnnData,
@@ -184,6 +185,10 @@ def _streaming_batch_corrected(
 
     tmp = tempfile.NamedTemporaryFile(prefix="cx_pb_pairsums_", suffix=".dat", delete=False)
     tmp.close()
+    warn_if_disk_space_low(
+        estimate_bytes(max(n_pairs, 1), n_genes), tmp.name,
+        context="pb batch-corrected accumulator",
+    )
     pair_sums = np.memmap(tmp.name, dtype=np.float64, mode="w+", shape=(max(n_pairs, 1), n_genes))
     try:
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
@@ -550,6 +555,11 @@ def _normalized_effects_impl(
         adata.layers[naming["matched_layer"]] = np.asarray(matched_profile)
         adata.uns["batch_column"] = str(batch_column)
         adata.uns["batch_ids"] = np.asarray(batch_ids, dtype=object)
+    n_layers = 3 if use_batch else 2  # X + profile_layer (+ matched_layer if batch-corrected)
+    warn_if_disk_space_low(
+        estimate_bytes(len(candidates), n_genes, n_layers, overhead=1.10), resolved_output,
+        context=log_name,
+    )
     if int(verbose) >= 1:
         print(f"[cx] {log_name}: {len(candidates)} perturbations × {len(gene_symbols)} genes")
         print(f"[cx] {log_name}: Saving → {resolved_output}")
@@ -1054,6 +1064,14 @@ def aggregate_pseudobulk(
                 existing.file.close()
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
+        warn_if_disk_space_low(
+            estimate_bytes(max(len(keys), 1), backed.n_vars), tempfile.gettempdir(),
+            context="pb.aggregate accumulator",
+        )
+        warn_if_disk_space_low(
+            estimate_bytes(max(len(keys), 1), backed.n_vars, overhead=1.10), resolved_output,
+            context="pb.aggregate",
+        )
         with tempfile.TemporaryDirectory(prefix="cx_pseudobulk_") as tmpdir:
             sums_path = Path(tmpdir) / "profiles.dat"
             profiles = np.memmap(
@@ -1313,6 +1331,10 @@ def compute_pseudobulk_effects(
                 n_output = len(target_rows)
 
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
+            warn_if_disk_space_low(
+                estimate_bytes(max(n_output, 1), bulk.n_vars, 3), tempfile.gettempdir(),
+                context="pb.effects accumulator",
+            )
             with tempfile.TemporaryDirectory(prefix="cx_pb_effects_") as tmpdir:
                 shape = (max(n_output, 1), bulk.n_vars)
                 effect_mm = np.memmap(Path(tmpdir) / "effect.dat", dtype=np.float64, mode="w+", shape=shape)
@@ -1425,6 +1447,144 @@ def compute_pseudobulk_effects(
         )
         bulk_result.close()
         return _run_from_bulk(temporary_bulk)
+
+
+# ---------------------------------------------------------------------------
+# Disk-usage resolvers for crispyx.estimate_disk_usage() (see _preflight.py).
+#
+# Each resolver reads only cheap obs/uns metadata (backed mode; never streams
+# X) to reproduce the same group/batch counts the real function computes in
+# its own preamble, then feeds them into the same _disk.estimate_bytes
+# formulas used by the automatic warnings above. This is intentionally a
+# second read of the counting logic rather than a shared call, since the
+# real functions already have these values in scope from their own preamble
+# and re-deriving them via a second backed open would be wasted I/O; the
+# requirement is one implementation of the counting *logic*, reproduced
+# here, not one call site.
+# ---------------------------------------------------------------------------
+
+
+def _estimate_shape_for_normalized_effects(
+    path: Path,
+    *,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
+    control_label: str | None = None,
+    reference: str | None = None,
+    batch_column: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    perturbation_column, control_label = resolve_group_reference_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        fn_name="compute_normalized_effects",
+    )
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        n_genes = backed.n_vars
+        if batch_column is None:
+            return {"output": estimate_bytes(len(candidates), n_genes, 2, overhead=1.10)}
+        batch_labels = backed.obs[batch_column].astype(str).to_numpy()
+        pert_code = pd.Index(candidates).get_indexer(pd.Index(labels))
+        batch_code, batch_uniques = pd.factorize(batch_labels, sort=False)
+        n_batches = len(batch_uniques)
+        cand_cell = pert_code >= 0
+        pair_key_all = pert_code[cand_cell].astype(np.int64) * n_batches + batch_code[cand_cell]
+        n_pairs = int(np.unique(pair_key_all).shape[0]) if cand_cell.any() else 0
+        return {
+            "tempdir": estimate_bytes(max(n_pairs, 1), n_genes),
+            "output": estimate_bytes(len(candidates), n_genes, 3, overhead=1.10),
+        }
+    finally:
+        backed.file.close()
+
+
+def _estimate_shape_for_aggregate_pseudobulk(
+    path: Path,
+    *,
+    groupby: str | Sequence[str],
+    min_cells: int = 5,
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    columns = _normalise_groupby(groupby)
+    backed = read_backed(path)
+    try:
+        n_vars = backed.n_vars
+        grouping = backed.obs[columns]
+        usable = ~grouping.isna().any(axis=1).to_numpy()
+        if not usable.any():
+            return {"tempdir": estimate_bytes(1, n_vars), "output": estimate_bytes(1, n_vars, overhead=1.10)}
+        multi = pd.MultiIndex.from_frame(grouping.iloc[np.flatnonzero(usable)].astype(str))
+        codes, uniques = pd.factorize(multi, sort=False)
+        counts = np.bincount(codes, minlength=len(uniques))
+        raw_keys = [tuple(str(value) for value in key) for key in uniques.tolist()]
+        requested = None if perturbations is None else {str(x) for x in perturbations}
+        n_keep = sum(
+            1
+            for index, key in enumerate(raw_keys)
+            if counts[index] >= min_cells and (requested is None or not requested.isdisjoint(key))
+        )
+        return {
+            "tempdir": estimate_bytes(max(n_keep, 1), n_vars),
+            "output": estimate_bytes(max(n_keep, 1), n_vars, overhead=1.10),
+        }
+    finally:
+        backed.file.close()
+
+
+def _estimate_shape_for_pseudobulk_effects(
+    path: Path,
+    *,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
+    batch_column: str | None = None,
+    control_label: str | None = None,
+    reference: str | None = None,
+    aggregate_batches: bool = False,
+    min_cells: int = 5,
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    perturbation_column = groupby if groupby is not None else perturbation_column
+    control_label = reference if reference is not None else control_label
+    if perturbation_column is None:
+        raise TypeError(
+            "estimate_disk_usage('compute_pseudobulk_effects', ...) requires "
+            "'perturbation_column' or 'groupby'."
+        )
+    backed = read_backed(path)
+    try:
+        n_vars = backed.n_vars
+        is_bulk = bool(backed.uns.get("crispyx_pseudobulk", {}).get("is_pseudobulk", False))
+        if is_bulk:
+            labels = backed.obs[perturbation_column].astype(str).to_numpy()
+            resolved_control = resolve_control_label(labels, control_label)
+            target_mask = labels != resolved_control
+            n_target = int(target_mask.sum())
+            n_output = len(set(labels[target_mask].tolist())) if aggregate_batches else n_target
+            return {"tempdir": estimate_bytes(max(n_output, 1), n_vars, 3)}
+    finally:
+        backed.file.close()
+    if batch_column is None:
+        raise TypeError(
+            "estimate_disk_usage('compute_pseudobulk_effects', ...) requires "
+            "'batch_column' for cell-level input."
+        )
+    # Cell-level input runs aggregate_pseudobulk into an intermediate file
+    # first (usually the dominant cost), then a smaller effects pass.
+    return _estimate_shape_for_aggregate_pseudobulk(
+        path,
+        groupby=[perturbation_column, batch_column],
+        min_cells=min_cells,
+        perturbations=perturbations,
+    )
 
 
 # docs/api.rst documents this module with ``automodule :members:``, which follows

@@ -21,6 +21,7 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
 - **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
 - **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`; Docker and Singularity support
+- **Disk-aware** – Estimates and warns about scratch-disk usage before large writes or CSC/CSR conversions, and `cx.estimate_disk_usage(...)` answers "how much disk will this need?" up front; the memory savings above assume the machine has enough free disk for streaming intermediates and output files
 
 ## Quick Start
 

@@ -58,6 +58,18 @@ Data loading and utilities
    :show-inheritance:
    :noindex:
 
+Disk-usage estimation
+~~~~~~~~~~~~~~~~~~~~~
+
+crispyx automatically warns -- without blocking the call -- when a
+streaming write's disk footprint looks large relative to free space. To
+check usage *before* committing to a run, call ``estimate_disk_usage`` with
+the function you intend to run, its input file, and the same keyword
+arguments you plan to pass. See :ref:`disk-space` in the usage guide for the
+full explanation and a worked example.
+
+.. autofunction:: crispyx.estimate_disk_usage
+
 Quality control
 ~~~~~~~~~~~~~~~
 

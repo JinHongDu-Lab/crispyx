@@ -15,6 +15,7 @@ import pandas as pd
 import scipy.sparse as sp
 from numpy.typing import ArrayLike
 
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from .data import (
     AnnData,
@@ -530,6 +531,14 @@ def batch_process(
                 f"stratified by '{batch_column}'"
             )
 
+        warn_if_disk_space_low(
+            estimate_bytes(max(n_groups, 1), n_genes) * 2, tempfile.gettempdir(),
+            context="tl.batch_process accumulator",
+        )
+        warn_if_disk_space_low(
+            estimate_bytes(max(n_groups, 1), n_genes, overhead=1.10) * 2, resolved_output,
+            context="tl.batch_process",
+        )
         with tempfile.TemporaryDirectory(prefix="cx_batch_") as tmpdir:
             values_path = Path(tmpdir) / "values.dat"
             weights_path = Path(tmpdir) / "weights.dat"
@@ -661,6 +670,54 @@ def batch_process(
     if int(verbose) >= 1:
         print(f"[cx] tl.batch_process: Saving → {resolved_output}")
     return AnnData(resolved_output)
+
+
+def _estimate_shape_for_batch_process(
+    path: Path,
+    *,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
+    control_label: str | None = None,
+    reference: str | None = None,
+    batch_column: str,
+    mode: Literal["group", "comparison"] = "group",
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    """Disk-usage resolver for :func:`batch_process`, used by
+    ``crispyx.estimate_disk_usage()`` (see ``_preflight.py``). Reproduces the
+    cheap, obs-only group-resolution preamble that :func:`batch_process`
+    already runs before allocating its ``values.dat``/``weights.dat``
+    memmaps, so the estimate can never disagree with the automatic warning
+    emitted inside the real call.
+    """
+    perturbation_column, control_label = resolve_group_reference_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        fn_name="batch_process",
+    )
+    backed = read_backed(path)
+    try:
+        n_genes = backed.n_vars
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        observed = _unique_strings(labels)
+        if mode == "comparison":
+            control_label = resolve_control_label(labels, control_label)
+        if perturbations is None:
+            groups = [g for g in observed if mode == "group" or g != control_label]
+        else:
+            groups = _unique_strings(perturbations)
+            if mode == "comparison":
+                groups = [g for g in groups if g != control_label]
+    finally:
+        backed.file.close()
+    n_groups = max(len(groups), 1)
+    return {
+        "tempdir": estimate_bytes(n_groups, n_genes) * 2,
+        "output": estimate_bytes(n_groups, n_genes, overhead=1.10) * 2,
+    }
 
 
 __all__ = ["BatchReducer", "BatchStatistic", "batch_process"]

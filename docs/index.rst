@@ -19,7 +19,10 @@ entire count matrix into memory, which can require 30–100+ GB of RAM. **crispy
 streams data directly from on-disk AnnData ``.h5ad`` files so that quality
 control, normalisation, pseudo-bulk aggregation, and differential expression all
 run without materialising the full matrix — even the largest screens can be
-processed with modest resources.
+processed with modest resources. These memory savings assume sufficient free
+disk space for streaming intermediates and the final output file; see
+:ref:`disk-space` in the usage guide for what to expect and how to estimate
+usage before running.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
 workflows can migrate with minimal changes. See the :doc:`tutorial <notebooks/crispyx_tutorial>`
@@ -38,6 +41,8 @@ Key features
 - **Scanpy-compatible API** — familiar namespaces and plotting helpers
 - **HPC-ready** — resume/checkpoint, configurable memory limits, Docker
   and Singularity
+- **Disk-aware** — warns before large writes or CSC/CSR conversions run low
+  on scratch disk; ``cx.estimate_disk_usage(...)`` checks usage up front
 
 .. toctree::
    :maxdepth: 2

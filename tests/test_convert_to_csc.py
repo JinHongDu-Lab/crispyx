@@ -219,3 +219,24 @@ def test_convert_to_csc_int64_indptr(tmp_path):
         assert f["X/indptr"].dtype in (np.int32, np.int64)
         # indices stores row IDs (0–5), must be integer type.
         assert np.issubdtype(f["X/indices"].dtype, np.integer)
+
+
+def test_convert_to_csc_warns_when_disk_space_low(tmp_path, monkeypatch):
+    """A near-full destination filesystem should warn but not block the conversion."""
+    import shutil
+    import types
+
+    src, dense = _make_csr_h5ad(tmp_path)
+    out = tmp_path / "low_disk.h5ad"
+
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda p: types.SimpleNamespace(total=1000, used=999, free=1),
+    )
+    with pytest.warns(UserWarning, match="pp.convert_to_csc"):
+        convert_to_csc(src, output_path=out, verbose=False)
+
+    # The conversion still completes correctly despite the warning.
+    result = ad.read_h5ad(out).X
+    arr = result.toarray() if sp.issparse(result) else result
+    np.testing.assert_array_almost_equal(arr, dense)

@@ -16,6 +16,7 @@ if str(SRC_PATH) not in sys.path:
 import anndata as ad
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
@@ -124,3 +125,35 @@ def test_memory_limit_with_batch_correction(tmp_path):
         output_path=tmp_path / "lim.h5ad",
     ).to_memory()
     np.testing.assert_allclose(ref.X, limited.X, rtol=1e-10, atol=1e-12)
+
+
+def test_warns_when_disk_space_low_for_batch_corrected_accumulator(tmp_path, monkeypatch):
+    """The batch-corrected accumulator warns on a near-full disk but still completes."""
+    import shutil
+    import types
+
+    from crispyx.pseudobulk import compute_normalized_effects
+
+    rng = np.random.default_rng(2)
+    n_cells, n_genes = 40, 5
+    counts = rng.poisson(2.0, size=(n_cells, n_genes)).astype(float)
+    perturbation = np.where(np.arange(n_cells) % 2 == 0, "ctrl", "A")
+    batch = np.where(np.arange(n_cells) < n_cells // 2, "b1", "b2")
+    obs = pd.DataFrame(
+        {"perturbation": perturbation, "batch": batch},
+        index=[f"cell_{i}" for i in range(n_cells)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    path = tmp_path / "low_disk.h5ad"
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var).write(path)
+
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda p: types.SimpleNamespace(total=1000, used=999, free=1),
+    )
+    with pytest.warns(UserWarning, match="pb batch-corrected accumulator"):
+        result = compute_normalized_effects(
+            path, perturbation_column="perturbation", control_label="ctrl",
+            batch_column="batch", output_path=tmp_path / "out.h5ad",
+        ).to_memory()
+    assert result.shape[0] == 1

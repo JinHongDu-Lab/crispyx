@@ -90,6 +90,7 @@ from ._checkpoint import (
     _create_progress_context,
     _DummyProgress,
 )
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _should_use_streaming
 from ._size_factors import (
@@ -1193,6 +1194,11 @@ def t_test(
 
     candidate_indices = {label: i for i, label in enumerate(candidates)}
 
+    warn_if_disk_space_low(
+        estimate_bytes(*shape, itemsize=8) * 3 + estimate_bytes(*shape, itemsize=4) * 4,
+        tempfile.gettempdir(),
+        context="t_test intermediate arrays",
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         stat_memmap = np.memmap(tmp_path / "statistics.dat", mode="w+", dtype=np.float64, shape=shape)
@@ -2772,7 +2778,13 @@ def nb_glm_test(
     
     # Create index mappings
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
-    
+
+    warn_if_disk_space_low(
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 11
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3,
+        tempfile.gettempdir(),
+        context="nb_glm_test intermediate arrays",
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
 
@@ -3723,6 +3735,12 @@ def _wilcoxon_test_streaming(
         np.zeros((n_groups, n_genes), dtype=np.float32),  # placeholder X, will be overwritten
         obs=obs, var=var,
     )
+    warn_if_disk_space_low(
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 6
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
+        output_path,
+        context="wilcoxon_test (streaming) output",
+    )
     scaffold.write(output_path)
     del scaffold
     gc.collect()
@@ -4126,6 +4144,12 @@ def _wilcoxon_test_stratified(
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
 
+    warn_if_disk_space_low(
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
+        tempfile.gettempdir(),
+        context="wilcoxon_test (stratified) intermediate arrays",
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
@@ -4902,7 +4926,13 @@ def wilcoxon_test(
     # Determine checkpoint interval (number of gene chunks between saves)
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
-    
+
+    warn_if_disk_space_low(
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
+        tempfile.gettempdir(),
+        context="wilcoxon_test intermediate arrays",
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
@@ -5733,6 +5763,11 @@ def shrink_lfc(
         output_dir = Path(output_dir)
 
     output_path = output_dir / f"{data_name}.h5ad"
+    warn_if_disk_space_low(
+        estimate_bytes(n_groups, n_genes, len(adata.layers) + 1, overhead=1.10),
+        output_path,
+        context="shrink_lfc",
+    )
     adata.write(output_path)
     
     # Build result object
@@ -5776,5 +5811,112 @@ def shrink_lfc(
         f"to {n_groups} perturbations, {n_genes} genes (prior_scale={global_prior_scale:.4f}). "
         f"Output: {output_path}"
     )
-    
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Disk-usage resolvers for crispyx.estimate_disk_usage() (see _preflight.py).
+#
+# Each resolver reproduces the cheap, obs-only preamble the real function
+# already runs before allocating its intermediate arrays, then applies the
+# exact same per-array dtype counts used at the real warn_if_disk_space_low
+# call sites above, so the estimate and the automatic in-call warning can
+# never disagree.
+# ---------------------------------------------------------------------------
+
+
+def _estimate_shape_for_t_test(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(list(labels), control_label)
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        n_genes = backed.n_vars
+    finally:
+        backed.file.close()
+    n_groups = len(candidates)
+    # statistics/pvalues/order (f64) + logfoldchanges/effect_size/pts/pts_rest (f32)
+    return {
+        "tempdir": estimate_bytes(n_groups, n_genes, itemsize=8) * 3
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 4,
+    }
+
+
+def _estimate_shape_for_nb_glm_test(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(list(labels), control_label)
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        n_genes = backed.n_vars
+    finally:
+        backed.file.close()
+    n_groups = len(candidates)
+    # 11 f64 arrays (effect, statistic, pvalue, logfoldchange, logfoldchange_raw,
+    # intercept, standard_error, dispersion, dispersion_raw, dispersion_trend, mean)
+    # + 3 4-byte arrays (pts, pts_rest, iterations)
+    return {
+        "tempdir": estimate_bytes(n_groups, n_genes, itemsize=8) * 11
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3,
+    }
+
+
+def _estimate_shape_for_wilcoxon_test(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    batch_column: str | None = None,
+    **_ignored,
+) -> dict[str, float]:
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        n_genes = backed.n_vars
+    finally:
+        backed.file.close()
+    n_groups = len(candidates)
+    # effect/u_stat/pvalue/z_score/logfoldchange (f64) + pts/pts_rest (f32);
+    # shared by the standard and batch-stratified memmap paths.
+    tempdir_bytes = (
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+    )
+    if batch_column is not None:
+        return {"tempdir": tempdir_bytes}
+    # Without a batch column, large group counts may instead take the
+    # group-batch streaming path, which writes 6 f64 + 2 f32 layers directly
+    # to the output file instead of a tempdir. Report both possible sinks.
+    output_bytes = (
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 6
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+    )
+    return {"tempdir": tempdir_bytes, "output": output_bytes}
+
+
+def _estimate_shape_for_shrink_lfc(path: Path, **_ignored) -> dict[str, float]:
+    backed = read_backed(path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        n_layers = len(backed.layers) + 1
+    finally:
+        backed.file.close()
+    return {"output": estimate_bytes(n_obs, n_vars, n_layers, overhead=1.10)}

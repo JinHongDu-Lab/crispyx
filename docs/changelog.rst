@@ -1,6 +1,41 @@
 Changelog
 =========
 
+Version 0.0.10
+--------------
+
+*Released 2026-08-08.*
+
+* **Disk-space awareness** – crispyx now estimates the disk space a
+  streaming call is about to need and warns -- without blocking the call --
+  when free space on the relevant filesystem looks tight or the write is
+  unusually large. This covers the disk-backed intermediate accumulators
+  behind ``cx.pb.normalized_effects`` (batch-corrected path),
+  ``cx.pb.aggregate``, ``cx.pb.effects``, ``cx.tl.t_test``,
+  ``cx.tl.wilcoxon_test``, ``cx.tl.nb_glm_test``, ``cx.tl.batch_process``, and
+  quality-control filtering, plus the ~2x transient disk requirement of
+  whole-file CSR/CSC conversion (:func:`crispyx.convert_to_csc`,
+  :func:`crispyx.convert_to_csr`, and
+  ``normalize_total_log1p(..., format_mismatch_policy="convert")``). The
+  check is automatic and has no configurable budget analogous to
+  ``memory_limit_gb``: it always reads real free space via
+  ``shutil.disk_usage`` and exists purely as a feasibility heads-up, not a
+  resource allocator.
+* **New: ``crispyx.estimate_disk_usage``** – an on-demand, standalone query
+  to check disk usage *before* committing to a run:
+  ``cx.estimate_disk_usage(func, data, **kwargs)`` accepts a function name
+  (e.g. ``"compute_normalized_effects"``, ``"t_test"``,
+  ``"convert_to_csc"``) or the function object itself, plus the same
+  arguments the real call would take, and returns the estimated bytes
+  required versus free space at each filesystem location involved (e.g.
+  ``$TMPDIR`` for intermediate accumulators, the output directory for the
+  final result). It reads only cheap ``obs``/``uns`` metadata in backed
+  mode and never touches the expression matrix. See :ref:`disk-space` in
+  the usage guide.
+* Documentation now notes that the memory/speed figures throughout the
+  README, docs, and tutorial assume adequate free scratch disk for
+  streaming intermediates and output files.
+
 Version 0.0.9
 -------------
 
