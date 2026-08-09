@@ -252,8 +252,10 @@ to ``memory_limit_gb``: the check is a feasibility heads-up, not a resource
 allocator, so it always reads the real filesystem via ``shutil.disk_usage``.
 
 To check disk usage *before* committing to a run, call
-``cx.estimate_disk_usage`` with the function you intend to run, its input
-file, and the same keyword arguments you plan to pass:
+``cx.estimate_disk_usage`` (also available as ``cx.tl.estimate_disk_usage``,
+same function, for Scanpy-style namespace discovery) with the function you
+intend to run, its input file, and the same keyword arguments you plan to
+pass:
 
 .. code-block:: python
 

@@ -30,8 +30,17 @@ Version 0.0.10
   required versus free space at each filesystem location involved (e.g.
   ``$TMPDIR`` for intermediate accumulators, the output directory for the
   final result). It reads only cheap ``obs``/``uns`` metadata in backed
-  mode and never touches the expression matrix. See :ref:`disk-space` in
-  the usage guide.
+  mode and never touches the expression matrix. Also available as
+  ``cx.tl.estimate_disk_usage`` for Scanpy-style namespace discovery (the
+  same pattern already used for ``compute_overlap``). See :ref:`disk-space`
+  in the usage guide.
+* **Cross-platform robustness** – disk-space checks now degrade gracefully
+  instead of raising when free space cannot be determined at all (an
+  unreachable network mount, a permission error on a Windows junction, a
+  drive ejected mid-check): the affected ``DiskEstimate`` reports
+  ``free_bytes=None`` and ``sufficient=True`` (fail open) rather than
+  crashing the caller's real computation. The "large write" heads-up still
+  fires in this case since it doesn't depend on free space.
 * Documentation now notes that the memory/speed figures throughout the
   README, docs, and tutorial assume adequate free scratch disk for
   streaming intermediates and output files.

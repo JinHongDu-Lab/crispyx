@@ -53,6 +53,11 @@ def estimate_disk_usage(
     ``obs``/``uns`` metadata in backed mode to reproduce the group/batch
     counts the real function would compute in its own preamble.
 
+    Also available as ``cx.tl.estimate_disk_usage`` for Scanpy-style
+    namespace discovery (the same pattern as ``compute_overlap``, which is
+    both top-level and under ``cx.tl``); the two are the same function and
+    always agree.
+
     Parameters
     ----------
     func

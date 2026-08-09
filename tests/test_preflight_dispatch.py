@@ -141,6 +141,17 @@ class TestEstimateDiskUsage:
         )
         assert "tempdir" in result
 
+    def test_reachable_via_tl_namespace_and_matches_top_level(self, tmp_path):
+        """cx.tl.estimate_disk_usage is the same function as cx.estimate_disk_usage."""
+        path = _make_normalised_h5ad(tmp_path)
+        via_top_level = cx.estimate_disk_usage(
+            "t_test", path, perturbation_column="perturbation", control_label="control",
+        )
+        via_tl = cx.tl.estimate_disk_usage(
+            "t_test", path, perturbation_column="perturbation", control_label="control",
+        )
+        assert via_top_level == via_tl
+
     def test_estimate_matches_scale_of_real_run(self, tmp_path):
         """The estimate should be the right order of magnitude, not just nonzero."""
         path = _make_normalised_h5ad(tmp_path, n_cells=200, n_genes=500, n_perts=5)

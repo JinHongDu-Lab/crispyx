@@ -8,6 +8,7 @@ from typing import Iterable, Literal, Sequence
 import anndata as ad
 import numpy as np
 
+from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
     AnnData,
@@ -1074,6 +1075,10 @@ class _ToolsNamespace:
     def compute_overlap(self, sets_dict, *, metric="both"):
         """Compute pairwise overlap statistics. See :func:`crispyx.compute_overlap`."""
         return compute_overlap(sets_dict, metric=metric)
+
+    def estimate_disk_usage(self, func, data, **kwargs):
+        """Estimate disk space a crispyx function will need. See :func:`crispyx.estimate_disk_usage`."""
+        return estimate_disk_usage(func, data, **kwargs)
 
 
 class _PlottingNamespace:
