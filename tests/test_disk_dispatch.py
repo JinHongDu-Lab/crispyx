@@ -141,11 +141,22 @@ class TestDiskEstimate:
 # environment, since the code path only branches on the exception type.
 # ---------------------------------------------------------------------------
 
+def _raising(exc: BaseException):
+    """A callable that raises *exc* regardless of the arguments it's given.
+
+    Used with ``monkeypatch.setattr`` to make ``shutil.disk_usage`` or
+    ``Path.resolve`` fail on demand -- plain ``lambda``s can't contain a
+    ``raise`` statement.
+    """
+    def _fn(*_args, **_kwargs):
+        raise exc
+    return _fn
+
+
 class TestUnknownFreeSpace:
     def test_free_bytes_none_when_disk_usage_raises(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            shutil, "disk_usage",
-            lambda p: (_ for _ in ()).throw(PermissionError("network mount unavailable")),
+            shutil, "disk_usage", _raising(PermissionError("network mount unavailable")),
         )
         estimate = assess_bytes(1e9, tmp_path)
         assert estimate.free_bytes is None
@@ -153,16 +164,14 @@ class TestUnknownFreeSpace:
 
     def test_sufficient_fails_open_when_unknown(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            shutil, "disk_usage",
-            lambda p: (_ for _ in ()).throw(OSError("disk_usage unavailable")),
+            shutil, "disk_usage", _raising(OSError("disk_usage unavailable")),
         )
         estimate = assess_bytes(1e15, tmp_path)  # absurdly large; still "sufficient"
         assert estimate.sufficient is True
 
     def test_str_reports_unknown_rather_than_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            shutil, "disk_usage",
-            lambda p: (_ for _ in ()).throw(OSError("disk_usage unavailable")),
+            shutil, "disk_usage", _raising(OSError("disk_usage unavailable")),
         )
         estimate = assess_bytes(1e9, tmp_path)
         assert "unknown" in str(estimate)
@@ -174,17 +183,13 @@ class TestUnknownFreeSpace:
         # unresolved (but already-absolute, from tmp_path) path, so the
         # free-space lookup can still succeed on the fallback -- the
         # invariant under test is simply that nothing raises.
-        monkeypatch.setattr(
-            Path, "resolve",
-            lambda self, *a, **k: (_ for _ in ()).throw(OSError("broken symlink")),
-        )
+        monkeypatch.setattr(Path, "resolve", _raising(OSError("broken symlink")))
         estimate = assess_bytes(1e9, tmp_path / "sub" / "file.h5ad")
         assert isinstance(estimate, DiskEstimate)
 
     def test_warn_if_disk_space_low_stays_silent_when_disk_usage_unavailable(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            shutil, "disk_usage",
-            lambda p: (_ for _ in ()).throw(OSError("disk_usage unavailable")),
+            shutil, "disk_usage", _raising(OSError("disk_usage unavailable")),
         )
         with warnings.catch_warnings():
             warnings.simplefilter("error")
@@ -192,8 +197,7 @@ class TestUnknownFreeSpace:
 
     def test_warn_if_disk_space_low_still_flags_large_write_when_unavailable(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            shutil, "disk_usage",
-            lambda p: (_ for _ in ()).throw(OSError("disk_usage unavailable")),
+            shutil, "disk_usage", _raising(OSError("disk_usage unavailable")),
         )
         with pytest.warns(UserWarning, match="approximately"):
             warn_if_disk_space_low(required_bytes=25 * 1e9, output_path=tmp_path, large_file_gb=20.0)

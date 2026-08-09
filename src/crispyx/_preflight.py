@@ -42,7 +42,7 @@ _TEMPDIR_LOCATIONS = {"tempdir"}
 
 def estimate_disk_usage(
     func: str | Callable,
-    data: "str | Path | AnnData",
+    data: str | Path | AnnData,
     **kwargs,
 ) -> dict[str, DiskEstimate]:
     """Estimate the disk space a crispyx function will need, before running it.

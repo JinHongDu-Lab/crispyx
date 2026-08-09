@@ -1077,7 +1077,7 @@ class _ToolsNamespace:
         return compute_overlap(sets_dict, metric=metric)
 
     def estimate_disk_usage(self, func, data, **kwargs):
-        """Estimate disk space a crispyx function will need. See :func:`crispyx.estimate_disk_usage`."""
+        """Estimate the disk space a crispyx function will need. See :func:`crispyx.estimate_disk_usage`."""
         return estimate_disk_usage(func, data, **kwargs)
 
 
