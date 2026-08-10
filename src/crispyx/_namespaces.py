@@ -189,6 +189,7 @@ class _PreprocessingNamespace:
         min_genes: int = 100,
         gene_name_column: str | None = None,
         chunk_size: int = 2048,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         return filter_cells_by_gene_count(
@@ -196,6 +197,7 @@ class _PreprocessingNamespace:
             min_genes=min_genes,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
+            verbose=verbose,
         )
 
     def filter_genes(
@@ -206,6 +208,7 @@ class _PreprocessingNamespace:
         cell_mask: np.ndarray | None = None,
         gene_name_column: str | None = None,
         chunk_size: int = 2048,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         return filter_genes_by_cell_count(
@@ -214,6 +217,7 @@ class _PreprocessingNamespace:
             cell_mask=cell_mask,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
+            verbose=verbose,
         )
 
     def filter_perturbations(
@@ -224,6 +228,7 @@ class _PreprocessingNamespace:
         control_label: str | None = None,
         min_cells: int = 50,
         base_mask: np.ndarray | None = None,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         return filter_perturbations_by_cell_count(
@@ -232,6 +237,7 @@ class _PreprocessingNamespace:
             control_label=control_label,
             min_cells=min_cells,
             base_mask=base_mask,
+            verbose=verbose,
         )
 
     def qc_summary(
@@ -249,7 +255,7 @@ class _PreprocessingNamespace:
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
         cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
-        verbose: int | bool = False,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         result = quality_control_summary(
@@ -277,7 +283,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 4096,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
-        verbose: bool = True,
+        verbose: int | bool = True,
     ) -> AnnData:
         """Convert a backed h5ad file's matrix to CSC format.
 
@@ -318,7 +324,7 @@ class _PreprocessingNamespace:
         chunk_size: int | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
-        verbose: bool = True,
+        verbose: int | bool = True,
     ) -> AnnData:
         """Convert a backed h5ad file's matrix to CSR format.
 
@@ -363,7 +369,7 @@ class _PreprocessingNamespace:
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         format_mismatch_policy: str = "warn",
-        verbose: bool = True,
+        verbose: int | bool = True,
     ) -> AnnData:
         """Stream normalize and/or log-transform an h5ad file.
 
@@ -545,7 +551,7 @@ class _PseudobulkNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,
-        verbose: int | bool = False,
+        verbose: int | bool = True,
         force: bool = False,
     ) -> AnnData:
         """Aggregate absolute profiles for observed combinations in ``groupby``.
@@ -595,7 +601,7 @@ class _PseudobulkNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,
-        verbose: int | bool = False,
+        verbose: int | bool = True,
         force: bool = False,
     ) -> AnnData:
         """Compute within-batch target-minus-reference pseudobulk effects."""
@@ -642,7 +648,7 @@ class _PseudobulkNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,
-        verbose: int | bool = False,
+        verbose: int | bool = True,
     ):
         """Library-size-normalised target-minus-reference effects, in one pass.
 
@@ -681,7 +687,7 @@ class _PseudobulkNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        verbose: int | bool = False,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         return compute_average_log_expression(
@@ -714,7 +720,7 @@ class _PseudobulkNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        verbose: int | bool = False,
+        verbose: int | bool = True,
     ):
         path = resolve_data_path(data)
         return compute_pseudobulk_expression(
@@ -807,7 +813,7 @@ class _ToolsNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,
-        verbose: int | bool = False,
+        verbose: int | bool = True,
         memory_limit_gb: float | None = None,
         force: bool = False,
     ) -> AnnData:
@@ -858,7 +864,7 @@ class _ToolsNamespace:
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         corr_method: str = "benjamini-hochberg",
-        verbose: int | bool = False,
+        verbose: int | bool = True,
         resume: bool = False,
         memory_limit_gb: float | None = None,
         force: bool = False,
@@ -1027,6 +1033,7 @@ class _ToolsNamespace:
         batch_size: int = 128,
         profiling: bool = False,
         memory_limit_gb: float | None = None,
+        verbose: int | bool = True,
     ):
         """Apply apeGLM LFC shrinkage to NB-GLM results.
 
@@ -1070,6 +1077,7 @@ class _ToolsNamespace:
             batch_size=batch_size,
             profiling=profiling,
             memory_limit_gb=memory_limit_gb,
+            verbose=verbose,
         )
 
     def compute_overlap(self, sets_dict, *, metric="both"):

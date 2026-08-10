@@ -241,12 +241,14 @@ def _create_progress_context(
     total: int,
     desc: str,
     verbose: int | bool,
+    *,
+    unit: str = "perturbation",
 ) -> "_tqdm | _DummyProgress":
     """Create a progress bar context manager.
-    
+
     Returns tqdm progress bar if verbose>=1 and tqdm is available,
     otherwise returns a dummy context manager.
     """
     if int(verbose) >= 1 and HAS_TQDM and total > 0:
-        return _tqdm(total=total, desc=desc, unit="perturbation")
+        return _tqdm(total=total, desc=desc, unit=unit)
     return _DummyProgress()

@@ -144,7 +144,7 @@ def warn_if_disk_space_low(
     min_free_fraction: float = 0.10,
     large_file_gb: float = 20.0,
     context: str = "",
-) -> None:
+) -> DiskEstimate:
     """Warn (never raises) if *output_path*'s filesystem looks too tight.
 
     Free space is always auto-detected from the real filesystem via
@@ -163,6 +163,10 @@ def warn_if_disk_space_low(
     unreachable network mount, a permission error -- trigger 1 is skipped
     rather than guessed at; trigger 2 still fires since it doesn't depend
     on free space.
+
+    Returns the computed :class:`DiskEstimate` so callers can print a
+    ``verbose``-gated confirmation alongside this unconditional warning
+    without re-running the free-space lookup.
     """
     estimate = assess_bytes(required_bytes, output_path)
     label = f"{context}: " if context else ""
@@ -183,6 +187,8 @@ def warn_if_disk_space_low(
             "it) is not -- make sure the output volume has room before running large batches.",
             stacklevel=3,
         )
+
+    return estimate
 
 
 __all__ = [

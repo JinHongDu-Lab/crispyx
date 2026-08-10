@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import numpy as np
+import warnings
 from pathlib import Path
 import tempfile
 import shutil
@@ -493,6 +494,126 @@ def test_iter_matrix_chunks_slow_axis_warns_once(tmp_output_dir, caplog):
 
     slow_warnings = [r for r in caplog.records if "slower" in r.getMessage()]
     assert len(slow_warnings) == 1, f"expected exactly one slow-axis warning, got {len(slow_warnings)}"
+
+
+def test_verbose_prefix_matches_current_function_and_namespace_names(tmp_output_dir, capsys):
+    """Regression test: quality_control_summary's print prefix must track its
+    own name (and cx.pp.qc_summary's), not a name it was renamed from.
+
+    quality_control_summary was previously named quality_control, and its
+    verbose output said "[cx] qc.quality_control: ..." long after the
+    rename -- three different names for one function. Guard against that
+    drifting again.
+    """
+    from crispyx.qc import quality_control_summary
+
+    dataset = TEST_DATASETS["csr_small"]
+    if not dataset["path"].exists():
+        pytest.skip(f"Dataset {dataset['path']} not found")
+
+    quality_control_summary(
+        dataset["path"],
+        perturbation_column=dataset["perturbation_column"],
+        output_dir=tmp_output_dir,
+        data_name="verbose_prefix_test",
+        verbose=1,
+        **QC_PARAMS,
+    )
+    out = capsys.readouterr().out
+    assert "[cx] pp.qc_summary:" in out
+    assert "qc.quality_control" not in out
+
+
+def _make_dataset_for_filtering(tmp_path, n=200, g=30, seed=0):
+    """A dataset where roughly a third of cells/genes are near-empty, so a
+    strict threshold drops a controllable majority."""
+    import anndata as ad
+    import pandas as pd
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(seed)
+    dense = rng.poisson(3, size=(n, g)).astype(np.float32)
+    # Zero out most rows/columns entirely so a min_genes/min_cells threshold
+    # of a handful reliably drops the majority.
+    dense[: int(n * 0.8), :] = 0
+    dense[:, : int(g * 0.8)] = 0
+    obs = pd.DataFrame({
+        "perturbation": pd.Categorical(
+            ["NTC"] * (n // 2) + [f"P{i}" for i in range(n // 2)]
+        )
+    })
+    var = pd.DataFrame(index=[f"g{i}" for i in range(g)])
+    path = Path(tmp_path) / "filter_test.h5ad"
+    ad.AnnData(X=sp.csr_matrix(dense), obs=obs, var=var).write_h5ad(path)
+    return path
+
+
+class TestFilteringMessaging:
+    def test_filter_cells_reports_kept_count(self, tmp_path, capsys):
+        from crispyx.qc import filter_cells_by_gene_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        filter_cells_by_gene_count(path, min_genes=1)
+        out = capsys.readouterr().out
+        assert "[cx] pp.filter_cells: Done" in out
+        assert "cells kept" in out
+
+    def test_filter_cells_warns_when_most_dropped(self, tmp_path):
+        from crispyx.qc import filter_cells_by_gene_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        with pytest.warns(UserWarning, match=r"pp\.filter_cells: only \d+/\d+ cells"):
+            filter_cells_by_gene_count(path, min_genes=1)
+
+    def test_filter_genes_warns_when_most_dropped(self, tmp_path):
+        from crispyx.qc import filter_genes_by_cell_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        with pytest.warns(UserWarning, match=r"pp\.filter_genes: only \d+/\d+ genes"):
+            filter_genes_by_cell_count(path, min_cells=1)
+
+    def test_filter_perturbations_warns_when_most_dropped(self, tmp_path):
+        from crispyx.qc import filter_perturbations_by_cell_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        with pytest.warns(UserWarning, match=r"pp\.filter_perturbations: only \d+/\d+ perturbations"):
+            filter_perturbations_by_cell_count(
+                path, perturbation_column="perturbation", control_label="NTC", min_cells=10_000,
+            )
+
+    def test_no_warning_when_most_pass(self, tmp_path):
+        from crispyx.qc import filter_cells_by_gene_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            filter_cells_by_gene_count(path, min_genes=0)
+
+    def test_verbose_false_silences_print_but_not_warning(self, tmp_path, capsys):
+        from crispyx.qc import filter_cells_by_gene_count
+
+        path = _make_dataset_for_filtering(tmp_path)
+        with pytest.warns(UserWarning):
+            filter_cells_by_gene_count(path, min_genes=1, verbose=False)
+        assert capsys.readouterr().out == ""
+
+    def test_quality_control_summary_reports_perturbation_counts(self, tmp_output_dir, capsys):
+        from crispyx.qc import quality_control_summary
+
+        dataset = TEST_DATASETS["csr_small"]
+        if not dataset["path"].exists():
+            pytest.skip(f"Dataset {dataset['path']} not found")
+
+        quality_control_summary(
+            dataset["path"],
+            perturbation_column=dataset["perturbation_column"],
+            output_dir=tmp_output_dir,
+            data_name="pert_count_test",
+            verbose=1,
+            **QC_PARAMS,
+        )
+        out = capsys.readouterr().out
+        assert "perturbations kept" in out
 
 
 if __name__ == "__main__":

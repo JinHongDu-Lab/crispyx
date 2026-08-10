@@ -279,6 +279,69 @@ need roughly 2× the source file's size, since the source and destination
 coexist until the caller deletes the source -- see :ref:`the CSC conversion
 note below <csc-disk-note>`.
 
+.. _messaging-and-verbosity:
+
+Messaging and verbosity
+-----------------------
+
+``verbose`` defaults to ``True`` (equivalent to ``1``) across crispyx, so a
+first-time call already reports what it did without any extra argument.
+Pass ``verbose=False`` (or ``0``) to silence it completely. A handful of
+differential-expression functions (``cx.tl.t_test``, ``cx.tl.nb_glm_test``,
+``cx.tl.wilcoxon_test``) additionally accept ``verbose=2`` for a per-
+perturbation progress line; every other function currently stops at level 1.
+
+crispyx separates feedback into three channels with different visibility
+rules:
+
+- **Prints** (``[cx] {name}: {message}``) -- gated on ``verbose``, this is
+  what most calls produce: what file is being read, what was inferred
+  (control label, an auto-picked chunk size, the QC in-memory/streaming
+  strategy), how many rows survived filtering, and what was written.
+- **Warnings** (``warnings.warn``, prefixed ``"{context}: "``) -- always
+  visible regardless of ``verbose``, since they flag something worth a
+  second look: low disk space, an unusually large write, filtering that
+  dropped most of the data, missing grouping/batch values, or groups with
+  no usable statistics. Silence them the standard Python way
+  (``warnings.filterwarnings``) if needed, not via ``verbose``.
+- **Logger messages** (``logger.debug``/``logger.info``) -- invisible
+  unless you configure logging yourself; this is where lower-level,
+  developer-oriented detail goes (e.g. the exact QC strategy heuristic
+  inputs), duplicating what the ``verbose`` print already told you in
+  plainer language.
+
+A run with the defaults touches most of this in one pass, for example
+:func:`crispyx.pb.aggregate`:
+
+.. code-block:: text
+
+   [cx] pb.aggregate: chunk_size=4096 (auto)
+   [cx] pb.aggregate accumulator: estimated disk usage: 0.8 GB (812.3 GB free)
+   [cx] pb.aggregate: estimated disk usage: 0.8 GB (812.3 GB free)
+   [cx] pb.aggregate: 18 perturbations × 2000 genes
+   [cx] pb.aggregate: Saving → screen_pseudobulk_mean_log1p.h5ad
+
+Coverage added beyond the basic Reading/Saving/Done triad:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Feedback
+     - Where
+   * - Filtering counts + aggressive-filter warning (kept/total, warns
+       below 50% retained)
+     - :func:`crispyx.pp.filter_cells`, :func:`crispyx.pp.filter_genes`,
+       :func:`crispyx.pp.filter_perturbations`, :func:`crispyx.pp.qc_summary`
+   * - Progress bars (``tqdm``, degrade to a no-op without it)
+     - CSC/CSR conversion, ``cx.pb.aggregate``, ``cx.tl.batch_process``, QC
+       streaming passes, plus the pre-existing DE loops
+   * - Auto-picked chunk size / streaming-vs-single-pass strategy
+     - Every function that calls ``calculate_optimal_chunk_size`` (and
+       siblings) or ``_should_use_streaming`` internally
+   * - Disk-usage confirmation alongside the unconditional warning
+     - Every ``warn_if_disk_space_low`` call site with a ``verbose``
+       parameter in scope
+
 Dimension Reduction
 -------------------
 

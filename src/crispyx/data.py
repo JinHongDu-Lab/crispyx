@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from . import _messages
+from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, estimate_conversion_bytes, estimate_sparse_output_bytes, warn_if_disk_space_low
 
 logger = logging.getLogger(__name__)
@@ -704,7 +706,7 @@ def resolve_control_label(
     labels: Sequence[str],
     control_label: str | None,
     *,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> str:
     """Return an explicit control label, inferring one when necessary."""
 
@@ -740,6 +742,7 @@ def resolve_control_label(
 
     if verbose:
         logger.info("Inferred control label '%s' from perturbation labels.", candidate)
+    _messages.vprint(verbose, "resolve_control_label", f"Inferred control label '{candidate}'")
     return candidate
 
 
@@ -1212,7 +1215,7 @@ def normalize_total_log1p(
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     format_mismatch_policy: Literal["warn", "convert", "off"] = "warn",
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> "AnnData":
     """Stream normalize and/or log-transform an h5ad file without loading it fully into memory.
     
@@ -1340,7 +1343,7 @@ def _normalize_total_log1p_impl(
     chunk_size: int,
     output_dir: str | Path | None,
     data_name: str | None,
-    verbose: bool,
+    verbose: int | bool,
 ) -> "AnnData":
     """Core streaming normalize/log1p implementation (source already resolved)."""
     # Resolve output path
@@ -1367,8 +1370,7 @@ def _normalize_total_log1p_impl(
         ops.append("normalize")
     if log1p:
         ops.append("log1p")
-    if verbose:
-        print(f"[cx] pp.normalize_total_log1p: Saving → {output_path}")
+    _messages.print_saving(verbose, "pp.normalize_total_log1p", output_path)
     
     # First pass: count non-zeros and get metadata
     backed = read_backed(source_path)
@@ -1487,9 +1489,8 @@ def _normalize_total_log1p_impl(
         finally:
             backed.file.close()
     
-    if verbose:
-        print(f"[cx] pp.normalize_total_log1p: Done  {n_obs} cells × {n_vars} genes")
-    
+    _messages.print_done(verbose, "pp.normalize_total_log1p", f"{n_obs} cells × {n_vars} genes")
+
     return AnnData(output_path)
 
 
@@ -1501,7 +1502,7 @@ def convert_to_csc(
     chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> "AnnData":
     """Convert a backed h5ad file's matrix from CSR (or dense) to CSC format.
 
@@ -1553,8 +1554,7 @@ def convert_to_csc(
 
     # Fast path: input is already CSC — return it directly.
     if get_matrix_storage_format(source_path) == "csc":
-        if verbose:
-            print(f"[cx] pp.convert_to_csc: Already CSC, returning source unchanged")
+        _messages.vprint(verbose, "pp.convert_to_csc", "Already CSC, returning source unchanged")
         return AnnData(source_path)
 
     # Resolve output path.
@@ -1572,8 +1572,7 @@ def convert_to_csc(
         context="pp.convert_to_csc",
     )
 
-    if verbose:
-        print(f"[cx] pp.convert_to_csc: {source_path} → {output_path}")
+    _messages.vprint(verbose, "pp.convert_to_csc", f"{source_path} → {output_path}")
 
     # ------------------------------------------------------------------ Pass 1
     # Read all rows in chunks; count non-zeros per *column*; collect metadata.
@@ -1583,6 +1582,7 @@ def convert_to_csc(
         n_vars = backed.n_vars
         if chunk_size is None:
             chunk_size = calculate_optimal_chunk_size(n_obs, n_vars)
+            _messages.vprint(verbose, "pp.convert_to_csc", f"chunk_size={chunk_size} (auto)")
         obs = backed.obs.copy()
         var = backed.var.copy()
         obs.index = obs.index.astype(str)
@@ -1590,12 +1590,15 @@ def convert_to_csc(
 
         col_nnz = np.zeros(n_vars, dtype=np.int64)
         total_nnz = 0
-        for _slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = _ensure_csr(block)
-            np.add.at(col_nnz, csr.indices, 1)
-            total_nnz += csr.nnz
+        n_chunks = (n_obs + chunk_size - 1) // chunk_size
+        with _create_progress_context(n_chunks, "pp.convert_to_csc (pass 1)", verbose, unit="chunk") as pbar:
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                csr = _ensure_csr(block)
+                np.add.at(col_nnz, csr.indices, 1)
+                total_nnz += csr.nnz
+                pbar.update(1)
     finally:
         backed.file.close()
 
@@ -1626,44 +1629,47 @@ def convert_to_csc(
     row_global = 0
     backed = read_backed(source_path)
     try:
-        for _slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = _ensure_csr(block)
-            n_chunk = csr.shape[0]
-            if csr.nnz == 0:
+        with _create_progress_context(n_chunks, "pp.convert_to_csc (pass 2)", verbose, unit="chunk") as pbar:
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                csr = _ensure_csr(block)
+                n_chunk = csr.shape[0]
+                if csr.nnz == 0:
+                    row_global += n_chunk
+                    pbar.update(1)
+                    continue
+
+                # Global row index for every non-zero in this chunk.
+                local_row_ids = np.repeat(
+                    np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
+                ) + row_dtype(row_global)
+
+                cols = csr.indices          # column index of each non-zero
+                vals = csr.data.astype(np.float32)
+
+                # Sort non-zeros by column so we can process contiguous groups.
+                col_order = np.argsort(cols, kind="stable")
+                sorted_cols = cols[col_order]
+                sorted_vals = vals[col_order]
+                sorted_rows = local_row_ids[col_order]
+
+                # Compute within-column sequential ranks: 0, 1, 2, … per column.
+                unique_cols, col_counts = np.unique(sorted_cols, return_counts=True)
+                col_ends = np.cumsum(col_counts)
+                col_starts = col_ends - col_counts
+                within_col = np.arange(len(sorted_cols)) - np.repeat(col_starts, col_counts)
+
+                # Absolute write positions: base position for each column + rank.
+                positions = np.repeat(offset[unique_cols], col_counts) + within_col
+
+                out_data[positions] = sorted_vals
+                out_row_indices[positions] = sorted_rows
+
+                # Advance column write offsets.
+                offset[unique_cols] += col_counts.astype(np.int64)
                 row_global += n_chunk
-                continue
-
-            # Global row index for every non-zero in this chunk.
-            local_row_ids = np.repeat(
-                np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
-            ) + row_dtype(row_global)
-
-            cols = csr.indices          # column index of each non-zero
-            vals = csr.data.astype(np.float32)
-
-            # Sort non-zeros by column so we can process contiguous groups.
-            col_order = np.argsort(cols, kind="stable")
-            sorted_cols = cols[col_order]
-            sorted_vals = vals[col_order]
-            sorted_rows = local_row_ids[col_order]
-
-            # Compute within-column sequential ranks: 0, 1, 2, … per column.
-            unique_cols, col_counts = np.unique(sorted_cols, return_counts=True)
-            col_ends = np.cumsum(col_counts)
-            col_starts = col_ends - col_counts
-            within_col = np.arange(len(sorted_cols)) - np.repeat(col_starts, col_counts)
-
-            # Absolute write positions: base position for each column + rank.
-            positions = np.repeat(offset[unique_cols], col_counts) + within_col
-
-            out_data[positions] = sorted_vals
-            out_row_indices[positions] = sorted_rows
-
-            # Advance column write offsets.
-            offset[unique_cols] += col_counts.astype(np.int64)
-            row_global += n_chunk
+                pbar.update(1)
     finally:
         backed.file.close()
 
@@ -1688,8 +1694,7 @@ def convert_to_csc(
         grp.create_dataset("indices", data=out_row_indices, chunks=chunk_arg)
         grp.create_dataset("indptr", data=indptr)
 
-    if verbose:
-        print(f"[cx] pp.convert_to_csc: Done  {n_obs} cells × {n_vars} genes")
+    _messages.print_done(verbose, "pp.convert_to_csc", f"{n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
 
@@ -1701,7 +1706,7 @@ def convert_to_csr(
     chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> "AnnData":
     """Convert a backed h5ad file's matrix from CSC (or dense) to CSR format.
 
@@ -1751,8 +1756,7 @@ def convert_to_csr(
     # Fast path: input is already CSR — return it directly.
     fmt = get_matrix_storage_format(source_path)
     if fmt == "csr":
-        if verbose:
-            print(f"[cx] pp.convert_to_csr: Already CSR, returning source unchanged")
+        _messages.vprint(verbose, "pp.convert_to_csr", "Already CSR, returning source unchanged")
         return AnnData(source_path)
 
     # Resolve output path.
@@ -1772,8 +1776,7 @@ def convert_to_csr(
 
     source_is_csc = fmt == "csc"
 
-    if verbose:
-        print(f"[cx] pp.convert_to_csr: {source_path} → {output_path}")
+    _messages.vprint(verbose, "pp.convert_to_csr", f"{source_path} → {output_path}")
 
     # Choose the optimal reading axis based on source format.
     # CSC: column-chunks (axis=1) are fast, row-chunks are O(total_nnz).
@@ -1788,6 +1791,7 @@ def convert_to_csr(
         n_vars = backed.n_vars
         if chunk_size is None:
             chunk_size = calculate_optimal_chunk_size(n_obs, n_vars)
+            _messages.vprint(verbose, "pp.convert_to_csr", f"chunk_size={chunk_size} (auto)")
         obs = backed.obs.copy()
         var = backed.var.copy()
         obs.index = obs.index.astype(str)
@@ -1795,31 +1799,37 @@ def convert_to_csr(
 
         row_nnz = np.zeros(n_obs, dtype=np.int64)
         total_nnz = 0
+        n_row_chunks = (n_obs + chunk_size - 1) // chunk_size
+        n_col_chunks = (n_vars + chunk_size - 1) // chunk_size
 
         if source_is_csc:
             # Column chunks: convert each to CSC, count NNZ per row via indices.
-            for _slc, block in iter_matrix_chunks(
-                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-            ):
-                if sp.issparse(block):
-                    csc = sp.csc_matrix(block)
-                    np.add.at(row_nnz, csc.indices, 1)
-                    total_nnz += csc.nnz
-                else:
-                    # Dense column block: count non-zeros per row.
-                    dense = np.asarray(block)
-                    nz_mask = dense != 0
-                    row_nnz += nz_mask.sum(axis=1)
-                    total_nnz += int(nz_mask.sum())
+            with _create_progress_context(n_col_chunks, "pp.convert_to_csr (pass 1)", verbose, unit="chunk") as pbar:
+                for _slc, block in iter_matrix_chunks(
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    if sp.issparse(block):
+                        csc = sp.csc_matrix(block)
+                        np.add.at(row_nnz, csc.indices, 1)
+                        total_nnz += csc.nnz
+                    else:
+                        # Dense column block: count non-zeros per row.
+                        dense = np.asarray(block)
+                        nz_mask = dense != 0
+                        row_nnz += nz_mask.sum(axis=1)
+                        total_nnz += int(nz_mask.sum())
+                    pbar.update(1)
         else:
             # Row chunks: convert to CSR, count NNZ per row via indptr diffs.
-            for _slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-            ):
-                csr = _ensure_csr(block)
-                row_counts = np.diff(csr.indptr)
-                row_nnz[_slc] += row_counts
-                total_nnz += csr.nnz
+            with _create_progress_context(n_row_chunks, "pp.convert_to_csr (pass 1)", verbose, unit="chunk") as pbar:
+                for _slc, block in iter_matrix_chunks(
+                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    csr = _ensure_csr(block)
+                    row_counts = np.diff(csr.indptr)
+                    row_nnz[_slc] += row_counts
+                    total_nnz += csr.nnz
+                    pbar.update(1)
     finally:
         backed.file.close()
 
@@ -1851,62 +1861,68 @@ def convert_to_csr(
             # Column-chunk reading: fast on CSC.  Mirror of convert_to_csc's
             # row-chunk scatter, but transposed.
             col_global = 0
-            for _slc, block in iter_matrix_chunks(
-                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-            ):
-                if sp.issparse(block):
-                    csc = sp.csc_matrix(block)
-                else:
-                    csc = sp.csc_matrix(np.asarray(block))
-                n_chunk_cols = csc.shape[1]
-                if csc.nnz == 0:
+            with _create_progress_context(n_col_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk") as pbar:
+                for _slc, block in iter_matrix_chunks(
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    if sp.issparse(block):
+                        csc = sp.csc_matrix(block)
+                    else:
+                        csc = sp.csc_matrix(np.asarray(block))
+                    n_chunk_cols = csc.shape[1]
+                    if csc.nnz == 0:
+                        col_global += n_chunk_cols
+                        pbar.update(1)
+                        continue
+
+                    # Global column index for every non-zero in this chunk.
+                    local_col_ids = np.repeat(
+                        np.arange(n_chunk_cols, dtype=col_dtype),
+                        np.diff(csc.indptr),
+                    ) + col_dtype(col_global)
+
+                    rows = csc.indices         # row index of each non-zero
+                    vals = csc.data.astype(np.float32)
+
+                    # Sort non-zeros by row so we can process contiguous groups.
+                    row_order = np.argsort(rows, kind="stable")
+                    sorted_rows = rows[row_order]
+                    sorted_vals = vals[row_order]
+                    sorted_cols = local_col_ids[row_order]
+
+                    # Compute within-row sequential ranks: 0, 1, 2, … per row.
+                    unique_rows, row_counts = np.unique(sorted_rows, return_counts=True)
+                    row_ends = np.cumsum(row_counts)
+                    row_starts = row_ends - row_counts
+                    within_row = np.arange(len(sorted_rows)) - np.repeat(row_starts, row_counts)
+
+                    # Absolute write positions: base offset for each row + rank.
+                    positions = np.repeat(offset[unique_rows], row_counts) + within_row
+
+                    out_data[positions] = sorted_vals
+                    out_col_indices[positions] = sorted_cols
+
+                    # Advance row write offsets.
+                    offset[unique_rows] += row_counts.astype(np.int64)
                     col_global += n_chunk_cols
-                    continue
-
-                # Global column index for every non-zero in this chunk.
-                local_col_ids = np.repeat(
-                    np.arange(n_chunk_cols, dtype=col_dtype),
-                    np.diff(csc.indptr),
-                ) + col_dtype(col_global)
-
-                rows = csc.indices         # row index of each non-zero
-                vals = csc.data.astype(np.float32)
-
-                # Sort non-zeros by row so we can process contiguous groups.
-                row_order = np.argsort(rows, kind="stable")
-                sorted_rows = rows[row_order]
-                sorted_vals = vals[row_order]
-                sorted_cols = local_col_ids[row_order]
-
-                # Compute within-row sequential ranks: 0, 1, 2, … per row.
-                unique_rows, row_counts = np.unique(sorted_rows, return_counts=True)
-                row_ends = np.cumsum(row_counts)
-                row_starts = row_ends - row_counts
-                within_row = np.arange(len(sorted_rows)) - np.repeat(row_starts, row_counts)
-
-                # Absolute write positions: base offset for each row + rank.
-                positions = np.repeat(offset[unique_rows], row_counts) + within_row
-
-                out_data[positions] = sorted_vals
-                out_col_indices[positions] = sorted_cols
-
-                # Advance row write offsets.
-                offset[unique_rows] += row_counts.astype(np.int64)
-                col_global += n_chunk_cols
+                    pbar.update(1)
         else:
             # Row-chunk reading: fast on dense.  Each chunk is already CSR-ordered.
-            for _slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-            ):
-                csr = _ensure_csr(block)
-                if csr.nnz == 0:
-                    continue
-                # Bulk copy: the chunk spans rows [_slc.start : _slc.stop].
-                # Global write position: indptr[_slc.start] to indptr[_slc.stop].
-                dst_start = int(indptr[_slc.start])
-                dst_end = dst_start + csr.nnz
-                out_data[dst_start:dst_end] = csr.data.astype(np.float32)
-                out_col_indices[dst_start:dst_end] = csr.indices.astype(col_dtype)
+            with _create_progress_context(n_row_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk") as pbar:
+                for _slc, block in iter_matrix_chunks(
+                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    csr = _ensure_csr(block)
+                    if csr.nnz == 0:
+                        pbar.update(1)
+                        continue
+                    # Bulk copy: the chunk spans rows [_slc.start : _slc.stop].
+                    # Global write position: indptr[_slc.start] to indptr[_slc.stop].
+                    dst_start = int(indptr[_slc.start])
+                    dst_end = dst_start + csr.nnz
+                    out_data[dst_start:dst_end] = csr.data.astype(np.float32)
+                    out_col_indices[dst_start:dst_end] = csr.indices.astype(col_dtype)
+                    pbar.update(1)
     finally:
         backed.file.close()
 
@@ -1936,8 +1952,7 @@ def convert_to_csr(
         grp.create_dataset("indices", data=out_col_indices, chunks=chunk_arg)
         grp.create_dataset("indptr", data=indptr)
 
-    if verbose:
-        print(f"[cx] pp.convert_to_csr: Done  {n_obs} cells × {n_vars} genes")
+    _messages.print_done(verbose, "pp.convert_to_csr", f"{n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
 
@@ -3877,7 +3892,7 @@ def detect_perturbation_column(
     *,
     control_label: str | None = None,
     min_unique: int = 2,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> str | None:
     """Heuristically identify the obs column containing perturbation labels.
 
@@ -3942,13 +3957,16 @@ def detect_perturbation_column(
         logger.info(
             "Detected perturbation column: '%s' (score=%d).", best_col, best_score
         )
+    _messages.vprint(
+        verbose, "detect_perturbation_column", f"Detected '{best_col}' (score={best_score})",
+    )
     return best_col
 
 
 def detect_gene_symbol_column(
     adata: "str | Path | AnnData | ad.AnnData",
     *,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> str | None:
     """Heuristically identify the var column containing gene symbols.
 
@@ -4000,6 +4018,9 @@ def detect_gene_symbol_column(
         logger.info(
             "Detected gene symbol column: '%s' (score=%d).", best_col, best_score
         )
+    _messages.vprint(
+        verbose, "detect_gene_symbol_column", f"Detected '{best_col}' (score={best_score})",
+    )
     return best_col
 
 
@@ -4007,7 +4028,7 @@ def infer_columns(
     adata: "str | Path | AnnData | ad.AnnData",
     *,
     control_label: str | None = None,
-    verbose: bool = True,
+    verbose: int | bool = True,
 ) -> dict[str, str | None]:
     """Detect perturbation and gene-symbol columns in a single call.
 

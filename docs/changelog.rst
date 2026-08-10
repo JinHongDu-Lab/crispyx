@@ -1,6 +1,47 @@
 Changelog
 =========
 
+Version 0.0.11
+--------------
+
+*Released 2026-08-09.*
+
+* **``verbose`` now defaults to ``True``** across the package (was ``False``
+  on most differential-expression and pseudo-bulk functions). A first-time
+  call already reports what it did -- what file is being read, what was
+  inferred, what was written -- without passing ``verbose=`` explicitly.
+  Pass ``verbose=False`` (or ``0``) for the previous silent behaviour. This
+  is a behavioural default change, not a signature change: no parameter was
+  removed or renamed.
+* **Filtering feedback** – :func:`crispyx.pp.filter_cells`,
+  :func:`crispyx.pp.filter_genes`, :func:`crispyx.pp.filter_perturbations`,
+  and :func:`crispyx.pp.qc_summary` now report kept/total counts and warn
+  when a filter removes more than half the data (cells, genes, or
+  perturbations), a common sign of a misconfigured threshold.
+* **Progress bars** extended beyond differential expression to CSC/CSR
+  conversion, ``cx.pb.aggregate``, ``cx.tl.batch_process``, and the QC
+  streaming passes. They use ``tqdm`` when available and degrade to a
+  no-op otherwise, gated on the same ``verbose`` as everything else.
+* **Chunk-size and streaming-strategy reporting** – functions that
+  auto-select a chunk size, or choose between a single-pass and a
+  streaming strategy internally, now say so at the default verbosity
+  (e.g. ``chunk_size=4096 (auto)``, ``Strategy — column-streaming``).
+* **Disk-usage confirmation** – every ``warn_if_disk_space_low`` call site
+  now also prints a ``verbose``-gated confirmation of the estimate
+  computed (required GB vs. free GB), shown whether or not the
+  unconditional warning fired.
+* Fixed a naming regression in :func:`crispyx.pp.qc_summary`'s verbose
+  output (it printed ``qc.quality_control:`` instead of
+  ``pp.qc_summary:``, left over from before the function was renamed).
+* Warnings for missing batch/grouping values and untestable groups in
+  ``cx.tl.batch_process``, ``cx.pb.aggregate``, ``cx.pb.effects``, and
+  ``cx.tl.wilcoxon_test`` (batch-stratified) are now prefixed with their
+  originating function, matching the convention already used by the
+  disk-space warnings.
+* See the new :ref:`Messaging and verbosity <messaging-and-verbosity>`
+  section in the usage guide for the full picture of what prints, what
+  warns, and what stays at logger level.
+
 Version 0.0.10
 --------------
 

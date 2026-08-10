@@ -77,6 +77,23 @@ def test_resolve_control_label_infers_ctrl(caplog):
     assert "Inferred control label" in caplog.text
 
 
+def test_resolve_control_label_prints_by_default(capsys):
+    """verbose defaults to True: the inferred label should be visible on
+    stdout without the caller configuring logging (unlike the logger.info
+    channel, which is silent by default)."""
+    inferred = resolve_control_label(["KO", "CTRL_cells"], None)
+
+    assert inferred == "CTRL_cells"
+    out = capsys.readouterr().out
+    assert "[cx] resolve_control_label:" in out
+    assert "CTRL_cells" in out
+
+
+def test_resolve_control_label_verbose_false_is_silent(capsys):
+    resolve_control_label(["KO", "CTRL_cells"], None, verbose=False)
+    assert capsys.readouterr().out == ""
+
+
 def test_read_h5ad_ondisk_returns_backed_object(tmp_path, capsys):
     path = _create_dataset(tmp_path)
 
@@ -550,6 +567,21 @@ class TestAutoDetect:
         assert "gene_name_column" in result
         assert result["perturbation_column"] == "perturbation"
         assert result["gene_name_column"] == "gene_symbols"
+
+    def test_detect_perturbation_column_prints_by_default(self, tmp_path, capsys):
+        path = _create_full_dataset(tmp_path)
+        col = detect_perturbation_column(path)
+        assert col == "perturbation"
+        out = capsys.readouterr().out
+        assert "[cx] detect_perturbation_column:" in out
+        assert "perturbation" in out
+
+    def test_detect_gene_symbol_column_prints_by_default(self, tmp_path, capsys):
+        path = _create_full_dataset(tmp_path)
+        col = detect_gene_symbol_column(path)
+        assert col == "gene_symbols"
+        out = capsys.readouterr().out
+        assert "[cx] detect_gene_symbol_column:" in out
 
 
 # ============================================================================

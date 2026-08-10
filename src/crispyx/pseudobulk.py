@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sparse
 
+from . import _messages
+from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from .data import (
@@ -304,7 +306,7 @@ def _normalized_effects_impl(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
 ) -> AnnData:
     """Shared implementation. ``layout`` picks the output naming scheme.
 
@@ -419,8 +421,7 @@ def _normalized_effects_impl(
             return np.log1p(baseline_count * mean)
 
     path = resolve_data_path(data)
-    if int(verbose) >= 1:
-        print(f"[cx] {log_name}: Reading {path}")
+    _messages.print_reading(verbose, log_name, path)
     backed = read_backed(path)
     use_batch = batch_column is not None
     effect_matrix_np = np.empty((0, 0), dtype=np.float64)
@@ -435,6 +436,7 @@ def _normalized_effects_impl(
             chunk_size = calculate_optimal_chunk_size(
                 backed.n_obs, backed.n_vars, available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, log_name, f"chunk_size={chunk_size} (auto)")
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -534,9 +536,8 @@ def _normalized_effects_impl(
         adata.uns["method"] = str(method)
         if method == "log_mean":
             adata.uns["baseline_count"] = float(baseline_count)
-        if int(verbose) >= 1:
-            print(f"[cx] {log_name}: 0 perturbations × {gene_symbols.shape[0]} genes")
-            print(f"[cx] {log_name}: Saving → {resolved_output}")
+        _messages.vprint(verbose, log_name, f"0 perturbations × {gene_symbols.shape[0]} genes")
+        _messages.print_saving(verbose, log_name, resolved_output)
         adata.write(resolved_output)
         return AnnData(resolved_output)
 
@@ -556,13 +557,13 @@ def _normalized_effects_impl(
         adata.uns["batch_column"] = str(batch_column)
         adata.uns["batch_ids"] = np.asarray(batch_ids, dtype=object)
     n_layers = 3 if use_batch else 2  # X + profile_layer (+ matched_layer if batch-corrected)
-    warn_if_disk_space_low(
+    _disk_estimate = warn_if_disk_space_low(
         estimate_bytes(len(candidates), n_genes, n_layers, overhead=1.10), resolved_output,
         context=log_name,
     )
-    if int(verbose) >= 1:
-        print(f"[cx] {log_name}: {len(candidates)} perturbations × {len(gene_symbols)} genes")
-        print(f"[cx] {log_name}: Saving → {resolved_output}")
+    _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
+    _messages.vprint(verbose, log_name, f"{len(candidates)} perturbations × {len(gene_symbols)} genes")
+    _messages.print_saving(verbose, log_name, resolved_output)
     adata.write(resolved_output)
     return AnnData(resolved_output)
 
@@ -584,7 +585,7 @@ def compute_normalized_effects(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
 ) -> AnnData:
     """Compute library-size-normalised target-minus-reference effects from cells.
 
@@ -703,7 +704,7 @@ def compute_average_log_expression(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
 ) -> AnnData:
     """Deprecated alias for ``compute_normalized_effects(method="mean_log1p")``.
 
@@ -750,7 +751,7 @@ def compute_pseudobulk_expression(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
 ) -> AnnData:
     """Deprecated alias for ``compute_normalized_effects(method="log_mean")``.
 
@@ -847,7 +848,7 @@ def aggregate_pseudobulk(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     force: bool = False,
 ) -> AnnData:
     """Aggregate cells into absolute pseudo-bulk profiles.
@@ -947,7 +948,8 @@ def aggregate_pseudobulk(
         usable = ~grouping.isna().any(axis=1).to_numpy()
         n_missing = int((~usable).sum())
         if n_missing:
-            warnings.warn(
+            _messages.warn(
+                "pb.aggregate",
                 f"{n_missing} cells have missing grouping values and are excluded.",
                 stacklevel=2,
             )
@@ -1011,6 +1013,7 @@ def aggregate_pseudobulk(
                 backed.n_vars,
                 available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, "pb.aggregate", f"chunk_size={chunk_size} (auto)")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
 
@@ -1064,14 +1067,16 @@ def aggregate_pseudobulk(
                 existing.file.close()
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
-        warn_if_disk_space_low(
+        _accumulator_disk_estimate = warn_if_disk_space_low(
             estimate_bytes(max(len(keys), 1), backed.n_vars), tempfile.gettempdir(),
             context="pb.aggregate accumulator",
         )
-        warn_if_disk_space_low(
+        _messages.print_disk_estimate(verbose, "pb.aggregate accumulator", _accumulator_disk_estimate)
+        _output_disk_estimate = warn_if_disk_space_low(
             estimate_bytes(max(len(keys), 1), backed.n_vars, overhead=1.10), resolved_output,
             context="pb.aggregate",
         )
+        _messages.print_disk_estimate(verbose, "pb.aggregate", _output_disk_estimate)
         with tempfile.TemporaryDirectory(prefix="cx_pseudobulk_") as tmpdir:
             sums_path = Path(tmpdir) / "profiles.dat"
             profiles = np.memmap(
@@ -1081,24 +1086,28 @@ def aggregate_pseudobulk(
                 shape=(max(len(keys), 1), backed.n_vars),
             )
             profiles.fill(0)
-            for start in range(0, backed.n_obs, chunk_size):
-                end = min(start + chunk_size, backed.n_obs)
-                local_codes = group_codes[start:end]
-                local_mult = multiplicity[start:end]
-                local = (local_codes >= 0) & (local_mult > 0)
-                if not local.any():
-                    continue
-                block = _densify_block(_matrix_block(matrix, start, end)[local])
-                if method == "mean_log1p" and all_integer:
-                    np.log1p(block, out=block)
-                codes = local_codes[local]
-                weights = local_mult[local].astype(np.float64)
-                unique_codes, inverse = np.unique(codes, return_inverse=True)
-                indicator = sparse.csr_matrix(
-                    (weights, (inverse, np.arange(codes.size))),
-                    shape=(unique_codes.size, codes.size),
-                )
-                profiles[unique_codes] = profiles[unique_codes] + indicator @ block
+            n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
+            with _create_progress_context(n_chunks, "pb.aggregate", verbose, unit="chunk") as pbar:
+                for start in range(0, backed.n_obs, chunk_size):
+                    end = min(start + chunk_size, backed.n_obs)
+                    local_codes = group_codes[start:end]
+                    local_mult = multiplicity[start:end]
+                    local = (local_codes >= 0) & (local_mult > 0)
+                    if not local.any():
+                        pbar.update(1)
+                        continue
+                    block = _densify_block(_matrix_block(matrix, start, end)[local])
+                    if method == "mean_log1p" and all_integer:
+                        np.log1p(block, out=block)
+                    codes = local_codes[local]
+                    weights = local_mult[local].astype(np.float64)
+                    unique_codes, inverse = np.unique(codes, return_inverse=True)
+                    indicator = sparse.csr_matrix(
+                        (weights, (inverse, np.arange(codes.size))),
+                        shape=(unique_codes.size, codes.size),
+                    )
+                    profiles[unique_codes] = profiles[unique_codes] + indicator @ block
+                    pbar.update(1)
             if method == "mean_log1p" and len(keys):
                 profiles[: len(keys)] /= aggregated_counts[:, None]
 
@@ -1160,7 +1169,7 @@ def compute_pseudobulk_effects(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     force: bool = False,
 ) -> AnnData:
     """Compute target-minus-control effects from batch-level pseudo-bulk profiles.
@@ -1262,7 +1271,8 @@ def compute_pseudobulk_effects(
                 target_rows.append(index)
                 control_rows.append(control_index)
             if missing_batches:
-                warnings.warn(
+                _messages.warn(
+                    "pb.effects",
                     "Dropping target profiles without a same-batch control. "
                     f"Affected batches: {sorted(missing_batches)[:5]}",
                     stacklevel=2,
@@ -1331,10 +1341,11 @@ def compute_pseudobulk_effects(
                 n_output = len(target_rows)
 
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
-            warn_if_disk_space_low(
+            _accumulator_disk_estimate = warn_if_disk_space_low(
                 estimate_bytes(max(n_output, 1), bulk.n_vars, 3), tempfile.gettempdir(),
                 context="pb.effects accumulator",
             )
+            _messages.print_disk_estimate(verbose, "pb.effects accumulator", _accumulator_disk_estimate)
             with tempfile.TemporaryDirectory(prefix="cx_pb_effects_") as tmpdir:
                 shape = (max(n_output, 1), bulk.n_vars)
                 effect_mm = np.memmap(Path(tmpdir) / "effect.dat", dtype=np.float64, mode="w+", shape=shape)

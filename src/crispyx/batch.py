@@ -15,6 +15,8 @@ import pandas as pd
 import scipy.sparse as sp
 from numpy.typing import ArrayLike
 
+from . import _messages
+from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from .data import (
@@ -233,7 +235,7 @@ def batch_process(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     memory_limit_gb: float | None = None,
     force: bool = False,
 ) -> AnnData:
@@ -454,9 +456,9 @@ def batch_process(
             raise ValueError(f"Batch column '{batch_column}' contains no usable batches.")
         n_missing_batch = int(np.sum(batch_codes < 0))
         if n_missing_batch:
-            warnings.warn(
-                f"{n_missing_batch} cells have a missing '{batch_column}' value and are "
-                "excluded from batch_process().",
+            _messages.warn(
+                "tl.batch_process",
+                f"{n_missing_batch} cells have a missing '{batch_column}' value and are excluded.",
                 stacklevel=2,
             )
 
@@ -490,12 +492,14 @@ def batch_process(
                 n_genes,
                 available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, "tl.batch_process", f"gene chunk_size={chunk_size} (auto)")
         if cell_chunk_size is None:
             cell_chunk_size = calculate_optimal_chunk_size(
                 backed.n_obs,
                 min(n_genes, chunk_size),
                 available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, "tl.batch_process", f"cell_chunk_size={cell_chunk_size} (auto)")
         if chunk_size <= 0 or cell_chunk_size <= 0:
             raise ValueError("chunk_size and cell_chunk_size must be positive")
 
@@ -531,14 +535,16 @@ def batch_process(
                 f"stratified by '{batch_column}'"
             )
 
-        warn_if_disk_space_low(
+        _accumulator_disk_estimate = warn_if_disk_space_low(
             estimate_bytes(max(n_groups, 1), n_genes) * 2, tempfile.gettempdir(),
             context="tl.batch_process accumulator",
         )
-        warn_if_disk_space_low(
+        _messages.print_disk_estimate(verbose, "tl.batch_process accumulator", _accumulator_disk_estimate)
+        _output_disk_estimate = warn_if_disk_space_low(
             estimate_bytes(max(n_groups, 1), n_genes, overhead=1.10) * 2, resolved_output,
             context="tl.batch_process",
         )
+        _messages.print_disk_estimate(verbose, "tl.batch_process", _output_disk_estimate)
         with tempfile.TemporaryDirectory(prefix="cx_batch_") as tmpdir:
             values_path = Path(tmpdir) / "values.dat"
             weights_path = Path(tmpdir) / "weights.dat"
@@ -552,93 +558,97 @@ def batch_process(
             weights_mm.fill(0)
             batches_used = np.zeros((n_groups, n_batches), dtype=bool)
 
-            for gene_start in range(0, n_genes, chunk_size):
-                gene_end = min(gene_start + chunk_size, n_genes)
-                width = gene_end - gene_start
-                states: dict[tuple[int, int], Any] = {}
+            n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
+            with _create_progress_context(n_gene_chunks, "tl.batch_process", verbose, unit="gene chunk") as pbar:
+                for gene_start in range(0, n_genes, chunk_size):
+                    gene_end = min(gene_start + chunk_size, n_genes)
+                    width = gene_end - gene_start
+                    states: dict[tuple[int, int], Any] = {}
 
-                for cell_start in range(0, backed.n_obs, cell_chunk_size):
-                    cell_end = min(cell_start + cell_chunk_size, backed.n_obs)
-                    local_groups = group_codes[cell_start:cell_end]
-                    local_batches = batch_codes[cell_start:cell_end]
-                    usable = (local_batches >= 0) & (
-                        (local_groups >= 0)
-                        | ((mode == "comparison") & (local_groups == reference_code))
-                    )
-                    if not usable.any():
-                        continue
-                    block = _as_dense(backed.X[cell_start:cell_end, gene_start:gene_end])
-                    pairs = np.unique(
-                        np.column_stack((local_groups[usable], local_batches[usable])), axis=0
-                    )
-                    for group_code, batch_code in pairs:
-                        key = (int(group_code), int(batch_code))
-                        mask = (local_groups == group_code) & (local_batches == batch_code)
-                        group_name = (
-                            str(control_label)
-                            if group_code == reference_code
-                            else groups[int(group_code)]
+                    for cell_start in range(0, backed.n_obs, cell_chunk_size):
+                        cell_end = min(cell_start + cell_chunk_size, backed.n_obs)
+                        local_groups = group_codes[cell_start:cell_end]
+                        local_batches = batch_codes[cell_start:cell_end]
+                        usable = (local_batches >= 0) & (
+                            (local_groups >= 0)
+                            | ((mode == "comparison") & (local_groups == reference_code))
                         )
-                        context = f"group '{group_name}', batch '{batch_ids[int(batch_code)]}'"
-                        try:
-                            if key in states:
-                                state = states[key]
-                            else:
-                                state = reducer.initialize(width)
-                            replacement = reducer.update(state, block[mask])
-                        except Exception as exc:
-                            raise RuntimeError(f"Reducer failed for {context}") from exc
-                        states[key] = state if replacement is None else replacement
+                        if not usable.any():
+                            continue
+                        block = _as_dense(backed.X[cell_start:cell_end, gene_start:gene_end])
+                        pairs = np.unique(
+                            np.column_stack((local_groups[usable], local_batches[usable])), axis=0
+                        )
+                        for group_code, batch_code in pairs:
+                            key = (int(group_code), int(batch_code))
+                            mask = (local_groups == group_code) & (local_batches == batch_code)
+                            group_name = (
+                                str(control_label)
+                                if group_code == reference_code
+                                else groups[int(group_code)]
+                            )
+                            context = f"group '{group_name}', batch '{batch_ids[int(batch_code)]}'"
+                            try:
+                                if key in states:
+                                    state = states[key]
+                                else:
+                                    state = reducer.initialize(width)
+                                replacement = reducer.update(state, block[mask])
+                            except Exception as exc:
+                                raise RuntimeError(f"Reducer failed for {context}") from exc
+                            states[key] = state if replacement is None else replacement
 
-                for group_index, group in enumerate(groups):
-                    numerator = np.zeros(width, dtype=np.float64)
-                    denominator = np.zeros(width, dtype=np.float64)
-                    for batch_index, batch_id in enumerate(batch_ids):
-                        if group_batch_counts[group_index, batch_index] == 0:
-                            continue
-                        group_key = (group_index, batch_index)
-                        if group_key not in states:
-                            continue
-                        group_state = states[group_key]
-                        context = f"group '{group}', batch '{batch_id}'"
-                        try:
-                            if mode == "group":
-                                finalized = reducer.finalize(group_state)
-                            else:
-                                if reference_batch_counts[batch_index] == 0:
-                                    continue
-                                reference_key = (reference_code, batch_index)
-                                if reference_key not in states:
-                                    continue
-                                reference_state = states[reference_key]
-                                finalized = reducer.compare(group_state, reference_state)  # type: ignore[misc]
-                            batch_values, batch_weights = _normalise_statistic(
-                                finalized, width, context=context
-                            )
-                        except Exception as exc:
-                            if isinstance(exc, (ValueError, TypeError)) and str(exc).startswith("Reducer"):
-                                raise
-                            raise RuntimeError(f"Reducer failed for {context}") from exc
-                        positive = batch_weights > 0
-                        if positive.any():
-                            numerator[positive] += (
-                                batch_values[positive] * batch_weights[positive]
-                            )
-                            denominator[positive] += batch_weights[positive]
-                            batches_used[group_index, batch_index] = True
-                    values_mm[group_index, gene_start:gene_end] = np.divide(
-                        numerator,
-                        denominator,
-                        out=np.full(width, np.nan, dtype=np.float64),
-                        where=denominator > 0,
-                    )
-                    weights_mm[group_index, gene_start:gene_end] = denominator
+                    for group_index, group in enumerate(groups):
+                        numerator = np.zeros(width, dtype=np.float64)
+                        denominator = np.zeros(width, dtype=np.float64)
+                        for batch_index, batch_id in enumerate(batch_ids):
+                            if group_batch_counts[group_index, batch_index] == 0:
+                                continue
+                            group_key = (group_index, batch_index)
+                            if group_key not in states:
+                                continue
+                            group_state = states[group_key]
+                            context = f"group '{group}', batch '{batch_id}'"
+                            try:
+                                if mode == "group":
+                                    finalized = reducer.finalize(group_state)
+                                else:
+                                    if reference_batch_counts[batch_index] == 0:
+                                        continue
+                                    reference_key = (reference_code, batch_index)
+                                    if reference_key not in states:
+                                        continue
+                                    reference_state = states[reference_key]
+                                    finalized = reducer.compare(group_state, reference_state)  # type: ignore[misc]
+                                batch_values, batch_weights = _normalise_statistic(
+                                    finalized, width, context=context
+                                )
+                            except Exception as exc:
+                                if isinstance(exc, (ValueError, TypeError)) and str(exc).startswith("Reducer"):
+                                    raise
+                                raise RuntimeError(f"Reducer failed for {context}") from exc
+                            positive = batch_weights > 0
+                            if positive.any():
+                                numerator[positive] += (
+                                    batch_values[positive] * batch_weights[positive]
+                                )
+                                denominator[positive] += batch_weights[positive]
+                                batches_used[group_index, batch_index] = True
+                        values_mm[group_index, gene_start:gene_end] = np.divide(
+                            numerator,
+                            denominator,
+                            out=np.full(width, np.nan, dtype=np.float64),
+                            where=denominator > 0,
+                        )
+                        weights_mm[group_index, gene_start:gene_end] = denominator
+                    pbar.update(1)
 
             untestable = np.all(np.asarray(weights_mm[:n_groups]) <= 0, axis=1)
             n_batches_used = batches_used.sum(axis=1).astype(np.int64)
             if untestable.any():
                 examples = [groups[i] for i in np.flatnonzero(untestable)[:5]]
-                warnings.warn(
+                _messages.warn(
+                    "tl.batch_process",
                     f"{int(untestable.sum())} group(s) have no usable batch statistics; "
                     f"results are NaN. Examples: {examples}",
                     stacklevel=2,

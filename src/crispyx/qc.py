@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from . import _messages
+from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
     AnnData,
@@ -325,12 +327,30 @@ class QualityControlResult:
     @property
     def filtered_path(self) -> Path | None:
         """Compatibility accessor exposing the on-disk filename.
-        
+
         Returns None if no output file was written (output_dir was None).
         """
         if self.filtered is None:
             return None
         return self.filtered.path
+
+
+def _warn_if_heavily_filtered(
+    context: str, kept: int, total: int, *, kind: str, warn_below: float = 0.5,
+) -> None:
+    """Warn when a filtering step keeps less than ``warn_below`` of its input.
+
+    Independent of ``verbose`` -- like every other warning in the package,
+    this signals something the caller should know about regardless of
+    verbosity, not something tied to how much routine progress output they
+    asked for.
+    """
+    if total > 0 and kept < total * warn_below:
+        _messages.warn(
+            context,
+            f"only {kept}/{total} {kind} ({100 * kept / total:.0f}%) passed "
+            f"filtering. Check your thresholds if this is unexpected.",
+        )
 
 
 def filter_cells_by_gene_count(
@@ -341,13 +361,14 @@ def filter_cells_by_gene_count(
     chunk_size: int = 2048,
     return_counts: bool = False,
     return_full_result: bool = False,
+    verbose: int | bool = True,
 ) -> np.ndarray | Tuple[np.ndarray, np.ndarray] | _CellFilterResult:
     """Return a boolean mask selecting cells with at least ``min_genes`` expressed genes.
-    
+
     This function can optionally compute both genes-per-cell (row nnz) AND
     cells-per-gene (column nnz) in a single matrix pass, avoiding a separate
     gene counting pass later.
-    
+
     Parameters
     ----------
     data
@@ -365,7 +386,9 @@ def filter_cells_by_gene_count(
         If True, return a _CellFilterResult containing cell_mask,
         gene_counts_per_cell, and gene_cell_counts_all (cells per gene
         for all cells, before any perturbation filtering).
-        
+    verbose
+        Print how many cells passed filtering, and warn if fewer than half did.
+
     Returns
     -------
     mask or (mask, counts) or _CellFilterResult
@@ -399,14 +422,20 @@ def filter_cells_by_gene_count(
         backed.file.close()
     
     mask = gene_counts_per_cell >= min_genes
-    
+    kept = int(mask.sum())
+    if n_obs > 0:
+        _messages.print_done(
+            verbose, "pp.filter_cells", f"{kept}/{n_obs} cells kept ({100 * kept / n_obs:.0f}%)",
+        )
+        _warn_if_heavily_filtered("pp.filter_cells", kept, n_obs, kind="cells")
+
     if return_full_result:
         return _CellFilterResult(
             cell_mask=mask,
             gene_counts_per_cell=gene_counts_per_cell,
             gene_cell_counts_all=gene_cell_counts_all,
         )
-    
+
     if return_counts:
         return mask, gene_counts_per_cell
     return mask
@@ -420,9 +449,10 @@ def filter_perturbations_by_cell_count(
     min_cells: int = 50,
     base_mask: np.ndarray | None = None,
     return_counts: bool = False,
+    verbose: int | bool = True,
 ) -> np.ndarray | Tuple[np.ndarray, pd.Series]:
     """Return a mask keeping cells whose perturbation has sufficient representation.
-    
+
     Parameters
     ----------
     data
@@ -437,7 +467,10 @@ def filter_perturbations_by_cell_count(
         Optional mask for cells to consider (e.g., from prior filtering).
     return_counts
         If True, return (mask, cell_counts_per_perturbation) tuple.
-        
+    verbose
+        Print how many perturbations passed filtering, and warn if fewer
+        than half did.
+
     Returns
     -------
     mask or (mask, counts)
@@ -469,7 +502,20 @@ def filter_perturbations_by_cell_count(
     is_control = labels == control_label
     has_enough_cells = count_per_cell >= min_cells
     mask = (is_control | has_enough_cells) & base_mask
-    
+
+    total_perturbations = int(counts.size)
+    if total_perturbations > 0:
+        qualifying = set(counts[counts >= min_cells].index) | {control_label}
+        kept_perturbations = len(qualifying & set(counts.index))
+        _messages.print_done(
+            verbose, "pp.filter_perturbations",
+            f"{kept_perturbations}/{total_perturbations} perturbations kept "
+            f"({100 * kept_perturbations / total_perturbations:.0f}%)",
+        )
+        _warn_if_heavily_filtered(
+            "pp.filter_perturbations", kept_perturbations, total_perturbations, kind="perturbations",
+        )
+
     if return_counts:
         return mask, counts
     return mask
@@ -483,9 +529,10 @@ def filter_genes_by_cell_count(
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
     return_counts: bool = False,
+    verbose: int | bool = True,
 ) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
     """Return a boolean mask selecting genes expressed in at least ``min_cells`` cells.
-    
+
     Parameters
     ----------
     data
@@ -500,7 +547,9 @@ def filter_genes_by_cell_count(
         Number of cells to process per chunk.
     return_counts
         If True, return (mask, counts) tuple instead of just mask.
-        
+    verbose
+        Print how many genes passed filtering, and warn if fewer than half did.
+
     Returns
     -------
     mask or (mask, counts)
@@ -526,6 +575,14 @@ def filter_genes_by_cell_count(
         backed.file.close()
     
     mask = counts >= min_cells
+    n_vars = int(counts.size)
+    if n_vars > 0:
+        kept = int(mask.sum())
+        _messages.print_done(
+            verbose, "pp.filter_genes", f"{kept}/{n_vars} genes kept ({100 * kept / n_vars:.0f}%)",
+        )
+        _warn_if_heavily_filtered("pp.filter_genes", kept, n_vars, kind="genes")
+
     if return_counts:
         return mask, counts
     return mask
@@ -610,6 +667,7 @@ def _filter_genes_with_cache(
     chunk_size: int = 2048,
     output_path: Path | None = None,
     cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+    verbose: int | bool = True,
 ) -> _GeneFilterResult:
     """Compute gene mask and cache CSR data in a single matrix pass.
     
@@ -707,42 +765,46 @@ def _filter_genes_with_cache(
         data_dtype: np.dtype | None = None
         row_offset = 0
         chunk_idx = 0
-        
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
-            local_cell_mask = cell_mask[slc]
-            if not np.any(local_cell_mask):
-                continue
-            
-            selected = block[local_cell_mask]
-            csr = _ensure_csr(selected)
-            
-            # Cache the full CSR data for this chunk (before gene filtering)
-            if chunk_cache is not None:
-                chunk_cache.write_chunk(
-                    chunk_idx,
-                    data=csr.data.copy(),
-                    indices=csr.indices.copy(),
-                    indptr_diff=np.diff(csr.indptr),
-                    n_cols=n_vars,
-                )
-            
-            # Apply gene mask and compute nnz
-            if gene_indices.size:
-                filtered = csr[:, gene_indices]
-            else:
-                filtered = csr[:, []]
-            
-            filtered_csr = _ensure_csr(filtered)
-            counts = np.diff(filtered_csr.indptr)
-            size = counts.size
-            row_nnz[row_offset : row_offset + size] = counts
-            total_nnz += int(filtered_csr.nnz)
-            
-            if data_dtype is None and csr.nnz:
-                data_dtype = csr.data.dtype
-            
-            row_offset += size
-            chunk_idx += 1
+        n_chunks = (n_obs + chunk_size - 1) // chunk_size
+
+        with _create_progress_context(n_chunks, "pp.qc_summary (gene filter)", verbose, unit="chunk") as pbar:
+            for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+                local_cell_mask = cell_mask[slc]
+                if not np.any(local_cell_mask):
+                    pbar.update(1)
+                    continue
+
+                selected = block[local_cell_mask]
+                csr = _ensure_csr(selected)
+
+                # Cache the full CSR data for this chunk (before gene filtering)
+                if chunk_cache is not None:
+                    chunk_cache.write_chunk(
+                        chunk_idx,
+                        data=csr.data.copy(),
+                        indices=csr.indices.copy(),
+                        indptr_diff=np.diff(csr.indptr),
+                        n_cols=n_vars,
+                    )
+
+                # Apply gene mask and compute nnz
+                if gene_indices.size:
+                    filtered = csr[:, gene_indices]
+                else:
+                    filtered = csr[:, []]
+
+                filtered_csr = _ensure_csr(filtered)
+                counts = np.diff(filtered_csr.indptr)
+                size = counts.size
+                row_nnz[row_offset : row_offset + size] = counts
+                total_nnz += int(filtered_csr.nnz)
+
+                if data_dtype is None and csr.nnz:
+                    data_dtype = csr.data.dtype
+
+                row_offset += size
+                chunk_idx += 1
+                pbar.update(1)
     finally:
         backed.file.close()
     
@@ -768,6 +830,7 @@ def _filter_genes_dense_optimized(
     gene_mask: np.ndarray,
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
+    verbose: int | bool = True,
 ) -> _GeneFilterResult:
     """Optimized gene filtering for dense-stored datasets.
     
@@ -813,37 +876,41 @@ def _filter_genes_dense_optimized(
         total_nnz = 0
         data_dtype: np.dtype | None = None
         row_offset = 0
-        
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
-            local_cell_mask = cell_mask[slc]
-            if not np.any(local_cell_mask):
-                continue
-            
-            selected = block[local_cell_mask]
-            
-            # Apply gene filter
-            if gene_indices.size:
-                filtered = selected[:, gene_indices]
-            else:
-                filtered = selected[:, []]
-            
-            # Vectorized nnz counting - works for both dense and sparse
-            if sp.issparse(filtered):
-                counts = np.asarray(filtered.getnnz(axis=1)).ravel()
-                chunk_nnz = int(filtered.nnz)
-                if data_dtype is None and filtered.nnz:
-                    data_dtype = filtered.data.dtype
-            else:
-                # Dense: count non-zeros per row without CSR conversion
-                counts = np.count_nonzero(filtered, axis=1)
-                chunk_nnz = int(counts.sum())
-                if data_dtype is None:
-                    data_dtype = filtered.dtype
-            
-            size = counts.size
-            row_nnz[row_offset : row_offset + size] = counts
-            total_nnz += chunk_nnz
-            row_offset += size
+        n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
+
+        with _create_progress_context(n_chunks, "pp.qc_summary (gene filter)", verbose, unit="chunk") as pbar:
+            for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+                local_cell_mask = cell_mask[slc]
+                if not np.any(local_cell_mask):
+                    pbar.update(1)
+                    continue
+
+                selected = block[local_cell_mask]
+
+                # Apply gene filter
+                if gene_indices.size:
+                    filtered = selected[:, gene_indices]
+                else:
+                    filtered = selected[:, []]
+
+                # Vectorized nnz counting - works for both dense and sparse
+                if sp.issparse(filtered):
+                    counts = np.asarray(filtered.getnnz(axis=1)).ravel()
+                    chunk_nnz = int(filtered.nnz)
+                    if data_dtype is None and filtered.nnz:
+                        data_dtype = filtered.data.dtype
+                else:
+                    # Dense: count non-zeros per row without CSR conversion
+                    counts = np.count_nonzero(filtered, axis=1)
+                    chunk_nnz = int(counts.sum())
+                    if data_dtype is None:
+                        data_dtype = filtered.dtype
+
+                size = counts.size
+                row_nnz[row_offset : row_offset + size] = counts
+                total_nnz += chunk_nnz
+                row_offset += size
+                pbar.update(1)
     finally:
         backed.file.close()
     
@@ -1019,6 +1086,7 @@ def _qc_column_oriented(
     gene_name_column: str | None,
     chunk_size: int,
     output_path: Path,
+    verbose: int | bool = True,
 ) -> QualityControlResult:
     """Column-oriented QC for large CSC datasets (Option B).
     
@@ -1069,21 +1137,24 @@ def _qc_column_oriented(
     genes_per_cell = np.zeros(n_obs, dtype=np.int64)
     cells_per_gene_all = np.zeros(n_vars, dtype=np.int64)
     
+    n_col_chunks = (n_vars + chunk_size - 1) // chunk_size
     backed = read_backed(path)
     try:
-        for col_start in range(0, n_vars, chunk_size):
-            col_end = min(col_start + chunk_size, n_vars)
-            # Column slice is O(1) for CSC
-            block = backed.X[:, col_start:col_end]
-            
-            if sp.issparse(block):
-                # Per-row nnz for this column chunk
-                genes_per_cell += np.asarray(block.getnnz(axis=1)).ravel()
-                # Per-column nnz
-                cells_per_gene_all[col_start:col_end] = np.asarray(block.getnnz(axis=0)).ravel()
-            else:
-                genes_per_cell += np.count_nonzero(block, axis=1)
-                cells_per_gene_all[col_start:col_end] = np.count_nonzero(block, axis=0)
+        with _create_progress_context(n_col_chunks, "pp.qc_summary (pass 1)", verbose, unit="chunk") as pbar:
+            for col_start in range(0, n_vars, chunk_size):
+                col_end = min(col_start + chunk_size, n_vars)
+                # Column slice is O(1) for CSC
+                block = backed.X[:, col_start:col_end]
+
+                if sp.issparse(block):
+                    # Per-row nnz for this column chunk
+                    genes_per_cell += np.asarray(block.getnnz(axis=1)).ravel()
+                    # Per-column nnz
+                    cells_per_gene_all[col_start:col_end] = np.asarray(block.getnnz(axis=0)).ravel()
+                else:
+                    genes_per_cell += np.count_nonzero(block, axis=1)
+                    cells_per_gene_all[col_start:col_end] = np.count_nonzero(block, axis=0)
+                pbar.update(1)
     finally:
         backed.file.close()
     
@@ -1107,14 +1178,16 @@ def _qc_column_oriented(
         # Subtract counts from removed cells using column-oriented pass
         backed = read_backed(path)
         try:
-            for col_start in range(0, n_vars, chunk_size):
-                col_end = min(col_start + chunk_size, n_vars)
-                block = backed.X[:, col_start:col_end]
-                selected = block[removed_cells]
-                if sp.issparse(selected):
-                    cells_per_gene_all[col_start:col_end] -= np.asarray(selected.getnnz(axis=0)).ravel()
-                else:
-                    cells_per_gene_all[col_start:col_end] -= np.count_nonzero(selected, axis=0)
+            with _create_progress_context(n_col_chunks, "pp.qc_summary (pass 2)", verbose, unit="chunk") as pbar:
+                for col_start in range(0, n_vars, chunk_size):
+                    col_end = min(col_start + chunk_size, n_vars)
+                    block = backed.X[:, col_start:col_end]
+                    selected = block[removed_cells]
+                    if sp.issparse(selected):
+                        cells_per_gene_all[col_start:col_end] -= np.asarray(selected.getnnz(axis=0)).ravel()
+                    else:
+                        cells_per_gene_all[col_start:col_end] -= np.count_nonzero(selected, axis=0)
+                    pbar.update(1)
         finally:
             backed.file.close()
     
@@ -1161,6 +1234,7 @@ def _qc_row_oriented(
     output_path: Path,
     cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
     delta_threshold: float = 0.3,
+    verbose: int | bool = True,
 ) -> QualityControlResult:
     """Row-oriented streaming QC for large CSR/dense datasets.
     
@@ -1280,6 +1354,7 @@ def _qc_row_oriented(
             gene_mask=gene_mask,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
+            verbose=verbose,
         )
         chunk_cache = None
     else:
@@ -1293,6 +1368,7 @@ def _qc_row_oriented(
             chunk_size=chunk_size,
             output_path=output_path,
             cache_mode=cache_mode,
+            verbose=verbose,
         )
         chunk_cache = gene_filter_result.chunk_cache
     
@@ -1613,7 +1689,7 @@ def quality_control_summary(
     cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
     delta_threshold: float = 0.3,
     force_streaming: bool = False,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
 ) -> QualityControlResult:
     """Run QC with automatic strategy selection for optimal performance.
     
@@ -1673,8 +1749,7 @@ def quality_control_summary(
         is None), and QC statistics.
     """
     path = resolve_data_path(data)
-    if int(verbose) >= 1:
-        print(f"[cx] qc.quality_control: Reading {path}")
+    _messages.print_reading(verbose, "pp.qc_summary", path)
     
     # Read metadata and resolve control label
     backed = read_backed(path)
@@ -1723,16 +1798,19 @@ def quality_control_summary(
         estimated_memory_gb = file_size_gb * 4
     
     # Determine chunk size for streaming paths
+    _chunk_size_auto = chunk_size is None
     if chunk_size is None:
         chunk_size = calculate_optimal_chunk_size(
             n_obs, n_vars, available_memory_gb=memory_limit_gb
         )
-    
+
     # Handle output_dir=None and output_path=None: return masks only without writing output
     if output_dir is None and output_path is None:
         logger.info("output_dir is None, returning QC masks without writing filtered h5ad")
-        if int(verbose) >= 1:
-            print("[cx] qc.quality_control: output_dir=None and output_path=None — returning masks only (no file written)")
+        _messages.vprint(
+            verbose, "pp.qc_summary",
+            "output_dir=None and output_path=None — returning masks only (no file written)",
+        )
         return _qc_masks_only(
             path,
             min_genes=min_genes,
@@ -1751,8 +1829,7 @@ def quality_control_summary(
         path, suffix="filtered", output_dir=output_dir, data_name=data_name,
         output_path=output_path,
     )
-    if int(verbose) >= 1:
-        print(f"[cx] qc.quality_control: Saving → {filtered_path}")
+    _messages.print_saving(verbose, "pp.qc_summary", filtered_path)
     
     # Common kwargs for all strategies
     common_kwargs = {
@@ -1771,13 +1848,16 @@ def quality_control_summary(
     # On a 128 GB node this allows in-memory QC for files up to ~12.5 GB
     # (estimated_memory = file_size × 4 < 50 GB → file < 12.5 GB).
     _in_memory_threshold_gb = min(memory_limit_gb * 0.6, 50.0)
+    _chunk_note = f", chunk_size={chunk_size} (auto)" if _chunk_size_auto else ""
     if not force_streaming and estimated_memory_gb < _in_memory_threshold_gb:
         # Option A: In-memory for small datasets
         logger.info(
             f"Using in-memory QC (estimated: {estimated_memory_gb:.1f}GB, threshold: {_in_memory_threshold_gb:.1f}GB)"
         )
-        if int(verbose) >= 1:
-            print(f"[cx] qc.quality_control: Strategy — in-memory ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
+        _messages.vprint(
+            verbose, "pp.qc_summary",
+            f"Strategy — in-memory ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)",
+        )
         result = _qc_in_memory(path, **common_kwargs)
     
     elif storage_format == 'csc':
@@ -1785,34 +1865,49 @@ def quality_control_summary(
         logger.info(
             f"Using column-oriented streaming QC (CSC format, {file_size_gb:.2f}GB)"
         )
-        if int(verbose) >= 1:
-            print(f"[cx] qc.quality_control: Strategy — column-streaming ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
-        result = _qc_column_oriented(path, chunk_size=chunk_size, **common_kwargs)
+        _messages.vprint(
+            verbose, "pp.qc_summary",
+            f"Strategy — column-streaming ({file_size_gb:.1f} GB, estimated "
+            f"{estimated_memory_gb:.1f} GB in memory{_chunk_note})",
+        )
+        result = _qc_column_oriented(path, chunk_size=chunk_size, verbose=verbose, **common_kwargs)
     
     else:
         # Row-oriented streaming for large CSR/dense
         logger.info(
             f"Using row-oriented streaming QC ({storage_format} format, {file_size_gb:.2f}GB)"
         )
-        if int(verbose) >= 1:
-            print(f"[cx] qc.quality_control: Strategy — row-streaming ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)")
+        _messages.vprint(
+            verbose, "pp.qc_summary",
+            f"Strategy — row-streaming ({file_size_gb:.1f} GB, estimated "
+            f"{estimated_memory_gb:.1f} GB in memory{_chunk_note})",
+        )
         result = _qc_row_oriented(
             path,
             chunk_size=chunk_size,
             cache_mode=cache_mode,
             delta_threshold=delta_threshold,
+            verbose=verbose,
             **common_kwargs,
         )
 
-    if int(verbose) >= 1:
-        n_obs_in = int(result.cell_mask.sum())
-        n_vars_in = int(result.gene_mask.sum())
-        pct_cells = 100 * n_obs_in / n_obs if n_obs else 0
-        pct_genes = 100 * n_vars_in / n_vars if n_vars else 0
-        print(
-            f"[cx] qc.quality_control: Done  "
-            f"{n_obs_in}/{n_obs} cells kept ({pct_cells:.0f}%), "
-            f"{n_vars_in}/{n_vars} genes kept ({pct_genes:.0f}%)"
-        )
+    n_obs_in = int(result.cell_mask.sum())
+    n_vars_in = int(result.gene_mask.sum())
+    n_perts_total = len(result.perturbation_keep)
+    n_perts_in = sum(result.perturbation_keep.values())
+    pct_cells = 100 * n_obs_in / n_obs if n_obs else 0
+    pct_genes = 100 * n_vars_in / n_vars if n_vars else 0
+    message = (
+        f"{n_obs_in}/{n_obs} cells kept ({pct_cells:.0f}%), "
+        f"{n_vars_in}/{n_vars} genes kept ({pct_genes:.0f}%)"
+    )
+    if n_perts_total:
+        pct_perts = 100 * n_perts_in / n_perts_total
+        message += f", {n_perts_in}/{n_perts_total} perturbations kept ({pct_perts:.0f}%)"
+    _messages.print_done(verbose, "pp.qc_summary", message)
+
+    _warn_if_heavily_filtered("pp.qc_summary", n_obs_in, n_obs, kind="cells")
+    _warn_if_heavily_filtered("pp.qc_summary", n_vars_in, n_vars, kind="genes")
+    _warn_if_heavily_filtered("pp.qc_summary", n_perts_in, n_perts_total, kind="perturbations")
     return result
 

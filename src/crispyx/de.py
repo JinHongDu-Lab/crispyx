@@ -90,6 +90,7 @@ from ._checkpoint import (
     _create_progress_context,
     _DummyProgress,
 )
+from . import _messages
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _should_use_streaming
@@ -926,7 +927,7 @@ def t_test(
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
@@ -1066,6 +1067,7 @@ def t_test(
                 backed.n_obs, backed.n_vars,
                 available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, "t_test", f"cell_chunk_size={cell_chunk_size} (auto)")
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -1194,11 +1196,12 @@ def t_test(
 
     candidate_indices = {label: i for i, label in enumerate(candidates)}
 
-    warn_if_disk_space_low(
+    _t_test_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(*shape, itemsize=8) * 3 + estimate_bytes(*shape, itemsize=4) * 4,
         tempfile.gettempdir(),
         context="t_test intermediate arrays",
     )
+    _messages.print_disk_estimate(verbose, "t_test", _t_test_disk_estimate)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         stat_memmap = np.memmap(tmp_path / "statistics.dat", mode="w+", dtype=np.float64, shape=shape)
@@ -1524,7 +1527,7 @@ def nb_glm_test(
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     scanpy_format: bool = False,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     profiling: bool = False,
     # ---- Resume/Memory parameters ----
     resume: bool = False,
@@ -1906,7 +1909,8 @@ def nb_glm_test(
             n_groups=len(candidates),
             memory_limit_gb=memory_limit_gb,
         )
-    
+        _messages.vprint(verbose, "nb_glm_test", f"chunk_size={chunk_size} (auto)")
+
     # For per_comparison size factors, we skip the expensive global computation
     # since size factors will be recomputed per-comparison anyway.
     # We use dummy size factors here (will be overwritten per-comparison).
@@ -2779,12 +2783,13 @@ def nb_glm_test(
     # Create index mappings
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
-    warn_if_disk_space_low(
+    _nb_glm_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(n_groups, n_genes, itemsize=8) * 11
         + estimate_bytes(n_groups, n_genes, itemsize=4) * 3,
         tempfile.gettempdir(),
         context="nb_glm_test intermediate arrays",
     )
+    _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
 
@@ -3735,12 +3740,13 @@ def _wilcoxon_test_streaming(
         np.zeros((n_groups, n_genes), dtype=np.float32),  # placeholder X, will be overwritten
         obs=obs, var=var,
     )
-    warn_if_disk_space_low(
+    _wilcoxon_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(n_groups, n_genes, itemsize=8) * 6
         + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
         output_path,
         context="wilcoxon_test (streaming) output",
     )
+    _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
     scaffold.write(output_path)
     del scaffold
     gc.collect()
@@ -4144,12 +4150,13 @@ def _wilcoxon_test_stratified(
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
 
-    warn_if_disk_space_low(
+    _wilcoxon_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(n_groups, n_genes, itemsize=8) * 5
         + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
         tempfile.gettempdir(),
         context="wilcoxon_test (stratified) intermediate arrays",
     )
+    _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
@@ -4183,9 +4190,10 @@ def _wilcoxon_test_stratified(
             n_batches = len(_batch_uniques)
             n_excluded = int((batch_codes < 0).sum())
             if n_excluded > 0:
-                warnings.warn(
+                _messages.warn(
+                    "wilcoxon_test",
                     f"{n_excluded} cells have a missing '{batch_column}' value and are "
-                    "excluded from the batch-stratified Wilcoxon test.",
+                    "excluded from the batch-stratified test.",
                     stacklevel=2,
                 )
             if n_batches < 1:
@@ -4260,10 +4268,11 @@ def _wilcoxon_test_stratified(
             if n_untestable_perts:
                 example_idx = np.where(untestable_pert_mask)[0][:5]
                 examples = [str(candidates[i]) for i in example_idx]
-                warnings.warn(
+                _messages.warn(
+                    "wilcoxon_test",
                     f"{n_untestable_perts} perturbation(s) have no batches "
                     "containing both perturbation and control cells; stratified "
-                    "Wilcoxon rank statistics for these perturbations will be "
+                    "rank statistics for these perturbations will be "
                     f"set to NaN. Examples: {examples}",
                     stacklevel=2,
                 )
@@ -4629,7 +4638,7 @@ def wilcoxon_test(
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
-    verbose: int | bool = False,
+    verbose: int | bool = True,
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
@@ -4804,6 +4813,7 @@ def wilcoxon_test(
                 backed.n_obs, backed.n_vars,
                 available_memory_gb=memory_limit_gb,
             )
+            _messages.vprint(verbose, "wilcoxon_test", f"chunk_size={chunk_size} (auto)")
     finally:
         backed.file.close()
 
@@ -4885,6 +4895,10 @@ def wilcoxon_test(
     # in Python heap and skips malloc_trim, leading to 20-35 GB peaks for mid-size
     # datasets like Feng-gwsnf (4,955 groups × 32,373 genes).
     if use_streaming and group_batch_size < n_groups:
+        _messages.vprint(
+            verbose, "wilcoxon_test",
+            f"Strategy — streaming (batch_size={group_batch_size})",
+        )
         return _wilcoxon_test_streaming(
             path,
             gene_symbols=gene_symbols,
@@ -4913,7 +4927,8 @@ def wilcoxon_test(
     # =========================================================================
     # Standard single-pass path (unchanged for small/medium datasets)
     # =========================================================================
-    
+    _messages.vprint(verbose, "wilcoxon_test", "Strategy — single-pass")
+
     # For wilcoxon, we track gene chunk progress (not perturbation progress)
     # Resume logic: read checkpoint to get last completed gene chunk
     last_completed_chunk = -1
@@ -4927,12 +4942,13 @@ def wilcoxon_test(
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
 
-    warn_if_disk_space_low(
+    _wilcoxon_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(n_groups, n_genes, itemsize=8) * 5
         + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
         tempfile.gettempdir(),
         context="wilcoxon_test intermediate arrays",
     )
+    _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
@@ -5304,6 +5320,7 @@ def shrink_lfc(
     batch_size: int = 128,
     profiling: bool = False,
     memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
 ) -> RankGenesGroupsResult:
     """Apply apeGLM log-fold change shrinkage to existing NB-GLM results.
     
@@ -5383,7 +5400,9 @@ def shrink_lfc(
         limits the number of parallel ``n_jobs`` so that joblib workers stay
         within the budget. When ``None`` (default), detects available system
         memory via ``psutil``.
-    
+    verbose
+        Print basic progress/completion messages. Defaults to ``True``.
+
     Returns
     -------
     RankGenesGroupsResult
@@ -5763,12 +5782,15 @@ def shrink_lfc(
         output_dir = Path(output_dir)
 
     output_path = output_dir / f"{data_name}.h5ad"
-    warn_if_disk_space_low(
+    _shrink_lfc_disk_estimate = warn_if_disk_space_low(
         estimate_bytes(n_groups, n_genes, len(adata.layers) + 1, overhead=1.10),
         output_path,
         context="shrink_lfc",
     )
+    _messages.print_disk_estimate(verbose, "shrink_lfc", _shrink_lfc_disk_estimate)
+    _messages.print_saving(verbose, "shrink_lfc", output_path)
     adata.write(output_path)
+    _messages.print_done(verbose, "shrink_lfc", f"{n_groups} perturbations × {n_genes} genes (method={method!r})")
     
     # Build result object
     corr_method = adata.uns.get("pvalue_correction", "benjamini-hochberg")
