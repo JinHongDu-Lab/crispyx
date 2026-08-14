@@ -123,7 +123,6 @@ HPC / SLURM tips
   be preempted.
 * ``drop_file_cache()`` is called automatically to prevent cgroup-cached
   pages from counting toward memory limits.
-* See ``benchmarking/singularity/`` for SLURM submission scripts.
 
 My DE result is loaded instantly on the second call — is that expected?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

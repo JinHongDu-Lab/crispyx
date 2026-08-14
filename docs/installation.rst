@@ -72,10 +72,3 @@ Verifying the installation
    # Quick check: open a dataset without loading into memory
    adata = cx.read_h5ad_ondisk("data/demo_benchmark.h5ad")
    print(adata)
-
-Docker and Singularity
-----------------------
-
-For HPC environments, pre-built container images are available. See
-:doc:`benchmarking` and the ``benchmarking/singularity/`` directory for
-Dockerfile and Singularity definition files.

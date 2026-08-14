@@ -58,9 +58,8 @@ Loading data
 
 Use :func:`crispyx.read_h5ad_ondisk` to open a dataset without
 materialising the expression matrix and print the first few rows of metadata.
-A synthetic demo dataset can be generated via
-``python benchmarking/generate_demo_dataset.py`` and stored at
-``data/demo_benchmark.h5ad``. The returned :class:`cx.AnnData` object keeps a
+The examples below assume a dataset at ``data/demo_benchmark.h5ad``; substitute
+the path to your own ``.h5ad`` file. The returned :class:`cx.AnnData` object keeps a
 backed AnnData handle alive lazily and automatically closes it when the wrapper
 is garbage collected. Explicitly call ``adata.close()`` to release the file as
 soon as you finish the preview.
@@ -784,19 +783,6 @@ using the ``resume`` and ``checkpoint_interval`` parameters:
 If interrupted, simply re-run the same command - completed perturbations will
 be skipped automatically. The checkpoint file ``<output>_progress.json`` is
 written atomically to prevent corruption.
-
-Benchmarking
-------------
-
-The ``benchmarking`` directory ships with a reusable script that measures time
-and memory usage across the main methods:
-
-.. code-block:: bash
-
-   cd benchmarking
-   ./run_benchmark.sh config/Adamson.yaml
-
-See :doc:`benchmarking` for configuration options and output structure.
 
 Data Preparation Utilities
 --------------------------

@@ -214,14 +214,11 @@ AGENTS.md
 .vscode/
 
 tutorial_outputs/
-/benchmarking/**/.*
-benchmarking/**/*.h5ad
-benchmarking/**/*.csv
-benchmarking/results/**.json
-benchmarking/results/Adamson_subset_fixed
+# benchmarking/ lives on another branch; keep it out of this one even if
+# regenerated locally.
+/benchmarking/
 data/
 yida\ wang/
 
 /tex
 /plan
-/benchmarking/logs

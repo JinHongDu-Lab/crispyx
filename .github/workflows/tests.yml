@@ -28,4 +28,4 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run tests
-        run: pytest --tb=short --ignore=tests/test_benchmarking.py
+        run: pytest --tb=short

@@ -8,10 +8,10 @@ crispyx vs Scanpy
 -----------------
 
 **Summary:** crispyx produces identical results to Scanpy for t-test and
-Wilcoxon differential expression (Pearson *r* > 0.9999), but uses 2–43×
-less time and 2–6× less memory by streaming from disk instead of loading the
-full count matrix into RAM. These figures assume adequate scratch disk; see
-:ref:`disk-space` in the usage guide.
+Wilcoxon differential expression (Pearson *r* > 0.9999), but uses substantially
+less time and memory by streaming from disk instead of loading the full count
+matrix into RAM. This assumes adequate scratch disk; see :ref:`disk-space` in
+the usage guide.
 
 When to use crispyx instead of Scanpy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -51,26 +51,13 @@ Example: Wilcoxon DE on a large screen
 The crispyx result for logfoldchanges, scores, and p-values matches Scanpy
 with Pearson *r* > 0.9999 across all tested datasets.
 
-Performance comparison
-~~~~~~~~~~~~~~~~~~~~~~~
-
-+--------------------+-----------------------+------------------------+
-| Dataset            | crispyx Wilcoxon      | Scanpy Wilcoxon        |
-+====================+=======================+========================+
-| Adamson (65K cells)| 123 s, 3.2 GB peak    | 1305 s, 3.3 GB peak    |
-+--------------------+-----------------------+------------------------+
-| Feng-gwsf (321K)   | 10761 s, 17.2 GB peak | timeout (>9 hours)     |
-+--------------------+-----------------------+------------------------+
-| Feng-gwsnf (1.97M) | completes             | timeout / OOM          |
-+--------------------+-----------------------+------------------------+
-
 crispyx vs Pertpy / PyDESeq2
 -----------------------------
 
-**Summary:** crispyx's NB-GLM is approximately 2× faster than Pertpy/PyDESeq2
-and uses substantially less memory. On genome-wide datasets, Pertpy/PyDESeq2
-typically exceeds 120 GB peak memory or fails outright; crispyx completes
-within 64 GB. Pearson *r* > 0.97 vs PyDESeq2 for log-fold-change estimates.
+**Summary:** crispyx's NB-GLM is substantially faster than Pertpy/PyDESeq2
+and uses substantially less memory, completing genome-wide datasets where
+Pertpy/PyDESeq2 typically exceeds available memory or fails outright.
+Log-fold-change estimates match PyDESeq2 closely (Pearson *r* > 0.97).
 
 When to use crispyx NB-GLM instead of Pertpy/PyDESeq2
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -105,26 +92,13 @@ Example: NB-GLM DE with crispyx
        memory_limit_gb=32,
    )
 
-Performance comparison (NB-GLM)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-+----------------------+-------------------+---------------------------+
-| Dataset              | crispyx NB-GLM    | Pertpy/PyDESeq2           |
-+======================+===================+===========================+
-| Adamson (65K cells)  | 2472 s, 3.5 GB    | 5318 s, 33.8 GB           |
-+----------------------+-------------------+---------------------------+
-| Feng-gwsf (321K)     | completes         | memory limit (>124 GB)    |
-+----------------------+-------------------+---------------------------+
-| Feng-gwsnf (1.97M)   | completes         | memory limit / fails      |
-+----------------------+-------------------+---------------------------+
-
 crispyx vs edgeR
 -----------------
 
 **Summary:** edgeR (via rpy2) times out or errors on most large CRISPR screen
-datasets tested in the benchmark. crispyx completes all 12 tested datasets.
-edgeR remains the standard for bulk RNA-seq and small pseudobulk experiments;
-for large perturbation screens with many groups, crispyx is more practical.
+datasets. crispyx completes reliably at that scale. edgeR remains the
+standard for bulk RNA-seq and small pseudobulk experiments; for large
+perturbation screens with many groups, crispyx is more practical.
 
 When to use edgeR instead of crispyx
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -151,6 +125,5 @@ Limitations of crispyx
 See also
 --------
 
-- :doc:`benchmarking` — full benchmark results and reproduction instructions
 - :doc:`usage` — complete workflow examples
 - :doc:`faq` — troubleshooting and common questions
