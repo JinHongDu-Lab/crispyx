@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os as _os
 import re as _re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Sequence
@@ -397,19 +398,35 @@ def read_backed(path: str | Path) -> ad.AnnData:
 # -----------------------------------------------------------------------------
 
 
-def write_obsm_to_h5ad(path: str | Path, key: str, data: np.ndarray) -> None:
+@contextmanager
+def _h5ad_write_handle(path_or_file: "str | Path | h5py.File") -> Iterator[h5py.File]:
+    """Yield an open-for-write h5py.File, accepting either a path or an
+    already-open handle.
+
+    Lets a caller writing many obsm/varm/obsp/varp keys in a loop open the
+    destination once and pass the handle through, instead of every
+    ``write_*_to_h5ad`` call reopening the same file.
+    """
+    if isinstance(path_or_file, h5py.File):
+        yield path_or_file
+    else:
+        with h5py.File(path_or_file, "r+") as f:
+            yield f
+
+
+def write_obsm_to_h5ad(path: "str | Path | h5py.File", key: str, data: np.ndarray) -> None:
     """Write a dense array to obsm/{key} in an h5ad file.
-    
+
     Parameters
     ----------
     path
-        Path to the h5ad file.
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
     key
         Key under obsm (e.g., 'X_pca').
     data
         Dense numpy array of shape (n_obs, n_dims).
     """
-    with h5py.File(path, "r+") as f:
+    with _h5ad_write_handle(path) as f:
         if "obsm" not in f:
             f.create_group("obsm")
         obsm = f["obsm"]
@@ -420,19 +437,19 @@ def write_obsm_to_h5ad(path: str | Path, key: str, data: np.ndarray) -> None:
         ds.attrs["encoding-version"] = "0.2.0"
 
 
-def write_varm_to_h5ad(path: str | Path, key: str, data: np.ndarray) -> None:
+def write_varm_to_h5ad(path: "str | Path | h5py.File", key: str, data: np.ndarray) -> None:
     """Write a dense array to varm/{key} in an h5ad file.
-    
+
     Parameters
     ----------
     path
-        Path to the h5ad file.
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
     key
         Key under varm (e.g., 'PCs').
     data
         Dense numpy array of shape (n_vars, n_dims).
     """
-    with h5py.File(path, "r+") as f:
+    with _h5ad_write_handle(path) as f:
         if "varm" not in f:
             f.create_group("varm")
         varm = f["varm"]
@@ -507,36 +524,107 @@ def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
             _write_value(grp, k, v)
 
 
-def write_obsp_to_h5ad(path: str | Path, key: str, data: sp.spmatrix) -> None:
+def write_obsp_to_h5ad(path: "str | Path | h5py.File", key: str, data: sp.spmatrix) -> None:
     """Write a sparse matrix to obsp/{key} in an h5ad file.
-    
+
     Stores in CSR format following AnnData conventions.
-    
+
     Parameters
     ----------
     path
-        Path to the h5ad file.
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
     key
         Key under obsp (e.g., 'distances', 'connectivities').
     data
         Sparse matrix of shape (n_obs, n_obs).
     """
+    _write_pairwise_matrix_to_h5ad(path, "obsp", key, data)
+
+
+def write_varp_to_h5ad(path: "str | Path | h5py.File", key: str, data: sp.spmatrix) -> None:
+    """Write a sparse matrix to varp/{key} in an h5ad file.
+
+    Stores in CSR format following AnnData conventions.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
+    key
+        Key under varp (e.g., a gene-gene network/correlation matrix).
+    data
+        Sparse matrix of shape (n_vars, n_vars).
+    """
+    _write_pairwise_matrix_to_h5ad(path, "varp", key, data)
+
+
+def _write_pairwise_matrix_to_h5ad(
+    path: "str | Path | h5py.File", group_name: str, key: str, data: sp.spmatrix
+) -> None:
     csr = sp.csr_matrix(data)
-    
-    with h5py.File(path, "r+") as f:
-        if "obsp" not in f:
-            f.create_group("obsp")
-        obsp = f["obsp"]
-        if key in obsp:
-            del obsp[key]
-        
-        grp = obsp.create_group(key)
+
+    with _h5ad_write_handle(path) as f:
+        if group_name not in f:
+            f.create_group(group_name)
+        parent = f[group_name]
+        if key in parent:
+            del parent[key]
+
+        grp = parent.create_group(key)
         grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
         grp.attrs["encoding-version"] = np.bytes_("0.1.0")
         grp.attrs["shape"] = np.array(csr.shape, dtype=np.int64)
         grp.create_dataset("data", data=csr.data, compression="gzip", compression_opts=4)
         grp.create_dataset("indices", data=csr.indices)
         grp.create_dataset("indptr", data=csr.indptr)
+
+
+def _copy_extra_slots(
+    output_path: "str | Path",
+    *,
+    backed: ad.AnnData,
+    obsm_keys: Sequence[str],
+    varm_keys: Sequence[str],
+    obsp_keys: Sequence[str],
+    varp_keys: Sequence[str],
+    cell_mask: np.ndarray | None,
+    gene_mask: np.ndarray | None,
+) -> None:
+    """Copy obsm/varm/obsp/varp from an open backed source AnnData into
+    ``output_path``, subsetting by ``cell_mask``/``gene_mask`` when given
+    (``None`` means "copy unchanged", i.e. cell/gene identity doesn't
+    change -- the case for :func:`downsample_counts`).
+
+    Shared by :func:`write_filtered_subset` and :func:`downsample_counts` so
+    the two don't independently re-implement (and risk drifting out of sync
+    on) the same slot-preservation logic. All keys are written through one
+    shared file handle rather than one open/close per key.
+    """
+    if not (obsm_keys or varm_keys or obsp_keys or varp_keys):
+        return
+    with h5py.File(output_path, "r+") as f:
+        for key in obsm_keys:
+            arr = np.asarray(backed.obsm[key])
+            if cell_mask is not None:
+                arr = arr[cell_mask]
+            write_obsm_to_h5ad(f, key, arr)
+        for key in varm_keys:
+            arr = np.asarray(backed.varm[key])
+            if gene_mask is not None:
+                arr = arr[gene_mask]
+            write_varm_to_h5ad(f, key, arr)
+        for key in obsp_keys:
+            mat = backed.obsp[key]
+            mat = mat.tocsr() if sp.issparse(mat) else np.asarray(mat)
+            if cell_mask is not None:
+                mat = mat[cell_mask][:, cell_mask]
+            write_obsp_to_h5ad(f, key, mat)
+        for key in varp_keys:
+            mat = backed.varp[key]
+            mat = mat.tocsr() if sp.issparse(mat) else np.asarray(mat)
+            if gene_mask is not None:
+                mat = mat[gene_mask][:, gene_mask]
+            write_varp_to_h5ad(f, key, mat)
 
 
 def resolve_data_path(
@@ -808,12 +896,19 @@ def iter_matrix_chunks(
     axis: int = 0,
     chunk_size: int = 1024,
     convert_to_dense: bool = True,
+    matrix: np.ndarray | sp.spmatrix | None = None,
 ) -> Iterator[tuple[slice, np.ndarray | sp.spmatrix]]:
-    """Yield chunks of the expression matrix."""
+    """Yield chunks of ``matrix`` (defaults to ``adata.X``).
+
+    Pass e.g. ``matrix=adata.layers[key]`` to stream a layer with the same
+    chunking and slow-axis-format dispatch used for ``X``.
+    """
 
     if axis not in (0, 1):
         raise ValueError("axis must be 0 (rows) or 1 (columns)")
-    fmt = _detect_backed_sparse_format(adata.X)
+    if matrix is None:
+        matrix = adata.X
+    fmt = _detect_backed_sparse_format(matrix)
     if (fmt == "csc" and axis == 0) or (fmt == "csr" and axis == 1):
         _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
@@ -821,9 +916,9 @@ def iter_matrix_chunks(
     for start in range(0, length, chunk_size):
         end = min(start + chunk_size, length)
         if axis == 0:
-            block = adata.X[start:end]
+            block = matrix[start:end]
         else:
-            block = adata.X[:, start:end]
+            block = matrix[:, start:end]
         if convert_to_dense:
             block = _to_dense(block)
         yield slice(start, end), block
@@ -950,6 +1045,209 @@ def _extract_csr_components_dense(
     return data, indices, row_nnz, total_nnz
 
 
+def _stream_write_matrix_subset(
+    source_path: Path,
+    *,
+    read_matrix,
+    dest_group: str,
+    cell_mask: np.ndarray,
+    gene_indices: np.ndarray,
+    n_obs: int,
+    n_vars: int,
+    output_path: Path,
+    chunk_size: int,
+    row_nnz: np.ndarray | None = None,
+    total_nnz: int | None = None,
+    data_dtype: np.dtype | None = None,
+    chunk_cache: Any = None,
+) -> None:
+    """Stream one CSR-shaped matrix (``X`` or a layer) filtered by
+    ``cell_mask``/``gene_indices`` into ``dest_group`` of ``output_path``.
+
+    ``read_matrix`` extracts the source matrix from a freshly-opened backed
+    AnnData (``lambda b: b.X`` or ``lambda b: b.layers[key]``). Shared by
+    ``write_filtered_subset`` for ``X`` (where a ``chunk_cache`` from
+    ``qc.py``'s gene-filter pass can skip re-reading the source) and for each
+    ``layers`` key (which always re-reads, since that cache is keyed to ``X``
+    only).
+    """
+    need_counting_pass = row_nnz is None or total_nnz is None or data_dtype is None
+
+    if need_counting_pass:
+        row_nnz = np.zeros(n_obs, dtype=np.int64)
+        total_nnz = 0
+        data_dtype_local: np.dtype | None = None
+
+        backed = read_backed(source_path)
+        try:
+            matrix = read_matrix(backed)
+            row_offset = 0
+            for slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
+            ):
+                local_mask = cell_mask[slc]
+                if not np.any(local_mask):
+                    continue
+                block = block[local_mask]
+                if gene_indices.size:
+                    block = block[:, gene_indices]
+                else:
+                    block = block[:, []]
+                csr = _ensure_csr(block)
+                counts = np.diff(csr.indptr)
+                size = counts.size
+                row_nnz[row_offset : row_offset + size] = counts
+                total_nnz += int(csr.nnz)
+                if data_dtype_local is None and csr.nnz:
+                    data_dtype_local = csr.data.dtype
+                row_offset += size
+        finally:
+            backed.file.close()
+
+        if data_dtype_local is None:
+            data_dtype_local = np.float32
+        data_dtype = data_dtype_local
+
+    warn_if_disk_space_low(
+        estimate_sparse_output_bytes(total_nnz), output_path,
+        context=f"write_filtered_subset ({dest_group})",
+    )
+
+    with h5py.File(output_path, "r+", libver='latest') as dest:
+        if dest_group in dest:
+            del dest[dest_group]
+        grp = dest.create_group(dest_group)
+        grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+
+        if n_obs == 0 or n_vars == 0:
+            grp.create_dataset("data", shape=(0,), dtype=data_dtype)
+            grp.create_dataset("indices", shape=(0,), dtype=np.int32)
+            grp.create_dataset("indptr", data=np.zeros(n_obs + 1, dtype=np.int64))
+            grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+            return
+
+        indptr = np.zeros(n_obs + 1, dtype=np.int64)
+        np.cumsum(row_nnz, out=indptr[1:])
+
+        # Phase 2 I/O Optimization: Use larger HDF5 chunks and write buffering
+        # Optimal chunk size: balance between I/O overhead and cache efficiency
+        # Target ~1MB chunks for data (assuming float32 = 4 bytes -> ~256K elements)
+        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))  # 8K to 256K elements
+
+        # Write buffer size: accumulate data before writing to reduce I/O syscalls
+        write_buffer_size = hdf5_chunk_size * 2  # Buffer 2x chunk size before flushing
+
+        # Use explicit chunk sizes for better I/O performance
+        data_ds = grp.create_dataset(
+            "data",
+            shape=(total_nnz,),
+            dtype=data_dtype,
+            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+        )
+        indices_ds = grp.create_dataset(
+            "indices",
+            shape=(total_nnz,),
+            dtype=np.int32,
+            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+        )
+        grp.create_dataset("indptr", data=indptr)
+        grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+
+        # Stream data with write buffering
+        if chunk_cache is not None:
+            # Read from cached CSR chunks (avoids re-reading the original matrix)
+            offset = 0
+            data_buffer = []
+            indices_buffer = []
+            buffer_nnz = 0
+
+            for filtered_data, filtered_indices, n_cells in chunk_cache.iter_filtered_chunks(
+                gene_indices, data_dtype
+            ):
+                nnz = len(filtered_data)
+                if nnz:
+                    data_buffer.append(filtered_data)
+                    indices_buffer.append(filtered_indices)
+                    buffer_nnz += nnz
+
+                    # Flush buffer when it exceeds threshold
+                    if buffer_nnz >= write_buffer_size:
+                        combined_data = np.concatenate(data_buffer)
+                        combined_indices = np.concatenate(indices_buffer)
+                        data_ds[offset : offset + buffer_nnz] = combined_data
+                        indices_ds[offset : offset + buffer_nnz] = combined_indices
+                        offset += buffer_nnz
+                        data_buffer = []
+                        indices_buffer = []
+                        buffer_nnz = 0
+
+            # Flush remaining buffer
+            if buffer_nnz > 0:
+                combined_data = np.concatenate(data_buffer)
+                combined_indices = np.concatenate(indices_buffer)
+                data_ds[offset : offset + buffer_nnz] = combined_data
+                indices_ds[offset : offset + buffer_nnz] = combined_indices
+        else:
+            # Read from source matrix (fallback when cache not available)
+            backed = read_backed(source_path)
+            try:
+                matrix = read_matrix(backed)
+                offset = 0
+                data_buffer = []
+                indices_buffer = []
+                buffer_nnz = 0
+
+                for slc, block in iter_matrix_chunks(
+                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
+                ):
+                    local_mask = cell_mask[slc]
+                    if not np.any(local_mask):
+                        continue
+                    block = block[local_mask]
+                    if gene_indices.size:
+                        block = block[:, gene_indices]
+                    else:
+                        block = block[:, []]
+
+                    # Use optimized extraction for dense, scipy for sparse
+                    if sp.issparse(block):
+                        csr = _ensure_csr(block, dtype=data_dtype)
+                        chunk_data = csr.data
+                        chunk_indices = csr.indices.astype(np.int32, copy=False)
+                        nnz = int(csr.nnz)
+                    else:
+                        # Dense: use numba-accelerated direct extraction
+                        chunk_data, chunk_indices, _row_nnz, nnz = _extract_csr_components_dense(
+                            block, data_dtype
+                        )
+
+                    if nnz:
+                        data_buffer.append(chunk_data)
+                        indices_buffer.append(chunk_indices)
+                        buffer_nnz += nnz
+
+                        # Flush buffer when it exceeds threshold
+                        if buffer_nnz >= write_buffer_size:
+                            combined_data = np.concatenate(data_buffer)
+                            combined_indices = np.concatenate(indices_buffer)
+                            data_ds[offset : offset + buffer_nnz] = combined_data
+                            indices_ds[offset : offset + buffer_nnz] = combined_indices
+                            offset += buffer_nnz
+                            data_buffer = []
+                            indices_buffer = []
+                            buffer_nnz = 0
+
+                # Flush remaining buffer
+                if buffer_nnz > 0:
+                    combined_data = np.concatenate(data_buffer)
+                    combined_indices = np.concatenate(indices_buffer)
+                    data_ds[offset : offset + buffer_nnz] = combined_data
+                    indices_ds[offset : offset + buffer_nnz] = combined_indices
+            finally:
+                backed.file.close()
+
+
 def write_filtered_subset(
     source_path: str | Path,
     *,
@@ -964,7 +1262,17 @@ def write_filtered_subset(
     chunk_cache: Any = None,
 ) -> None:
     """Stream a filtered AnnData view to disk without materialising ``X``.
-    
+
+    Every slot is carried through the filter, not just ``X``/``obs``/``var``:
+    ``layers`` are streamed the same way as ``X`` (chunked, never fully
+    materialised); ``obsm``/``varm``/``obsp``/``varp``/``uns`` are copied in
+    memory (they are small relative to ``X`` — dense embeddings, sparse
+    cell-cell/gene-gene graphs, or global metadata) and subset on whichever
+    axis applies (``obsm``/``obsp`` by ``cell_mask``, ``varm``/``varp`` by
+    ``gene_mask``). A source ``.raw`` is not copied — a warning is emitted
+    instead, since regenerating it from the source is the caller's
+    responsibility.
+
     Parameters
     ----------
     source_path
@@ -980,15 +1288,16 @@ def write_filtered_subset(
     var_assignments
         Optional dict of column assignments for var DataFrame.
     row_nnz
-        Optional pre-computed non-zero counts per row. When provided along
-        with total_nnz and data_dtype, skips the counting pass.
+        Optional pre-computed non-zero counts per row for ``X``. When
+        provided along with total_nnz and data_dtype, skips ``X``'s counting
+        pass (layers always run their own counting pass).
     total_nnz
-        Optional pre-computed total non-zero count.
+        Optional pre-computed total non-zero count for ``X``.
     data_dtype
-        Optional pre-computed data type for the sparse matrix.
+        Optional pre-computed data type for ``X``'s sparse matrix.
     chunk_cache
         Optional _ChunkCache object from qc module. When provided, reads
-        CSR data from cache instead of re-reading the source matrix.
+        ``X``'s CSR data from cache instead of re-reading the source matrix.
     """
 
     source_path = Path(source_path)
@@ -1013,195 +1322,86 @@ def write_filtered_subset(
                         f"Length mismatch for column '{key}': expected {var.shape[0]}, received {len(values)}"
                     )
                 var[key] = np.asarray(values)
+        uns = dict(backed.uns)
+        layer_keys = list(backed.layers.keys())
+        obsm_keys = list(backed.obsm.keys())
+        varm_keys = list(backed.varm.keys())
+        obsp_keys = list(backed.obsp.keys())
+        varp_keys = list(backed.varp.keys())
+        has_raw = backed.raw is not None
     finally:
         backed.file.close()
+
+    if has_raw:
+        _messages.warn(
+            "write_filtered_subset",
+            "source AnnData has a `.raw` layer; it is not copied to the "
+            "filtered/subsampled output. Regenerate it from the source file "
+            "separately if you need it.",
+        )
 
     n_obs = int(cell_mask.sum())
     n_vars = int(gene_mask.sum())
 
     gene_indices = np.flatnonzero(gene_mask)
 
-    # Use pre-computed values if all three are provided, otherwise compute
+    # Use pre-computed X values if all three are provided, otherwise compute
     need_counting_pass = row_nnz is None or total_nnz is None or data_dtype is None
-    
+    x_data_dtype = data_dtype
     if need_counting_pass:
-        row_nnz = np.zeros(n_obs, dtype=np.int64)
-        total_nnz = 0
-        data_dtype_local: np.dtype | None = None
+        # _stream_write_matrix_subset will compute these; a placeholder dtype
+        # is still needed for the initial ad.AnnData(...).write() below.
+        x_data_dtype = None
+    placeholder_dtype = x_data_dtype if x_data_dtype is not None else np.float32
 
-        backed = read_backed(source_path)
-        try:
-            row_offset = 0
-            for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
-                local_mask = cell_mask[slc]
-                if not np.any(local_mask):
-                    continue
-                block = block[local_mask]
-                if gene_indices.size:
-                    block = block[:, gene_indices]
-                else:
-                    block = block[:, []]
-                csr = _ensure_csr(block)
-                counts = np.diff(csr.indptr)
-                size = counts.size
-                row_nnz[row_offset : row_offset + size] = counts
-                total_nnz += int(csr.nnz)
-                if data_dtype_local is None and csr.nnz:
-                    data_dtype_local = csr.data.dtype
-                row_offset += size
-        finally:
-            backed.file.close()
-        
-        if data_dtype_local is None:
-            data_dtype_local = np.float32
-        data_dtype = data_dtype_local
-
-    warn_if_disk_space_low(
-        estimate_sparse_output_bytes(total_nnz), output_path,
-        context="write_filtered_subset",
-    )
-    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=data_dtype)
-    adata = ad.AnnData(placeholder, obs=obs, var=var)
+    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=placeholder_dtype)
+    adata = ad.AnnData(placeholder, obs=obs, var=var, uns=uns)
     adata.write(output_path)
 
-    if n_obs == 0 or n_vars == 0:
-        with h5py.File(output_path, "r+", libver='latest') as dest:
-            if "X" in dest:
-                del dest["X"]
-            grp = dest.create_group("X")
-            grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
-            grp.attrs["encoding-version"] = np.bytes_("0.1.0")
-            grp.create_dataset("data", shape=(0,), dtype=data_dtype)
-            grp.create_dataset("indices", shape=(0,), dtype=np.int32)
-            grp.create_dataset("indptr", data=np.zeros(n_obs + 1, dtype=np.int64))
-            grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
-        return
+    _stream_write_matrix_subset(
+        source_path,
+        read_matrix=lambda b: b.X,
+        dest_group="X",
+        cell_mask=cell_mask,
+        gene_indices=gene_indices,
+        n_obs=n_obs,
+        n_vars=n_vars,
+        output_path=output_path,
+        chunk_size=chunk_size,
+        row_nnz=row_nnz,
+        total_nnz=total_nnz,
+        data_dtype=data_dtype,
+        chunk_cache=chunk_cache,
+    )
 
-    indptr = np.zeros(n_obs + 1, dtype=np.int64)
-    np.cumsum(row_nnz, out=indptr[1:])
-
-    # Phase 2 I/O Optimization: Use larger HDF5 chunks and write buffering
-    # Optimal chunk size: balance between I/O overhead and cache efficiency
-    # Target ~1MB chunks for data (assuming float32 = 4 bytes -> ~256K elements)
-    hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))  # 8K to 256K elements
-    
-    # Write buffer size: accumulate data before writing to reduce I/O syscalls
-    write_buffer_size = hdf5_chunk_size * 2  # Buffer 2x chunk size before flushing
-
-    with h5py.File(output_path, "r+", libver='latest') as dest:
-        if "X" in dest:
-            del dest["X"]
-        grp = dest.create_group("X")
-        grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
-        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
-        
-        # Use explicit chunk sizes for better I/O performance
-        data_ds = grp.create_dataset(
-            "data", 
-            shape=(total_nnz,), 
-            dtype=data_dtype, 
-            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+    for key in layer_keys:
+        _stream_write_matrix_subset(
+            source_path,
+            read_matrix=(lambda b, _key=key: b.layers[_key]),
+            dest_group=f"layers/{key}",
+            cell_mask=cell_mask,
+            gene_indices=gene_indices,
+            n_obs=n_obs,
+            n_vars=n_vars,
+            output_path=output_path,
+            chunk_size=chunk_size,
         )
-        indices_ds = grp.create_dataset(
-            "indices", 
-            shape=(total_nnz,), 
-            dtype=np.int32, 
-            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
-        )
-        grp.create_dataset("indptr", data=indptr)
-        grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        # Stream data with write buffering
-        if chunk_cache is not None:
-            # Read from cached CSR chunks (avoids re-reading the original matrix)
-            offset = 0
-            data_buffer = []
-            indices_buffer = []
-            buffer_nnz = 0
-            
-            for filtered_data, filtered_indices, n_cells in chunk_cache.iter_filtered_chunks(
-                gene_indices, data_dtype
-            ):
-                nnz = len(filtered_data)
-                if nnz:
-                    data_buffer.append(filtered_data)
-                    indices_buffer.append(filtered_indices)
-                    buffer_nnz += nnz
-                    
-                    # Flush buffer when it exceeds threshold
-                    if buffer_nnz >= write_buffer_size:
-                        combined_data = np.concatenate(data_buffer)
-                        combined_indices = np.concatenate(indices_buffer)
-                        data_ds[offset : offset + buffer_nnz] = combined_data
-                        indices_ds[offset : offset + buffer_nnz] = combined_indices
-                        offset += buffer_nnz
-                        data_buffer = []
-                        indices_buffer = []
-                        buffer_nnz = 0
-            
-            # Flush remaining buffer
-            if buffer_nnz > 0:
-                combined_data = np.concatenate(data_buffer)
-                combined_indices = np.concatenate(indices_buffer)
-                data_ds[offset : offset + buffer_nnz] = combined_data
-                indices_ds[offset : offset + buffer_nnz] = combined_indices
-        else:
-            # Read from source matrix (fallback when cache not available)
-            backed = read_backed(source_path)
-            try:
-                offset = 0
-                data_buffer = []
-                indices_buffer = []
-                buffer_nnz = 0
-                
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-                ):
-                    local_mask = cell_mask[slc]
-                    if not np.any(local_mask):
-                        continue
-                    block = block[local_mask]
-                    if gene_indices.size:
-                        block = block[:, gene_indices]
-                    else:
-                        block = block[:, []]
-                    
-                    # Use optimized extraction for dense, scipy for sparse
-                    if sp.issparse(block):
-                        csr = _ensure_csr(block, dtype=data_dtype)
-                        chunk_data = csr.data
-                        chunk_indices = csr.indices.astype(np.int32, copy=False)
-                        nnz = int(csr.nnz)
-                    else:
-                        # Dense: use numba-accelerated direct extraction
-                        chunk_data, chunk_indices, _row_nnz, nnz = _extract_csr_components_dense(
-                            block, data_dtype
-                        )
-                    
-                    if nnz:
-                        data_buffer.append(chunk_data)
-                        indices_buffer.append(chunk_indices)
-                        buffer_nnz += nnz
-                        
-                        # Flush buffer when it exceeds threshold
-                        if buffer_nnz >= write_buffer_size:
-                            combined_data = np.concatenate(data_buffer)
-                            combined_indices = np.concatenate(indices_buffer)
-                            data_ds[offset : offset + buffer_nnz] = combined_data
-                            indices_ds[offset : offset + buffer_nnz] = combined_indices
-                            offset += buffer_nnz
-                            data_buffer = []
-                            indices_buffer = []
-                            buffer_nnz = 0
-                
-                # Flush remaining buffer
-                if buffer_nnz > 0:
-                    combined_data = np.concatenate(data_buffer)
-                    combined_indices = np.concatenate(indices_buffer)
-                    data_ds[offset : offset + buffer_nnz] = combined_data
-                    indices_ds[offset : offset + buffer_nnz] = combined_indices
-            finally:
-                backed.file.close()
+    if obsm_keys or varm_keys or obsp_keys or varp_keys:
+        backed = read_backed(source_path)
+        try:
+            _copy_extra_slots(
+                output_path,
+                backed=backed,
+                obsm_keys=obsm_keys,
+                varm_keys=varm_keys,
+                obsp_keys=obsp_keys,
+                varp_keys=varp_keys,
+                cell_mask=cell_mask,
+                gene_mask=gene_mask,
+            )
+        finally:
+            backed.file.close()
 
 
 def normalize_total_log1p(
@@ -1225,7 +1425,12 @@ def normalize_total_log1p(
     
     The output is written as a sparse CSR matrix. This is the streaming equivalent
     of calling ``scanpy.pp.normalize_total`` followed by ``scanpy.pp.log1p``.
-    
+
+    Only ``X`` is transformed. ``layers``/``obsm``/``varm``/``obsp``/``varp``/
+    ``uns`` are carried through unchanged (cell/gene identity, order, and
+    count never change here), same as :func:`write_filtered_subset` and
+    :func:`downsample_counts`; a source ``.raw`` is dropped with a warning.
+
     Parameters
     ----------
     data
@@ -1381,11 +1586,18 @@ def _normalize_total_log1p_impl(
         var = backed.var.copy()
         obs.index = obs.index.astype(str)
         var.index = var.index.astype(str)
-        
+        uns = dict(backed.uns)
+        layer_keys = list(backed.layers.keys())
+        obsm_keys = list(backed.obsm.keys())
+        varm_keys = list(backed.varm.keys())
+        obsp_keys = list(backed.obsp.keys())
+        varp_keys = list(backed.varp.keys())
+        has_raw = backed.raw is not None
+
         # Count non-zeros per row (after normalization, same sparsity as input)
         row_nnz = np.zeros(n_obs, dtype=np.int64)
         total_nnz = 0
-        
+
         row_offset = 0
         for slc, block in iter_matrix_chunks(
             backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
@@ -1397,14 +1609,47 @@ def _normalize_total_log1p_impl(
             row_offset += len(counts)
     finally:
         backed.file.close()
-    
+
+    if has_raw:
+        _messages.warn(
+            "pp.normalize_total_log1p",
+            "source AnnData has a `.raw` layer; it is not copied to the "
+            "normalized output. Regenerate it from the source file "
+            "separately if you need it.",
+        )
+
+    def _copy_slots() -> None:
+        if layer_keys:
+            with h5py.File(source_path, "r") as src, h5py.File(output_path, "r+") as dst:
+                dst_layers = dst.require_group("layers")
+                for key in layer_keys:
+                    if key in dst_layers:
+                        del dst_layers[key]
+                    src.copy(src[f"layers/{key}"], dst_layers, name=key)
+        if obsm_keys or varm_keys or obsp_keys or varp_keys:
+            backed_slots = read_backed(source_path)
+            try:
+                _copy_extra_slots(
+                    output_path,
+                    backed=backed_slots,
+                    obsm_keys=obsm_keys,
+                    varm_keys=varm_keys,
+                    obsp_keys=obsp_keys,
+                    varp_keys=varp_keys,
+                    cell_mask=None,
+                    gene_mask=None,
+                )
+            finally:
+                backed_slots.file.close()
+
     if total_nnz == 0:
         # Empty matrix: write placeholder
         placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
-        adata = ad.AnnData(placeholder, obs=obs, var=var)
+        adata = ad.AnnData(placeholder, obs=obs, var=var, uns=uns)
         adata.write(output_path)
-        return output_path
-    
+        _copy_slots()
+        return AnnData(output_path)
+
     # Choose consistent index dtype for both indptr and indices.
     # scipy requires indptr and indices to share the same integer dtype;
     # mixed int32/int64 triggers "Output dtype not compatible" in scipy >= 1.15.
@@ -1413,15 +1658,15 @@ def _normalize_total_log1p_impl(
     # Compute indptr
     indptr = np.zeros(n_obs + 1, dtype=idx_dtype)
     np.cumsum(row_nnz, out=indptr[1:])
-    
+
     # HDF5 chunk sizing
     hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
-    
+
     # Create output file with placeholder
     placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
-    adata = ad.AnnData(placeholder, obs=obs, var=var)
+    adata = ad.AnnData(placeholder, obs=obs, var=var, uns=uns)
     adata.write(output_path)
-    
+
     # Second pass: normalize, log1p, and write
     with h5py.File(output_path, "r+", libver='latest') as dest:
         if "X" in dest:
@@ -1488,11 +1733,304 @@ def _normalize_total_log1p_impl(
                     offset += nnz
         finally:
             backed.file.close()
-    
+
+    _copy_slots()
+
     _messages.print_done(verbose, "pp.normalize_total_log1p", f"{n_obs} cells × {n_vars} genes")
 
     return AnnData(output_path)
 
+
+def _row_seeds(random_state: int, n_obs: int) -> np.ndarray:
+    """Deterministic per-row uint64 seeds for :func:`downsample_counts`.
+
+    A vectorized splitmix64-style bit mix rather than one ``hashlib`` call per
+    row (as ``_grouping._group_seed`` uses for per-*group* seeds) -- with up
+    to millions of rows, a Python-level hash call per row would dominate
+    runtime. Being a pure function of ``(random_state, row_index)``, the
+    result -- and therefore each row's thinning -- is independent of
+    chunk_size and chunk iteration order.
+
+    Kept at the full 64-bit splitmix64 output (not truncated to 32 bits):
+    at the "hundreds of thousands to millions of cells" scale this function
+    targets, a 32-bit seed space collides between distinct rows often enough
+    to give them bit-identical thinning draws (birthday bound), which breaks
+    the documented per-cell independence of the sampling.
+    """
+    z = np.arange(n_obs, dtype=np.uint64)
+    z += np.uint64(0x9E3779B97F4A7C15) + (np.uint64(random_state) << np.uint64(1))
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    z = z ^ (z >> np.uint64(31))
+    return z
+
+
+def _thin_csr_chunk(indptr: np.ndarray, data: np.ndarray, target: int, seeds: np.ndarray) -> None:
+    """In-place exact thinning of a CSR chunk, without replacement.
+
+    For each row whose total exceeds ``target``, draws a new per-gene count
+    vector summing to ``target`` via ``Generator.multivariate_hypergeometric``
+    -- the same distribution scanpy's ``downsample_counts(..., replace=False)``
+    draws via its own choice/searchsorted decomposition
+    (``scanpy.preprocessing._simple._downsample_array``), but as a single
+    library call per row instead of a hand-rolled cumsum/choice/searchsorted/
+    bincount sequence.
+
+    ``seeds[r]`` seeds a fresh ``Generator`` for row ``r``, so results depend
+    only on each row's own seed, not on how rows are grouped into chunks.
+    """
+    n_rows = indptr.shape[0] - 1
+    for r in range(n_rows):
+        start, end = indptr[r], indptr[r + 1]
+        row = data[start:end]
+        total = int(row.sum())
+        if total <= target:
+            continue
+        rng = np.random.default_rng(int(seeds[r]))
+        row[:] = rng.multivariate_hypergeometric(row, target)
+
+
+def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> None:
+    """Raise if a chunk's values don't look like non-negative integer counts.
+
+    :func:`downsample_counts` casts ``X`` to int64 and thins it; running it
+    on already-normalized/log1p data would silently truncate fractional
+    values instead of raising, and (since normalized values are typically
+    far below any reasonable ``counts_per_cell``) mostly no-op.
+    """
+    values = chunk.data if sp.issparse(chunk) else np.asarray(chunk)
+    if values.size == 0:
+        return
+    if np.any(values < 0):
+        raise ValueError(
+            f"{context}: X contains negative values. downsample_counts requires "
+            "non-negative integer counts, not normalized/log-transformed data."
+        )
+    if not np.all(np.isclose(values, np.round(values))):
+        raise ValueError(
+            f"{context}: X contains non-integer values. downsample_counts requires "
+            "raw integer counts -- run it before cx.pp.normalize_total_log1p, not after."
+        )
+
+
+def downsample_counts(
+    data: str | Path | "AnnData" | ad.AnnData,
+    output_path: str | Path | None = None,
+    *,
+    counts_per_cell: int,
+    chunk_size: int = 4096,
+    data_name: str | None = None,
+    random_state: int = 0,
+    verbose: int | bool = True,
+) -> "AnnData":
+    """Stream-thin every cell's counts down to at most ``counts_per_cell``.
+
+    This is the streaming, dependency-free equivalent of
+    ``scanpy.pp.downsample_counts(adata, counts_per_cell=..., replace=False)``:
+    a cell already at or below the target is left unchanged; a cell above it
+    has its counts thinned via exact sampling without replacement (see
+    :func:`_thin_csr_chunk`), never loading the full matrix into memory.
+
+    Unlike :func:`crispyx.pp.subsample`, this never changes *which* cells or
+    genes are present -- it thins the values within every surviving cell. Use
+    ``subsample`` first if you also want to reduce cell counts; the two are
+    independent, composable streaming passes.
+
+    Only ``X`` is thinned, matching ``scanpy.pp.downsample_counts``.
+    ``layers``/``obsm``/``varm``/``obsp``/``varp``/``uns`` are carried
+    through unchanged (cell/gene identity, order, and count never change
+    here, only the values in ``X``); a source ``.raw`` is dropped with a
+    warning, same as :func:`write_filtered_subset`. ``X`` must hold
+    non-negative integer counts.
+
+    Parameters
+    ----------
+    data
+        Path to source h5ad file, or a backed AnnData object.
+    output_path
+        Path for output h5ad file. If None, derived from ``data_name``.
+    counts_per_cell
+        Target total count per cell. Must be a positive integer.
+    chunk_size
+        Number of cells to process per chunk. Default 4096.
+    data_name
+        Custom name for output file.
+    random_state
+        Seed. Thinning is deterministic for a fixed seed and independent of
+        ``chunk_size``.
+    verbose
+        Print progress information.
+
+    Returns
+    -------
+    AnnData
+        Read-only AnnData wrapper pointing to the output file.
+    """
+    if not isinstance(counts_per_cell, (int, np.integer)) or counts_per_cell <= 0:
+        raise ValueError("counts_per_cell must be a positive integer")
+
+    source_path = resolve_data_path(data)
+    output_path = resolve_output_path(
+        source_path, suffix="downsample_counts", data_name=data_name, output_path=output_path,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _messages.print_saving(verbose, "pp.downsample_counts", output_path)
+
+    backed = read_backed(source_path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        obs = backed.obs.copy()
+        var = backed.var.copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
+        uns = dict(backed.uns)
+        layer_keys = list(backed.layers.keys())
+        obsm_keys = list(backed.obsm.keys())
+        varm_keys = list(backed.varm.keys())
+        obsp_keys = list(backed.obsp.keys())
+        varp_keys = list(backed.varp.keys())
+        has_raw = backed.raw is not None
+        # Only the first chunk is checked -- same lightweight heuristic
+        # de.py's t_test/wilcoxon_test use for the opposite check (that data
+        # looks normalized, not raw). A cell above counts_per_cell whose data
+        # isn't actually raw counts would otherwise be silently truncated to
+        # int64 and thinned instead of raising.
+        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+            _validate_counts_chunk(chunk, context="pp.downsample_counts")
+            break
+    finally:
+        backed.file.close()
+
+    if has_raw:
+        _messages.warn(
+            "pp.downsample_counts",
+            "source AnnData has a `.raw` layer; it is not copied to the "
+            "downsampled output. Regenerate it from the source file "
+            "separately if you need it.",
+        )
+
+    storage_format = get_matrix_storage_format(source_path)
+    if storage_format == "dense":
+        total_nnz_bound = n_obs * n_vars
+        with h5py.File(source_path, "r") as f:
+            x_obj = f["X"]
+            src_dtype = x_obj.dtype if isinstance(x_obj, h5py.Dataset) else x_obj["data"].dtype
+    else:
+        with h5py.File(source_path, "r") as f:
+            total_nnz_bound = f["X"]["data"].shape[0]
+            src_dtype = f["X"]["data"].dtype
+
+    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=src_dtype)
+    ad.AnnData(placeholder, obs=obs, var=var, uns=uns).write(output_path)
+
+    n_thinned = 0
+    if total_nnz_bound != 0:
+        warn_if_disk_space_low(
+            estimate_sparse_output_bytes(total_nnz_bound), output_path, context="pp.downsample_counts",
+        )
+        idx_dtype = np.int32 if total_nnz_bound <= np.iinfo(np.int32).max else np.int64
+        hdf5_chunk_size = min(262144, max(8192, total_nnz_bound // 16))
+        seeds = _row_seeds(random_state, n_obs)
+        row_nnz = np.zeros(n_obs, dtype=np.int64)
+
+        with h5py.File(output_path, "r+", libver="latest") as dest:
+            if "X" in dest:
+                del dest["X"]
+            grp = dest.create_group("X")
+            grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+            grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+
+            # Upper-bounded, resizable: downsampling only ever removes nonzeros,
+            # so the final size (known only after thinning) is <= total_nnz_bound.
+            # One streaming pass writes at the running offset; resize() at the
+            # end trims to the true final size -- no second pass over the source
+            # and no re-drawing the random thinning to "just count" it first.
+            data_ds = grp.create_dataset(
+                "data", shape=(total_nnz_bound,), maxshape=(total_nnz_bound,), dtype=src_dtype,
+                chunks=(hdf5_chunk_size,) if total_nnz_bound >= hdf5_chunk_size else None,
+            )
+            indices_ds = grp.create_dataset(
+                "indices", shape=(total_nnz_bound,), maxshape=(total_nnz_bound,), dtype=idx_dtype,
+                chunks=(hdf5_chunk_size,) if total_nnz_bound >= hdf5_chunk_size else None,
+            )
+
+            backed = read_backed(source_path)
+            try:
+                offset = 0
+                row_offset = 0
+                n_chunks = (n_obs + chunk_size - 1) // chunk_size
+                with _create_progress_context(n_chunks, "pp.downsample_counts", verbose, unit="chunk") as pbar:
+                    for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+                        csr = _ensure_csr(block)
+                        n_rows = csr.shape[0]
+                        chunk_seeds = seeds[row_offset : row_offset + n_rows]
+
+                        # The thinning kernel needs exact integer counts; work in
+                        # int64 regardless of the source's on-disk dtype (often
+                        # float32) and cast back only when writing out.
+                        row_totals_before = np.asarray(csr.sum(axis=1)).ravel()
+                        thinned = csr.data.astype(np.int64)
+                        _thin_csr_chunk(csr.indptr, thinned, int(counts_per_cell), chunk_seeds)
+                        n_thinned += int(np.count_nonzero(row_totals_before > counts_per_cell))
+
+                        keep = thinned > 0
+                        cum_keep = np.concatenate(([0], np.cumsum(keep)))
+                        row_nnz[row_offset : row_offset + n_rows] = np.diff(cum_keep[csr.indptr])
+
+                        kept_data = thinned[keep].astype(src_dtype, copy=False)
+                        kept_indices = csr.indices[keep].astype(idx_dtype, copy=False)
+                        nnz = kept_data.shape[0]
+                        if nnz:
+                            data_ds[offset : offset + nnz] = kept_data
+                            indices_ds[offset : offset + nnz] = kept_indices
+                            offset += nnz
+                        row_offset += n_rows
+                        pbar.update(1)
+            finally:
+                backed.file.close()
+
+            data_ds.resize((offset,))
+            indices_ds.resize((offset,))
+            indptr = np.zeros(n_obs + 1, dtype=idx_dtype)
+            np.cumsum(row_nnz, out=indptr[1:])
+            grp.create_dataset("indptr", data=indptr)
+            grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+
+    # layers/obsm/varm/obsp/varp are untouched by this transform (only X's
+    # counts are thinned; cell/gene identity, order, and count never change),
+    # but still need to be carried through explicitly since the output is a
+    # new file, not an in-place edit of the source. Layers are copied with a
+    # direct HDF5 object copy rather than _stream_write_matrix_subset: with
+    # an identity mask there is no filtering to do, so a native copy avoids
+    # paying for a counting pass plus a full re-serialize of every value.
+    if layer_keys:
+        with h5py.File(source_path, "r") as src, h5py.File(output_path, "r+") as dst:
+            dst_layers = dst.require_group("layers")
+            for key in layer_keys:
+                if key in dst_layers:
+                    del dst_layers[key]
+                src.copy(src[f"layers/{key}"], dst_layers, name=key)
+    if obsm_keys or varm_keys or obsp_keys or varp_keys:
+        backed = read_backed(source_path)
+        try:
+            _copy_extra_slots(
+                output_path,
+                backed=backed,
+                obsm_keys=obsm_keys,
+                varm_keys=varm_keys,
+                obsp_keys=obsp_keys,
+                varp_keys=varp_keys,
+                cell_mask=None,
+                gene_mask=None,
+            )
+        finally:
+            backed.file.close()
+
+    _messages.print_done(
+        verbose, "pp.downsample_counts",
+        f"{n_thinned}/{n_obs} cells thinned to <= {counts_per_cell} counts",
+    )
+    return AnnData(output_path)
 
 
 def convert_to_csc(

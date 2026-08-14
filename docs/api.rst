@@ -79,6 +79,14 @@ Quality control
    :undoc-members:
    :show-inheritance:
 
+Subsampling
+~~~~~~~~~~~
+
+.. automodule:: crispyx.sample
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Pseudo-bulk aggregation
 ~~~~~~~~~~~~~~~~~~~~~~~
 
