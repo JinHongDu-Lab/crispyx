@@ -1,6 +1,73 @@
 Changelog
 =========
 
+Version 0.1.0
+-------------
+
+*Released 2026-08-13.*
+
+* **New: ``cx.pp.subsample``** – streaming, stratified/cluster subsampling.
+  The mask is computed entirely from ``.obs`` metadata (no matrix pass
+  needed to decide which cells survive), then streamed out via the same
+  writer every other filtering function uses. ``groupby`` stratifies (one
+  column, several columns, or ``None`` for a single global stratum);
+  ``unit="cell"`` (default) draws individual cells, while passing an
+  ``obs`` column name instead (e.g. ``unit="batch"``) switches to cluster
+  sampling, where a chosen unit's cells are kept in full and an unchosen
+  unit's are dropped in full. ``n`` (exact count) or ``frac`` (proportion)
+  is drawn independently per stratum, matching
+  ``pandas.DataFrameGroupBy.sample(n=, frac=)`` semantics.
+  ``drop_insufficient`` controls what happens to a stratum smaller than the
+  requested count (drop it entirely by default, or keep it in full), and
+  every affected stratum is reported via a warning regardless of
+  ``verbose``. Sampling is deterministic for a fixed ``random_state`` and
+  independent of ``chunk_size``.
+* **New: ``cx.pp.downsample_counts``** – streaming, dependency-free
+  equivalent of ``scanpy.pp.downsample_counts(..., replace=False)``: thins
+  every cell's total count down to a target via exact sampling without
+  replacement (a cell already at or below the target is left unchanged).
+  Complements ``subsample`` on the orthogonal axis — ``subsample`` decides
+  *which cells* survive, ``downsample_counts`` decides *how many counts*
+  survive within a surviving cell. A single streaming pass with a
+  resizable HDF5 output avoids a separate counting pass over the source.
+* **Fix: filtered/subsampled/normalized outputs now keep every AnnData slot.**
+  ``write_filtered_subset`` — the shared streaming writer behind
+  ``cx.pp.filter_cells``, ``cx.pp.filter_genes``, ``cx.pp.filter_perturbations``,
+  ``cx.pp.qc_summary``, and the new ``cx.pp.subsample`` — previously wrote
+  only ``X``, ``obs``, and ``var``, silently dropping ``layers``, ``obsm``,
+  ``varm``, ``obsp``, ``varp``, and ``uns`` from every filtered output. It now
+  streams ``layers`` the same way as ``X`` and carries
+  ``obsm``/``varm``/``obsp``/``varp``/``uns`` through (subset on whichever axis
+  applies); a source ``.raw`` is not copied, and a warning says so instead of
+  the data silently disappearing. ``cx.pp.downsample_counts`` and
+  ``cx.pp.normalize_total_log1p`` carry the same slots through unchanged, with
+  the same ``.raw`` warning — including for an all-empty ``X``, which
+  previously skipped the slot copy-through entirely.
+* **Fix: ``cx.pp.downsample_counts`` per-cell thinning seed collisions.**
+  The per-row RNG seed was truncated to 32 bits, which collides often enough
+  at the "hundreds of thousands to millions of cells" scale this function
+  targets that distinct cells could draw bit-identical thinning outcomes.
+  Seeds now use the full 64-bit range, and the thinning kernel itself now
+  draws via ``numpy.random.Generator.multivariate_hypergeometric`` in one
+  call per row instead of a hand-rolled cumsum/choice/searchsorted/bincount
+  sequence.
+* **Fix: ``cx.pp.downsample_counts`` on dense-stored input.** A dense-stored
+  ``X`` was previously always cast to ``float32`` regardless of its actual
+  on-disk dtype (e.g. ``int32``); it's now read and preserved like the sparse
+  path already did. ``X`` must hold non-negative integer counts — non-count
+  (e.g. already-normalized) input now raises instead of being silently
+  truncated and mostly no-op'd.
+* **``write_filtered_subset`` is now exported at the top level**
+  (``crispyx.write_filtered_subset``), reflecting that it is already relied
+  on directly by real pipelines, not just an internal implementation
+  detail of the filtering functions above.
+* **Removed: ``compute_average_log_expression`` and
+  ``compute_pseudobulk_expression``** (and the ``cx.pb.average_log_expression`` /
+  ``cx.pb.pseudobulk`` namespace methods), deprecated in 0.0.9 with an explicit
+  promise to remove them in 0.1.0. Use ``compute_normalized_effects`` /
+  ``cx.pb.normalized_effects`` with ``method="mean_log1p"`` or
+  ``method="log_mean"`` respectively instead.
+
 Version 0.0.10
 --------------
 
