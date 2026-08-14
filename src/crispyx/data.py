@@ -1323,7 +1323,9 @@ def write_filtered_subset(
                     )
                 var[key] = np.asarray(values)
         uns = dict(backed.uns)
-        layer_keys = list(backed.layers.keys())
+        # anndata >= 0.13 exposes X itself as layers[None]; only real,
+        # named layers should be streamed/copied here.
+        layer_keys = [key for key in backed.layers.keys() if key is not None]
         obsm_keys = list(backed.obsm.keys())
         varm_keys = list(backed.varm.keys())
         obsp_keys = list(backed.obsp.keys())
@@ -1587,7 +1589,9 @@ def _normalize_total_log1p_impl(
         obs.index = obs.index.astype(str)
         var.index = var.index.astype(str)
         uns = dict(backed.uns)
-        layer_keys = list(backed.layers.keys())
+        # anndata >= 0.13 exposes X itself as layers[None]; only real,
+        # named layers should be streamed/copied here.
+        layer_keys = [key for key in backed.layers.keys() if key is not None]
         obsm_keys = list(backed.obsm.keys())
         varm_keys = list(backed.varm.keys())
         obsp_keys = list(backed.obsp.keys())
@@ -1884,7 +1888,9 @@ def downsample_counts(
         obs.index = obs.index.astype(str)
         var.index = var.index.astype(str)
         uns = dict(backed.uns)
-        layer_keys = list(backed.layers.keys())
+        # anndata >= 0.13 exposes X itself as layers[None]; only real,
+        # named layers should be streamed/copied here.
+        layer_keys = [key for key in backed.layers.keys() if key is not None]
         obsm_keys = list(backed.obsm.keys())
         varm_keys = list(backed.varm.keys())
         obsp_keys = list(backed.obsp.keys())
