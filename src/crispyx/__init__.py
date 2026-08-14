@@ -35,6 +35,7 @@ from .data import (
     convert_to_csr,
     detect_gene_symbol_column,
     detect_perturbation_column,
+    downsample_counts,
     ensure_gene_symbol_column,
     infer_columns,
     load_obs,
@@ -45,6 +46,7 @@ from .data import (
     read_backed,
     resolve_data_path,
     standardise_gene_names,
+    write_filtered_subset,
     write_obs,
     write_var,
 )
@@ -79,10 +81,8 @@ from .plotting import (
 from .pseudobulk import (
     PseudobulkMethod,
     aggregate_pseudobulk,
-    compute_average_log_expression,
     compute_normalized_effects,
     compute_pseudobulk_effects,
-    compute_pseudobulk_expression,
 )
 from .qc import (
     filter_cells_by_gene_count,
@@ -90,6 +90,7 @@ from .qc import (
     filter_perturbations_by_cell_count,
     quality_control_summary,
 )
+from .sample import subsample
 
 # ---------------------------------------------------------------------------
 # Scanpy-style namespace singletons: cx.pp, cx.pb, cx.tl, cx.pl
@@ -123,13 +124,13 @@ __all__ = [
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",
     "quality_control_summary",
+    # Subsampling
+    "subsample",
     # Pseudo-bulk
     "PseudobulkMethod",
     "aggregate_pseudobulk",
-    "compute_average_log_expression",
     "compute_normalized_effects",
     "compute_pseudobulk_effects",
-    "compute_pseudobulk_expression",
     # Generic batch statistics
     "BatchReducer",
     "BatchStatistic",
@@ -147,12 +148,14 @@ __all__ = [
     "read_backed",
     "resolve_data_path",
     "normalize_total_log1p",
+    "downsample_counts",
     "convert_to_csc",
     "convert_to_csr",
     "load_obs",
     "load_var",
     "write_obs",
     "write_var",
+    "write_filtered_subset",
     "standardise_gene_names",
     "normalise_perturbation_labels",
     "detect_perturbation_column",

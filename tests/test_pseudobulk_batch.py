@@ -20,10 +20,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
-from crispyx.pseudobulk import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
-)
+from crispyx.pseudobulk import compute_normalized_effects
 
 
 def _write(tmp_path, counts, perturbation, batch=None, name="data.h5ad"):
@@ -86,12 +83,14 @@ def test_single_batch_equivalence_avg_log(tmp_path):
     batch = ["only"] * 6
     path = _write(tmp_path, counts, perturbation, batch)
 
-    pooled = compute_average_log_expression(
+    pooled = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", output_path=tmp_path / "pooled.h5ad",
     ).to_memory()
-    batched = compute_average_log_expression(
+    batched = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "batched.h5ad",
     ).to_memory()
@@ -115,12 +114,14 @@ def test_single_batch_equivalence_pseudobulk(tmp_path):
     batch = ["only"] * 6
     path = _write(tmp_path, counts, perturbation, batch)
 
-    pooled = compute_pseudobulk_expression(
+    pooled = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", output_path=tmp_path / "pooled.h5ad",
     ).to_memory()
-    batched = compute_pseudobulk_expression(
+    batched = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "batched.h5ad",
     ).to_memory()
@@ -167,8 +168,9 @@ def test_batch_corrected_avg_log_matches_reference(batched_adata):
     perturbation = ["ctrl", "ctrl", "A", "A", "ctrl", "ctrl", "A", "A"]
     batch = ["b1", "b1", "b1", "b1", "b2", "b2", "b2", "b2"]
 
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
@@ -191,8 +193,9 @@ def test_batch_corrected_pseudobulk_matches_reference(batched_adata):
     perturbation = ["ctrl", "ctrl", "A", "A", "ctrl", "ctrl", "A", "A"]
     batch = ["b1", "b1", "b1", "b1", "b2", "b2", "b2", "b2"]
 
-    result = compute_pseudobulk_expression(
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
@@ -239,12 +242,14 @@ def test_batch_removes_confound(tmp_path):
     counts = np.vstack(rows).astype(float)
     path = _write(tmp_path, counts, perturbation, batch)
 
-    pooled = compute_pseudobulk_expression(
+    pooled = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", output_path=tmp_path / "pooled.h5ad",
     ).to_memory()
-    batched = compute_pseudobulk_expression(
+    batched = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "batched.h5ad",
     ).to_memory()
@@ -268,8 +273,9 @@ def test_missing_batch_column_raises(tmp_path):
     path = _write(tmp_path, counts, perturbation, batch=["b1", "b1", "b1", "b1"])
 
     with pytest.raises(KeyError):
-        compute_pseudobulk_expression(
+        compute_normalized_effects(
             path, perturbation_column="perturbation", control_label="ctrl",
+            method="log_mean",
             gene_name_column="gene_symbols", batch_column="does_not_exist",
             output_path=tmp_path / "out.h5ad",
         )
@@ -288,8 +294,9 @@ def test_batch_with_empty_pert_batch_skipped(tmp_path):
     batch = ["b1", "b1", "b1", "b1", "b2", "b2"]
     path = _write(tmp_path, counts, perturbation, batch)
 
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "out.h5ad",
     ).to_memory()
@@ -308,16 +315,18 @@ def test_no_shared_batch_raises(tmp_path):
     path = _write(tmp_path, counts, perturbation, batch)
 
     with pytest.raises(ValueError, match="shares no batch"):
-        compute_average_log_expression(
+        compute_normalized_effects(
             path, perturbation_column="perturbation", control_label="ctrl",
+            method="mean_log1p",
             gene_name_column="gene_symbols", batch_column="batch",
             output_path=tmp_path / "out.h5ad",
         )
 
 
 def test_uns_fields_written(batched_adata):
-    result = compute_pseudobulk_expression(
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
@@ -335,8 +344,9 @@ def test_no_batch_column_unchanged(tmp_path):
     perturbation = ["ctrl", "ctrl", "A", "A"]
     path = _write(tmp_path, counts, perturbation)
 
-    result = compute_pseudobulk_expression(
+    result = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", output_path=tmp_path / "out.h5ad",
     ).to_memory()
     assert "batch_column" not in result.uns
@@ -348,13 +358,15 @@ def test_no_batch_column_unchanged(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_namespace_passes_batch_column(batched_adata):
-    direct = compute_pseudobulk_expression(
+    direct = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "direct.h5ad",
     ).to_memory()
-    wrapped = cx.pb.pseudobulk(
+    wrapped = cx.pb.normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "wrapped.h5ad",
     ).to_memory()
@@ -366,31 +378,33 @@ def test_namespace_passes_batch_column(batched_adata):
 # ---------------------------------------------------------------------------
 
 def test_corrected_mean_consistency_avg_log(batched_adata):
-    """X == perturbation_mean - control_mean_matched (batch-corrected layers)."""
-    result = compute_average_log_expression(
+    """X == perturbation_profile - control_profile_matched (batch-corrected layers)."""
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
-    assert "control_mean_matched" in result.layers
-    recon = result.layers["perturbation_mean"] - result.layers["control_mean_matched"]
+    assert "control_profile_matched" in result.layers
+    recon = result.layers["perturbation_profile"] - result.layers["control_profile_matched"]
     np.testing.assert_allclose(result.X, recon, rtol=1e-10, atol=1e-12)
 
 
 def test_corrected_mean_consistency_pseudobulk(batched_adata):
-    """X == perturbation_bulk - control_bulk_matched (batch-corrected layers)."""
-    result = compute_pseudobulk_expression(
+    """X == perturbation_profile - control_profile_matched (batch-corrected layers)."""
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
-    assert "control_bulk_matched" in result.layers
-    recon = result.layers["perturbation_bulk"] - result.layers["control_bulk_matched"]
+    assert "control_profile_matched" in result.layers
+    recon = result.layers["perturbation_profile"] - result.layers["control_profile_matched"]
     np.testing.assert_allclose(result.X, recon, rtol=1e-10, atol=1e-12)
 
 
 def test_corrected_mean_matches_reference(batched_adata):
-    """Corrected perturbation_mean / control_mean_matched match an independent
+    """Corrected perturbation_profile / control_profile_matched match an independent
     per-batch harmonic-weight reference."""
     counts = np.array(
         [
@@ -402,8 +416,9 @@ def test_corrected_mean_matches_reference(batched_adata):
     perturbation = ["ctrl", "ctrl", "A", "A", "ctrl", "ctrl", "A", "A"]
     batch = ["b1", "b1", "b1", "b1", "b2", "b2", "b2", "b2"]
 
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         batched_adata, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=batched_adata.parent / "out.h5ad",
     ).to_memory()
@@ -430,13 +445,13 @@ def test_corrected_mean_matches_reference(batched_adata):
             tot += w
         return num / tot
 
-    np.testing.assert_allclose(result.layers["perturbation_mean"][0], weighted("pert"), rtol=1e-8, atol=1e-10)
-    np.testing.assert_allclose(result.layers["control_mean_matched"][0], weighted("ctrl"), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(result.layers["perturbation_profile"][0], weighted("pert"), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(result.layers["control_profile_matched"][0], weighted("ctrl"), rtol=1e-8, atol=1e-10)
 
 
 def test_single_batch_mean_equals_pooled(tmp_path):
-    """With one batch, corrected perturbation_mean equals the pooled mean and
-    control_mean_matched equals the pooled uns['control_mean']."""
+    """With one batch, corrected perturbation_profile equals the pooled profile
+    and control_profile_matched equals the pooled uns['control_profile']."""
     counts = np.array(
         [[1, 0, 3, 0], [0, 2, 1, 0], [4, 0, 0, 1], [3, 1, 0, 0], [0, 0, 2, 2], [1, 0, 1, 3]],
         dtype=float,
@@ -444,40 +459,44 @@ def test_single_batch_mean_equals_pooled(tmp_path):
     perturbation = ["ctrl", "ctrl", "A", "A", "B", "B"]
     path = _write(tmp_path, counts, perturbation, batch=["only"] * 6)
 
-    pooled = compute_average_log_expression(
+    pooled = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", output_path=tmp_path / "pooled.h5ad",
     ).to_memory()
-    batched = compute_average_log_expression(
+    batched = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "batched.h5ad",
     ).to_memory()
 
     np.testing.assert_allclose(
-        batched.layers["perturbation_mean"], pooled.layers["perturbation_mean"],
+        batched.layers["perturbation_profile"], pooled.layers["perturbation_profile"],
         rtol=1e-10, atol=1e-12,
     )
     # Single batch -> matched control equals the pooled control for every pert.
-    for row in batched.layers["control_mean_matched"]:
-        np.testing.assert_allclose(row, pooled.uns["control_mean"], rtol=1e-10, atol=1e-12)
+    for row in batched.layers["control_profile_matched"]:
+        np.testing.assert_allclose(row, pooled.uns["control_profile"], rtol=1e-10, atol=1e-12)
 
 
 def test_matched_layer_only_with_batch(tmp_path):
-    """control_mean_matched present iff batch_column is set."""
+    """control_profile_matched present iff batch_column is set."""
     counts = np.array([[1, 0], [0, 2], [3, 1], [1, 1]], dtype=float)
     perturbation = ["ctrl", "ctrl", "A", "A"]
     path = _write(tmp_path, counts, perturbation, batch=["b1", "b1", "b1", "b1"])
 
-    pooled = compute_average_log_expression(
+    pooled = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", output_path=tmp_path / "pooled.h5ad",
     ).to_memory()
-    batched = compute_average_log_expression(
+    batched = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch",
         output_path=tmp_path / "batched.h5ad",
     ).to_memory()
-    assert "control_mean_matched" not in pooled.layers
-    assert "control_mean_matched" in batched.layers
+    assert "control_profile_matched" not in pooled.layers
+    assert "control_profile_matched" in batched.layers
 

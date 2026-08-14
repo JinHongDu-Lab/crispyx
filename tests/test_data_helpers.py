@@ -32,7 +32,7 @@ from crispyx.data import (
     write_obs,
     write_var,
 )
-from crispyx.pseudobulk import compute_average_log_expression
+from crispyx.pseudobulk import compute_normalized_effects
 
 
 def _create_dataset(tmp_path: Path) -> Path:
@@ -107,14 +107,15 @@ def test_read_h5ad_ondisk_returns_backed_object(tmp_path, capsys):
     adata_ro.close()
 
 
-def test_compute_average_log_expression_infers_control(tmp_path, caplog):
+def test_compute_normalized_effects_infers_control(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="crispyx.data")
     path = _create_dataset(tmp_path)
 
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         path,
         perturbation_column="perturbation",
         control_label=None,
+        method="mean_log1p",
         gene_name_column="gene_symbol",
     )
 

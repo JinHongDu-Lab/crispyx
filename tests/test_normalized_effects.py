@@ -205,51 +205,6 @@ def test_layout_is_not_public_api():
     assert "_layout" not in parameters
 
 
-@pytest.mark.parametrize(
-    "deprecated,method,profile_layer,matched_layer,reference_uns",
-    [
-        ("compute_average_log_expression", "mean_log1p",
-         "perturbation_mean", "control_mean_matched", "control_mean"),
-        ("compute_pseudobulk_expression", "log_mean",
-         "perturbation_bulk", "control_bulk_matched", "control_bulk"),
-    ],
-)
-def test_deprecated_aliases_warn_and_keep_their_original_names(
-    tmp_path, deprecated, method, profile_layer, matched_layer, reference_uns
-):
-    path, _, _ = _write_screen(tmp_path)
-    with pytest.warns(DeprecationWarning, match=f"method='{method}'"):
-        legacy = getattr(cx, deprecated)(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            batch_column="batch",
-            output_path=tmp_path / f"{deprecated}.h5ad",
-        )
-    legacy_values, _, legacy_layers, legacy_uns = _materialise(legacy)
-    legacy.close()
-
-    # Historical output naming is part of the compatibility contract.
-    assert set(legacy_layers) == {profile_layer, matched_layer}
-    assert reference_uns in legacy_uns
-
-    # The values must be identical to the replacement call.
-    current = cx.pb.normalized_effects(
-        path,
-        groupby="perturbation",
-        reference="control",
-        method=method,
-        batch_column="batch",
-        output_path=tmp_path / f"{deprecated}_new.h5ad",
-    )
-    current_values, _, current_layers, _ = _materialise(current)
-    current.close()
-    np.testing.assert_allclose(legacy_values, current_values, atol=1e-12)
-    np.testing.assert_allclose(
-        legacy_layers[profile_layer], current_layers["perturbation_profile"], atol=1e-12
-    )
-
-
 def test_effects_warns_on_raw_counts_but_normalized_effects_does_not(tmp_path):
     """cx.pb.effects never normalises, so raw-count input must be flagged."""
     path, counts, obs = _write_screen(tmp_path)

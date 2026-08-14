@@ -21,7 +21,7 @@ import scipy.sparse as sp
 
 import crispyx as cx
 from crispyx import pseudobulk as pb_mod
-from crispyx.pseudobulk import compute_average_log_expression
+from crispyx.pseudobulk import compute_normalized_effects
 
 
 def _write(tmp_path, n_cells=40, n_genes=6, name="data.h5ad"):
@@ -43,15 +43,17 @@ def _write(tmp_path, n_cells=40, n_genes=6, name="data.h5ad"):
 
 
 def test_namespace_chunk_size_defaults_none(tmp_path):
-    """``cx.pb.average_log_expression`` auto-sizes by default and matches an
+    """``cx.pb.normalized_effects`` auto-sizes by default and matches an
     explicit chunk size bit-for-bit."""
     path = _write(tmp_path)
-    auto = cx.pb.average_log_expression(
+    auto = cx.pb.normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", output_path=tmp_path / "auto.h5ad",
     ).to_memory()
-    explicit = cx.pb.average_log_expression(
+    explicit = cx.pb.normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", chunk_size=3,
         output_path=tmp_path / "explicit.h5ad",
     ).to_memory()
@@ -70,8 +72,9 @@ def test_memory_limit_threaded_into_chunk_sizing(tmp_path, monkeypatch):
         return orig(n_obs, n_vars, available_memory_gb=available_memory_gb, **kw)
 
     monkeypatch.setattr(pb_mod, "calculate_optimal_chunk_size", spy)
-    compute_average_log_expression(
+    compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", memory_limit_gb=4.0,
         output_path=tmp_path / "out.h5ad",
     )
@@ -82,13 +85,15 @@ def test_memory_limit_result_invariance(tmp_path):
     """Results are identical regardless of ``memory_limit_gb`` (only the chunk
     size, not the numbers, changes)."""
     path = _write(tmp_path)
-    small = compute_average_log_expression(
+    small = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", memory_limit_gb=0.001,
         output_path=tmp_path / "small.h5ad",
     ).to_memory()
-    big = compute_average_log_expression(
+    big = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", memory_limit_gb=256.0,
         output_path=tmp_path / "big.h5ad",
     ).to_memory()
@@ -114,13 +119,15 @@ def test_memory_limit_with_batch_correction(tmp_path):
     path = tmp_path / "b.h5ad"
     ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var).write(path)
 
-    ref = compute_average_log_expression(
+    ref = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch", chunk_size=64,
         output_path=tmp_path / "ref.h5ad",
     ).to_memory()
-    limited = compute_average_log_expression(
+    limited = compute_normalized_effects(
         path, perturbation_column="perturbation", control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols", batch_column="batch", memory_limit_gb=0.001,
         output_path=tmp_path / "lim.h5ad",
     ).to_memory()

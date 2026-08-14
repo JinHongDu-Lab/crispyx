@@ -24,10 +24,7 @@ from scipy.stats import norm, rankdata, t as t_dist
 
 from crispyx.data import ensure_gene_symbol_column
 from crispyx.de import _tie_correction, t_test, wilcoxon_test
-from crispyx.pseudobulk import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
-)
+from crispyx.pseudobulk import compute_normalized_effects
 
 
 def _to_dense(matrix):
@@ -154,16 +151,17 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
 
 def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols",
         chunk_size=2,
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_cx_avg_log_effects.h5ad"
+    output_path = tmp_path / "small_cx_normalized_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -192,16 +190,17 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
 
 def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
-    result = compute_pseudobulk_expression(
+    result = compute_normalized_effects(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols",
         chunk_size=2,
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_cx_pseudobulk_effects.h5ad"
+    output_path = tmp_path / "small_cx_normalized_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -549,3 +548,75 @@ def test_normalize_invalid_policy_raises(tmp_path):
     _write_fmt(p, X, "csr")
     with pytest.raises(ValueError, match="format_mismatch_policy"):
         normalize_total_log1p(p, tmp_path / "o.h5ad", format_mismatch_policy="bogus")
+
+
+def _make_h5ad_with_extra_slots(tmp_path, *, seed=0, n_obs=25, n_vars=9, with_raw=False):
+    from crispyx.data import normalize_total_log1p  # noqa: F401  (import kept local to mirror other tests)
+
+    rng = np.random.default_rng(seed)
+    counts = sp.csr_matrix(rng.poisson(5.0, size=(n_obs, n_vars)).astype(np.float32))
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n_obs)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+    adata = ad.AnnData(counts, obs=obs, var=var)
+    adata.obsm["X_pca"] = rng.normal(size=(n_obs, 3)).astype(np.float32)
+    adata.varm["PCs"] = rng.normal(size=(n_vars, 3)).astype(np.float32)
+    adata.obsp["conn"] = sp.random(n_obs, n_obs, density=0.05, random_state=seed, format="csr")
+    adata.varp["gene_net"] = sp.random(n_vars, n_vars, density=0.1, random_state=seed, format="csr")
+    adata.layers["counts2"] = (counts * 2).astype(np.float32)
+    adata.uns["some_key"] = "hello"
+    if with_raw:
+        adata.raw = adata
+
+    path = tmp_path / "extra_slots.h5ad"
+    adata.write(path)
+    return path
+
+
+def test_normalize_total_log1p_preserves_extra_slots(tmp_path):
+    from crispyx.data import normalize_total_log1p
+
+    path = _make_h5ad_with_extra_slots(tmp_path, seed=20)
+    src = ad.read_h5ad(path)
+    out = normalize_total_log1p(path, tmp_path / "out.h5ad", verbose=False)
+    om = out.to_memory()
+
+    np.testing.assert_allclose(om.obsm["X_pca"], src.obsm["X_pca"])
+    np.testing.assert_allclose(om.varm["PCs"], src.varm["PCs"])
+    np.testing.assert_allclose(om.obsp["conn"].toarray(), src.obsp["conn"].toarray())
+    np.testing.assert_allclose(om.varp["gene_net"].toarray(), src.varp["gene_net"].toarray())
+    out_counts2 = om.layers["counts2"]
+    out_counts2 = out_counts2.toarray() if sp.issparse(out_counts2) else out_counts2
+    src_counts2 = src.layers["counts2"]
+    src_counts2 = src_counts2.toarray() if sp.issparse(src_counts2) else src_counts2
+    np.testing.assert_allclose(out_counts2, src_counts2)
+    assert om.uns["some_key"] == "hello"
+
+
+def test_normalize_total_log1p_warns_and_drops_raw(tmp_path):
+    from crispyx.data import normalize_total_log1p
+
+    path = _make_h5ad_with_extra_slots(tmp_path, seed=21, with_raw=True)
+    with pytest.warns(UserWarning, match="raw"):
+        out = normalize_total_log1p(path, tmp_path / "out.h5ad", verbose=False)
+    assert out.to_memory().raw is None
+
+
+def test_normalize_total_log1p_empty_matrix_preserves_slots_and_returns_anndata(tmp_path):
+    """Item 3-style regression: an all-zero X must not short-circuit before
+    the slot copy-through, and the empty branch must return an AnnData
+    handle (not a bare path)."""
+    from crispyx.data import AnnData as CxAnnData
+    from crispyx.data import normalize_total_log1p
+
+    path = _make_h5ad_with_extra_slots(tmp_path, seed=22, n_obs=15, n_vars=6)
+    src_backed = ad.read_h5ad(path)
+    src_backed.X = sp.csr_matrix(src_backed.X.shape, dtype=src_backed.X.dtype)
+    empty_path = tmp_path / "empty.h5ad"
+    src_backed.write(empty_path)
+
+    out = normalize_total_log1p(empty_path, tmp_path / "out.h5ad", verbose=False)
+    assert isinstance(out, CxAnnData)
+    om = out.to_memory()
+    assert om.X.nnz == 0
+    np.testing.assert_allclose(om.obsm["X_pca"], src_backed.obsm["X_pca"])
+    assert om.uns["some_key"] == "hello"

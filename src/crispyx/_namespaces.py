@@ -15,6 +15,7 @@ from .data import (
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
+    downsample_counts,
     ensure_gene_symbol_column,
     normalize_total_log1p,
     read_backed,
@@ -49,10 +50,8 @@ from .pseudobulk import (
     NormalizedEffectMethod,
     PseudobulkMethod,
     aggregate_pseudobulk,
-    compute_average_log_expression,
     compute_normalized_effects,
     compute_pseudobulk_effects,
-    compute_pseudobulk_expression,
 )
 from .qc import (
     filter_cells_by_gene_count,
@@ -60,6 +59,7 @@ from .qc import (
     filter_perturbations_by_cell_count,
     quality_control_summary,
 )
+from .sample import subsample
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +240,40 @@ class _PreprocessingNamespace:
             verbose=verbose,
         )
 
+    def subsample(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        n: int | None = None,
+        frac: float | None = None,
+        groupby: str | Sequence[str] | None = None,
+        unit: str = "cell",
+        drop_insufficient: bool = True,
+        random_state: int = 0,
+        chunk_size: int = 4096,
+        output_path: str | Path | None = None,
+        data_name: str | None = None,
+        verbose: int | bool = True,
+    ):
+        """Stream a stratified or cluster-sampled subset to disk.
+
+        See :func:`crispyx.subsample` for the full parameter documentation.
+        """
+        path = resolve_data_path(data)
+        return subsample(
+            path,
+            n=n,
+            frac=frac,
+            groupby=groupby,
+            unit=unit,
+            drop_insufficient=drop_insufficient,
+            random_state=random_state,
+            chunk_size=chunk_size,
+            output_path=output_path,
+            data_name=data_name,
+            verbose=verbose,
+        )
+
     def qc_summary(
         self,
         data: str | Path | ad.AnnData,
@@ -413,6 +447,33 @@ class _PreprocessingNamespace:
             output_dir=output_dir,
             data_name=data_name,
             format_mismatch_policy=format_mismatch_policy,
+            verbose=verbose,
+        )
+
+    def downsample_counts(
+        self,
+        data: str | Path | ad.AnnData,
+        output_path: str | Path | None = None,
+        *,
+        counts_per_cell: int,
+        chunk_size: int = 4096,
+        data_name: str | None = None,
+        random_state: int = 0,
+        verbose: int | bool = True,
+    ) -> AnnData:
+        """Stream-thin every cell's counts down to at most ``counts_per_cell``.
+
+        See :func:`crispyx.data.downsample_counts` for the full parameter
+        documentation. Dependency-free streaming equivalent of
+        ``scanpy.pp.downsample_counts(..., replace=False)``.
+        """
+        return downsample_counts(
+            data,
+            output_path,
+            counts_per_cell=counts_per_cell,
+            chunk_size=chunk_size,
+            data_name=data_name,
+            random_state=random_state,
             verbose=verbose,
         )
 
@@ -670,72 +731,6 @@ class _PseudobulkNamespace:
             data_name=data_name,
             output_path=output_path,
             output_dir=output_dir,
-            verbose=verbose,
-        )
-
-    def average_log_expression(
-        self,
-        data: str | Path | ad.AnnData,
-        *,
-        perturbation_column: str,
-        control_label: str | None = None,
-        gene_name_column: str | None = None,
-        perturbations: Iterable[str] | None = None,
-        batch_column: str | None = None,
-        chunk_size: int | None = None,
-        memory_limit_gb: float | None = None,
-        data_name: str | None = None,
-        output_path: str | Path | None = None,
-        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        verbose: int | bool = True,
-    ):
-        path = resolve_data_path(data)
-        return compute_average_log_expression(
-            path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            batch_column=batch_column,
-            chunk_size=chunk_size,
-            memory_limit_gb=memory_limit_gb,
-            output_dir=output_dir,
-            data_name=data_name,
-            output_path=output_path,
-            verbose=verbose,
-        )
-
-    def pseudobulk(
-        self,
-        data: str | Path | ad.AnnData,
-        *,
-        perturbation_column: str,
-        control_label: str | None = None,
-        gene_name_column: str | None = None,
-        perturbations: Iterable[str] | None = None,
-        batch_column: str | None = None,
-        baseline_count: float = 1.0,
-        chunk_size: int | None = None,
-        memory_limit_gb: float | None = None,
-        data_name: str | None = None,
-        output_path: str | Path | None = None,
-        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        verbose: int | bool = True,
-    ):
-        path = resolve_data_path(data)
-        return compute_pseudobulk_expression(
-            path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            batch_column=batch_column,
-            baseline_count=baseline_count,
-            chunk_size=chunk_size,
-            memory_limit_gb=memory_limit_gb,
-            output_dir=output_dir,
-            data_name=data_name,
-            output_path=output_path,
             verbose=verbose,
         )
 

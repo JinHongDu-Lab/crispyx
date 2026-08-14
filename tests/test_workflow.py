@@ -21,8 +21,7 @@ import h5py
 import crispyx as cx
 
 from crispyx import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
+    compute_normalized_effects,
     quality_control_summary,
     t_test,
     wilcoxon_test,
@@ -170,10 +169,11 @@ def test_downstream_effect_outputs(tmp_path):
         output_dir=tmp_path,
         data_name="de",
     )
-    avg = compute_average_log_expression(
+    avg = compute_normalized_effects(
         qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="avg_effects",
@@ -181,10 +181,11 @@ def test_downstream_effect_outputs(tmp_path):
     wilcoxon_input = _log_normalise_sparse(qc_result.filtered.to_memory())
     wilcoxon_input_path = tmp_path / "qc_filtered_log_norm.h5ad"
     wilcoxon_input.write(wilcoxon_input_path)
-    pseudo = compute_pseudobulk_expression(
+    pseudo = compute_normalized_effects(
         qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="pseudo_effects",
@@ -223,7 +224,7 @@ def test_downstream_effect_outputs(tmp_path):
     filtered = qc_result.filtered.to_memory()
     ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
     ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
-    # compute_average_log_expression uses _normalize_total(target_sum=1e4) then log1p
+    # compute_normalized_effects(method="mean_log1p") uses _normalize_total(target_sum=1e4) then log1p
     raw_block = np.asarray(filtered.X.toarray())
     log_block = np.log1p(_normalize_total(raw_block, target_sum=1e4))
     ctrl = log_block[ctrl_mask, 0]
@@ -231,8 +232,8 @@ def test_downstream_effect_outputs(tmp_path):
     expected = ko1.mean() - ctrl.mean()
     assert np.isclose(avg_df.loc["KO1", "gene0"], expected)
 
-    assert (tmp_path / "avg_effects_cx_avg_log_effects.h5ad").exists()
-    assert (tmp_path / "pseudo_effects_cx_pseudobulk_effects.h5ad").exists()
+    assert (tmp_path / "avg_effects_cx_normalized_effects.h5ad").exists()
+    assert (tmp_path / "pseudo_effects_cx_normalized_effects.h5ad").exists()
     assert (tmp_path / "t_test_cx_t_test.h5ad").exists()
     assert (tmp_path / "wilcoxon_cx_wilcoxon.h5ad").exists()
 
@@ -283,18 +284,20 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     pd.testing.assert_index_equal(qc_wrapped_mem.obs.index, filtered_direct.obs.index)
     pd.testing.assert_index_equal(qc_wrapped_mem.var_names, filtered_direct.var_names)
 
-    avg_wrapped = cx.pb.average_log_expression(
+    avg_wrapped = cx.pb.normalized_effects(
         qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="wrapped_avg",
     )
-    avg_direct = compute_average_log_expression(
+    avg_direct = compute_normalized_effects(
         qc_direct.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="mean_log1p",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="direct_avg",
@@ -305,18 +308,20 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     pd.testing.assert_index_equal(avg_wrapped_mem.obs.index, avg_direct_mem.obs.index)
     pd.testing.assert_index_equal(avg_wrapped_mem.var_names, avg_direct_mem.var_names)
 
-    pseudo_wrapped = cx.pb.pseudobulk(
+    pseudo_wrapped = cx.pb.normalized_effects(
         qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="wrapped_pseudo",
     )
-    pseudo_direct = compute_pseudobulk_expression(
+    pseudo_direct = compute_normalized_effects(
         qc_direct.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
+        method="log_mean",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="direct_pseudo",

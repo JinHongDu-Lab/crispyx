@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import tempfile
 import warnings
@@ -17,7 +16,7 @@ import scipy.sparse as sparse
 from . import _messages
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import resolve_group_reference_aliases
+from ._grouping import _group_seed, resolve_group_reference_aliases
 from .data import (
     AnnData,
     calculate_optimal_chunk_size,
@@ -36,8 +35,8 @@ PseudobulkMethod = Literal["mean_log1p", "sum", "log_mean"]
 # so keeping the public hint narrow stops a type checker from waving it through.
 NormalizedEffectMethod = Literal["mean_log1p", "log_mean"]
 
-# Output naming. "modern" is what compute_normalized_effects returns; the two
-# deprecated wrappers request their historical names so existing code keeps working.
+# Output naming for compute_normalized_effects. "modern" is the only layout in
+# use; the dict is keyed for symmetry with other per-method naming tables.
 _NORMALIZED_LAYOUTS = {
     "modern": {
         "profile_layer": "perturbation_profile",
@@ -45,20 +44,6 @@ _NORMALIZED_LAYOUTS = {
         "reference_uns": "control_profile",
         "suffix": "normalized_effects",
         "log_name": "pb.normalized_effects",
-    },
-    "mean_log1p": {
-        "profile_layer": "perturbation_mean",
-        "matched_layer": "control_mean_matched",
-        "reference_uns": "control_mean",
-        "suffix": "avg_log_effects",
-        "log_name": "pb.compute_average_log_expression",
-    },
-    "log_mean": {
-        "profile_layer": "perturbation_bulk",
-        "matched_layer": "control_bulk_matched",
-        "reference_uns": "control_bulk",
-        "suffix": "pseudobulk_effects",
-        "log_name": "pb.compute_pseudobulk_expression",
     },
 }
 
@@ -691,100 +676,6 @@ def compute_normalized_effects(
     )
 
 
-def compute_average_log_expression(
-    data: str | Path | AnnData | ad.AnnData,
-    *,
-    perturbation_column: str,
-    control_label: str | None = None,
-    gene_name_column: str | None = None,
-    perturbations: Iterable[str] | None = None,
-    batch_column: str | None = None,
-    chunk_size: int | None = None,
-    memory_limit_gb: float | None = None,
-    data_name: str | None = None,
-    output_path: str | Path | None = None,
-    output_dir: str | Path | None = None,
-    verbose: int | bool = True,
-) -> AnnData:
-    """Deprecated alias for ``compute_normalized_effects(method="mean_log1p")``.
-
-    Retained for backward compatibility, including its original layer and ``uns``
-    names. The output additionally carries ``uns['method']``, which earlier releases
-    did not write; nothing else changes. Scheduled for removal in 0.1.0.
-    """
-    warnings.warn(
-        "compute_average_log_expression() is deprecated and will be removed in "
-        "crispyx 0.1.0. Use compute_normalized_effects(..., method='mean_log1p') "
-        "(cx.pb.normalized_effects) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _normalized_effects_impl(
-        data,
-        layout="mean_log1p",
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        method="mean_log1p",
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        batch_column=batch_column,
-        chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb,
-        data_name=data_name,
-        output_path=output_path,
-        output_dir=output_dir,
-        verbose=verbose,
-    )
-
-
-def compute_pseudobulk_expression(
-    data: str | Path | AnnData | ad.AnnData,
-    *,
-    perturbation_column: str,
-    control_label: str | None = None,
-    gene_name_column: str | None = None,
-    perturbations: Iterable[str] | None = None,
-    batch_column: str | None = None,
-    baseline_count: float = 1.0,
-    chunk_size: int | None = None,
-    memory_limit_gb: float | None = None,
-    data_name: str | None = None,
-    output_path: str | Path | None = None,
-    output_dir: str | Path | None = None,
-    verbose: int | bool = True,
-) -> AnnData:
-    """Deprecated alias for ``compute_normalized_effects(method="log_mean")``.
-
-    Retained for backward compatibility, including its original layer and ``uns``
-    names. The output additionally carries ``uns['method']``, which earlier releases
-    did not write; nothing else changes. Scheduled for removal in 0.1.0.
-    """
-    warnings.warn(
-        "compute_pseudobulk_expression() is deprecated and will be removed in "
-        "crispyx 0.1.0. Use compute_normalized_effects(..., method='log_mean') "
-        "(cx.pb.normalized_effects) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _normalized_effects_impl(
-        data,
-        layout="log_mean",
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        method="log_mean",
-        baseline_count=baseline_count,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        batch_column=batch_column,
-        chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb,
-        data_name=data_name,
-        output_path=output_path,
-        output_dir=output_dir,
-        verbose=verbose,
-    )
-
-
 def _normalise_groupby(groupby: str | Sequence[str]) -> list[str]:
     if isinstance(groupby, str):
         columns = [groupby]
@@ -812,16 +703,6 @@ def _validate_expression_block(block, *, context: str) -> bool:
     if np.any(values < 0):
         raise ValueError(f"{context} contains negative values")
     return bool(np.all(np.abs(values - np.rint(values)) <= 1e-8))
-
-
-def _group_seed(random_state: int, key: tuple[str, ...]) -> np.random.SeedSequence:
-    digest = hashlib.blake2b(
-        "\x1f".join(key).encode("utf-8"), digest_size=8
-    ).digest()
-    key_seed = int.from_bytes(digest, "little", signed=False)
-    return np.random.SeedSequence(
-        [int(random_state), key_seed & 0xFFFFFFFF, key_seed >> 32]
-    )
 
 
 def _metadata_value_equal(actual, expected) -> bool:
@@ -1599,9 +1480,7 @@ def _estimate_shape_for_pseudobulk_effects(
 
 
 # docs/api.rst documents this module with ``automodule :members:``, which follows
-# ``__all__``. compute_average_log_expression and compute_pseudobulk_expression are
-# deliberately absent: they remain importable for backward compatibility but must not
-# appear in the rendered API, so that only compute_normalized_effects is discoverable.
+# ``__all__``.
 __all__ = [
     "NormalizedEffectMethod",
     "PseudobulkMethod",

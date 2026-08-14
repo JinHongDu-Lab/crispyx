@@ -2,6 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+
+import numpy as np
+
+
+def _group_seed(random_state: int, key: tuple[str, ...]) -> np.random.SeedSequence:
+    """Deterministic per-group seed, independent of dict/iteration order.
+
+    Derives from a stable hash of ``key`` (``hashlib.blake2b``, not Python's
+    randomized ``hash()``) so a given ``(random_state, key)`` pair always
+    produces the same seed across processes and runs. Shared by any grouped
+    sampling that needs one independent RNG stream per group (pseudo-bulk
+    bootstrap, stratified subsampling).
+    """
+    digest = hashlib.blake2b(
+        "\x1f".join(key).encode("utf-8"), digest_size=8
+    ).digest()
+    key_seed = int.from_bytes(digest, "little", signed=False)
+    return np.random.SeedSequence(
+        [int(random_state), key_seed & 0xFFFFFFFF, key_seed >> 32]
+    )
+
 
 def resolve_group_reference_aliases(
     *,
