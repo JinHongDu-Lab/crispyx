@@ -1,7 +1,7 @@
-"""Checkpoint and progress utilities for streaming DE tests.
+"""Checkpoint and progress utilities for streaming, resumable computations.
 
-This module provides atomic checkpointing and progress tracking for
-resumable differential expression tests.
+This module provides atomic checkpointing and progress tracking shared by
+streaming differential expression tests and by ``batch_process``.
 """
 
 from __future__ import annotations
@@ -56,9 +56,18 @@ def _write_checkpoint_atomic(
         raise
 
 
-def _read_checkpoint(checkpoint_path: Path) -> dict | None:
+def _read_checkpoint(
+    checkpoint_path: Path,
+    required_keys: tuple[str, ...] = ("completed", "total"),
+) -> dict | None:
     """Read checkpoint file, returning None if missing or corrupted.
-    
+
+    ``required_keys`` distinguishes a valid checkpoint from a corrupted or
+    schema-mismatched one; it defaults to the per-candidate DE schema
+    (``t_test``/``wilcoxon_test``/``nb_glm_test``). ``batch_process`` uses
+    its own gene-chunk schema and passes
+    ``required_keys=("last_gene_chunk", "total_gene_chunks")``.
+
     Returns
     -------
     dict or None
@@ -72,7 +81,7 @@ def _read_checkpoint(checkpoint_path: Path) -> dict | None:
         # Validate required fields
         if not isinstance(data, dict):
             return None
-        if "completed" not in data or "total" not in data:
+        if any(key not in data for key in required_keys):
             return None
         return data
     except (json.JSONDecodeError, IOError, OSError):
@@ -133,6 +142,53 @@ def _scan_h5ad_completed(
     return completed
 
 
+def _find_last_completed_gene_chunk(
+    h5ad_path: Path,
+    n_gene_chunks: int,
+    chunk_size: int,
+    n_genes: int,
+    weight_dataset: str = "layers/weight_sum",
+) -> int:
+    """Scan an output file's weight layer for the last fully-written gene
+    chunk, as a fallback when the checkpoint JSON is missing or corrupted.
+
+    Used by ``batch_process``, whose gene chunks are written strictly in
+    order (unlike DE's per-candidate resume, where any candidate can
+    complete independently): a chunk is "done" once *every* group's row in
+    its column slice of ``weight_dataset`` holds a finite, positive weight
+    (a crash partway through the per-group write loop for a chunk leaves
+    some rows unwritten, and must not be mistaken for a completed chunk).
+    Scanning stops at the first not-fully-written chunk. Returns -1 if none
+    are complete.
+
+    Known limitation: a group with zero cells for every gene in a chunk has
+    a legitimately-zero weight there and looks indistinguishable from
+    "not yet written" -- the same convention DE's ``_scan_h5ad_completed``
+    already uses.
+    """
+    if not h5ad_path.exists():
+        return -1
+    try:
+        with h5py.File(h5ad_path, "r") as f:
+            if weight_dataset not in f:
+                return -1
+            ds = f[weight_dataset]
+            last = -1
+            for i in range(n_gene_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, n_genes)
+                column = np.asarray(ds[:, start:end])
+                row_has_value = np.any(np.isfinite(column) & (column > 0), axis=1)
+                if np.all(row_has_value):
+                    last = i
+                else:
+                    break
+            return last
+    except Exception as e:
+        logger.warning(f"Failed to scan h5ad for completed gene chunks: {e}")
+        return -1
+
+
 def _get_resumable_candidates(
     checkpoint_path: Path,
     h5ad_path: Path,
@@ -140,7 +196,7 @@ def _get_resumable_candidates(
     retry_failed: bool = True,
 ) -> tuple[list[str], list[str], list[str]]:
     """Get candidates to process, accounting for previous progress.
-    
+
     Parameters
     ----------
     checkpoint_path
@@ -151,7 +207,7 @@ def _get_resumable_candidates(
         List of all perturbation labels to process.
     retry_failed
         If True, previously failed perturbations will be retried.
-        
+
     Returns
     -------
     tuple[list[str], list[str], list[str]]
@@ -161,7 +217,7 @@ def _get_resumable_candidates(
         - failed: perturbations that failed (for logging)
     """
     checkpoint = _read_checkpoint(checkpoint_path)
-    
+
     if checkpoint is not None:
         completed = checkpoint.get("completed", [])
         failed = checkpoint.get("failed", [])

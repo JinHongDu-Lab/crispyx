@@ -20,31 +20,66 @@ Set ``memory_limit_gb`` to match your available RAM:
 
 For very large datasets, consider:
 
-* Converting to CSC before Wilcoxon (see :doc:`usage`).
+* Converting to CSC before Wilcoxon or ``batch_process`` (see :doc:`usage`).
 * Converting to CSR before NB-GLM.
 * Using ``freeze_control=True`` for datasets with >100K control cells.
 
-When should I use CSC vs CSR format?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When should I use CSC vs CSR format, and how do I control the streaming order?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-* **CSC** (Compressed Sparse Column): Use for Wilcoxon rank-sum tests, which
-  iterate over gene columns. Convert with :func:`crispyx.convert_to_csc`.
-* **CSR** (Compressed Sparse Row): Use for NB-GLM, size factors, and
-  operations that iterate over cells (rows). Convert with
+There's no separate "streaming order" setting to pick independently -- each
+function reads the matrix along one fixed axis (cells or genes), determined
+by what it computes, and that axis is cheap only on the matching sparse
+format. The choice that actually matters is **which format the file is
+stored in**:
+
+* **CSC** (Compressed Sparse Column) -- fast for gene-(column-)major
+  functions: :func:`crispyx.wilcoxon_test` and :func:`crispyx.batch_process`
+  (including custom ``BatchReducer`` callbacks). Convert with
+  :func:`crispyx.convert_to_csc`.
+* **CSR** (Compressed Sparse Row) -- fast for cell-(row-)major functions:
+  :func:`crispyx.t_test`, :func:`crispyx.nb_glm_test`, size factors, quality
+  control, and :func:`crispyx.normalize_total_log1p`. Convert with
   :func:`crispyx.convert_to_csr`.
 
-The benchmark pipeline handles this automatically, but manual workflows
-should convert before calling DE functions.
+Which axis a function needs follows directly from what it has to hold in
+memory at once. ``batch_process`` keeps one accumulator per
+``(group, batch)`` pair, finalized only once every cell for that pair has
+been seen; holding those accumulators for every gene simultaneously would
+need ``O(n_groups × n_batches × n_genes)`` memory, unbounded for a
+genome-wide screen with many perturbations. So it chunks by **genes**
+instead, bounding memory to ``O(n_groups × n_batches × chunk_size)`` --
+which means its actual disk access, repeated once per chunk, is "these few
+columns, across every row." That's cheap on CSC (column ranges are
+contiguous in the underlying arrays) and ``O(total_nnz)`` on CSR (every
+row's full nonzero list has to be scanned and filtered, regardless of how
+narrow the column range is) -- exactly the ~100x penalty
+``wilcoxon_test`` already has for the identical reason (it also chunks by
+gene, ranking cells within each gene across groups). ``t_test``/
+``nb_glm_test`` instead chunk by **cells** to accumulate simple per-gene
+running sums, so their access is row-slices -- cheap on CSR, and why they
+prefer the opposite format.
 
-QC or normalisation is extremely slow on a CSC file
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Running a function against the wrong format still produces correct results,
+just up to ~100x slower per chunk (see below). Two ways to fix that:
+
+1. **Convert the file once**, up front, if it will be reused across several
+   steps that want the same format.
+2. **Pass ``format_mismatch_policy``** for a one-off call, on the functions
+   that support it (:func:`crispyx.normalize_total_log1p` and
+   :func:`crispyx.batch_process`) -- see the next section for the exact
+   options.
+
+QC, normalisation, or batch_process is extremely slow on a mismatched file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Cell-(row-)streaming operations — quality control and
 :func:`crispyx.normalize_total_log1p` — read the matrix one block of cells at a
 time. On a **CSC** file a row slice must scan the column pointers across every
 gene, making each chunk ``O(total_nnz)`` and the whole pass up to ~100x slower
-than the equivalent CSR streaming. Gene-(column-)streaming operations such as
-the Wilcoxon test are naturally fast on CSC and slow on CSR — the penalty is
+than the equivalent CSR streaming. Gene-(column-)streaming operations —
+:func:`crispyx.wilcoxon_test` and :func:`crispyx.batch_process` — are
+naturally fast on CSC and just as slow on a **CSR** file; the penalty is
 symmetric.
 
 crispyx mitigates this for you:
@@ -52,7 +87,8 @@ crispyx mitigates this for you:
 * **Quality control** automatically dispatches CSC inputs to a
   column-oriented path (including the masks-only ``output_dir=None`` call), so
   no action is needed.
-* :func:`crispyx.normalize_total_log1p` exposes ``format_mismatch_policy``:
+* :func:`crispyx.normalize_total_log1p` and :func:`crispyx.batch_process`
+  both expose ``format_mismatch_policy``:
 
   .. code-block:: python
 
@@ -67,6 +103,11 @@ crispyx mitigates this for you:
 
      # Proceed silently (you have already accounted for the cost).
      cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="off")
+
+     # batch_process takes the same three values, for the opposite mismatch
+     # (a CSR source, since it streams gene-major): "warn" (default),
+     # "convert" (via a temporary CSC copy), or "off".
+     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="convert", ...)
 
 For a file you will reuse across several cell-streaming steps, convert it once
 up front instead:
@@ -168,8 +209,9 @@ backed AnnData reference (e.g. to call ``result.result_path``), re-open it:
 Performance tips
 ----------------
 
-* **Pre-convert matrix formats** before DE: CSC for Wilcoxon, CSR for NB-GLM.
-  This avoids O(total_nnz × n_chunks) scans.
+* **Pre-convert matrix formats** before DE: CSC for Wilcoxon and
+  ``batch_process``, CSR for NB-GLM. This avoids O(total_nnz × n_chunks)
+  scans.
 * **Use ``freeze_control=True``** for datasets with >100K control cells to
   reduce per-worker memory from ~32 GB to <1 GB.
 * **Increase ``n_jobs``** for multi-core NB-GLM on machines with sufficient

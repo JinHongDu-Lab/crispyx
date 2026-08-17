@@ -897,11 +897,14 @@ def iter_matrix_chunks(
     chunk_size: int = 1024,
     convert_to_dense: bool = True,
     matrix: np.ndarray | sp.spmatrix | None = None,
+    start_chunk: int = 0,
 ) -> Iterator[tuple[slice, np.ndarray | sp.spmatrix]]:
     """Yield chunks of ``matrix`` (defaults to ``adata.X``).
 
     Pass e.g. ``matrix=adata.layers[key]`` to stream a layer with the same
-    chunking and slow-axis-format dispatch used for ``X``.
+    chunking and slow-axis-format dispatch used for ``X``. ``start_chunk``
+    skips directly to that 0-indexed chunk (e.g. for resuming a previously
+    interrupted run) without reading the skipped chunks from disk.
     """
 
     if axis not in (0, 1):
@@ -913,7 +916,7 @@ def iter_matrix_chunks(
         _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
-    for start in range(0, length, chunk_size):
+    for start in range(start_chunk * chunk_size, length, chunk_size):
         end = min(start + chunk_size, length)
         if axis == 0:
             block = matrix[start:end]
@@ -3342,14 +3345,16 @@ def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame)
             
             # Store codes
             cat_grp.create_dataset('codes', data=col_data.cat.codes.values)
-        elif col_data.dtype == object or col_data.dtype.kind in ('U', 'S'):
-            # String column - store as variable-length strings
-            str_vals = col_data.astype(str).values
-            grp.create_dataset(col, data=str_vals.astype('O'), 
-                               dtype=h5py.special_dtype(vlen=str))
-        else:
-            # Numeric column
+        elif pd.api.types.is_numeric_dtype(col_data):
+            # Numeric column (includes bool).
             grp.create_dataset(col, data=col_data.values)
+        else:
+            # String-like column: plain object, numpy fixed-width str/bytes,
+            # or any pandas string dtype (StringDtype, pandas>=3's default
+            # "str" dtype) -- store as variable-length strings.
+            str_vals = col_data.astype(str).values
+            grp.create_dataset(col, data=str_vals.astype('O'),
+                               dtype=h5py.special_dtype(vlen=str))
 
 
 def _update_h5ad_uns(h5file: h5py.File, group_name: str, uns_dict: dict) -> None:
