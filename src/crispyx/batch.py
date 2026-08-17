@@ -637,6 +637,7 @@ def batch_process(
                 "groups": groups,
                 "batch_ids": batch_ids,
                 "channels": list(channels) if channels else None,
+                "chunk_size": int(chunk_size),
                 # Identify the input itself, so that regenerating the source in place
                 # invalidates the cache instead of silently returning stale values.
                 "source_path": str(path.resolve()),
@@ -670,25 +671,34 @@ def batch_process(
             # ---- Resume bookkeeping: gene chunks complete strictly in order. ----
             last_completed_chunk = -1
             reuse_existing_output = False
-            if resume and checkpoint_path.exists():
-                checkpoint = _read_checkpoint(checkpoint_path)
+            checkpoint: dict[str, Any] | None = None
+            recovered_via_scan = False
+            if resume:
+                checkpoint = _read_checkpoint(
+                    checkpoint_path,
+                    required_keys=("last_gene_chunk", "total_gene_chunks"),
+                )
                 if checkpoint is not None:
                     last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
                     _messages.vprint(
                         verbose, "tl.batch_process",
                         f"resuming from gene chunk {last_completed_chunk + 1}/{n_gene_chunks}",
                     )
-            elif resume and resolved_output.exists():
-                last_completed_chunk = _find_last_completed_gene_chunk(
-                    resolved_output, n_gene_chunks, chunk_size, n_genes,
-                    weight_dataset="layers/weight_sum" if not channels else f"layers/{channels[0]}_weight_sum",
-                )
-                if last_completed_chunk >= 0:
-                    _messages.vprint(
-                        verbose, "tl.batch_process",
-                        f"checkpoint missing/corrupted; recovered progress through "
-                        f"gene chunk {last_completed_chunk} by scanning {resolved_output.name}",
+                elif resolved_output.exists():
+                    # Checkpoint is missing or corrupted -- fall back to scanning
+                    # the (potentially partial) output file for the last chunk
+                    # every group's row was fully written for.
+                    last_completed_chunk = _find_last_completed_gene_chunk(
+                        resolved_output, n_gene_chunks, chunk_size, n_genes,
+                        weight_dataset="layers/weight_sum" if not channels else f"layers/{channels[0]}_weight_sum",
                     )
+                    if last_completed_chunk >= 0:
+                        recovered_via_scan = True
+                        _messages.vprint(
+                            verbose, "tl.batch_process",
+                            f"checkpoint missing/corrupted; recovered progress through "
+                            f"gene chunk {last_completed_chunk} by scanning {resolved_output.name}",
+                        )
             if resume and last_completed_chunk >= 0 and resolved_output.exists():
                 existing = ad.read_h5ad(resolved_output, backed="r")
                 try:
@@ -735,7 +745,6 @@ def batch_process(
                 placeholder.uns.update(expected_metadata)
                 placeholder.uns["stratified"] = True
                 placeholder.uns["stratified_n_batches"] = int(n_batches)
-                placeholder.uns["chunk_size"] = int(chunk_size)
                 placeholder.uns["cell_chunk_size"] = int(cell_chunk_size)
                 placeholder.write(resolved_output)
 
@@ -775,11 +784,26 @@ def batch_process(
             stream_backed = backed if stream_path == path else read_backed(stream_path)
             try:
                 batches_used = np.zeros((n_groups, n_batches), dtype=bool)
+                if checkpoint is not None:
+                    # Exact restore: which (group, batch) pairs already
+                    # contributed usable weight in the chunks being skipped.
+                    for group_index, batch_index in checkpoint.get("batches_used", []):
+                        batches_used[group_index, batch_index] = True
+                elif recovered_via_scan and last_completed_chunk >= 0:
+                    _messages.warn(
+                        "tl.batch_process",
+                        "Recovered progress by scanning the output file (checkpoint "
+                        "was missing/corrupted); obs['n_batches_used'] may undercount "
+                        "batches used only in the recovered chunks. Pass force=True "
+                        "for an exact recount if this matters.",
+                        stacklevel=2,
+                    )
 
                 def _save_checkpoint(chunk_idx: int) -> None:
                     _write_checkpoint_atomic(checkpoint_path, {
                         "total_gene_chunks": n_gene_chunks,
                         "last_gene_chunk": chunk_idx,
+                        "batches_used": np.argwhere(batches_used).tolist(),
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "method": "batch_process",
                         "statistic_name": statistic_name,
@@ -791,16 +815,15 @@ def batch_process(
                 ) as pbar:
                     out_X = out_f["X"]
                     out_layers = out_f["layers"]
-                    current_chunk = 0
+                    current_chunk = last_completed_chunk + 1
+                    if current_chunk:
+                        pbar.update(current_chunk)
                     for slc, block in iter_matrix_chunks(
-                        stream_backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                        stream_backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                        start_chunk=current_chunk,
                     ):
                         gene_start, gene_end = slc.start, slc.stop
                         width = gene_end - gene_start
-                        if current_chunk <= last_completed_chunk:
-                            current_chunk += 1
-                            pbar.update(1)
-                            continue
 
                         if sp.issparse(block):
                             block = block.tocsr()

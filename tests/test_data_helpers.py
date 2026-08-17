@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 
@@ -640,3 +641,33 @@ class TestComputeOverlap:
     def test_returns_overlap_result_instance(self):
         result = compute_overlap({"X": {"a"}, "Y": {"b"}})
         assert isinstance(result, OverlapResult)
+
+
+class TestUpdateH5adDataframe:
+    """`_update_h5ad_dataframe` must recognise every string-like column
+    dtype, not just plain numpy ``object``/``U``/``S`` -- pandas'
+    ``StringDtype`` (and, since pandas 3.0, its default string dtype for
+    plain-text columns) reports ``.dtype.kind == 'O'`` but
+    ``.dtype == object`` is False, which previously fell through to the
+    numeric branch and crashed h5py with
+    ``TypeError: Object dtype dtype('O') has no native HDF5 equivalent``.
+    """
+
+    def test_pandas_string_dtype_column_is_written_as_vlen_string(self, tmp_path):
+        from crispyx.data import _update_h5ad_dataframe
+
+        df = pd.DataFrame(
+            {
+                "label": pd.array(["a", "b", "c"], dtype="string"),
+                "count": np.array([1, 2, 3], dtype=np.int64),
+            },
+            index=pd.Index(["r0", "r1", "r2"], name="index"),
+        )
+        h5ad_path = tmp_path / "update.h5ad"
+        ad.AnnData(np.zeros((3, 1)), obs=df.iloc[:, :0].copy()).write(h5ad_path)
+        with h5py.File(h5ad_path, "r+") as f:
+            _update_h5ad_dataframe(f, "obs", df)
+
+        result = ad.read_h5ad(h5ad_path)
+        assert list(result.obs["label"]) == ["a", "b", "c"]
+        assert list(result.obs["count"]) == [1, 2, 3]

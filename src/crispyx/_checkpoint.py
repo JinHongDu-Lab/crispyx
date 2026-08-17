@@ -56,9 +56,18 @@ def _write_checkpoint_atomic(
         raise
 
 
-def _read_checkpoint(checkpoint_path: Path) -> dict | None:
+def _read_checkpoint(
+    checkpoint_path: Path,
+    required_keys: tuple[str, ...] = ("completed", "total"),
+) -> dict | None:
     """Read checkpoint file, returning None if missing or corrupted.
-    
+
+    ``required_keys`` distinguishes a valid checkpoint from a corrupted or
+    schema-mismatched one; it defaults to the per-candidate DE schema
+    (``t_test``/``wilcoxon_test``/``nb_glm_test``). ``batch_process`` uses
+    its own gene-chunk schema and passes
+    ``required_keys=("last_gene_chunk", "total_gene_chunks")``.
+
     Returns
     -------
     dict or None
@@ -72,7 +81,7 @@ def _read_checkpoint(checkpoint_path: Path) -> dict | None:
         # Validate required fields
         if not isinstance(data, dict):
             return None
-        if "completed" not in data or "total" not in data:
+        if any(key not in data for key in required_keys):
             return None
         return data
     except (json.JSONDecodeError, IOError, OSError):
@@ -145,9 +154,17 @@ def _find_last_completed_gene_chunk(
 
     Used by ``batch_process``, whose gene chunks are written strictly in
     order (unlike DE's per-candidate resume, where any candidate can
-    complete independently): a chunk is "done" once its column slice of
-    ``weight_dataset`` holds any finite, positive weight. Scanning stops at
-    the first not-yet-written chunk. Returns -1 if none are complete.
+    complete independently): a chunk is "done" once *every* group's row in
+    its column slice of ``weight_dataset`` holds a finite, positive weight
+    (a crash partway through the per-group write loop for a chunk leaves
+    some rows unwritten, and must not be mistaken for a completed chunk).
+    Scanning stops at the first not-fully-written chunk. Returns -1 if none
+    are complete.
+
+    Known limitation: a group with zero cells for every gene in a chunk has
+    a legitimately-zero weight there and looks indistinguishable from
+    "not yet written" -- the same convention DE's ``_scan_h5ad_completed``
+    already uses.
     """
     if not h5ad_path.exists():
         return -1
@@ -161,7 +178,8 @@ def _find_last_completed_gene_chunk(
                 start = i * chunk_size
                 end = min(start + chunk_size, n_genes)
                 column = np.asarray(ds[:, start:end])
-                if np.any(np.isfinite(column) & (column > 0)):
+                row_has_value = np.any(np.isfinite(column) & (column > 0), axis=1)
+                if np.all(row_has_value):
                     last = i
                 else:
                     break

@@ -15,6 +15,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
+from crispyx._checkpoint import _find_last_completed_gene_chunk
 from crispyx.data import convert_to_csc
 
 
@@ -534,6 +535,147 @@ def test_resume_falls_back_to_scanning_output_when_checkpoint_corrupted(tmp_path
     resumed.close()
 
     np.testing.assert_allclose(resumed_values, reference_values)
+
+
+def test_resume_skips_already_completed_gene_chunks(tmp_path):
+    """A resume must not redo work for chunks the checkpoint says are done.
+
+    Regression test for a bug where `_read_checkpoint` required DE's
+    "completed"/"total" schema keys, which `batch_process`'s checkpoint
+    never has -- every resume silently fell through to a full restart. A
+    full run of this dataset calls update() 9 (group, batch) pairs x 4 gene
+    chunks = 36 times; only the last 2 chunks (18 calls) should remain
+    after chunks 0-1 are already checkpointed as complete.
+    """
+    path, *_ = _write_data(tmp_path)
+    kwargs = dict(
+        groupby="perturbation",
+        batch_column="batch",
+        statistic_name="std",
+        chunk_size=2,
+        cell_chunk_size=100,
+        force=True,
+    )
+    output_path = tmp_path / "resumable_count.h5ad"
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, **kwargs,
+        )
+    checkpoint_path = output_path.with_suffix(".progress.json")
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["last_gene_chunk"] == 1
+
+    base = _moment_reducer()
+    counter = {"n": 0}
+
+    def counting_update(state, block):
+        counter["n"] += 1
+        return base.update(state, block)
+
+    cx.batch_process(
+        path, replace(base, update=counting_update),
+        output_path=output_path, resume=True, **kwargs,
+    )
+    assert counter["n"] == 9 * 2
+
+
+def test_find_last_completed_gene_chunk_requires_all_groups_written(tmp_path):
+    """A chunk is only "complete" once every group's row was written.
+
+    Regression test: the scan previously used np.any() over the whole
+    (group, gene) block, so a crash mid-way through the per-group write
+    loop for a chunk (some groups written, some not) was misclassified as
+    a fully-completed chunk.
+    """
+    h5ad_path = tmp_path / "partial.h5ad"
+    n_groups, n_genes, chunk_size = 5, 8, 2
+    with h5py.File(h5ad_path, "w") as f:
+        ds = f.create_dataset(
+            "layers/weight_sum", shape=(n_groups, n_genes), dtype="float64", fillvalue=0.0,
+        )
+        ds[:, 0:4] = 1.0  # chunks 0 and 1: every group written
+        ds[0:3, 4:6] = 1.0  # chunk 2: only groups 0-2 written, 3-4 still zero
+
+    last = _find_last_completed_gene_chunk(
+        h5ad_path, n_gene_chunks=4, chunk_size=chunk_size, n_genes=n_genes,
+    )
+    assert last == 1
+
+
+def test_resume_with_different_chunk_size_restarts_instead_of_dropping_genes(tmp_path):
+    """A chunk_size change across a resume must be detected, not silently
+    misalign gene-chunk boundaries against what's already on disk.
+
+    Regression test: `expected_metadata` previously omitted chunk_size, so
+    resuming with a different chunk_size than the interrupted run went
+    undetected and could permanently leave genes as NaN.
+    """
+    path, *_ = _write_data(tmp_path)
+    common = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100, force=True,
+    )
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "reference_cs.h5ad",
+        chunk_size=3, **common,
+    )
+    reference_values = np.asarray(reference.backed.X[:]).copy()
+    reference.close()
+
+    output_path = tmp_path / "resumable_chunksize.h5ad"
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, chunk_size=2, **common,
+        )
+    checkpoint_path = output_path.with_suffix(".progress.json")
+    assert checkpoint_path.exists()
+
+    with pytest.warns(UserWarning, match="does not match this call's parameters"):
+        resumed = cx.batch_process(
+            path, _moment_reducer(), output_path=output_path, resume=True,
+            chunk_size=3, **{**common, "force": False},
+        )
+    resumed_values = np.asarray(resumed.backed.X[:]).copy()
+    resumed.close()
+    np.testing.assert_allclose(resumed_values, reference_values)
+
+
+def test_resume_with_nothing_left_preserves_n_batches_used(tmp_path):
+    """Resuming a run that's already fully complete must not zero out
+    obs['n_batches_used'].
+
+    Regression test: `batches_used` was always reinitialized to all-False
+    and only set inside the per-chunk loop, which resume skips entirely
+    for already-completed chunks -- a resume that finds nothing left to
+    process silently overwrote correct historical counts with zeros.
+    """
+    path, *_ = _write_data(tmp_path)
+    kwargs = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        chunk_size=2, cell_chunk_size=100, force=True,
+    )
+    output_path = tmp_path / "resumable_done.h5ad"
+    result = cx.batch_process(path, _moment_reducer(), output_path=output_path, **kwargs)
+    original_n_batches_used = np.asarray(result.backed.obs["n_batches_used"]).copy()
+    result.close()
+    assert (original_n_batches_used > 0).all()
+
+    checkpoint_path = output_path.with_suffix(".progress.json")
+    checkpoint_path.write_text(json.dumps({
+        "total_gene_chunks": 4,
+        "last_gene_chunk": 3,
+        "batches_used": np.argwhere(np.ones((3, 3), dtype=bool)).tolist(),
+        "method": "batch_process",
+        "statistic_name": "std",
+        "mode": "group",
+    }))
+
+    resumed = cx.batch_process(path, _moment_reducer(), output_path=output_path, resume=True, **kwargs)
+    resumed_n_batches_used = np.asarray(resumed.backed.obs["n_batches_used"]).copy()
+    resumed.close()
+    np.testing.assert_array_equal(resumed_n_batches_used, original_n_batches_used)
 
 
 def test_multi_channel_output_populates_layers_and_x(tmp_path):
