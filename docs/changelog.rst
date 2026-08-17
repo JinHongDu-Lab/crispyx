@@ -1,6 +1,35 @@
 Changelog
 =========
 
+Version 0.1.1
+-------------
+
+*Released 2026-08-17.*
+
+* **``cx.tl.batch_process`` now streams gene-major in a single pass** via
+  the same ``iter_matrix_chunks(axis=1, ...)`` access pattern
+  ``wilcoxon_test`` already uses, instead of re-reading the full cell axis
+  once per gene chunk. This is a strict speed improvement with no memory
+  regression, and native/cheap for a CSC-stored source. A new
+  ``format_mismatch_policy`` parameter (``"warn"`` / ``"convert"`` /
+  ``"off"``, matching ``normalize_total_log1p``) controls what happens when
+  the source is CSR instead.
+* **``cx.tl.batch_process`` gains ``resume``/``checkpoint_interval``**,
+  extending the same atomic-checkpoint, corruption-safe-read infrastructure
+  ``t_test``/``wilcoxon_test``/``nb_glm_test`` already use to the generic
+  streaming-statistics API. The unit of resumable progress is a gene chunk;
+  results are written directly into the (pre-sized) output file as each
+  chunk finishes, and a missing/corrupted checkpoint falls back to scanning
+  that output file for the last completed chunk.
+* **``BatchReducer`` supports multiple named channels from one pass.**
+  Setting ``channels=(...)`` lets ``finalize``/``compare`` return a dict of
+  related statistics computed from the same streaming state -- for example
+  a mean difference and its standard error, so a caller can form
+  ``t = mean_diff / se`` without a second pass over the data. Each channel
+  is combined across batches independently and written to its own
+  ``layers[name]``; the first channel is also copied into ``X``. Existing
+  reducers returning a single ``BatchStatistic``/array are unaffected.
+
 Version 0.1.0
 -------------
 
