@@ -243,8 +243,12 @@ Disk space
 crispyx's memory savings come from streaming, but several operations trade
 RAM for **disk**: the per-``(perturbation, batch)`` accumulator described
 above, the intermediate result arrays used by ``cx.tl.t_test`` /
-``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test`` / ``cx.tl.batch_process``, and
-whole-file CSR↔CSC conversions. crispyx warns automatically -- without
+``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test``, and whole-file CSR↔CSC
+conversions. ``cx.tl.batch_process`` writes results directly into its output
+file as each gene chunk finishes rather than using a separate disk-backed
+accumulator, so its ``"output"`` disk estimate already accounts for the full
+footprint (see ``resume`` below for what that also enables). crispyx warns
+automatically -- without
 blocking the call -- if free space on the relevant filesystem looks tight or
 the write is unusually large. There is no configurable disk budget analogous
 to ``memory_limit_gb``: the check is a feasibility heads-up, not a resource
@@ -781,8 +785,15 @@ using the ``resume`` and ``checkpoint_interval`` parameters:
    )
 
 If interrupted, simply re-run the same command - completed perturbations will
-be skipped automatically. The checkpoint file ``<output>_progress.json`` is
+be skipped automatically. The checkpoint file ``<output>.progress.json`` is
 written atomically to prevent corruption.
+
+``cx.tl.batch_process`` supports the same ``resume``/``checkpoint_interval``
+parameters. Its unit of resumable progress is a *gene chunk* rather than a
+perturbation, since a chunk's result depends on every group and batch having
+been swept once, not on one group alone; if the checkpoint file is itself
+missing or corrupted, it falls back to scanning the (already partially
+written) output file to detect the last completed chunk.
 
 Data Preparation Utilities
 --------------------------

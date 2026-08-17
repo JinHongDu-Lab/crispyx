@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
+from crispyx.data import convert_to_csc
 
 
 def _write_data(tmp_path: Path, *, sparse: bool = True) -> tuple[Path, np.ndarray, np.ndarray, np.ndarray]:
@@ -436,3 +440,227 @@ def test_warns_when_disk_space_low(tmp_path, monkeypatch):
             output_path=tmp_path / "low_disk.h5ad",
         )
     assert result.backed.n_obs > 0
+
+
+def _crashing_reducer(crash_after_updates: int) -> cx.BatchReducer:
+    """A moment reducer whose update() raises after a fixed call count.
+
+    With cell_chunk_size larger than any (group, batch) cell count, each
+    (group, batch) pair triggers exactly one update() call per gene chunk --
+    so this deterministically fails partway through a specific gene chunk.
+    """
+    base = _moment_reducer()
+    counter = {"n": 0}
+
+    def update(state, block):
+        counter["n"] += 1
+        if counter["n"] > crash_after_updates:
+            raise RuntimeError("simulated crash")
+        return base.update(state, block)
+
+    return replace(base, update=update)
+
+
+def test_resume_after_interruption_matches_uninterrupted_run(tmp_path):
+    path, *_ = _write_data(tmp_path)
+    kwargs = dict(
+        groupby="perturbation",
+        batch_column="batch",
+        statistic_name="std",
+        chunk_size=2,         # 7 genes -> 4 gene chunks (2, 2, 2, 1)
+        cell_chunk_size=100,  # >= total n_obs (63): one cell chunk, one update() per pair
+        force=True,
+    )
+
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "reference.h5ad", **kwargs,
+    )
+    reference_values = np.asarray(reference.backed.X[:]).copy()
+    reference.close()
+
+    output_path = tmp_path / "resumable.h5ad"
+    # 3 groups x 3 batches = 9 update() calls per gene chunk; crash partway
+    # through the 3rd gene chunk (after chunks 0 and 1 fully complete).
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, **kwargs,
+        )
+    checkpoint_path = output_path.with_suffix(".progress.json")
+    assert checkpoint_path.exists()
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["last_gene_chunk"] == 1
+
+    resumed = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path, resume=True, **kwargs,
+    )
+    resumed_values = np.asarray(resumed.backed.X[:]).copy()
+    resumed.close()
+
+    np.testing.assert_allclose(resumed_values, reference_values)
+    assert not checkpoint_path.exists()  # cleaned up on successful completion
+
+
+def test_resume_falls_back_to_scanning_output_when_checkpoint_corrupted(tmp_path):
+    path, *_ = _write_data(tmp_path)
+    kwargs = dict(
+        groupby="perturbation",
+        batch_column="batch",
+        statistic_name="std",
+        chunk_size=2,
+        cell_chunk_size=100,
+        force=True,
+    )
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "reference2.h5ad", **kwargs,
+    )
+    reference_values = np.asarray(reference.backed.X[:]).copy()
+    reference.close()
+
+    output_path = tmp_path / "resumable_corrupt.h5ad"
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, **kwargs,
+        )
+    checkpoint_path = output_path.with_suffix(".progress.json")
+    assert checkpoint_path.exists()
+    checkpoint_path.write_text("{not valid json")  # simulate corruption
+
+    resumed = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path, resume=True, **kwargs,
+    )
+    resumed_values = np.asarray(resumed.backed.X[:]).copy()
+    resumed.close()
+
+    np.testing.assert_allclose(resumed_values, reference_values)
+
+
+def test_multi_channel_output_populates_layers_and_x(tmp_path):
+    path, X, labels, batches = _write_data(tmp_path)
+
+    def initialize(width):
+        return {"n": 0, "sum": np.zeros(width), "sumsq": np.zeros(width)}
+
+    def update(state, block):
+        state["n"] += block.shape[0]
+        state["sum"] += block.sum(axis=0)
+        state["sumsq"] += np.square(block).sum(axis=0)
+
+    def compare(group_state, reference_state):
+        def _mean_var(state):
+            mean = state["sum"] / state["n"]
+            var = state["sumsq"] / state["n"] - mean ** 2
+            return mean, np.clip(var, 0, None)
+
+        g_mean, g_var = _mean_var(group_state)
+        r_mean, r_var = _mean_var(reference_state)
+        n_g, n_r = group_state["n"], reference_state["n"]
+        weight = n_g * n_r / (n_g + n_r)
+        se = np.sqrt(g_var / n_g + r_var / n_r)
+        return {
+            "mean_diff": cx.BatchStatistic(g_mean - r_mean, weight=weight),
+            "se": cx.BatchStatistic(se, weight=weight),
+        }
+
+    reducer = cx.BatchReducer(
+        initialize, update, finalize=lambda state: state, compare=compare,
+        channels=("mean_diff", "se"),
+    )
+    result = cx.batch_process(
+        path, reducer,
+        groupby="perturbation", reference="ctrl", batch_column="batch",
+        mode="comparison", statistic_name="mean_se",
+        perturbations=["A"], chunk_size=3, cell_chunk_size=20,
+        output_path=tmp_path / "multi_channel.h5ad", force=True,
+    )
+    backed = result.backed
+    assert set(backed.layers.keys()) & {"mean_diff", "se", "mean_diff_weight_sum", "se_weight_sum"} == {
+        "mean_diff", "se", "mean_diff_weight_sum", "se_weight_sum",
+    }
+    np.testing.assert_allclose(np.asarray(backed.X[:]), np.asarray(backed.layers["mean_diff"][:]))
+    assert backed.uns["channels"].tolist() == ["mean_diff", "se"]
+    assert np.all(np.asarray(backed.layers["se"][:]) >= 0)
+    result.close()
+
+
+def test_channels_mismatch_raises(tmp_path):
+    path, *_ = _write_data(tmp_path)
+
+    # finalize() returns a dict but the reducer never declared `channels`.
+    undeclared = cx.BatchReducer(
+        lambda w: np.zeros(w), lambda s, b: None, lambda s: {"a": s},
+    )
+    with pytest.raises(TypeError, match="channels was not set"):
+        cx.batch_process(
+            path, undeclared, groupby="perturbation", perturbations=["A"],
+            batch_column="batch", statistic_name="undeclared", chunk_size=2,
+            output_path=tmp_path / "undeclared.h5ad", force=True,
+        )
+
+    # `channels` is declared but finalize() returns the wrong keys.
+    wrong_keys = cx.BatchReducer(
+        lambda w: np.zeros(w), lambda s, b: None, lambda s: {"wrong": s},
+        channels=("mean", "se"),
+    )
+    with pytest.raises(ValueError, match="must have exactly the keys"):
+        cx.batch_process(
+            path, wrong_keys, groupby="perturbation", perturbations=["A"],
+            batch_column="batch", statistic_name="wrong_keys", chunk_size=2,
+            output_path=tmp_path / "wrong_keys.h5ad", force=True,
+        )
+
+
+def test_csr_source_warns_but_csc_does_not(tmp_path, caplog):
+    import logging
+
+    import crispyx.data as cxd
+
+    path, *_ = _write_data(tmp_path, sparse=True)  # written as CSR by default
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        result = cx.batch_process(
+            path, _moment_reducer(),
+            groupby="perturbation", batch_column="batch", statistic_name="std_csr",
+            chunk_size=2, cell_chunk_size=20,
+            output_path=tmp_path / "csr_result.h5ad", force=True,
+        )
+    result.close()
+    assert any("slower" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    cxd._SLOW_AXIS_WARNED.clear()
+    csc_result = convert_to_csc(path, output_path=tmp_path / "csc_source.h5ad", verbose=False)
+    csc_result.close()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        result = cx.batch_process(
+            tmp_path / "csc_source.h5ad", _moment_reducer(),
+            groupby="perturbation", batch_column="batch", statistic_name="std_csc",
+            chunk_size=2, cell_chunk_size=20,
+            output_path=tmp_path / "csc_result.h5ad", force=True,
+        )
+    result.close()
+    assert not any("slower" in r.getMessage() for r in caplog.records)
+
+
+def test_format_mismatch_policy_convert_matches_native_csc(tmp_path):
+    path, *_ = _write_data(tmp_path, sparse=True)
+    kwargs = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        chunk_size=2, cell_chunk_size=20, force=True,
+    )
+    converted = cx.batch_process(
+        path, _moment_reducer(), format_mismatch_policy="convert",
+        output_path=tmp_path / "via_convert.h5ad", **kwargs,
+    )
+    converted_values = np.asarray(converted.backed.X[:]).copy()
+    converted.close()
+
+    native = cx.batch_process(
+        path, _moment_reducer(), format_mismatch_policy="off",
+        output_path=tmp_path / "native.h5ad", **kwargs,
+    )
+    native_values = np.asarray(native.backed.X[:]).copy()
+    native.close()
+
+    np.testing.assert_allclose(converted_values, native_values)
