@@ -86,9 +86,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "scipy>=1.10,<=1.12.0" \
     "pandas>=1.5" \
     "anndata>=0.9" \
-    h5py \
+    "h5py>=3.0" \
     "numba>=0.59" \
+    "joblib>=1.0" \
+    "scikit-learn>=1.0" \
+    "scikit-misc>=0.1.4" \
     "scanpy>=1.9.2" \
+    "seaborn>=0.12" \
+    "matplotlib>=3.5" \
     "statsmodels>=0.14"
 
 # Install DE/benchmark dependencies (including pertpy with ott-jax)

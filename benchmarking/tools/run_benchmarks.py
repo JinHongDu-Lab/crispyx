@@ -72,10 +72,7 @@ from crispyx.data import (
 )
 from crispyx.de import t_test, wilcoxon_test, nb_glm_test, shrink_lfc
 from .comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
-from crispyx.pseudobulk import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
-)
+from crispyx.pseudobulk import compute_normalized_effects
 from crispyx.qc import quality_control_summary
 
 # Import constants from centralized module
@@ -3478,13 +3475,33 @@ class DockerRunner:
         self.n_cores = n_cores
         self.workspace_root = workspace_root or REPO_ROOT
         self.quiet = quiet
-        
+        self.extra_mounts = self._resolve_symlink_mounts()
+
         # Validate Docker is available
         if not _is_docker_available():
             raise RuntimeError(
                 "Docker is not available. Please install Docker or use native execution."
             )
-    
+
+    def _resolve_symlink_mounts(self) -> list[Path]:
+        """Find workspace symlinks pointing outside the workspace (e.g.
+        benchmarking/results -> external storage) and return their targets so
+        they can be bind-mounted at the same absolute path in the container.
+        Without this, the symlink dangles inside the container and any read
+        or write through it raises FileNotFoundError.
+        """
+        candidates = [self.workspace_root / "benchmarking" / "results"]
+        mounts: list[Path] = []
+        for link in candidates:
+            if link.is_symlink():
+                target = link.resolve()
+                try:
+                    target.relative_to(self.workspace_root)
+                except ValueError:
+                    if target.exists():
+                        mounts.append(target)
+        return mounts
+
     def _get_function_info(self, method: BenchmarkMethod) -> Dict[str, str]:
         """Extract function module and name from a BenchmarkMethod."""
         func = method.function
@@ -3643,6 +3660,13 @@ class DockerRunner:
                 f"--cpus={self.n_cores}",
                 # Mount workspace
                 "-v", f"{self.workspace_root}:/workspace:rw",
+            ]
+            # Mount any workspace symlink targets (e.g. benchmarking/results
+            # -> external storage) at the same absolute path so they resolve
+            # inside the container too.
+            for mount_target in self.extra_mounts:
+                cmd += ["-v", f"{mount_target}:{mount_target}:rw"]
+            cmd += [
                 # Mount temp directory for IPC
                 "-v", f"{temp_dir}:/ipc:rw",
                 # Mount host timezone so container timestamps match host time
@@ -4267,10 +4291,11 @@ def create_benchmark_suite(
         "crispyx_pb_avg_log": BenchmarkMethod(
             name="crispyx_pb_avg_log",
             description="Average log-normalised expression per perturbation",
-            function=compute_average_log_expression,
+            function=compute_normalized_effects,
             kwargs={
                 "data": dataset_path,
                 **shared_kwargs,
+                "method": "mean_log1p",
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_avg_log",
             },
@@ -4279,10 +4304,11 @@ def create_benchmark_suite(
         "crispyx_pb_pseudobulk": BenchmarkMethod(
             name="crispyx_pb_pseudobulk",
             description="Pseudo-bulk log fold-change per perturbation",
-            function=compute_pseudobulk_expression,
+            function=compute_normalized_effects,
             kwargs={
                 "data": dataset_path,
                 **shared_kwargs,
+                "method": "log_mean",
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_pseudobulk",
             },

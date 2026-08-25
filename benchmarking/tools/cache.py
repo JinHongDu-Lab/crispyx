@@ -136,9 +136,9 @@ def get_expected_output_path(method_name: str, output_dir: Path) -> Optional[Pat
     elif method_name == "scanpy_qc_filtered":
         return preprocessing_dir / "scanpy_qc_filtered.h5ad"
     elif method_name == "scanpy_de_t_test":
-        return de_dir / "scanpy_de_t_test.h5ad"
+        return de_dir / "scanpy_de_t_test.csv"
     elif method_name == "scanpy_de_wilcoxon":
-        return de_dir / "scanpy_de_wilcoxon.h5ad"
+        return de_dir / "scanpy_de_wilcoxon.csv"
     
     # Reference tool CSV outputs
     elif method_name == "edger_de_glm":
