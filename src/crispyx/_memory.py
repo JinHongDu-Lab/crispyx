@@ -6,7 +6,10 @@ determining optimal batch sizes for parallel processing.
 
 from __future__ import annotations
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def _get_available_memory_mb() -> float:
@@ -127,3 +130,117 @@ def _estimate_max_workers(
     cpu_count = os.cpu_count() or 4
     
     return min(max_workers, cpu_count)
+
+
+def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
+    """Resolve the effective memory limit in bytes.
+
+    If *memory_limit_gb* is provided, convert it to bytes.
+    Otherwise, query the system with ``psutil`` and fall back to 64 GB.
+
+    Parameters
+    ----------
+    memory_limit_gb
+        Explicit memory limit in gigabytes, or ``None`` for auto-detect.
+
+    Returns
+    -------
+    float
+        Memory budget in bytes.
+    """
+    if memory_limit_gb is not None:
+        return memory_limit_gb * 1e9
+
+    try:
+        import psutil
+        return float(psutil.virtual_memory().available)
+    except ImportError:
+        return 64 * 1e9  # conservative default
+
+
+def _should_use_streaming(
+    n_groups: int,
+    n_genes: int,
+    *,
+    memory_limit_gb: float | None = None,
+    n_float64_arrays: int = 7,
+    n_float32_arrays: int = 2,
+    peak_multiplier: float = 5.0,
+    threshold_fraction: float = 0.30,
+) -> tuple[bool, float, float, int]:
+    """Decide whether to use group-batch streaming for output arrays.
+
+    Estimates the peak memory of the single-pass (memmap) approach, where
+    ``n_groups × n_genes`` result arrays are allocated for all groups at
+    once, then copied at the end.  If the estimated peak exceeds
+    ``threshold_fraction`` of the available memory budget, streaming is
+    recommended.
+
+    The default ``peak_multiplier=5.0`` accounts for five additive
+    contributions that are proportional to the output-array footprint:
+
+    1. Memmap pages resident in the page cache after all gene chunks
+       have been processed (~1×).
+    2. ``numpy.array()`` copies created from the memmaps before the
+       temporary directory is deleted (~1×).
+    3. Backed h5ad file pages that accumulate in RSS as gene chunks
+       are read from the sparse backing store (~1.5×).
+    4. AnnData / h5py write buffers and Python working memory (~0.5×).
+    5. glibc arena overhead and freed-but-unreturned pages (~1×).
+
+    Parameters
+    ----------
+    n_groups
+        Number of perturbation groups (excluding control).
+    n_genes
+        Number of genes.
+    memory_limit_gb
+        Explicit memory cap in GB.  ``None`` → auto-detect via psutil.
+    n_float64_arrays
+        Number of ``float64`` output arrays per group (default 7).
+    n_float32_arrays
+        Number of ``float32`` output arrays per group (default 2).
+    peak_multiplier
+        Factor applied to the memmap footprint to account for the
+        end-of-run copy, backing-file RSS, and write overhead
+        (default 4×).
+    threshold_fraction
+        Fraction of available memory above which streaming is triggered
+        (default 0.30).
+
+    Returns
+    -------
+    use_streaming : bool
+        ``True`` when the streaming path should be used.
+    estimated_peak_bytes : float
+        Estimated peak memory for the standard path.
+    memory_budget_bytes : float
+        Effective memory budget in bytes.
+    group_batch_size : int
+        Recommended group batch size (meaningful only when
+        ``use_streaming`` is ``True``).
+    """
+    bytes_per_group = n_genes * (n_float64_arrays * 8 + n_float32_arrays * 4)
+    memmap_total_bytes = n_groups * bytes_per_group
+    estimated_peak_bytes = memmap_total_bytes * peak_multiplier
+
+    memory_budget_bytes = _resolve_memory_limit_bytes(memory_limit_gb)
+    streaming_threshold = memory_budget_bytes * threshold_fraction
+    use_streaming = estimated_peak_bytes > streaming_threshold
+
+    # Calculate adaptive group batch size
+    group_batch_size = n_groups  # default: all at once
+    if use_streaming:
+        batch_budget_bytes = memory_budget_bytes * (threshold_fraction / 2)
+        group_batch_size = max(100, int(batch_budget_bytes / bytes_per_group))
+        group_batch_size = min(group_batch_size, n_groups)
+
+        logger.info(
+            "Large result matrix detected: %d groups × %d genes = "
+            "%.1f GB estimated peak (budget: %.1f GB). "
+            "Switching to streaming mode with batch_size=%d.",
+            n_groups, n_genes, estimated_peak_bytes / 1e9,
+            memory_budget_bytes / 1e9, group_batch_size,
+        )
+
+    return use_streaming, estimated_peak_bytes, memory_budget_bytes, group_batch_size

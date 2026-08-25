@@ -1,0 +1,33 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+version: 2
+
+# Build settings
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.10"
+  apt_packages:
+    - pandoc
+
+# Sphinx configuration
+sphinx:
+  configuration: docs/conf.py
+  fail_on_warning: false
+
+# Python configuration
+python:
+  install:
+    # Install documentation dependencies
+    - requirements: docs/requirements.txt
+    # Install the package itself
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
+
+# Formats to build
+formats:
+  - pdf
+  - epub

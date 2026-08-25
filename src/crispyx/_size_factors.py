@@ -229,26 +229,63 @@ def _deseq2_style_size_factors(
     
     # Collect counts for all-expressed genes
     all_expressed_idx = np.where(all_expressed)[0]
-    counts_filtered = np.zeros((n_cells, n_all_expressed), dtype=np.float64)
-    
-    backed = read_backed(path)
-    try:
-        cell_offset = 0
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
-        ):
-            block_arr = np.asarray(block)
-            counts_filtered[slc.start:slc.stop, :] = block_arr[:, all_expressed_idx]
-            cell_offset = slc.stop
-    finally:
-        backed.file.close()
-    
-    # Compute geometric means per gene
-    geo_means = gmean(counts_filtered, axis=0)
-    
-    # Compute ratios and take median
-    ratios = counts_filtered / geo_means
-    size_factors = np.median(ratios, axis=1)
+
+    # Memory check: estimate size of counts_filtered array
+    counts_filtered_gb = n_cells * n_all_expressed * 8 / 1e9
+    use_streaming = counts_filtered_gb > 4.0  # >4 GB → stream to avoid OOM
+
+    if use_streaming:
+        logger.info(
+            f"Large counts_filtered ({n_cells:,} × {n_all_expressed:,} = "
+            f"{counts_filtered_gb:.1f} GB). Using streaming DESeq2 size factors."
+        )
+
+        # Streaming Pass 2: compute geometric means via log-sum accumulation.
+        # All selected genes have count > 0 in every cell, so log is finite.
+        log_sum = np.zeros(n_all_expressed, dtype=np.float64)
+        backed = read_backed(path)
+        try:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
+            ):
+                block_arr = np.asarray(block, dtype=np.float64)
+                block_filtered = block_arr[:, all_expressed_idx]
+                log_sum += np.log(np.maximum(block_filtered, 1e-300)).sum(axis=0)
+        finally:
+            backed.file.close()
+        geo_means = np.exp(log_sum / n_cells)
+
+        # Streaming Pass 3: compute per-cell median of ratios
+        size_factors = np.full(n_cells, np.nan, dtype=np.float64)
+        backed = read_backed(path)
+        try:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
+            ):
+                block_arr = np.asarray(block, dtype=np.float64)
+                block_filtered = block_arr[:, all_expressed_idx]
+                ratios = block_filtered / geo_means
+                size_factors[slc] = np.median(ratios, axis=1)
+        finally:
+            backed.file.close()
+    else:
+        counts_filtered = np.zeros((n_cells, n_all_expressed), dtype=np.float64)
+        backed = read_backed(path)
+        try:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
+            ):
+                block_arr = np.asarray(block)
+                counts_filtered[slc.start:slc.stop, :] = block_arr[:, all_expressed_idx]
+        finally:
+            backed.file.close()
+
+        # Compute geometric means per gene
+        geo_means = gmean(counts_filtered, axis=0)
+
+        # Compute ratios and take median
+        ratios = counts_filtered / geo_means
+        size_factors = np.median(ratios, axis=1)
     
     # Handle any invalid values
     valid_sf = np.isfinite(size_factors) & (size_factors > 0)

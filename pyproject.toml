@@ -4,38 +4,84 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.7.3"
-description = "Tools for scalable CRISPR screen analysis on on-disk AnnData objects"
-authors = [{name = "Streamlining CRISPR Team"}]
+version = "0.1.2"
+description = "Memory-efficient streaming analysis of large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Jin-Hong Du"}]
+requires-python = ">=3.10"
+keywords = [
+    "CRISPR",
+    "Perturb-seq",
+    "single-cell RNA-seq",
+    "AnnData",
+    "Scanpy",
+    "differential expression",
+    "negative binomial GLM",
+    "pseudobulk",
+    "bioinformatics",
+    "functional genomics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "anndata>=0.9",
     "numpy>=1.23",
     "numba>=0.59",
     "pandas>=1.5",
-    "scipy>=1.10,<=1.12.0",
+    "scipy>=1.10",
+    "h5py>=3.0",
+    "joblib>=1.0",
+    "scikit-learn>=1.0",
+    "scikit-misc>=0.1.4",
     "scanpy>=1.9.2",
-    "pertpy>=0.4",
+    "seaborn>=0.12",
+    "matplotlib>=3.5",
+    "tqdm>=4.50",
 ]
 
 [project.optional-dependencies]
 test = [
-    "anndata>=0.9",
-    "numpy>=1.23",
-    "numba>=0.59",
-    "pandas>=1.5",
-    "scipy>=1.10,<=1.12.0",
-    "scanpy>=1.9.2",
-    "pertpy>=0.4",
     "filelock",
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
 ]
 benchmark = [
+    "pertpy>=0.4",
     "pyyaml>=6.0",
     "tqdm>=4.65",
     "psutil>=5.9",
 ]
+docs = [
+    "sphinx>=6.0",
+    "sphinx-rtd-theme>=1.2",
+    "sphinx-copybutton>=0.5",
+    "nbsphinx>=0.9",
+    "ipykernel>=6.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/jinhongdu-lab/crispyx"
+Documentation = "https://crispyx.readthedocs.io"
+Repository = "https://github.com/jinhongdu-lab/crispyx"
+"Bug Tracker" = "https://github.com/jinhongdu-lab/crispyx/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+crispyx = ["py.typed"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -50,4 +96,8 @@ filterwarnings = [
     "ignore:The dispersion trend curve fitting did not converge:UserWarning",
     # Ignore AnnData implicit modification warnings (third-party issue)
     "ignore:Transforming to str index:anndata.ImplicitModificationWarning",
+    # Ignore AnnData old-format warnings from test fixture files written without encoding metadata
+    "ignore:.*was written without encoding metadata:anndata.OldFormatWarning",
+    # Ignore matplotlib layout warnings in plotting tests
+    "ignore:Tight layout not applied:UserWarning",
 ]

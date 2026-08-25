@@ -190,7 +190,7 @@ def precompute_control_statistics(
         set control_matrix to None to save memory. This reduces per-worker pickle
         size from ~5GB to ~1MB for large datasets. Workers can use the frozen
         stats with `fit_batch_with_frozen_control()` instead of the raw matrix.
-        Default False for backward compatibility.
+        Default False.
         
     Returns
     -------
@@ -334,7 +334,7 @@ def precompute_control_statistics(
             f"memory saved: {n_control * n_genes * 8 / 1e6:.1f} MB"
         )
     else:
-        Y_to_store = Y  # Store dense matrix for backward compatibility
+        Y_to_store = Y
     
     # Free temporary arrays
     del mu, weights, z_centered, eta
@@ -357,6 +357,203 @@ def precompute_control_statistics(
         frozen_control_resid_sq_sum=frozen_control_resid_sq_sum,
         frozen_control_Y_sum=frozen_control_Y_sum,
         use_frozen_control=use_frozen,
+    )
+
+
+def precompute_control_statistics_streaming(
+    path: "str | Path",
+    control_mask: np.ndarray,
+    control_offset: np.ndarray,
+    *,
+    max_iter: int = 10,
+    tol: float = 1e-6,
+    min_mu: float = 0.5,
+    global_size_factors: np.ndarray | None = None,
+    freeze_control: bool = True,
+    chunk_size: int = 4096,
+) -> ControlStatisticsCache:
+    """Streaming version of precompute_control_statistics for very large control groups.
+
+    Instead of densifying the full control matrix (which can exceed 100+ GiB for
+    large datasets), this function reads control cells from disk in chunks and
+    accumulates sufficient statistics for the intercept-only IRLS model.
+
+    Peak memory is O(chunk_size × n_genes) instead of O(n_control × n_genes).
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file containing the count matrix.
+    control_mask
+        Boolean mask over all cells indicating control cells, shape (n_cells,).
+    control_offset
+        Log size factors for control cells, shape (n_control,).
+    max_iter
+        Maximum IRLS iterations for intercept estimation.
+    tol
+        Convergence tolerance.
+    min_mu
+        Minimum fitted mean value.
+    global_size_factors
+        Optional precomputed size factors for all cells (n_cells_total,).
+    freeze_control
+        Must be True for streaming mode (raw control_matrix is never materialised).
+    chunk_size
+        Number of control cells to process per chunk. Default 4096.
+
+    Returns
+    -------
+    ControlStatisticsCache
+        Cached statistics with frozen control sufficient statistics.
+    """
+    from pathlib import Path as _Path
+    from .data import read_backed
+
+    if not freeze_control:
+        raise ValueError(
+            "Streaming precompute_control_statistics requires freeze_control=True "
+            "because the raw control matrix is never materialised."
+        )
+
+    path = _Path(path)
+    offset = np.asarray(control_offset, dtype=np.float64)
+    control_indices = np.where(control_mask)[0]
+    n_control = len(control_indices)
+
+    # Get n_genes from file
+    backed = read_backed(path)
+    n_genes = backed.n_vars
+    backed.file.close()
+
+    log_min_mu = np.log(min_mu)
+
+    # ---- Helper to iterate control cells in chunks from disk ----
+    def _iter_control_chunks():
+        """Yield (Y_chunk, offset_chunk) for control cells."""
+        bk = read_backed(path)
+        try:
+            for start in range(0, n_control, chunk_size):
+                end = min(start + chunk_size, n_control)
+                idx = control_indices[start:end]
+                chunk = bk.X[idx, :]
+                if sp.issparse(chunk):
+                    chunk = np.asarray(chunk.toarray(), dtype=np.float64)
+                else:
+                    chunk = np.asarray(chunk, dtype=np.float64)
+                yield chunk, offset[start:end]
+        finally:
+            bk.file.close()
+
+    # ---- Pass 0: Compute expression counts & mean counts (single pass) ----
+    expr_counts = np.zeros(n_genes, dtype=np.int64)
+    count_sum = np.zeros(n_genes, dtype=np.float64)
+    norm_sum = np.zeros(n_genes, dtype=np.float64)
+
+    for Y_chunk, off_chunk in _iter_control_chunks():
+        expr_counts += np.asarray((Y_chunk > 0).sum(axis=0)).ravel()
+        count_sum += Y_chunk.sum(axis=0)
+        norm_sum += (Y_chunk / np.exp(off_chunk)[:, None]).sum(axis=0)
+
+    mean_counts = count_sum / n_control
+    control_mean_expr = norm_sum / n_control
+    pts_rest = (expr_counts / n_control).astype(np.float32) if n_control > 0 else np.zeros(n_genes, dtype=np.float32)
+
+    # ---- Initialise intercept & dispersion ----
+    mean_offset = np.exp(offset).mean()
+    beta_intercept = np.log(np.maximum(mean_counts / mean_offset, 1e-10))
+    alpha = np.full(n_genes, 0.1, dtype=np.float64)
+
+    # ---- IRLS loop (each iteration streams through control cells) ----
+    for iteration in range(max_iter):
+        xtwx = np.zeros(n_genes, dtype=np.float64)
+        xtwz = np.zeros(n_genes, dtype=np.float64)
+        mom_numerator = np.zeros(n_genes, dtype=np.float64)
+
+        for Y_chunk, off_chunk in _iter_control_chunks():
+            n_chunk = Y_chunk.shape[0]
+            # eta = beta_intercept + offset
+            eta = beta_intercept[None, :] + off_chunk[:, None]
+            np.clip(eta, log_min_mu, 20.0, out=eta)
+            mu = np.exp(eta)
+            np.maximum(mu, min_mu, out=mu)
+
+            # Weights: W = mu^2 / var, var = mu + alpha * mu^2
+            variance = mu + alpha[None, :] * mu * mu
+            W = mu * mu / np.maximum(variance, min_mu)
+
+            # Working response z = eta + (Y - mu) / mu
+            resid = Y_chunk - mu
+            z = eta + resid / np.maximum(mu, min_mu)
+            z_centered = z - off_chunk[:, None]
+
+            xtwx += W.sum(axis=0)
+            xtwz += (W * z_centered).sum(axis=0)
+
+            # MoM numerator: sum((y-mu)^2 - y) / mu^2
+            mom_numerator += ((resid * resid - Y_chunk) / np.maximum(mu * mu, min_mu)).sum(axis=0)
+
+        beta_new = xtwz / np.maximum(xtwx, 1e-10)
+
+        if np.max(np.abs(beta_new - beta_intercept)) < tol:
+            beta_intercept = beta_new
+            break
+        beta_intercept = beta_new
+
+        # Update dispersion (MoM)
+        dof = max(n_control - 1, 1)
+        alpha_new = np.clip(mom_numerator / dof, 1e-8, 1e6)
+        alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
+
+    # ---- Final pass: compute frozen sufficient statistics ----
+    frozen_W_sum = np.zeros(n_genes, dtype=np.float64)
+    frozen_Wz_sum = np.zeros(n_genes, dtype=np.float64)
+    frozen_mu_sum = np.zeros(n_genes, dtype=np.float64)
+    frozen_resid_sq_sum = np.zeros(n_genes, dtype=np.float64)
+    frozen_Y_sum = np.zeros(n_genes, dtype=np.float64)
+
+    for Y_chunk, off_chunk in _iter_control_chunks():
+        eta = beta_intercept[None, :] + off_chunk[:, None]
+        np.clip(eta, log_min_mu, 20.0, out=eta)
+        mu = np.exp(eta)
+        np.maximum(mu, min_mu, out=mu)
+
+        variance = mu + alpha[None, :] * mu * mu
+        W = mu * mu / np.maximum(variance, min_mu)
+
+        resid = Y_chunk - mu
+        z = eta + resid / np.maximum(mu, min_mu)
+        z_centered = z - off_chunk[:, None]
+
+        frozen_W_sum += W.sum(axis=0)
+        frozen_Wz_sum += (W * z_centered).sum(axis=0)
+        frozen_mu_sum += mu.sum(axis=0)
+        frozen_resid_sq_sum += (resid * resid).sum(axis=0)
+        frozen_Y_sum += Y_chunk.sum(axis=0)
+
+    logger.info(
+        f"Streaming control statistics computed: {n_control:,} cells × {n_genes:,} genes "
+        f"in chunks of {chunk_size} "
+        f"(peak memory saved: {n_control * n_genes * 8 / 1e9:.1f} GB)"
+    )
+
+    return ControlStatisticsCache(
+        control_matrix=None,
+        control_n=n_control,
+        control_offset=None,
+        beta_intercept=beta_intercept,
+        control_dispersion=alpha,
+        control_xtwx_intercept=frozen_W_sum,
+        control_xtwz_intercept=frozen_Wz_sum,
+        control_mean_expr=control_mean_expr,
+        control_expr_counts=expr_counts.astype(np.int32),
+        pts_rest=pts_rest,
+        global_size_factors=global_size_factors,
+        frozen_control_W_sum=frozen_W_sum,
+        frozen_control_Wz_sum=frozen_Wz_sum,
+        frozen_control_mu_sum=frozen_mu_sum,
+        frozen_control_resid_sq_sum=frozen_resid_sq_sum,
+        frozen_control_Y_sum=frozen_Y_sum,
+        use_frozen_control=True,
     )
 
 
@@ -872,10 +1069,11 @@ class NBGLMFitter:
         Genes with a total count below this threshold are not fitted (the
         resulting ``NBGLMResult`` will report ``converged=False``).
     dispersion_method:
-        Method for estimating dispersion when ``dispersion`` is None:
-        - "moments": Method-of-moments (fast but less accurate)
-        - "cox-reid": Cox-Reid adjusted profile likelihood (slower but more
-          accurate, similar to DESeq2)
+        Method for estimating dispersion when ``dispersion`` is None.
+
+        - ``"moments"``: Method-of-moments (fast but less accurate).
+        - ``"cox-reid"``: Cox-Reid adjusted profile likelihood (slower but more
+          accurate, similar to DESeq2).
     """
 
     def __init__(
@@ -935,6 +1133,21 @@ class NBGLMFitter:
         return self._fit_gene_lbfgsb(y)
 
     def fit_matrix(self, matrix: ArrayLike, *, batch_size: int | None = None) -> list[NBGLMResult]:
+        """Fit NB GLM for every gene (column) in a count matrix.
+
+        Parameters
+        ----------
+        matrix : array-like of shape (n_samples, n_genes)
+            Raw count matrix.  Sparse (CSC) and dense formats are accepted.
+        batch_size : int or None, optional
+            Number of genes to densify at once when *matrix* is sparse.
+            ``None`` processes all genes in one batch.
+
+        Returns
+        -------
+        list of NBGLMResult
+            One result per gene, in column order.
+        """
         if sp.issparse(matrix):
             sparse_matrix = sp.csc_matrix(matrix, dtype=np.float64)
             n_genes = sparse_matrix.shape[1]
@@ -1327,14 +1540,14 @@ def fit_dispersion_trend(
     n_iter: int = 10,
 ) -> np.ndarray:
     """Fit a smooth mean-dispersion trend using DESeq2/PyDESeq2-style Gamma GLM.
-    
-    The parametric trend models dispersion as:
-        dispersion = asymptDisp + extraPois / mean
-    
+
+    The parametric trend models dispersion as
+    ``dispersion = asymptDisp + extraPois / mean``.
+
     This matches PyDESeq2's fitDispersionTrend which uses iteratively reweighted
-    least squares (IRLS) with a Gamma family and log link, fitting:
-        E[disp] = a0 + a1 / mean
-    
+    least squares (IRLS) with a Gamma family and log link, fitting
+    ``E[disp] = a0 + a1 / mean``.
+
     Outliers are iteratively removed based on prediction ratio bounds.
     
     Parameters
@@ -1624,13 +1837,13 @@ def estimate_dispersion_map(
     n_jobs: int = -1,
 ) -> np.ndarray:
     """Estimate MAP dispersion using vectorized grid search + optional refinement.
-    
+
     This implements PyDESeq2-style MAP estimation where the dispersion
-    is estimated by maximizing:
-        log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)
-    
-    The prior is log-normal: log(alpha) ~ N(log(trend), prior_var)
-    
+    is estimated by maximizing
+    ``log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)``.
+
+    The prior is log-normal: ``log(alpha) ~ N(log(trend), prior_var)``.
+
     **Optimization (v5)**: Uses fused Numba kernel that combines grid search
     with Brent's method refinement in a single parallel pass over genes.
     This eliminates joblib process spawning overhead, achieving ~2-3× speedup
@@ -2157,27 +2370,27 @@ def shrink_lfc_apeglm_from_stats(
     hybrid_base_mean_threshold: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Apply apeGLM-style shrinkage using pre-computed MLE statistics.
-    
+
     This is a memory-efficient, fully vectorized version of apeGLM shrinkage
     that uses pre-computed MLE coefficients and standard errors without
     requiring access to the full count matrix. It applies a Cauchy prior and
     finds the MAP estimate using a damped Newton-Raphson optimization across
     all genes simultaneously.
-    
-    **Accuracy improvements (v2)**:
-    1. Gene-specific prior scales based on expression level (sqrt(base_mean))
-    2. Moment-corrected SE using observed Fisher information approximation
-    3. Hybrid fallback: marks genes with |MLE|/SE > threshold or low expression
-       for full NB-GLM re-fitting to achieve Eff ρ ≥ 0.98
-    
-    The posterior mode is found by solving:
-        beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }
-    
+
+    Accuracy improvements (v2):
+
+    1. Gene-specific prior scales based on expression level (sqrt(base_mean)).
+    2. Moment-corrected SE using observed Fisher information approximation.
+    3. Hybrid fallback: marks genes with ``abs(MLE)/SE`` > threshold or low
+       expression for full NB-GLM re-fitting to achieve Eff rho >= 0.98.
+
+    The posterior mode is found by solving
+    ``beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }``
     which is the negative log posterior with a Cauchy prior.
-    
+
     This implementation uses a robust damped Newton method with Hessian
     clamping to ensure convergence even when the standard Hessian becomes
-    negative (which can happen when |beta| > prior_scale). This matches
+    negative (which can happen when ``abs(beta)`` > prior_scale). This matches
     PyDESeq2's behavior which uses L-BFGS-B for robustness.
     
     Parameters
@@ -2206,9 +2419,9 @@ def shrink_lfc_apeglm_from_stats(
         be shrunk more aggressively. Default True.
     hybrid_fallback
         If True, return a mask indicating genes that need full NB-GLM re-fitting
-        due to problematic statistics (large |MLE|/SE or low expression).
+        due to problematic statistics (large ``abs(MLE)/SE`` or low expression).
     hybrid_mle_se_threshold
-        Genes with |MLE|/SE > this threshold are marked for full re-fitting.
+        Genes with ``abs(MLE)/SE`` > this threshold are marked for full re-fitting.
     hybrid_base_mean_threshold
         Genes with base_mean < this threshold are marked for full re-fitting.
     

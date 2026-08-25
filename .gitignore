@@ -206,18 +206,27 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Claude Code / AI assistant instructions (local-only)
+CLAUDE.md
+AGENTS.md
+
 
 .vscode/
 
 tutorial_outputs/
+
+# benchmarking/ IS tracked on this branch (unlike crispyx main) -- only
+# ignore its generated/external artifacts, not the folder itself.
 /benchmarking/**/.*
 benchmarking/**/*.h5ad
 benchmarking/**/*.csv
 # benchmarking/results is a symlink to external storage (real, current
-# results for all datasets live outside the repo) -- never track its contents.
-# (no trailing slash: it's a symlink, not a plain directory, so a
-# directory-only pattern would not match it)
+# results for all datasets live outside the repo) -- never track its
+# contents. No trailing slash: it's a symlink, not a plain directory, so a
+# directory-only pattern would not match it.
 benchmarking/results
 data/
 yida\ wang/
 
+/tex
+/plan

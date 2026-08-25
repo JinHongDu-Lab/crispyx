@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use crispyx in your research, please cite it as below."
+title: "crispyx: Streaming analysis of large-scale CRISPR and Perturb-seq screens"
+authors:
+  - family-names: Du
+    given-names: Jin-Hong
+version: 0.1.2
+date-released: 2026-08-25
+url: "https://github.com/jinhongdu-lab/crispyx"
+repository-code: "https://github.com/jinhongdu-lab/crispyx"
+license: MIT
+abstract: >
+  crispyx is a Python package for memory-efficient, streaming analysis of
+  large-scale CRISPR and Perturb-seq screens. It operates directly on
+  disk-backed AnnData (.h5ad) files, enabling quality control, normalization,
+  pseudobulk aggregation, and differential expression (t-test, Wilcoxon,
+  NB-GLM) without loading the full count matrix into memory. crispyx provides
+  a Scanpy-compatible API and has been benchmarked across 12 public CRISPR
+  screen datasets ranging from 21,000 to 1.97 million cells.
+keywords:
+  - CRISPR screen
+  - Perturb-seq
+  - single-cell RNA-seq
+  - AnnData
+  - differential expression
+  - negative binomial GLM
+  - pseudobulk
+  - bioinformatics
+  - functional genomics

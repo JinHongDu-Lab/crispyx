@@ -1,21 +1,28 @@
 # crispyx
 
-A lightweight toolkit for streaming CRISPR screen analysis that processes large datasets without loading them into memory. Uses backed AnnData `.h5ad` files to perform QC, pseudo-bulk aggregation, and differential expression while data remains on disk.
+[![License: Modified MIT](https://img.shields.io/badge/License-Modified%20MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/project/crispyx)
+[![Tests](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml)
+
+## Motivation
+
+Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, requiring large RAM allocations and often making routine workflows impractical on laptops or shared compute nodes.
+
+**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix.
 
 ## Features
 
-- **Streaming QC** – Filters low-quality cells, perturbations, and genes with automatic control label detection and adaptive thresholds
-- **Streaming preprocessing** – Normalize and log-transform large datasets without loading into memory
-- **Scanpy-style API** – Familiar `cx.pp`, `cx.pb`, and `cx.tl` namespaces for quality control, pseudo-bulk, and differential expression
-- **Scanpy-style plotting** – `cx.pl` helpers for rank genes groups, volcano/MA plots, and QC summaries without loading counts
-- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk counts for effect size estimation
-- **Differential expression** – t-test, Wilcoxon, and negative binomial GLM tests with multi-core support
-- **LFC shrinkage** – apeGLM adaptive shrinkage for more accurate log-fold change estimates
-- **Resume/checkpoint** – Long-running analyses can be resumed after interruption
-- **Adaptive processing** – Automatic QC parameter calculation and dataset standardization with caching
-- **Production-ready** – Comprehensive benchmarking scripts with logging, lazy-loading GLM comparisons, and multi-dataset support
-
-See [CHANGELOG.md](CHANGELOG.md) for version history and breaking changes.
+- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
+- **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
+- **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation
+- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
+- **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
+- **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
+- **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`
+- **Disk-aware** – Estimates and warns about scratch-disk usage before large writes or CSC/CSR conversions, and `cx.estimate_disk_usage(...)` answers "how much disk will this need?" up front; the memory savings above assume the machine has enough free disk for streaming intermediates and output files
 
 ## Quick Start
 
@@ -25,13 +32,6 @@ import crispyx as cx
 # Open dataset without loading into memory
 adata = cx.read_h5ad_ondisk("data/demo_benchmark.h5ad")
 
-# Streaming normalization + log1p (for t-test/Wilcoxon)
-adata_norm = cx.pp.normalize_total_log1p(
-    adata,  # Pass AnnData object directly
-    output_dir="results/",
-    data_name="normalized",
-)
-
 # Quality control with adaptive thresholds
 adata = cx.pp.qc_summary(
     adata,
@@ -40,98 +40,67 @@ adata = cx.pp.qc_summary(
     min_cells_per_perturbation=5,
 )
 
-# Pseudo-bulk aggregation
-adata_pb = cx.pb.average_log_expression(
-    adata,
-    perturbation_column="perturbation",
-)
-
-# Differential expression with multi-core support
+# Differential expression
 adata = cx.tl.rank_genes_groups(
     adata,
     perturbation_column="perturbation",
-    method="t-test",  # or "wilcoxon", "nb-glm"
-    n_jobs=4,  # Use 4 cores
-)
-
-# For NB-GLM with LFC shrinkage (two-step workflow)
-result = cx.nb_glm_test(
-    adata,
-    perturbation_column="perturbation",
-)
-shrunk = cx.shrink_lfc(result.result_path)
-
-# Resume interrupted analyses
-result = cx.nb_glm_test(
-    adata,
-    perturbation_column="perturbation",
-    resume=True,  # Skip completed perturbations
-    checkpoint_interval=10,  # Save progress every 10 perturbations
+    method="wilcoxon",  # or "t-test", "nb_glm"
 )
 
 # Access results
 print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
-
-# Plotting (Scanpy-style)
-cx.pl.rank_genes_groups(adata, n_genes=20, sharey=False)
-df = cx.pl.rank_genes_groups_df(adata, group="perturbation_A", n_genes=200)
-cx.pl.volcano(de_df=df, group="perturbation_A")
-cx.pl.ma(
-    data=adata,
-    de_result=adata,
-    group="perturbation_A",
-    reference="control",
-    perturbation_column="perturbation",
-    mean_mode="raw",
-)
 ```
+
+For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Usage Guide](docs/usage.rst) and the [tutorial notebook](docs/notebooks/crispyx_tutorial.ipynb).
+
+## Performance
+
+crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both speed and memory across a range of CRISPR screen dataset sizes, with results matching Scanpy to Pearson *r* > 0.999:
+
+<p align="center">
+  <img src="docs/_static/fig2.png" width="800" alt="Benchmark results across 12 CRISPR screens: (a) dataset sizes, (b) completion status by method, (c) concordance with Scanpy, (d) runtime scaling, (e) peak memory scaling">
+</p>
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install crispyx
 ```
 
-## Benchmarking
-
-### Single Dataset
+For development (editable install with all extras):
 
 ```bash
-cd benchmarking
-./run_benchmark.sh config/Adamson.yaml
+git clone https://github.com/jinhongdu-lab/crispyx.git
+cd crispyx
+pip install -e ".[test,benchmark,docs]"
 ```
 
-### Multiple Datasets
-
-```bash
-cd benchmarking
-./run_benchmark.sh config/*.yaml
-```
-
-See `benchmarking/README.md` for detailed configuration options, adaptive features, and output structure.
+crispyx supports Python 3.10–3.12 and is compatible with recent releases of the
+scientific stack, including `anndata >= 0.13` and `pandas >= 3.0` (where string
+metadata is stored on disk using the nullable-string encoding).
 
 ## Testing
 
 ```bash
-pytest  # Run all tests
-pytest tests/test_workflow.py  # Run specific test file
+pytest
 ```
 
 ## Documentation
-
-Build docs locally:
 
 ```bash
 sphinx-build docs docs/_build
 ```
 
-## Output Structure
+## Acknowledgements
 
-crispyx uses a standardized directory structure with `crispyx_` prefixed filenames:
+crispyx builds on the foundational work of [Scanpy](https://scanpy.readthedocs.io/) (Wolf *et al.*, 2018), [Pertpy](https://pertpy.readthedocs.io/), [PyDESeq2](https://pydeseq2.readthedocs.io/) (Muzellec *et al.*, 2023), and [AnnData](https://anndata.readthedocs.io/) (Virshup *et al.*, 2024). We gratefully acknowledge these projects for establishing the single-cell analysis ecosystem in Python; crispyx extends their APIs and algorithmic designs to enable memory-efficient, streaming computation for large-scale CRISPR screen datasets.
 
-- **Preprocessing**: `crispyx_qc_filtered.h5ad`, `crispyx_pb_avg_log.h5ad`, `crispyx_pb_pseudobulk.h5ad`
-- **Differential expression**: `crispyx_de_t_test.h5ad`, `crispyx_de_wilcoxon.h5ad`, `crispyx_de_nb_glm.h5ad`
-- **Reference comparisons**: `scanpy_de_*.csv`, `edger_de_glm.csv`, `pertpy_de_pydeseq2.csv`
+## Contributing
 
-See [benchmarking/README.md](benchmarking/README.md#output-structure) for the complete directory structure and file naming conventions.
+Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jaydu1/crispyx/issues) or submit a pull request.
+
+## License
+
+crispyx is released under a [Modified MIT License](LICENSE).
+If you use crispyx in research, please cite it — see [CITATION.cff](CITATION.cff).

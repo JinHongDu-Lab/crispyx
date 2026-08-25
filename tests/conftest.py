@@ -1,11 +1,15 @@
-"""Test configuration to keep loky backend usable in restricted environments.
-
-Some macOS sandboxed environments deny os.sysconf("SC_SEM_NSEMS_MAX"), which
-joblib/loky uses to check semaphore limits. We keep loky as the backend but
-skip the check when sysconf is not permitted.
-"""
+"""Pytest configuration for the crispyx test suite."""
 
 from __future__ import annotations
+
+import os
+
+# Pin NUMBA_NUM_THREADS before any import so umap-learn / pynndescent cannot
+# raise "Cannot set NUMBA_NUM_THREADS to a different value once the threads
+# have been launched" across the full test session.
+# NUMBA_THREADING_LAYER is handled by crispyx.__init__ (workqueue, to avoid
+# the libiomp5 / libomp conflict when torch is co-installed).
+os.environ.setdefault("NUMBA_NUM_THREADS", "4")
 
 
 def pytest_sessionstart(session):  # pragma: no cover - test harness setup

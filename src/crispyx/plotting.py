@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 import anndata as ad
 import h5py
@@ -18,6 +18,7 @@ import scipy.sparse as sp
 
 from .data import (
     AnnData,
+    OverlapResult,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
@@ -941,3 +942,483 @@ def plot_qc_summary(
         plt.show()
         return None
     return axes
+
+
+# -----------------------------------------------------------------------------
+# PCA Plotting Functions
+# -----------------------------------------------------------------------------
+
+
+def plot_pca(
+    data: PlotInput,
+    *,
+    color: str | Sequence[str] | None = None,
+    use_raw: bool | None = None,
+    layer: str | None = None,
+    sort_order: bool = True,
+    groups: str | Sequence[str] | None = None,
+    projection: str = "2d",
+    components: str | Sequence[str] | None = None,
+    palette=None,
+    na_color: str = "lightgray",
+    na_in_legend: bool = True,
+    size: float | None = None,
+    frameon: bool | None = None,
+    legend_fontsize: int | float | str | None = None,
+    legend_fontweight: int | str | None = None,
+    legend_loc: str = "right margin",
+    legend_fontoutline: int | None = None,
+    colorbar_loc: str | None = "right",
+    ncols: int = 4,
+    wspace: float | None = None,
+    hspace: float = 0.25,
+    title: str | Sequence[str] | None = None,
+    show: bool | None = None,
+    save: str | bool | None = None,
+    ax=None,
+    return_fig: bool | None = None,
+    **kwargs,
+):
+    """Plot PCA scatter from on-disk crispyx/backed AnnData or in-memory AnnData.
+    
+    Wrapper around scanpy.pl.pca that works with backed and in-memory AnnData.
+    Loads only the PCA embeddings and specified color columns.
+    
+    Parameters
+    ----------
+    data
+        Path to h5ad, crispyx.AnnData, or anndata.AnnData with X_pca computed.
+    color
+        Keys for annotations of observations in .obs or variables in .var.
+    components
+        e.g. '1,2' or ['1,2', '3,4']. Default first 2 components.
+    projection
+        '2d' or '3d'.
+    palette
+        Color palette for categorical annotations.
+    size
+        Point size.
+    show
+        Show the figure.
+    save
+        Save the figure.
+    **kwargs
+        Passed to scanpy.pl.pca.
+    
+    Returns
+    -------
+    matplotlib.axes.Axes or list of Axes, or None if show=True.
+    """
+    try:
+        import scanpy as sc
+    except ImportError as exc:
+        raise ImportError("scanpy is required for PCA plotting") from exc
+
+    # Handle both backed and in-memory AnnData
+    if isinstance(data, ad.AnnData) and not hasattr(data, 'path'):
+        # In-memory AnnData: use directly
+        adata = data
+    else:
+        # Backed data: resolve path and load
+        path = _resolve_path(data)
+        adata = read_backed(path)
+    
+    # Check X_pca exists
+    if "X_pca" not in adata.obsm:
+        raise ValueError(
+            "X_pca not found in adata.obsm. Run cx.pp.pca() first."
+        )
+    
+    # Load into memory for plotting (just embeddings + obs)
+    adata_plot = ad.AnnData(
+        X=sp.csr_matrix((adata.n_obs, adata.n_vars), dtype=np.float32),
+        obs=adata.obs.copy() if hasattr(adata.obs, 'copy') else pd.DataFrame(adata.obs),
+    )
+    adata_plot.obsm["X_pca"] = np.asarray(adata.obsm["X_pca"])
+    
+    # Copy uns['pca'] if present
+    if "pca" in adata.uns:
+        adata_plot.uns["pca"] = dict(adata.uns["pca"])
+    
+    return sc.pl.pca(
+        adata_plot,
+        color=color,
+        use_raw=use_raw,
+        layer=layer,
+        sort_order=sort_order,
+        groups=groups,
+        projection=projection,
+        components=components,
+        palette=palette,
+        na_color=na_color,
+        na_in_legend=na_in_legend,
+        size=size,
+        frameon=frameon,
+        legend_fontsize=legend_fontsize,
+        legend_fontweight=legend_fontweight,
+        legend_loc=legend_loc,
+        legend_fontoutline=legend_fontoutline,
+        colorbar_loc=colorbar_loc,
+        ncols=ncols,
+        wspace=wspace,
+        hspace=hspace,
+        title=title,
+        show=show,
+        save=save,
+        ax=ax,
+        return_fig=return_fig,
+        **kwargs,
+    )
+
+
+def plot_pca_variance_ratio(
+    data: PlotInput,
+    *,
+    n_pcs: int | None = None,
+    log: bool = False,
+    show: bool | None = None,
+    save: str | bool | None = None,
+):
+    """Plot variance ratio explained by each PC.
+    
+    Wrapper around scanpy.pl.pca_variance_ratio that works with backed AnnData.
+    
+    Parameters
+    ----------
+    data
+        Path to h5ad, crispyx.AnnData, or anndata.AnnData with PCA computed.
+    n_pcs
+        Number of PCs to show. Default shows all computed.
+    log
+        Plot on log scale.
+    show
+        Show the figure.
+    save
+        Save the figure.
+    
+    Returns
+    -------
+    matplotlib.axes.Axes or None if show=True.
+    """
+    try:
+        import scanpy as sc
+    except ImportError as exc:
+        raise ImportError("scanpy is required for PCA plotting") from exc
+
+    # Handle both backed and in-memory AnnData
+    if isinstance(data, ad.AnnData) and not hasattr(data, 'path'):
+        adata = data
+    else:
+        path = _resolve_path(data)
+        adata = read_backed(path)
+    
+    if "pca" not in adata.uns or "variance_ratio" not in adata.uns["pca"]:
+        raise ValueError(
+            "PCA variance info not found. Run cx.pp.pca() first."
+        )
+    
+    # Create minimal AnnData with just PCA uns
+    adata_plot = ad.AnnData(
+        X=sp.csr_matrix((1, 1), dtype=np.float32),
+    )
+    adata_plot.uns["pca"] = dict(adata.uns["pca"])
+    
+    # Only pass n_pcs if specified, otherwise let scanpy use its default
+    kwargs = {"log": log, "show": show, "save": save}
+    if n_pcs is not None:
+        kwargs["n_pcs"] = n_pcs
+    
+    return sc.pl.pca_variance_ratio(adata_plot, **kwargs)
+
+
+def plot_pca_loadings(
+    data: PlotInput,
+    *,
+    components: int | str | Sequence[int] | None = None,
+    include_lowest: bool = True,
+    show: bool | None = None,
+    save: str | bool | None = None,
+):
+    """Plot gene loadings for principal components.
+    
+    Wrapper around scanpy.pl.pca_loadings that works with backed and in-memory AnnData.
+    
+    Parameters
+    ----------
+    data
+        Path to h5ad, crispyx.AnnData, or anndata.AnnData with PCA computed.
+    components
+        Which PCs to plot loadings for. e.g. [1, 2, 3] or '1,2,3'.
+        Default shows first few components.
+    include_lowest
+        Show genes with lowest loadings (most negative) as well.
+    show
+        Show the figure.
+    save
+        Save the figure.
+    
+    Returns
+    -------
+    matplotlib.axes.Axes or None if show=True.
+    """
+    try:
+        import scanpy as sc
+    except ImportError as exc:
+        raise ImportError("scanpy is required for PCA plotting") from exc
+
+    # Handle both backed and in-memory AnnData
+    if isinstance(data, ad.AnnData) and not hasattr(data, 'path'):
+        adata = data
+    else:
+        path = _resolve_path(data)
+        adata = read_backed(path)
+    
+    if "PCs" not in adata.varm:
+        raise ValueError(
+            "PCA loadings (varm['PCs']) not found. Run cx.pp.pca() first."
+        )
+    
+    # Load var and PCs for plotting
+    adata_plot = ad.AnnData(
+        X=sp.csr_matrix((1, adata.n_vars), dtype=np.float32),
+        var=adata.var.copy() if hasattr(adata.var, 'copy') else pd.DataFrame(adata.var),
+    )
+    adata_plot.varm["PCs"] = np.asarray(adata.varm["PCs"])
+    
+    if "pca" in adata.uns:
+        adata_plot.uns["pca"] = dict(adata.uns["pca"])
+    
+    return sc.pl.pca_loadings(
+        adata_plot,
+        components=components,
+        include_lowest=include_lowest,
+        show=show,
+        save=save,
+    )
+
+
+# -----------------------------------------------------------------------------
+# UMAP Plotting Functions
+# -----------------------------------------------------------------------------
+
+
+def plot_umap(
+    data: PlotInput,
+    *,
+    color: str | Sequence[str] | None = None,
+    use_raw: bool | None = None,
+    layer: str | None = None,
+    sort_order: bool = True,
+    groups: str | Sequence[str] | None = None,
+    components: str | Sequence[int] | None = None,
+    palette=None,
+    na_color: str = "lightgray",
+    na_in_legend: bool = True,
+    size: float | None = None,
+    frameon: bool | None = None,
+    legend_fontsize: int | float | str | None = None,
+    legend_fontweight: int | str | None = None,
+    legend_loc: str = "right margin",
+    legend_fontoutline: int | None = None,
+    colorbar_loc: str | None = "right",
+    ncols: int = 4,
+    wspace: float | None = None,
+    hspace: float = 0.25,
+    title: str | Sequence[str] | None = None,
+    show: bool | None = None,
+    save: str | bool | None = None,
+    ax=None,
+    return_fig: bool | None = None,
+    **kwargs,
+):
+    """Plot UMAP embedding from on-disk crispyx/backed AnnData or in-memory AnnData.
+    
+    Wrapper around scanpy.pl.umap that works with backed and in-memory AnnData.
+    Loads only the UMAP embeddings and specified color columns.
+    
+    Parameters
+    ----------
+    data
+        Path to h5ad, crispyx.AnnData, or anndata.AnnData with X_umap computed.
+    color
+        Keys for annotations of observations in .obs or variables in .var.
+    components
+        Which dimensions to use (e.g. [0, 1] for first two). Default first 2.
+    palette
+        Color palette for categorical annotations.
+    size
+        Point size.
+    show
+        Show the figure.
+    save
+        Save the figure.
+    **kwargs
+        Passed to scanpy.pl.umap.
+    
+    Returns
+    -------
+    matplotlib.axes.Axes or list of Axes, or None if show=True.
+    
+    Examples
+    --------
+    >>> import crispyx as cx
+    >>> adata = cx.read_backed("data.h5ad")
+    >>> cx.pl.umap(adata, color="perturbation")
+    
+    See Also
+    --------
+    cx.tl.umap : Compute UMAP embedding.
+    cx.pp.neighbors : Compute neighbor graph (required for UMAP).
+    """
+    try:
+        import scanpy as sc
+    except ImportError as exc:
+        raise ImportError("scanpy is required for UMAP plotting") from exc
+
+    # Handle both backed and in-memory AnnData
+    if isinstance(data, ad.AnnData) and not hasattr(data, 'path'):
+        # In-memory AnnData: use directly
+        adata = data
+    else:
+        # Backed data: resolve path and load
+        path = _resolve_path(data)
+        adata = read_backed(path)
+    
+    # Check X_umap exists
+    if "X_umap" not in adata.obsm:
+        raise ValueError(
+            "X_umap not found in adata.obsm. Run cx.tl.umap() first."
+        )
+    
+    # Load into memory for plotting (just embeddings + obs)
+    adata_plot = ad.AnnData(
+        X=sp.csr_matrix((adata.n_obs, adata.n_vars), dtype=np.float32),
+        obs=adata.obs.copy() if hasattr(adata.obs, 'copy') else pd.DataFrame(adata.obs),
+    )
+    adata_plot.obsm["X_umap"] = np.asarray(adata.obsm["X_umap"])
+    
+    # Copy uns['umap'] if present
+    if "umap" in adata.uns:
+        adata_plot.uns["umap"] = dict(adata.uns["umap"])
+    
+    return sc.pl.umap(
+        adata_plot,
+        color=color,
+        use_raw=use_raw,
+        layer=layer,
+        sort_order=sort_order,
+        groups=groups,
+        components=components,
+        palette=palette,
+        na_color=na_color,
+        na_in_legend=na_in_legend,
+        size=size,
+        frameon=frameon,
+        legend_fontsize=legend_fontsize,
+        legend_fontweight=legend_fontweight,
+        legend_loc=legend_loc,
+        legend_fontoutline=legend_fontoutline,
+        colorbar_loc=colorbar_loc,
+        ncols=ncols,
+        wspace=wspace,
+        hspace=hspace,
+        title=title,
+        show=show,
+        save=save,
+        ax=ax,
+        return_fig=return_fig,
+        **kwargs,
+    )
+
+
+# =============================================================================
+# Overlap heatmap (Feature 5)
+# =============================================================================
+
+def plot_overlap_heatmap(
+    result,
+    *,
+    metric="jaccard",
+    ax=None,
+    cmap="Blues",
+    annot=True,
+    fmt=None,
+    title=None,
+):
+    """Heatmap of pairwise overlap statistics.
+
+    Parameters
+    ----------
+    result
+        :class:`~crispyx.data.OverlapResult` from
+        :func:`~crispyx.data.compute_overlap`.
+    metric
+        ``"jaccard"`` (default) or ``"count"``.
+    ax
+        Existing :class:`matplotlib.axes.Axes`; a new figure is created if
+        ``None``.
+    cmap
+        Matplotlib colormap name.
+    annot
+        Annotate each cell with the numeric value.
+    fmt
+        Number format. Defaults to ``".2f"`` for Jaccard and ``"d"`` for
+        counts.
+    title
+        Figure title. Defaults to ``"Jaccard similarity"`` or
+        ``"Overlap counts"``.
+
+    Returns
+    -------
+    matplotlib.axes.Axes or None
+    """
+    plt = _require_matplotlib()
+    if plt is None:
+        return None
+
+    data = result.jaccard_matrix if metric == "jaccard" else result.count_matrix
+    default_fmt = ".2f" if metric == "jaccard" else "d"
+    fmt = fmt or default_fmt
+    title = title or (
+        "Jaccard similarity" if metric == "jaccard" else "Overlap counts"
+    )
+    n = len(data)
+
+    try:
+        import seaborn as sns  # type: ignore[import]
+        if ax is None:
+            _, ax = plt.subplots(figsize=(max(4, n * 0.8), max(3, n * 0.7)))
+        sns.heatmap(
+            data,
+            ax=ax,
+            cmap=cmap,
+            annot=annot,
+            fmt=fmt,
+            linewidths=0.5,
+            square=True,
+            vmin=0,
+            vmax=1.0 if metric == "jaccard" else None,
+            cbar_kws={"shrink": 0.6},
+        )
+        ax.set_title(title)
+    except ImportError:
+        if ax is None:
+            _, ax = plt.subplots(figsize=(max(4, n * 0.8), max(3, n * 0.7)))
+        arr = data.to_numpy(dtype=float)
+        vmax = 1.0 if metric == "jaccard" else None
+        im = ax.imshow(arr, aspect="auto", cmap=cmap, vmin=0, vmax=vmax)
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(data.columns, rotation=45, ha="right")
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(data.index)
+        if annot:
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[1]):
+                    ax.text(
+                        j, i, f"{arr[i, j]:{fmt}}",
+                        ha="center", va="center", fontsize=8,
+                    )
+        ax.figure.colorbar(im, ax=ax, shrink=0.6)
+        ax.set_title(title)
+
+    return ax

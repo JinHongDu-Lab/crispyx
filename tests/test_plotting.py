@@ -14,6 +14,7 @@ if str(SRC_PATH) not in sys.path:
 import numpy as np
 import pandas as pd
 import pytest
+import scanpy as sc
 import scipy.sparse as sp
 import anndata as ad
 
@@ -44,6 +45,8 @@ def small_dataset(tmp_path_factory):
     )
     var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
     adata = ad.AnnData(sp.csr_matrix(X), obs=obs, var=var)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
     data_path = tmp_path / "toy.h5ad"
     adata.write(data_path)
     return data_path
@@ -116,3 +119,59 @@ def test_qc_plotting_functions(small_dataset, tmp_path):
     assert ax is not None
     axes = plot_qc_summary(qc, min_genes=1, min_cells_per_gene=1, show=False)
     assert axes is not None
+
+
+# ============================================================================
+# Feature 5: plot_overlap_heatmap
+# ============================================================================
+
+from crispyx.data import OverlapResult, compute_overlap
+from crispyx.plotting import plot_overlap_heatmap
+
+
+class TestPlotOverlapHeatmap:
+    def _make_result(self):
+        return compute_overlap({
+            "A": {"x", "y", "z"},
+            "B": {"y", "z", "w"},
+            "C": {"z"},
+        })
+
+    def test_returns_axes(self):
+        pytest.importorskip("matplotlib")
+        result = self._make_result()
+        ax = plot_overlap_heatmap(result)
+        assert ax is not None
+
+    def test_count_metric(self):
+        pytest.importorskip("matplotlib")
+        result = self._make_result()
+        ax = plot_overlap_heatmap(result, metric="count")
+        assert ax is not None
+
+    def test_jaccard_metric(self):
+        pytest.importorskip("matplotlib")
+        result = self._make_result()
+        ax = plot_overlap_heatmap(result, metric="jaccard")
+        assert ax is not None
+
+    def test_annotation_toggle(self):
+        pytest.importorskip("matplotlib")
+        result = self._make_result()
+        ax = plot_overlap_heatmap(result, annot=False)
+        assert ax is not None
+
+    def test_custom_title(self):
+        pytest.importorskip("matplotlib")
+        result = self._make_result()
+        ax = plot_overlap_heatmap(result, title="My Title")
+        assert ax.get_title() == "My Title"
+
+    def test_existing_ax_used(self):
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+        _, provided_ax = plt.subplots()
+        result = self._make_result()
+        returned_ax = plot_overlap_heatmap(result, ax=provided_ax)
+        assert returned_ax is provided_ax
+        plt.close("all")
