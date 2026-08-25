@@ -213,8 +213,11 @@ tutorial_outputs/
 /benchmarking/**/.*
 benchmarking/**/*.h5ad
 benchmarking/**/*.csv
-benchmarking/results/**.json
-benchmarking/results/Adamson_subset_fixed
+# benchmarking/results is a symlink to external storage (real, current
+# results for all datasets live outside the repo) -- never track its contents.
+# (no trailing slash: it's a symlink, not a plain directory, so a
+# directory-only pattern would not match it)
+benchmarking/results
 data/
 yida\ wang/
 
