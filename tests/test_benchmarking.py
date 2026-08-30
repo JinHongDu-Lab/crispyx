@@ -18,7 +18,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from benchmarking.tools.run_benchmarks import _summarise_dataframe, create_benchmark_suite
-from crispyx import compute_average_log_expression
+from crispyx import compute_normalized_effects
 
 
 def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
@@ -47,11 +47,12 @@ def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
 
 def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
     dataset_path = _create_demo_dataset(tmp_path)
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         dataset_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbol",
+        method="mean_log1p",
         output_dir=tmp_path,
         data_name="summary_test",
     )
@@ -61,7 +62,7 @@ def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
 
     assert summary["rows"] == 2
     assert summary["columns"] == 4
-    assert summary["result_path"] == "crispyx_summary_test_avg_log_effects.h5ad"
+    assert summary["result_path"] == "summary_test_cx_normalized_effects.h5ad"
 
     result.close()
 
