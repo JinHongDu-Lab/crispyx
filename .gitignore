@@ -226,6 +226,10 @@ benchmarking/**/*.csv
 # directory-only pattern would not match it.
 benchmarking/results
 data/
+# Built container images are reproducible from Dockerfile + build_singularity.sh;
+# too large for git and not source.
+benchmarking/singularity/*.sif
+benchmarking/singularity/*.tar
 yida\ wang/
 
 /tex
