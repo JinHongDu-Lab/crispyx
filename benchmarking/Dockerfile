@@ -102,7 +102,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "statsmodels>=0.14,<0.15" \
     "pydeseq2>=0.4" \
     "pertpy>=0.4" \
-    rpy2 \
+    "rpy2<3.6" \
     "psutil>=5.9" \
     "pyyaml>=6.0" \
     "tqdm>=4.65" \
