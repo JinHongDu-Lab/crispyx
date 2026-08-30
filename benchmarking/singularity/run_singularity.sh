@@ -25,6 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Configuration with defaults
 SIF_FILE="${CRISPYX_SIF:-$SCRIPT_DIR/crispyx-benchmark.sif}"
 DATA_DIR="${DATA_DIR:-$SCRIPT_DIR/../data}"
+ORIGIN_DATA_DIR="${ORIGIN_DATA_DIR:-$SCRIPT_DIR/../../data/origin}"  # large-dataset .h5ad files; override on HPC
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 LOGS_DIR="${LOGS_DIR:-$SCRIPT_DIR/logs}"
 CONFIG_DIR="${CONFIG_DIR:-$SCRIPT_DIR/config}"
@@ -51,6 +52,7 @@ echo "=== Running CRISPYx Benchmark with Singularity ==="
 echo "SIF file: $SIF_FILE"
 echo "Config: $CONFIG_FILE"
 echo "Data dir: $DATA_DIR"
+echo "Origin data dir: $ORIGIN_DATA_DIR"
 echo "Results dir: $RESULTS_DIR"
 echo "Cores: $N_CORES"
 echo ""
@@ -65,11 +67,21 @@ export NUMBA_NUM_THREADS=$N_CORES
 # --bind mounts directories into the container
 # --pwd sets the working directory
 # --cleanenv prevents host environment from leaking in (except explicitly passed vars)
+# Build bind args for /data/origin (large-dataset absolute paths in YAML configs)
+ORIGIN_BIND=""
+if [ -d "$ORIGIN_DATA_DIR" ]; then
+    ORIGIN_BIND="--bind $ORIGIN_DATA_DIR:/data/origin:ro"
+else
+    echo "WARNING: ORIGIN_DATA_DIR '$ORIGIN_DATA_DIR' not found — large-dataset configs will fail."
+fi
+
+# shellcheck disable=SC2086  # ORIGIN_BIND intentionally unquoted for word splitting
 singularity exec \
     --bind "$DATA_DIR:/workspace/data:ro" \
     --bind "$RESULTS_DIR:/workspace/benchmarking/results:rw" \
     --bind "$LOGS_DIR:/workspace/benchmarking/logs:rw" \
     --bind "$CONFIG_DIR:/workspace/benchmarking/config:ro" \
+    $ORIGIN_BIND \
     --pwd /workspace \
     --env "OMP_NUM_THREADS=$N_CORES" \
     --env "MKL_NUM_THREADS=$N_CORES" \

@@ -31,39 +31,66 @@ DEFAULT_CONFIGS=(
     "Replogle-GW-k562.yaml"
     # "Tian-crispra.yaml"
     # "Tian-crispri.yaml"
+    # "Huang-HCT116.yaml"
+    # "Huang-HEK293T.yaml"
 )
+
+# Benchmark-specific flags that should be forwarded to Python script
+# (not to sbatch)
+BENCHMARK_FLAGS=("--force" "--clean" "--methods")
 
 # If no arguments provided, use default configs
 if [ $# -lt 1 ]; then
     echo "No config specified, using default configs: ${DEFAULT_CONFIGS[*]}"
     CONFIGS=("${DEFAULT_CONFIGS[@]}")
-    EXTRA_ARGS=()
+    SBATCH_ARGS=()
+    BENCHMARK_ARGS=()
 else
-    # Collect config files and extra arguments
+    # Collect config files, sbatch options, and benchmark options
     CONFIGS=()
-    EXTRA_ARGS=()
+    SBATCH_ARGS=()      # Options for sbatch (e.g., --partition, --qos)
+    BENCHMARK_ARGS=()   # Options for Python script (e.g., --force, --clean)
+    
+    SKIP_NEXT=false
+    PREV_ARG=""
     for arg in "$@"; do
-        if [[ "$arg" == --* ]]; then
-            EXTRA_ARGS+=("$arg")
-        elif [[ "$arg" == *.yaml ]]; then
+        if [ "$SKIP_NEXT" = true ]; then
+            # This is a value for a benchmark flag (e.g., methods list)
+            BENCHMARK_ARGS+=("$arg")
+            SKIP_NEXT=false
+            continue
+        fi
+        
+        if [[ "$arg" == *.yaml ]]; then
             CONFIGS+=("$arg")
+        elif [[ "$arg" == --* ]]; then
+            # Check if this is a benchmark flag
+            IS_BENCHMARK_FLAG=false
+            for bf in "${BENCHMARK_FLAGS[@]}"; do
+                if [[ "$arg" == "$bf" || "$arg" == "$bf="* ]]; then
+                    IS_BENCHMARK_FLAG=true
+                    break
+                fi
+            done
+            
+            if [ "$IS_BENCHMARK_FLAG" = true ]; then
+                BENCHMARK_ARGS+=("$arg")
+                # Check if this flag expects a value (--methods)
+                if [[ "$arg" == "--methods" ]]; then
+                    SKIP_NEXT=true
+                fi
+            else
+                SBATCH_ARGS+=("$arg")
+            fi
         else
-            EXTRA_ARGS+=("$arg")
+            SBATCH_ARGS+=("$arg")
         fi
     done
     
-    # If no yaml files found in args, show usage
+    # If no yaml files found in args, use default configs (allows --force without specifying configs)
     if [ ${#CONFIGS[@]} -eq 0 ]; then
-        echo "Usage: $0 [config.yaml ...] [additional sbatch options]"
-        echo ""
-        echo "Examples:"
-        echo "  $0                                    # Submit all default configs"
-        echo "  $0 Adamson_subset.yaml"
-        echo "  $0 Adamson.yaml --partition=gpu"
-        echo "  $0 Replogle-GW-k562.yaml --qos=long"
-        echo ""
-        echo "Default configs: ${DEFAULT_CONFIGS[*]}"
-        exit 1
+        echo "No config specified, using default configs with flags: ${BENCHMARK_ARGS[*]}"
+        CONFIGS=("${DEFAULT_CONFIGS[@]}")
     fi
 fi
 
@@ -151,10 +178,13 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
     echo "Container Memory Limit: ${MEMORY_GB}G (enforced by Singularity)"
     echo "CPUs: $N_CORES"
     echo "Log: ${DATASET_NAME}_${TIMESTAMP}.out/err"
+    [ ${#BENCHMARK_ARGS[@]} -gt 0 ] && echo "Benchmark args: ${BENCHMARK_ARGS[*]}"
     echo "========================================"
 
     # Submit job with auto-configured resources
     # Pass MEMORY_GB as second argument for Singularity --memory enforcement
+    # Pass benchmark args as third argument (quoted to preserve as single arg)
+    BENCHMARK_ARGS_STR="${BENCHMARK_ARGS[*]}"
     sbatch \
         --job-name="cx-$DATASET_NAME" \
         --time="$JOB_TIME_LIMIT" \
@@ -162,8 +192,8 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
         --cpus-per-task="$N_CORES" \
         --output="$LOG_OUT" \
         --error="$LOG_ERR" \
-        "${EXTRA_ARGS[@]}" \
-        "$SLURM_SCRIPT" "$CONFIG_FILE" "$MEMORY_GB"
+        "${SBATCH_ARGS[@]}" \
+        "$SLURM_SCRIPT" "$CONFIG_FILE" "$MEMORY_GB" "$BENCHMARK_ARGS_STR"
     
     echo ""
 done

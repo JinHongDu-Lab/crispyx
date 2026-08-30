@@ -164,11 +164,13 @@ def _top_k_indices_fast(
     use_absolute: bool,
     ascending: bool,
     genes: Optional[np.ndarray] = None,
+    tiebreak_values: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Get indices of top-k values using fast numpy operations.
     
     Uses np.argpartition for O(n) selection instead of O(n log n) full sort,
-    with optional gene-based tie-breaking only when ties exist.
+    with optional tie-breaking by *tiebreak_values* (e.g. |effect_size|,
+    descending) then by gene name when ties exist.
     
     Parameters
     ----------
@@ -181,7 +183,11 @@ def _top_k_indices_fast(
     ascending : bool
         If True, smaller values are "top" (for p-values)
     genes : np.ndarray, optional
-        Gene names for tie-breaking. Applied lazily only when ties exist.
+        Gene names for tertiary tie-breaking.
+    tiebreak_values : np.ndarray, optional
+        Secondary tie-breaking values (ranked by descending absolute value).
+        Typically |effect_size| so that, among genes with equal p-values,
+        the ones with the largest fold-change are selected first.
     
     Returns
     -------
@@ -217,20 +223,24 @@ def _top_k_indices_fast(
     sorted_order = np.argsort(top_k_vals)
     top_k_idx = part_idx[sorted_order]
     
-    # Apply gene tie-breaking only if needed (ties exist in top-k values)
-    if genes is not None:
+    # Apply tie-breaking only if needed (ties exist in top-k values)
+    if tiebreak_values is not None or genes is not None:
         final_vals = rank_vals[top_k_idx]
-        # Check for ties (consecutive values that are equal)
         if len(final_vals) > 1:
             diffs = np.diff(final_vals)
             has_ties = np.any(np.abs(diffs) < 1e-15)
             
             if has_ties:
-                # Re-sort with gene tie-breaking
-                # Create structured array for stable sort by (value, gene)
-                top_genes = genes[top_k_idx]
-                # Sort by value first, then by gene for ties
-                sort_keys = np.lexsort((top_genes, final_vals))
+                # Build lexsort keys: last key is primary (ascending rank_vals),
+                # second-to-last is secondary (|effect_size| descending), etc.
+                keys: list[np.ndarray] = []
+                if genes is not None:
+                    keys.append(genes[top_k_idx])
+                if tiebreak_values is not None:
+                    # Negate so larger |effect_size| comes first
+                    keys.append(-np.abs(tiebreak_values[top_k_idx]))
+                keys.append(final_vals)
+                sort_keys = np.lexsort(tuple(keys))
                 top_k_idx = top_k_idx[sort_keys]
     
     return top_k_idx
@@ -243,10 +253,18 @@ def _compute_overlap_vectorized(
     use_absolute: bool,
     ascending: bool,
     genes: Optional[np.ndarray] = None,
+    tiebreak_a: Optional[np.ndarray] = None,
+    tiebreak_b: Optional[np.ndarray] = None,
 ) -> Optional[float]:
     """Compute top-k overlap between two value arrays.
     
     Optimized version using numpy operations instead of pandas.
+    
+    Parameters
+    ----------
+    tiebreak_a, tiebreak_b : np.ndarray, optional
+        Secondary sort values for methods A and B (e.g. effect_size).
+        Used to break ties in the primary ranking column.
     
     Returns
     -------
@@ -261,6 +279,8 @@ def _compute_overlap_vectorized(
     valid_a = values_a[valid_mask]
     valid_b = values_b[valid_mask]
     valid_genes = genes[valid_mask] if genes is not None else None
+    valid_tb_a = tiebreak_a[valid_mask] if tiebreak_a is not None else None
+    valid_tb_b = tiebreak_b[valid_mask] if tiebreak_b is not None else None
     
     n = len(valid_a)
     if n == 0:
@@ -272,8 +292,8 @@ def _compute_overlap_vectorized(
     
     # Get top-k indices for each method
     # We need to track original positions, so work with indices
-    idx_a = _top_k_indices_fast(valid_a, actual_k, use_absolute, ascending, valid_genes)
-    idx_b = _top_k_indices_fast(valid_b, actual_k, use_absolute, ascending, valid_genes)
+    idx_a = _top_k_indices_fast(valid_a, actual_k, use_absolute, ascending, valid_genes, valid_tb_a)
+    idx_b = _top_k_indices_fast(valid_b, actual_k, use_absolute, ascending, valid_genes, valid_tb_b)
     
     # Compute overlap
     overlap = len(set(idx_a) & set(idx_b))
@@ -405,6 +425,8 @@ def _compute_per_perturbation_overlap_multi_k(
     k_values: tuple[int, ...],
     use_absolute: bool,
     ascending: bool,
+    tiebreak_col_a: Optional[str] = None,
+    tiebreak_col_b: Optional[str] = None,
 ) -> Dict[int, Optional[float]]:
     """Compute top-k overlap per perturbation for multiple k values in one pass.
     
@@ -442,6 +464,18 @@ def _compute_per_perturbation_overlap_multi_k(
     has_genes = "gene" in merged.columns
     genes_all = merged["gene"].to_numpy() if has_genes else None
     
+    # Optional effect-size tiebreaker arrays
+    tb_a_all = (
+        pd.to_numeric(merged[tiebreak_col_a], errors="coerce").to_numpy()
+        if tiebreak_col_a and tiebreak_col_a in merged.columns
+        else None
+    )
+    tb_b_all = (
+        pd.to_numeric(merged[tiebreak_col_b], errors="coerce").to_numpy()
+        if tiebreak_col_b and tiebreak_col_b in merged.columns
+        else None
+    )
+    
     # Get perturbation groups using numpy for speed
     perturbations = merged["perturbation"].fillna("__NA__").astype(str).to_numpy()
     unique_perts, inverse_idx = np.unique(perturbations, return_inverse=True)
@@ -458,6 +492,8 @@ def _compute_per_perturbation_overlap_multi_k(
         values_b = values_b_all[mask]
         n_genes = len(values_a)
         genes = genes_all[mask] if has_genes else None
+        tb_a = tb_a_all[mask] if tb_a_all is not None else None
+        tb_b = tb_b_all[mask] if tb_b_all is not None else None
         
         # Skip if not enough genes for any k
         if n_genes == 0:
@@ -469,7 +505,8 @@ def _compute_per_perturbation_overlap_multi_k(
             if actual_k <= 0:
                 continue
             overlap = _compute_overlap_vectorized(
-                values_a, values_b, actual_k, use_absolute, ascending, genes
+                values_a, values_b, actual_k, use_absolute, ascending, genes,
+                tb_a, tb_b,
             )
             if overlap is not None:
                 overlaps_by_k[k].append(overlap)
@@ -914,6 +951,12 @@ def compute_de_comparison_metrics(
         if name in ("effect", "pvalue"):
             # Compute for all k values in one pass (optimized multi-k function)
             k_values = (top_k, 100, 500)
+            # For p-value overlap, break ties by |effect_size| so that
+            # both methods agree on rankings when p-values are equal.
+            tb_a = tb_b = None
+            if name == "pvalue":
+                tb_a = "effect_size_method_a"
+                tb_b = "effect_size_method_b"
             overlaps_by_k = _compute_per_perturbation_overlap_multi_k(
                 merged,
                 method_a_col,
@@ -921,6 +964,8 @@ def compute_de_comparison_metrics(
                 k_values=k_values,
                 use_absolute=settings["use_absolute"],
                 ascending=settings["ascending"],
+                tiebreak_col_a=tb_a,
+                tiebreak_col_b=tb_b,
             )
             for k, mean_ovl in overlaps_by_k.items():
                 if k == top_k:

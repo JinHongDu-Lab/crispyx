@@ -35,6 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # R and build tools
     r-base \
     r-base-dev \
+    # Threaded BLAS for R — replaces single-threaded reference BLAS
+    libopenblas-dev \
     # Build dependencies for Python packages
     build-essential \
     gcc \
@@ -56,7 +58,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     # Cleanup
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Configure R to use OpenBLAS instead of reference BLAS
+    && update-alternatives --set libblas.so.3-x86_64-linux-gnu \
+       /usr/lib/x86_64-linux-gnu/openblas-pthread/libblas.so.3
 
 # Install Bioconductor and R packages
 # Pin versions for reproducibility
@@ -78,28 +83,23 @@ WORKDIR /workspace
 # These layers are intentionally placed BEFORE any COPY commands to maximize
 # cache hit rate. Dependencies only reinstall when the RUN commands change.
 
-# Install core dependencies first (for caching)
-# Use BuildKit cache mount to cache pip downloads across builds
+# Install all Python dependencies in a single pip call so pip resolves a
+# consistent set of package versions in one pass.
+# Formerly split across two RUN steps with a scipy<=1.12.0 upper bound;
+# that caused pertpy/pydeseq2 to upgrade scipy in a later layer while leaving
+# the old _rotation.cpython-311.so from scipy<=1.12.0 as a stale file,
+# producing a numpy ABI mismatch at import time.
+# scipy>=1.14 fully supports the numpy 2.x ABI; no upper bound is needed.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     "numpy>=1.23" \
-    "scipy>=1.10,<=1.12.0" \
+    "scipy>=1.14" \
     "pandas>=1.5" \
     "anndata>=0.9" \
-    "h5py>=3.0" \
+    h5py \
     "numba>=0.59" \
-    "joblib>=1.0" \
-    "scikit-learn>=1.0" \
-    "scikit-misc>=0.1.4" \
     "scanpy>=1.9.2" \
-    "seaborn>=0.12" \
-    "matplotlib>=3.5" \
-    "statsmodels>=0.14"
-
-# Install DE/benchmark dependencies (including pertpy with ott-jax)
-# This layer is slow but only rebuilds when dependency versions change
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
+    "statsmodels>=0.14" \
     "pydeseq2>=0.4" \
     "pertpy>=0.4" \
     rpy2 \
@@ -128,6 +128,12 @@ COPY benchmarking/ /workspace/benchmarking/
 RUN mkdir -p /app \
     && cp /workspace/benchmarking/tools/docker_worker.py /app/docker_worker.py \
     && cp /workspace/benchmarking/tools/profiling.py /app/profiling.py
+
+# Pre-compile Numba JIT kernels and cache them inside the image.
+# Exercises both float32 (native h5ad dtype after O2 dtype alignment) and
+# float64 paths so the Numba cache covers all benchmark datasets.
+# Using a standalone script avoids Dockerfile multi-line RUN escaping issues.
+RUN python3.11 /workspace/benchmarking/tools/numba_warmup.py
 
 # Set working directory for benchmark execution
 WORKDIR /workspace

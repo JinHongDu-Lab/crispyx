@@ -39,7 +39,11 @@ resource_limits:
 
 ## Benchmark Methods
 
-**crispyx**: `crispyx_qc_filtered`, `crispyx_pb_avg_log`, `crispyx_pb_pseudobulk`, `crispyx_de_t_test`, `crispyx_de_wilcoxon`, `crispyx_de_nb_glm`
+**crispyx**: `crispyx_qc_filtered`, `crispyx_preprocess`, `crispyx_pb_avg_log`, `crispyx_pb_pseudobulk`, `crispyx_de_t_test`, `crispyx_de_wilcoxon`, `crispyx_de_nb_glm`
+
+> `crispyx_preprocess` normalizes the QC-filtered output (total-count + log1p) and its
+> result is used by all four t-test / Wilcoxon DE methods (both crispyx and Scanpy).
+> Execution order is enforced by `depends_on`: **QC → preprocess → DE**.
 
 **Reference**: `scanpy_qc_filtered`, `scanpy_de_t_test`, `scanpy_de_wilcoxon`, `edger_de_glm`, `pertpy_de_pydeseq2`
 
@@ -67,6 +71,47 @@ The benchmarking tools are organized into focused modules:
 - `visualization.py`: Overlap heatmap generation
 - `run_benchmarks.py`: Main benchmark runner
 - `generate_results.py`: Report generation from cached results
+- `rerun_scanpy.py`: Rerun Scanpy methods without resource limits
+
+## Rerun Scanpy (for Large Datasets)
+
+For large datasets where Scanpy times out or runs out of memory during benchmarks,
+use the rerun_scanpy script AFTER benchmarks complete:
+
+```bash
+# Native mode - rerun Scanpy methods for one dataset
+./run_rerun_scanpy.sh config/Replogle-GW-k562.yaml
+
+# Rerun specific methods only
+./run_rerun_scanpy.sh --methods scanpy_de_wilcoxon config/Feng-ts.yaml
+
+# Force re-run even if outputs exist
+./run_rerun_scanpy.sh --force config/Replogle-GW-k562.yaml
+
+# Skip report regeneration
+./run_rerun_scanpy.sh --no-report config/Replogle-GW-k562.yaml
+```
+
+**SLURM submission (HPC):**
+
+```bash
+cd benchmarking/singularity
+
+# Submit single dataset
+./submit_rerun_scanpy.sh Replogle-GW-k562.yaml
+
+# Submit with options
+./submit_rerun_scanpy.sh Feng-ts.yaml --force
+
+# Submit all large datasets (default)
+./submit_rerun_scanpy.sh
+```
+
+**Key features:**
+- No time/memory limits (methods run to completion)
+- Outputs saved to same locations as benchmarks
+- Does NOT modify .benchmark_cache
+- Automatically regenerates reports with accuracy comparisons
 
 ## Docker
 
@@ -79,6 +124,20 @@ docker run --rm --memory=64g -v $(pwd):/workspace crispyx-benchmark \
   python -m benchmarking.tools.run_benchmarks --config benchmarking/config/Adamson.yaml
 ```
 
+## Memory Management for Large Datasets
+
+crispyx automatically adapts to dataset size:
+
+| Dataset Size | Wilcoxon Chunk | NB-GLM freeze_control | Notes |
+|-------------|----------------|----------------------|-------|
+| <300K cells | Default (512) | Auto (off if feasible) | Full speed |
+| 300K-500K cells | 128 genes | Auto (on if control >10GB) | Balanced |
+| 500K-1M cells | 64 genes | Auto (on) | Memory-safe |
+| >1M cells | 32 genes | Auto (on) | Very conservative |
+
+For datasets like Feng (320K-1.16M cells) with large control populations (~110K cells),
+`freeze_control` auto-enables to reduce per-worker memory from ~32 GB to <1 GB.
+
 ## Troubleshooting
 
 | Issue | Solution |
@@ -86,6 +145,8 @@ docker run --rm --memory=64g -v $(pwd):/workspace crispyx-benchmark \
 | Permission denied | `chmod +x *.sh` |
 | Docker image not found | Build with command above |
 | Out of memory | Increase `--memory` flag or `memory_limit` in config |
+| "Worker process crashed" | Subprocess hit memory limit; reduce `chunk_size` or increase `memory_limit` |
+| "Result transmission failed" | Queue data corruption from crash; rerun with `--force` |
 
 ---
 See [CHANGELOG.md](../CHANGELOG.md) for version history.
