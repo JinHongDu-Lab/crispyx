@@ -99,14 +99,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     h5py \
     "numba>=0.59" \
     "scanpy>=1.9.2" \
-    "statsmodels>=0.14" \
+    "statsmodels>=0.14,<0.15" \
     "pydeseq2>=0.4" \
     "pertpy>=0.4" \
     rpy2 \
     "psutil>=5.9" \
     "pyyaml>=6.0" \
     "tqdm>=4.65" \
-    filelock
+    filelock \
+    pytest
 
 # ============================================================================
 # SOURCE CODE INSTALLATION (frequently changing layers - at the end)
