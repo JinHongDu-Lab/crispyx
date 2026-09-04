@@ -5,7 +5,7 @@ output_dir: "benchmarking/results/Pan-GW-hESC"
 
 # Dataset column configuration
 perturbation_column: "perturbation"
-control_label: null  # Auto-detects 'NTC'
+control_label: "NTC"  # Explicit: auto-detect fails ("ntc" matches no recognized pattern)
 gene_name_column: null  # Uses var.index
 
 # Quality control parameters - set to null to use adaptive calculation
