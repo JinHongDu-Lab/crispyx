@@ -240,3 +240,73 @@ def test_convert_to_csc_warns_when_disk_space_low(tmp_path, monkeypatch):
     result = ad.read_h5ad(out).X
     arr = result.toarray() if sp.issparse(result) else result
     np.testing.assert_array_almost_equal(arr, dense)
+
+
+# ---------------------------------------------------------------------------
+# Memory-bounded (banded) conversion
+# ---------------------------------------------------------------------------
+
+def _make_random_csr_h5ad(tmp_path: Path, dtype=np.float64, seed: int = 0) -> tuple[Path, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    dense = (rng.random((50, 30)) < 0.3) * rng.random((50, 30))
+    dense = dense.astype(dtype)
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(50)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(30)])
+    path = tmp_path / f"random_{np.dtype(dtype).name}.h5ad"
+    ad.AnnData(sp.csr_matrix(dense), obs=obs, var=var).write(path)
+    return path, dense
+
+
+def _read_csc_arrays(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    with h5py.File(path, "r") as f:
+        return f["X/data"][:], f["X/indices"][:], f["X/indptr"][:]
+
+
+def test_contiguous_bands_respects_budget_and_covers_everything():
+    from crispyx.data import _contiguous_bands
+
+    counts = np.array([5, 1, 9, 2, 2, 2, 40, 1])
+    bands = _contiguous_bands(counts, per_item_bytes=1, budget_bytes=10)
+    assert bands[0][0] == 0 and bands[-1][1] == len(counts)
+    assert all(b[1] == nb[0] for b, nb in zip(bands, bands[1:]))  # contiguous
+    for start, stop in bands:
+        # Within budget unless a single index alone exceeds it (index 6: 40).
+        assert counts[start:stop].sum() <= 10 or stop - start == 1
+    assert (6, 7) in bands
+    assert _contiguous_bands(counts, per_item_bytes=1, budget_bytes=1000) == [(0, len(counts))]
+    assert _contiguous_bands(np.zeros(0, dtype=np.int64), per_item_bytes=1, budget_bytes=1) == [(0, 0)]
+
+
+def test_banded_conversion_is_identical_to_single_pass(tmp_path):
+    """A tiny memory budget forces several column bands; the file must be
+    byte-identical to the unbanded conversion and to scipy's canonical CSC."""
+    src, dense = _make_random_csr_h5ad(tmp_path)
+    single = tmp_path / "single.h5ad"
+    banded = tmp_path / "banded.h5ad"
+    convert_to_csc(src, output_path=single, chunk_size=7, verbose=False)
+    convert_to_csc(src, output_path=banded, chunk_size=7, memory_limit_gb=1e-6, verbose=False)
+
+    from crispyx.data import _contiguous_bands, _conversion_buffer_budget_bytes
+    col_nnz = np.count_nonzero(dense, axis=0)
+    assert len(_contiguous_bands(col_nnz, per_item_bytes=12, budget_bytes=_conversion_buffer_budget_bytes(1e-6))) > 1
+
+    for out in (single, banded):
+        data, indices, indptr = _read_csc_arrays(out)
+        ref = sp.csc_matrix(dense)
+        ref.sort_indices()
+        np.testing.assert_array_equal(indptr, ref.indptr)
+        np.testing.assert_array_equal(indices, ref.indices)
+        np.testing.assert_array_equal(data, ref.data)
+        assert get_matrix_storage_format(out) == "csc"
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+def test_conversion_preserves_value_dtype(tmp_path, dtype):
+    """A storage-format change must not change the stored values or their dtype."""
+    src, dense = _make_random_csr_h5ad(tmp_path, dtype=dtype)
+    out = tmp_path / "out.h5ad"
+    convert_to_csc(src, output_path=out, verbose=False)
+    data, _, _ = _read_csc_arrays(out)
+    assert data.dtype == np.dtype(dtype)
+    loaded = ad.read_h5ad(out).X.toarray()
+    np.testing.assert_array_equal(loaded, dense)

@@ -81,9 +81,13 @@ def estimate_disk_usage(
     -------
     dict[str, DiskEstimate]
         Keyed by filesystem location -- ``"tempdir"`` for disk-backed
-        intermediate accumulators, ``"output"`` for the final result file.
-        Not every function uses both; a conversion function like
-        ``convert_to_csc`` only has ``"output"``.
+        intermediate accumulators in ``$TMPDIR``, ``"output"`` for the final
+        result file, and ``"scratch"`` for the temporary fast-axis copy a
+        ``format_mismatch_policy="convert"`` call writes beside the output.
+        Not every function uses all of them; a conversion function like
+        ``convert_to_csc`` only has ``"output"``. Pass ``output_path`` to
+        assess ``"output"``/``"scratch"`` against that location instead of
+        the source file's directory.
 
     Examples
     --------
@@ -106,9 +110,12 @@ def estimate_disk_usage(
     path = resolve_data_path(data)
     required_by_location = resolver(path, **kwargs)
     tempdir = Path(tempfile.gettempdir())
+    output_parent = (
+        Path(kwargs["output_path"]).parent if kwargs.get("output_path") else path.parent
+    )
     return {
         location: assess_bytes(
-            required_bytes, tempdir if location in _TEMPDIR_LOCATIONS else path.parent,
+            required_bytes, tempdir if location in _TEMPDIR_LOCATIONS else output_parent,
         )
         for location, required_bytes in required_by_location.items()
     }

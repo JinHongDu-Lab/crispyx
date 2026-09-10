@@ -1,6 +1,71 @@
 Changelog
 =========
 
+Version 0.1.3
+-------------
+
+*Released 2026-09-10.*
+
+* **Gene-streaming functions no longer re-read a CSR source once per gene
+  chunk.** ``wilcoxon_test`` (all three paths: standard, group-batch
+  streaming, batch-stratified) and ``batch_process`` stream ``X`` by gene
+  (column) chunks. On a CSR-stored file -- what every crispyx writer
+  produces -- anndata serves a column slice by reading the *whole*
+  ``data``/``indices`` arrays into memory and filtering, so each of the
+  ``n_gene_chunks`` chunks paid a full read of the file (tens of minutes
+  per chunk on a network filesystem for a multi-million-cell screen, and
+  the matrix's full size in transient RAM). Both functions now take
+  ``format_mismatch_policy`` -- new on ``wilcoxon_test``, and its default on
+  both flips from ``"warn"`` to ``"convert"``: the source is converted once
+  to a temporary CSC copy *beside the output file* (not ``$TMPDIR``) and
+  removed before returning. ``"warn"`` now emits a ``UserWarning`` that
+  quantifies the cost (matrix size × chunk count) instead of only a logger
+  line; ``"off"`` is unchanged. The three hand-rolled copies of this logic
+  (``normalize_total_log1p``, ``batch_process``, and none for
+  ``wilcoxon_test``) are replaced by one ``crispyx.data.stream_on_fast_axis``
+  helper. ``estimate_disk_usage`` reports the temporary copy under a new
+  ``"scratch"`` location and accepts ``output_path`` to assess it (and
+  ``"output"``) where the file will actually be written.
+* **``convert_to_csc`` / ``convert_to_csr`` are memory-bounded and
+  dtype-preserving.** Previously the whole converted matrix
+  (``total_nnz × 8`` bytes) was buffered in RAM before a single write, which
+  made the automatic conversion above unsafe for files near the node's
+  memory. Both converters gain ``memory_limit_gb``: the output buffers use
+  at most half of it, and a matrix that does not fit is converted in
+  contiguous column (CSC) or row (CSR) *bands*, each costing one extra
+  streaming pass over the source -- ``K`` bands for a matrix ``K`` times the
+  budget instead of an OOM. A dense-to-CSR conversion now writes chunk by
+  chunk with no whole-matrix buffer at all. The converters also stop
+  silently casting values to ``float32``: the output keeps the source's
+  value dtype, so a format change never changes results (the old cast made
+  a converted float64 matrix disagree with its source at the 1e-7 level).
+* **``batch_process`` inner loop is ``O(n_pairs)`` per gene chunk instead of
+  ``O(n_cells)``.** Cells are sorted by ``(group, batch)`` once; each gene
+  chunk is then row-permuted once and the reducer's ``update`` is called
+  once per contiguous ``(group, batch)`` segment (per densified slab),
+  replacing a mask scan plus a scipy fancy-index per pair per 4096-cell
+  chunk -- which, with tens of thousands of groups, amounted to one call per
+  cell. Combined statistics are written as one ``(n_groups, width)`` block
+  per layer per gene chunk into output datasets whose HDF5 chunks are
+  aligned to the gene chunks, instead of ``n_groups × n_layers`` strided
+  7 KB row writes per chunk. Results are unchanged (the ``BatchReducer``
+  contract is untouched; existing reducers need no change); a synthetic
+  4000-group × 6-batch × 120k-cell run went from 25 s to 5.5 s of pure
+  compute.
+* **``wilcoxon_test`` drops ``n_jobs``.** It was accepted but never read on
+  any Wilcoxon path (parallelism comes from the numba ``prange`` rank
+  kernels, which already use every CPU the process is allowed to run on).
+  Also removed from ``rank_genes_groups(method="wilcoxon")``'s accepted
+  keywords. The one-time per-group row lookup in all three Wilcoxon paths
+  is now a single factorize/argsort instead of ``n_groups`` full scans of
+  the label array (minutes at 18k groups × 2M cells).
+* **``normalize_total_log1p(format_mismatch_policy="convert")`` names its
+  output correctly.** The default output name was derived from the
+  temporary CSR copy's random filename instead of the source's.
+* ``cx.tl.batch_process`` now forwards ``resume``, ``checkpoint_interval``
+  and ``format_mismatch_policy`` (previously only reachable via
+  ``cx.batch_process``).
+
 Version 0.1.2
 -------------
 

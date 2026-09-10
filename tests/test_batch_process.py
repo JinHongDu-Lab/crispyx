@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -753,36 +754,62 @@ def test_channels_mismatch_raises(tmp_path):
         )
 
 
-def test_csr_source_warns_but_csc_does_not(tmp_path, caplog):
+def test_csr_source_warns_under_warn_policy_but_csc_does_not(tmp_path, caplog):
     import logging
 
     import crispyx.data as cxd
 
     path, *_ = _write_data(tmp_path, sparse=True)  # written as CSR by default
     cxd._SLOW_AXIS_WARNED.clear()
-    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"), pytest.warns(
+        UserWarning, match=r"tl\.batch_process: X is stored as CSR.*re-reads the whole matrix"
+    ):
         result = cx.batch_process(
             path, _moment_reducer(),
             groupby="perturbation", batch_column="batch", statistic_name="std_csr",
-            chunk_size=2, cell_chunk_size=20,
+            chunk_size=2, cell_chunk_size=20, format_mismatch_policy="warn",
             output_path=tmp_path / "csr_result.h5ad", force=True,
         )
     result.close()
-    assert any("slower" in r.getMessage() for r in caplog.records)
+    assert len([r for r in caplog.records if "slower" in r.getMessage()]) == 1
 
     caplog.clear()
     cxd._SLOW_AXIS_WARNED.clear()
     csc_result = convert_to_csc(path, output_path=tmp_path / "csc_source.h5ad", verbose=False)
     csc_result.close()
-    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"), warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
         result = cx.batch_process(
             tmp_path / "csc_source.h5ad", _moment_reducer(),
             groupby="perturbation", batch_column="batch", statistic_name="std_csc",
-            chunk_size=2, cell_chunk_size=20,
+            chunk_size=2, cell_chunk_size=20, format_mismatch_policy="warn",
             output_path=tmp_path / "csc_result.h5ad", force=True,
         )
     result.close()
     assert not any("slower" in r.getMessage() for r in caplog.records)
+
+
+def test_default_policy_converts_csr_source_and_removes_scratch_copy(tmp_path, caplog):
+    import logging
+
+    import crispyx.data as cxd
+
+    path, *_ = _write_data(tmp_path, sparse=True)  # CSR
+    out_dir = tmp_path / "out"
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"), warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            path, _moment_reducer(),
+            groupby="perturbation", batch_column="batch", statistic_name="std",
+            chunk_size=2, cell_chunk_size=20,
+            output_path=out_dir / "result.h5ad", force=True,
+        )
+    result.close()
+    # No slow-axis access happened, and the temporary CSC copy beside the
+    # output is gone again.
+    assert not any("slower" in r.getMessage() for r in caplog.records)
+    assert sorted(p.name for p in out_dir.iterdir()) == ["result.h5ad"]
 
 
 def test_format_mismatch_policy_convert_matches_native_csc(tmp_path):
@@ -806,3 +833,67 @@ def test_format_mismatch_policy_convert_matches_native_csc(tmp_path):
     native.close()
 
     np.testing.assert_allclose(converted_values, native_values)
+
+
+def test_cell_order_and_slab_boundaries_do_not_change_results(tmp_path):
+    """Cells are sorted by (group, batch) internally, so a shuffled source and a
+    cell_chunk_size that splits segments across slabs must give the same
+    statistics, weights and n_batches_used as the grouped source."""
+    path, X, labels, batches = _write_data(tmp_path, sparse=True)
+    rng = np.random.default_rng(5)
+    perm = rng.permutation(X.shape[0])
+    shuffled = tmp_path / "shuffled.h5ad"
+    ad.AnnData(
+        sp.csr_matrix(X[perm]),
+        obs=pd.DataFrame(
+            {"perturbation": labels[perm], "batch": batches[perm]},
+            index=[f"cell_{i}" for i in perm],
+        ),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])]),
+    ).write(shuffled)
+
+    def run(src, name, cell_chunk_size):
+        result = cx.batch_process(
+            src, _moment_reducer(), groupby="perturbation", reference="ctrl",
+            batch_column="batch", mode="comparison", statistic_name="delta",
+            chunk_size=3, cell_chunk_size=cell_chunk_size,
+            output_path=tmp_path / f"{name}_result.h5ad", force=True,
+        )
+        values, weights, obs, _ = _read_result(result)
+        result.close()
+        return values, weights, obs["n_batches_used"].tolist()
+
+    grouped = run(path, "grouped", cell_chunk_size=1000)
+    split = run(path, "split", cell_chunk_size=4)
+    shuffled_split = run(shuffled, "shuffled", cell_chunk_size=5)
+    for other in (split, shuffled_split):
+        np.testing.assert_allclose(other[0], grouped[0], rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(other[1], grouped[1])
+        assert other[2] == grouped[2]
+
+    # Reference check against a direct computation.
+    expected = []
+    for group in ("A", "B"):
+        num = np.zeros(X.shape[1])
+        den = np.zeros(X.shape[1])
+        for batch in ("b1", "b2", "b3"):
+            g = X[(labels == group) & (batches == batch)]
+            r = X[(labels == "ctrl") & (batches == batch)]
+            w = g.shape[0] * r.shape[0] / (g.shape[0] + r.shape[0])
+            num += w * (g.mean(axis=0) - r.mean(axis=0))
+            den += w
+        expected.append(num / den)
+    np.testing.assert_allclose(grouped[0], expected, rtol=1e-12, atol=1e-12)
+
+
+def test_output_datasets_are_chunked_along_gene_chunks(tmp_path):
+    path, X, *_ = _write_data(tmp_path, sparse=True)
+    result = cx.batch_process(
+        path, _moment_reducer(), groupby="perturbation", batch_column="batch",
+        statistic_name="std", chunk_size=3, output_path=tmp_path / "chunked.h5ad", force=True,
+    )
+    result.close()
+    with h5py.File(tmp_path / "chunked.h5ad", "r") as f:
+        for name in ("X", "layers/weight_sum"):
+            assert f[name].chunks is not None
+            assert f[name].chunks[1] == 3

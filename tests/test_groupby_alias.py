@@ -125,12 +125,12 @@ class TestTTestAliases:
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="control_label.*reference|reference.*control_label"):
             t_test(path, perturbation_column="perturbation",
-                   control_label="ctrl", reference="ctrl", n_jobs=1)
+                   control_label="ctrl", reference="ctrl")
 
     def test_missing_perturbation_column_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
-            t_test(path, control_label="ctrl", n_jobs=1)
+            t_test(path, control_label="ctrl")
 
 
 # ===========================================================================
@@ -141,43 +141,42 @@ class TestWilcoxonAliases:
     def test_groupby_alias(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = wilcoxon_test(path, groupby="perturbation", control_label="ctrl",
-                               n_jobs=1, force=True)
+                               force=True)
         _assert_result(result)
 
     def test_reference_alias(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = wilcoxon_test(path, perturbation_column="perturbation", reference="ctrl",
-                               n_jobs=1, force=True)
+                               force=True)
         _assert_result(result)
 
     def test_both_aliases(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = wilcoxon_test(path, groupby="perturbation", reference="ctrl",
-                               n_jobs=1, force=True)
+                               force=True)
         _assert_result(result)
 
     def test_canonical_still_works(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = wilcoxon_test(path, perturbation_column="perturbation", control_label="ctrl",
-                               n_jobs=1, force=True)
+                               force=True)
         _assert_result(result)
 
     def test_conflict_groupby_and_perturbation_column_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
-            wilcoxon_test(path, perturbation_column="perturbation", groupby="perturbation",
-                          n_jobs=1)
+            wilcoxon_test(path, perturbation_column="perturbation", groupby="perturbation")
 
     def test_conflict_reference_and_control_label_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="control_label.*reference|reference.*control_label"):
             wilcoxon_test(path, perturbation_column="perturbation",
-                          control_label="ctrl", reference="ctrl", n_jobs=1)
+                          control_label="ctrl", reference="ctrl")
 
     def test_missing_perturbation_column_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
-            wilcoxon_test(path, control_label="ctrl", n_jobs=1)
+            wilcoxon_test(path, control_label="ctrl")
 
 
 # ===========================================================================
@@ -219,12 +218,12 @@ class TestNbGlmAliases:
         path = _make_count_h5ad(tmp_path)
         with pytest.raises(TypeError, match="control_label.*reference|reference.*control_label"):
             nb_glm_test(path, perturbation_column="perturbation",
-                        control_label="ctrl", reference="ctrl", n_jobs=1)
+                        control_label="ctrl", reference="ctrl")
 
     def test_missing_perturbation_column_raises(self, tmp_path):
         path = _make_count_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
-            nb_glm_test(path, control_label="ctrl", n_jobs=1)
+            nb_glm_test(path, control_label="ctrl")
 
 
 # ===========================================================================
@@ -235,38 +234,38 @@ class TestTlRankGenesGroupsAliases:
     def test_groupby_alias(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = cx.tl.rank_genes_groups(path, groupby="perturbation", control_label="ctrl",
-                                         method="wilcoxon", n_jobs=1, force=True)
+                                         method="wilcoxon", force=True)
         assert result is not None
 
     def test_reference_alias(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = cx.tl.rank_genes_groups(path, perturbation_column="perturbation",
                                          reference="ctrl", method="wilcoxon",
-                                         n_jobs=1, force=True)
+                                         force=True)
         assert result is not None
 
     def test_both_aliases(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         result = cx.tl.rank_genes_groups(path, groupby="perturbation", reference="ctrl",
-                                         method="wilcoxon", n_jobs=1, force=True)
+                                         method="wilcoxon", force=True)
         assert result is not None
 
     def test_conflict_groupby_and_perturbation_column_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
             cx.tl.rank_genes_groups(path, perturbation_column="perturbation",
-                                    groupby="perturbation", n_jobs=1)
+                                    groupby="perturbation")
 
     def test_conflict_reference_and_control_label_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="control_label.*reference|reference.*control_label"):
             cx.tl.rank_genes_groups(path, perturbation_column="perturbation",
-                                    control_label="ctrl", reference="ctrl", n_jobs=1)
+                                    control_label="ctrl", reference="ctrl")
 
     def test_missing_perturbation_column_raises(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         with pytest.raises(TypeError, match="perturbation_column.*groupby|groupby.*perturbation_column"):
-            cx.tl.rank_genes_groups(path, method="wilcoxon", n_jobs=1)
+            cx.tl.rank_genes_groups(path, method="wilcoxon")
 
 
 # ===========================================================================
@@ -283,7 +282,7 @@ class TestResolveDeAliases:
         with warnings.catch_warnings():
             warnings.simplefilter("error")  # any warning → error
             result = t_test(path, perturbation_column="perturbation", control_label="ctrl",
-                            min_pct_both=0.05, n_jobs=1, force=True)
+                            min_pct_both=0.05, force=True)
         _assert_result(result)
 
     def test_groupby_sets_perturbation_column(self, tmp_path):
@@ -300,8 +299,8 @@ class TestResolveDeAliases:
     def test_reference_sets_control_label(self, tmp_path):
         path = _make_log_h5ad(tmp_path)
         r1 = wilcoxon_test(path, perturbation_column="perturbation", control_label="ctrl",
-                           n_jobs=1, force=True)
+                           force=True)
         r2 = wilcoxon_test(path, perturbation_column="perturbation", reference="ctrl",
-                           n_jobs=1, force=True)
+                           force=True)
         _assert_result(r1)
         _assert_result(r2)

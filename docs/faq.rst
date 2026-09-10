@@ -61,17 +61,17 @@ running sums, so their access is row-slices -- cheap on CSR, and why they
 prefer the opposite format.
 
 Running a function against the wrong format still produces correct results,
-just up to ~100x slower per chunk (see below). Two ways to fix that:
+just far slower (see below). Two ways to fix that:
 
 1. **Convert the file once**, up front, if it will be reused across several
    steps that want the same format.
-2. **Pass ``format_mismatch_policy``** for a one-off call, on the functions
-   that support it (:func:`crispyx.normalize_total_log1p` and
-   :func:`crispyx.batch_process`) -- see the next section for the exact
-   options.
+2. **Let ``format_mismatch_policy`` handle it** for a one-off call, on the
+   functions that support it (:func:`crispyx.wilcoxon_test`,
+   :func:`crispyx.batch_process` and :func:`crispyx.normalize_total_log1p`)
+   -- see the next section for the exact options and defaults.
 
-QC, normalisation, or batch_process is extremely slow on a mismatched file
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+QC, normalisation, DE, or batch_process is extremely slow on a mismatched file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Cell-(row-)streaming operations — quality control and
 :func:`crispyx.normalize_total_log1p` — read the matrix one block of cells at a
@@ -79,44 +79,56 @@ time. On a **CSC** file a row slice must scan the column pointers across every
 gene, making each chunk ``O(total_nnz)`` and the whole pass up to ~100x slower
 than the equivalent CSR streaming. Gene-(column-)streaming operations —
 :func:`crispyx.wilcoxon_test` and :func:`crispyx.batch_process` — are
-naturally fast on CSC and just as slow on a **CSR** file; the penalty is
-symmetric.
+naturally fast on CSC and just as slow on a **CSR** file, and CSR is what
+every crispyx writer produces. The mechanism there is worse than a scan:
+anndata serves a column slice of a backed CSR matrix by reading the *entire*
+``data``/``indices`` arrays into memory and filtering them, so every gene
+chunk re-reads the whole file and transiently needs the matrix's full size in
+RAM. For a multi-million-cell screen on a network filesystem that is tens of
+minutes per gene chunk, times ~40 chunks.
 
 crispyx mitigates this for you:
 
 * **Quality control** automatically dispatches CSC inputs to a
   column-oriented path (including the masks-only ``output_dir=None`` call), so
   no action is needed.
-* :func:`crispyx.normalize_total_log1p` and :func:`crispyx.batch_process`
-  both expose ``format_mismatch_policy``:
+* :func:`crispyx.wilcoxon_test` and :func:`crispyx.batch_process` default to
+  ``format_mismatch_policy="convert"``: a CSR source is converted once to a
+  temporary CSC copy **beside the output file** (bounded memory, honouring
+  ``memory_limit_gb``), streamed from there, and the copy is removed before
+  returning. This temporarily needs ~2x the source file's size in free disk
+  space at the output location; crispyx warns automatically if that looks
+  tight, and :func:`crispyx.estimate_disk_usage` reports it under
+  ``"scratch"``.
+* :func:`crispyx.normalize_total_log1p` (the opposite mismatch, a CSC
+  source) defaults to ``"warn"`` because crispyx writers never produce CSC.
 
   .. code-block:: python
 
-     # Default: proceed but log one actionable warning.
-     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="warn")
+     # wilcoxon_test / batch_process on a CSR file: converted for you.
+     cx.de.wilcoxon_test(csr_path, ..., memory_limit_gb=128)      # "convert" is the default
 
-     # Transparently stream via a temporary CSR copy (bounded memory);
-     # the temp file is removed before returning. This temporarily needs
-     # ~2x the source file's size in free disk space (source + temp copy
-     # coexist); crispyx warns automatically if that looks tight.
+     # Proceed on the mismatched file after one UserWarning that quantifies
+     # the cost (matrix size x number of chunks) ...
+     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="warn", ...)
+
+     # ... or silently (you have already accounted for the cost).
+     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="off", ...)
+
+     # normalize_total_log1p takes the same three values for a CSC source.
      cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
 
-     # Proceed silently (you have already accounted for the cost).
-     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="off")
-
-     # batch_process takes the same three values, for the opposite mismatch
-     # (a CSR source, since it streams gene-major): "warn" (default),
-     # "convert" (via a temporary CSC copy), or "off".
-     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="convert", ...)
-
-For a file you will reuse across several cell-streaming steps, convert it once
-up front instead:
+For a file you will reuse across several steps that want the same format --
+e.g. Wilcoxon DE *and* ``batch_process`` on the same screen -- convert it once
+up front instead, so the conversion is not repeated per call:
 
 .. code-block:: python
 
-   cx.data.convert_to_csr(csc_path, output_path=csr_path)  # bounded-memory, two-pass
-   # Also needs ~2x the source file's size in free disk space during
-   # conversion; check up front with cx.estimate_disk_usage("convert_to_csr", csc_path).
+   cx.pp.convert_to_csc(csr_path, output_path=csc_path, memory_limit_gb=128)
+   # Peak memory is bounded by memory_limit_gb (larger matrices are converted
+   # in several bands, one extra pass over the source each). Also needs ~2x
+   # the source file's size in free disk space during conversion; check up
+   # front with cx.estimate_disk_usage("convert_to_csc", csr_path).
 
 ``tomllib`` / ``tomli`` import errors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

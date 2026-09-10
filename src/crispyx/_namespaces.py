@@ -857,6 +857,9 @@ class _ToolsNamespace:
         verbose: int | bool = True,
         memory_limit_gb: float | None = None,
         force: bool = False,
+        resume: bool = False,
+        checkpoint_interval: int | None = None,
+        format_mismatch_policy: Literal["warn", "convert", "off"] = "convert",
     ) -> AnnData:
         """Compute a streaming gene-wise statistic within biological batches.
 
@@ -889,6 +892,9 @@ class _ToolsNamespace:
             verbose=verbose,
             memory_limit_gb=memory_limit_gb,
             force=force,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
+            format_mismatch_policy=format_mismatch_policy,
         )
 
     def rank_genes_groups(
@@ -963,9 +969,9 @@ class _ToolsNamespace:
             allowed = {
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
-                "n_jobs",
                 "checkpoint_interval",
                 "batch_column",
+                "format_mismatch_policy",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:

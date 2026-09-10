@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import re
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,15 +23,13 @@ from ._checkpoint import (
     _read_checkpoint,
     _write_checkpoint_atomic,
 )
-from ._disk import estimate_bytes, warn_if_disk_space_low
+from ._disk import estimate_bytes, estimate_conversion_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from .data import (
     AnnData,
-    _SLOW_AXIS_WARNED,
     _update_h5ad_dataframe,
     calculate_optimal_chunk_size,
     calculate_wilcoxon_chunk_size,
-    convert_to_csc,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
     iter_matrix_chunks,
@@ -41,6 +37,7 @@ from .data import (
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    stream_on_fast_axis,
 )
 
 
@@ -322,7 +319,7 @@ def batch_process(
     force: bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
-    format_mismatch_policy: Literal["warn", "convert", "off"] = "warn",
+    format_mismatch_policy: Literal["warn", "convert", "off"] = "convert",
 ) -> AnnData:
     """Compute a generic gene-wise statistic within experimental batches.
 
@@ -414,13 +411,18 @@ def batch_process(
         of gene chunks when omitted.
     format_mismatch_policy
         How to handle a source stored as CSR, whose gene-(column-)streaming
-        here is ``O(total_nnz)`` per chunk and can be ~100x slower than CSC:
+        here re-reads the *whole* matrix once per gene chunk and holds it in
+        memory -- typically ~100x more I/O than CSC:
 
-        * ``"warn"`` (default): proceed but log a single actionable warning.
-        * ``"convert"``: transparently convert the source to CSC in a
-          temporary file (bounded-memory two-pass streaming via
-          :func:`crispyx.data.convert_to_csc`) and stream from that; the
-          temporary file is removed before returning.
+        * ``"convert"`` (default): transparently convert the source to CSC in
+          a temporary file beside the output (bounded-memory streaming via
+          :func:`crispyx.data.convert_to_csc`, honouring ``memory_limit_gb``)
+          and stream from that; the temporary file is removed before
+          returning. Needs ~2x the source file's size in free disk space
+          there. Run ``cx.pp.convert_to_csc`` once instead if several steps
+          will reuse the file.
+        * ``"warn"``: proceed on the CSR source after one warning that
+          quantifies the cost.
         * ``"off"``: proceed silently with no warning.
 
     Returns
@@ -538,249 +540,264 @@ def batch_process(
     )
     checkpoint_path = resolved_output.with_suffix(".progress.json")
 
-    _tmp_converted: Path | None = None
+    backed = read_backed(path)
     try:
-        backed = read_backed(path)
-        try:
-            if perturbation_column not in backed.obs.columns:
-                raise KeyError(
-                    f"Perturbation column '{perturbation_column}' was not found in adata.obs. "
-                    f"Available columns: {list(backed.obs.columns)}"
-                )
-            if batch_column not in backed.obs.columns:
-                raise KeyError(
-                    f"Batch column '{batch_column}' was not found in adata.obs. "
-                    f"Available columns: {list(backed.obs.columns)}"
-                )
-            gene_symbols = ensure_gene_symbol_column(backed, gene_name_column).astype(str)
-            labels = backed.obs[perturbation_column].astype(str).to_numpy()
-            observed = _unique_strings(labels)
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. "
+                f"Available columns: {list(backed.obs.columns)}"
+            )
+        if batch_column not in backed.obs.columns:
+            raise KeyError(
+                f"Batch column '{batch_column}' was not found in adata.obs. "
+                f"Available columns: {list(backed.obs.columns)}"
+            )
+        gene_symbols = ensure_gene_symbol_column(backed, gene_name_column).astype(str)
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        observed = _unique_strings(labels)
 
+        if mode == "comparison":
+            control_label = resolve_control_label(labels, control_label)
+            if control_label not in observed:
+                raise ValueError(f"Reference group '{control_label}' contains no cells")
+        if perturbations is None:
+            groups = [g for g in observed if mode == "group" or g != control_label]
+        else:
+            groups = _unique_strings(perturbations)
             if mode == "comparison":
-                control_label = resolve_control_label(labels, control_label)
-                if control_label not in observed:
-                    raise ValueError(f"Reference group '{control_label}' contains no cells")
-            if perturbations is None:
-                groups = [g for g in observed if mode == "group" or g != control_label]
-            else:
-                groups = _unique_strings(perturbations)
-                if mode == "comparison":
-                    groups = [g for g in groups if g != control_label]
-            missing_groups = [group for group in groups if group not in observed]
-            if missing_groups:
-                raise ValueError(
-                    f"Perturbation(s) {missing_groups[:3]}"
-                    f"{'...' if len(missing_groups) > 3 else ''} contain no cells"
-                )
+                groups = [g for g in groups if g != control_label]
+        missing_groups = [group for group in groups if group not in observed]
+        if missing_groups:
+            raise ValueError(
+                f"Perturbation(s) {missing_groups[:3]}"
+                f"{'...' if len(missing_groups) > 3 else ''} contain no cells"
+            )
 
-            raw_batch = np.asarray(backed.obs[batch_column].to_numpy())
-            batch_codes, batch_uniques = pd.factorize(raw_batch, sort=True)
-            batch_codes = batch_codes.astype(np.int64)
-            batch_ids = [str(x) for x in batch_uniques]
-            if not batch_ids:
-                raise ValueError(f"Batch column '{batch_column}' contains no usable batches.")
-            n_missing_batch = int(np.sum(batch_codes < 0))
-            if n_missing_batch:
+        raw_batch = np.asarray(backed.obs[batch_column].to_numpy())
+        batch_codes, batch_uniques = pd.factorize(raw_batch, sort=True)
+        batch_codes = batch_codes.astype(np.int64)
+        batch_ids = [str(x) for x in batch_uniques]
+        if not batch_ids:
+            raise ValueError(f"Batch column '{batch_column}' contains no usable batches.")
+        n_missing_batch = int(np.sum(batch_codes < 0))
+        if n_missing_batch:
+            _messages.warn(
+                "tl.batch_process",
+                f"{n_missing_batch} cells have a missing '{batch_column}' value and are excluded.",
+                stacklevel=2,
+            )
+
+        group_lookup = {group: idx for idx, group in enumerate(groups)}
+        group_codes = np.asarray([group_lookup.get(label, -1) for label in labels], dtype=np.int64)
+        reference_code = -2
+        if mode == "comparison":
+            group_codes[labels == control_label] = reference_code
+
+        n_groups = len(groups)
+        n_genes = backed.n_vars
+        n_batches = len(batch_ids)
+
+        if chunk_size is None:
+            chunk_size = calculate_wilcoxon_chunk_size(
+                backed.n_obs,
+                n_genes,
+                available_memory_gb=memory_limit_gb,
+            )
+            _messages.vprint(verbose, "tl.batch_process", f"gene chunk_size={chunk_size} (auto)")
+        if cell_chunk_size is None:
+            cell_chunk_size = calculate_optimal_chunk_size(
+                backed.n_obs,
+                min(n_genes, chunk_size),
+                available_memory_gb=memory_limit_gb,
+            )
+            _messages.vprint(verbose, "tl.batch_process", f"cell_chunk_size={cell_chunk_size} (auto)")
+        if chunk_size <= 0 or cell_chunk_size <= 0:
+            raise ValueError("chunk_size and cell_chunk_size must be positive")
+
+        expected_metadata = {
+            "statistic_name": statistic_name,
+            "mode": mode,
+            "perturbation_column": perturbation_column,
+            "control_label": control_label if mode == "comparison" else None,
+            "batch_column": batch_column,
+            "groups": groups,
+            "batch_ids": batch_ids,
+            "channels": list(channels) if channels else None,
+            "chunk_size": int(chunk_size),
+            # Identify the input itself, so that regenerating the source in place
+            # invalidates the cache instead of silently returning stale values.
+            "source_path": str(path.resolve()),
+            "source_mtime_ns": int(path.stat().st_mtime_ns),
+        }
+        # A checkpoint file means a previous run didn't finish; never treat
+        # that partial output as a complete, reusable cached result.
+        if resolved_output.exists() and not force and not checkpoint_path.exists():
+            existing = ad.read_h5ad(resolved_output, backed="r")
+            try:
+                matches = _metadata_matches(existing, expected_metadata)
+            finally:
+                existing.file.close()
+            if matches:
+                if int(verbose) >= 1:
+                    print(f"[cx] Loading existing result: {resolved_output}")
+                    print("[cx] Pass force=True to rerun the analysis.")
+                return AnnData(resolved_output)
+
+        resolved_output.parent.mkdir(parents=True, exist_ok=True)
+        if int(verbose) >= 1:
+            print(
+                f"[cx] tl.batch_process: {n_groups} groups × {n_genes} genes, "
+                f"stratified by '{batch_column}'"
+            )
+
+        n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
+        eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
+        layer_names: list[str | None] = list(channels) if channels else [None]
+
+        # ---- Resume bookkeeping: gene chunks complete strictly in order. ----
+        last_completed_chunk = -1
+        reuse_existing_output = False
+        checkpoint: dict[str, Any] | None = None
+        recovered_via_scan = False
+        if resume:
+            checkpoint = _read_checkpoint(
+                checkpoint_path,
+                required_keys=("last_gene_chunk", "total_gene_chunks"),
+            )
+            if checkpoint is not None:
+                last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
+                _messages.vprint(
+                    verbose, "tl.batch_process",
+                    f"resuming from gene chunk {last_completed_chunk + 1}/{n_gene_chunks}",
+                )
+            elif resolved_output.exists():
+                # Checkpoint is missing or corrupted -- fall back to scanning
+                # the (potentially partial) output file for the last chunk
+                # every group's row was fully written for.
+                last_completed_chunk = _find_last_completed_gene_chunk(
+                    resolved_output, n_gene_chunks, chunk_size, n_genes,
+                    weight_dataset="layers/weight_sum" if not channels else f"layers/{channels[0]}_weight_sum",
+                )
+                if last_completed_chunk >= 0:
+                    recovered_via_scan = True
+                    _messages.vprint(
+                        verbose, "tl.batch_process",
+                        f"checkpoint missing/corrupted; recovered progress through "
+                        f"gene chunk {last_completed_chunk} by scanning {resolved_output.name}",
+                    )
+        if resume and last_completed_chunk >= 0 and resolved_output.exists():
+            existing = ad.read_h5ad(resolved_output, backed="r")
+            try:
+                reuse_existing_output = (
+                    _metadata_matches(existing, expected_metadata)
+                    and existing.shape == (n_groups, n_genes)
+                )
+            finally:
+                existing.file.close()
+            if not reuse_existing_output:
+                last_completed_chunk = -1
                 _messages.warn(
                     "tl.batch_process",
-                    f"{n_missing_batch} cells have a missing '{batch_column}' value and are excluded.",
+                    "Existing partial output does not match this call's parameters "
+                    "or source; restarting from scratch.",
                     stacklevel=2,
                 )
 
-            group_lookup = {group: idx for idx, group in enumerate(groups)}
-            group_codes = np.asarray([group_lookup.get(label, -1) for label in labels], dtype=np.int64)
-            reference_code = -2
-            if mode == "comparison":
-                group_codes[labels == control_label] = reference_code
+        n_layer_arrays = 1 + 2 * len(channels) if channels else 2
+        _output_disk_estimate = warn_if_disk_space_low(
+            estimate_bytes(max(n_groups, 1), n_genes, overhead=1.10) * n_layer_arrays,
+            resolved_output,
+            context="tl.batch_process",
+        )
+        _messages.print_disk_estimate(verbose, "tl.batch_process", _output_disk_estimate)
 
-            n_groups = len(groups)
-            n_genes = backed.n_vars
-            n_batches = len(batch_ids)
-            group_batch_counts = np.zeros((n_groups, n_batches), dtype=np.int64)
-            valid_group_cells = (group_codes >= 0) & (batch_codes >= 0)
-            if valid_group_cells.any():
-                np.add.at(
-                    group_batch_counts,
-                    (group_codes[valid_group_cells], batch_codes[valid_group_cells]),
-                    1,
-                )
-            reference_batch_counts = np.zeros(n_batches, dtype=np.int64)
-            if mode == "comparison":
-                ref_cells = (group_codes == reference_code) & (batch_codes >= 0)
-                reference_batch_counts += np.bincount(
-                    batch_codes[ref_cells], minlength=n_batches
-                ).astype(np.int64)
-
-            if chunk_size is None:
-                chunk_size = calculate_wilcoxon_chunk_size(
-                    backed.n_obs,
-                    n_genes,
-                    available_memory_gb=memory_limit_gb,
-                )
-                _messages.vprint(verbose, "tl.batch_process", f"gene chunk_size={chunk_size} (auto)")
-            if cell_chunk_size is None:
-                cell_chunk_size = calculate_optimal_chunk_size(
-                    backed.n_obs,
-                    min(n_genes, chunk_size),
-                    available_memory_gb=memory_limit_gb,
-                )
-                _messages.vprint(verbose, "tl.batch_process", f"cell_chunk_size={cell_chunk_size} (auto)")
-            if chunk_size <= 0 or cell_chunk_size <= 0:
-                raise ValueError("chunk_size and cell_chunk_size must be positive")
-
-            expected_metadata = {
-                "statistic_name": statistic_name,
-                "mode": mode,
-                "perturbation_column": perturbation_column,
-                "control_label": control_label if mode == "comparison" else None,
-                "batch_column": batch_column,
-                "groups": groups,
-                "batch_ids": batch_ids,
-                "channels": list(channels) if channels else None,
-                "chunk_size": int(chunk_size),
-                # Identify the input itself, so that regenerating the source in place
-                # invalidates the cache instead of silently returning stale values.
-                "source_path": str(path.resolve()),
-                "source_mtime_ns": int(path.stat().st_mtime_ns),
-            }
-            # A checkpoint file means a previous run didn't finish; never treat
-            # that partial output as a complete, reusable cached result.
-            if resolved_output.exists() and not force and not checkpoint_path.exists():
-                existing = ad.read_h5ad(resolved_output, backed="r")
+        if not reuse_existing_output:
+            if checkpoint_path.exists():
                 try:
-                    matches = _metadata_matches(existing, expected_metadata)
-                finally:
-                    existing.file.close()
-                if matches:
-                    if int(verbose) >= 1:
-                        print(f"[cx] Loading existing result: {resolved_output}")
-                        print("[cx] Pass force=True to rerun the analysis.")
-                    return AnnData(resolved_output)
-
-            resolved_output.parent.mkdir(parents=True, exist_ok=True)
-            if int(verbose) >= 1:
-                print(
-                    f"[cx] tl.batch_process: {n_groups} groups × {n_genes} genes, "
-                    f"stratified by '{batch_column}'"
-                )
-
-            n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
-            eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
-            layer_names: list[str | None] = list(channels) if channels else [None]
-
-            # ---- Resume bookkeeping: gene chunks complete strictly in order. ----
-            last_completed_chunk = -1
-            reuse_existing_output = False
-            checkpoint: dict[str, Any] | None = None
-            recovered_via_scan = False
-            if resume:
-                checkpoint = _read_checkpoint(
-                    checkpoint_path,
-                    required_keys=("last_gene_chunk", "total_gene_chunks"),
-                )
-                if checkpoint is not None:
-                    last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
-                    _messages.vprint(
-                        verbose, "tl.batch_process",
-                        f"resuming from gene chunk {last_completed_chunk + 1}/{n_gene_chunks}",
-                    )
-                elif resolved_output.exists():
-                    # Checkpoint is missing or corrupted -- fall back to scanning
-                    # the (potentially partial) output file for the last chunk
-                    # every group's row was fully written for.
-                    last_completed_chunk = _find_last_completed_gene_chunk(
-                        resolved_output, n_gene_chunks, chunk_size, n_genes,
-                        weight_dataset="layers/weight_sum" if not channels else f"layers/{channels[0]}_weight_sum",
-                    )
-                    if last_completed_chunk >= 0:
-                        recovered_via_scan = True
-                        _messages.vprint(
-                            verbose, "tl.batch_process",
-                            f"checkpoint missing/corrupted; recovered progress through "
-                            f"gene chunk {last_completed_chunk} by scanning {resolved_output.name}",
-                        )
-            if resume and last_completed_chunk >= 0 and resolved_output.exists():
-                existing = ad.read_h5ad(resolved_output, backed="r")
-                try:
-                    reuse_existing_output = (
-                        _metadata_matches(existing, expected_metadata)
-                        and existing.shape == (n_groups, n_genes)
-                    )
-                finally:
-                    existing.file.close()
-                if not reuse_existing_output:
-                    last_completed_chunk = -1
-                    _messages.warn(
-                        "tl.batch_process",
-                        "Existing partial output does not match this call's parameters "
-                        "or source; restarting from scratch.",
-                        stacklevel=2,
-                    )
-
-            n_layer_arrays = 1 + 2 * len(channels) if channels else 2
-            _output_disk_estimate = warn_if_disk_space_low(
-                estimate_bytes(max(n_groups, 1), n_genes, overhead=1.10) * n_layer_arrays,
-                resolved_output,
-                context="tl.batch_process",
+                    checkpoint_path.unlink()
+                except Exception:
+                    pass
+            obs = pd.DataFrame(
+                {
+                    perturbation_column: groups,
+                    "n_batches_used": np.zeros(n_groups, dtype=np.int64),
+                },
+                index=pd.Index(groups, name="perturbation"),
             )
-            _messages.print_disk_estimate(verbose, "tl.batch_process", _output_disk_estimate)
+            var = pd.DataFrame(index=pd.Index(gene_symbols, name=backed.var_names.name))
+            placeholder = ad.AnnData(
+                sp.csr_matrix((n_groups, n_genes), dtype=np.float64), obs=obs, var=var,
+            )
+            placeholder.uns.update(expected_metadata)
+            placeholder.uns["stratified"] = True
+            placeholder.uns["stratified_n_batches"] = int(n_batches)
+            placeholder.uns["cell_chunk_size"] = int(cell_chunk_size)
+            placeholder.write(resolved_output)
 
-            if not reuse_existing_output:
-                if checkpoint_path.exists():
-                    try:
-                        checkpoint_path.unlink()
-                    except Exception:
-                        pass
-                obs = pd.DataFrame(
-                    {
-                        perturbation_column: groups,
-                        "n_batches_used": np.zeros(n_groups, dtype=np.int64),
-                    },
-                    index=pd.Index(groups, name="perturbation"),
+            # HDF5 chunks aligned to the gene chunks, so each finished gene
+            # chunk's (n_groups, width) block write -- and the resume scan's
+            # column reads -- touch a few whole chunks rather than n_groups
+            # strided row segments of a contiguous dataset.
+            chunk_width = min(chunk_size, n_genes)
+            chunk_rows = max(1, min(n_groups, (8 << 20) // (8 * max(chunk_width, 1))))
+            hdf5_chunks = (chunk_rows, chunk_width) if n_groups and n_genes else None
+
+            def _create_dense(group: h5py.Group, name: str, fill: float) -> None:
+                if name in group:
+                    del group[name]
+                ds = group.create_dataset(
+                    name, shape=(n_groups, n_genes), dtype="float64", fillvalue=fill,
+                    chunks=hdf5_chunks,
                 )
-                var = pd.DataFrame(index=pd.Index(gene_symbols, name=backed.var_names.name))
-                placeholder = ad.AnnData(
-                    sp.csr_matrix((n_groups, n_genes), dtype=np.float64), obs=obs, var=var,
-                )
-                placeholder.uns.update(expected_metadata)
-                placeholder.uns["stratified"] = True
-                placeholder.uns["stratified_n_batches"] = int(n_batches)
-                placeholder.uns["cell_chunk_size"] = int(cell_chunk_size)
-                placeholder.write(resolved_output)
+                ds.attrs["encoding-type"] = "array"
+                ds.attrs["encoding-version"] = "0.2.0"
 
-                def _create_dense(group: h5py.Group, name: str, fill: float) -> None:
-                    if name in group:
-                        del group[name]
-                    ds = group.create_dataset(
-                        name, shape=(n_groups, n_genes), dtype="float64", fillvalue=fill,
-                    )
-                    ds.attrs["encoding-type"] = "array"
-                    ds.attrs["encoding-version"] = "0.2.0"
+            with h5py.File(resolved_output, "r+") as f:
+                _create_dense(f, "X", np.nan)
+                layers_grp = f.require_group("layers")
+                if channels:
+                    for name in channels:
+                        _create_dense(layers_grp, name, np.nan)
+                        _create_dense(layers_grp, f"{name}_weight_sum", 0.0)
+                else:
+                    _create_dense(layers_grp, "weight_sum", 0.0)
+            last_completed_chunk = -1
 
-                with h5py.File(resolved_output, "r+") as f:
-                    _create_dense(f, "X", np.nan)
-                    layers_grp = f.require_group("layers")
-                    if channels:
-                        for name in channels:
-                            _create_dense(layers_grp, name, np.nan)
-                            _create_dense(layers_grp, f"{name}_weight_sum", 0.0)
-                    else:
-                        _create_dense(layers_grp, "weight_sum", 0.0)
-                last_completed_chunk = -1
+        # ---- Cells sorted by (group, batch) once. Each gene chunk then needs a
+        # single O(nnz) row permutation, and the reducer is called once per
+        # contiguous (group, batch) segment (per densified slab) instead of
+        # once per pair per cell chunk with a mask scan and a scipy
+        # fancy-index each time -- ~n_pairs calls per chunk, not ~n_cells.
+        usable = (batch_codes >= 0) & (
+            (group_codes >= 0) | ((mode == "comparison") & (group_codes == reference_code))
+        )
+        usable_rows = np.flatnonzero(usable)
+        # Reference cells sort after every group (pair_group == n_groups).
+        pair_group = np.where(
+            group_codes[usable_rows] == reference_code, n_groups, group_codes[usable_rows]
+        )
+        pair_key = pair_group * n_batches + batch_codes[usable_rows]
+        key_order = np.argsort(pair_key, kind="stable")
+        order = usable_rows[key_order]
+        sorted_key = pair_key[key_order]
+        if order.size:
+            seg_starts = np.concatenate(([0], np.flatnonzero(np.diff(sorted_key)) + 1))
+            seg_ends = np.concatenate((seg_starts[1:], [order.size]))
+        else:
+            seg_starts = seg_ends = np.empty(0, dtype=np.int64)
+        seg_group = sorted_key[seg_starts] // n_batches
+        seg_group = np.where(seg_group == n_groups, reference_code, seg_group)
+        seg_batch = sorted_key[seg_starts] % n_batches
 
-            # ---- CSR/CSC streaming-order handling for the real streaming pass. ----
-            stream_path = path
-            if get_matrix_storage_format(path) == "csr":
-                if format_mismatch_policy == "convert":
-                    fd, tmp_name = tempfile.mkstemp(suffix=".csc.h5ad", prefix="cx_batch_")
-                    os.close(fd)
-                    _tmp_converted = Path(tmp_name)
-                    convert_to_csc(path, output_path=_tmp_converted, verbose=False)
-                    stream_path = _tmp_converted
-                elif format_mismatch_policy == "off":
-                    _SLOW_AXIS_WARNED.add(("csr", 1))
-                # "warn": iter_matrix_chunks(axis=1, ...) below warns on its own.
+        def _pair_context(group_code: int, batch_code: int) -> str:
+            group_name = str(control_label) if group_code == reference_code else groups[group_code]
+            return f"group '{group_name}', batch '{batch_ids[batch_code]}'"
 
+        with stream_on_fast_axis(
+            path, axis=1, policy=format_mismatch_policy, fn_name="tl.batch_process",
+            scratch_dir=resolved_output.parent, chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb, verbose=verbose,
+        ) as stream_path:
             stream_backed = backed if stream_path == path else read_backed(stream_path)
             try:
                 batches_used = np.zeros((n_groups, n_batches), dtype=bool)
@@ -825,104 +842,82 @@ def batch_process(
                         gene_start, gene_end = slc.start, slc.stop
                         width = gene_end - gene_start
 
-                        if sp.issparse(block):
-                            block = block.tocsr()
+                        permuted = (block.tocsr() if sp.issparse(block) else np.asarray(block))[order]
                         states: dict[tuple[int, int], Any] = {}
-
-                        for cell_start in range(0, backed.n_obs, cell_chunk_size):
-                            cell_end = min(cell_start + cell_chunk_size, backed.n_obs)
-                            local_groups = group_codes[cell_start:cell_end]
-                            local_batches = batch_codes[cell_start:cell_end]
-                            usable = (local_batches >= 0) & (
-                                (local_groups >= 0)
-                                | ((mode == "comparison") & (local_groups == reference_code))
-                            )
-                            if not usable.any():
-                                continue
-                            sub_block = block[cell_start:cell_end]
-                            pairs = np.unique(
-                                np.column_stack((local_groups[usable], local_batches[usable])), axis=0
-                            )
-                            for group_code, batch_code in pairs:
-                                key = (int(group_code), int(batch_code))
-                                mask = (local_groups == group_code) & (local_batches == batch_code)
-                                group_name = (
-                                    str(control_label)
-                                    if group_code == reference_code
-                                    else groups[int(group_code)]
-                                )
-                                context = f"group '{group_name}', batch '{batch_ids[int(batch_code)]}'"
+                        for slab_start in range(0, order.size, cell_chunk_size):
+                            slab_end = min(slab_start + cell_chunk_size, order.size)
+                            dense = _as_dense(permuted[slab_start:slab_end])
+                            # Segments overlapping [slab_start, slab_end).
+                            first = int(np.searchsorted(seg_ends, slab_start, side="right"))
+                            last = int(np.searchsorted(seg_starts, slab_end, side="left"))
+                            for s in range(first, last):
+                                lo = max(int(seg_starts[s]), slab_start) - slab_start
+                                hi = min(int(seg_ends[s]), slab_end) - slab_start
+                                key = (int(seg_group[s]), int(seg_batch[s]))
                                 try:
-                                    if key in states:
-                                        state = states[key]
-                                    else:
-                                        state = reducer.initialize(width)
-                                    replacement = reducer.update(state, _as_dense(sub_block[mask]))
+                                    state = states[key] if key in states else reducer.initialize(width)
+                                    replacement = reducer.update(state, dense[lo:hi])
                                 except Exception as exc:
-                                    raise RuntimeError(f"Reducer failed for {context}") from exc
+                                    raise RuntimeError(
+                                        f"Reducer failed for {_pair_context(*key)}"
+                                    ) from exc
                                 states[key] = state if replacement is None else replacement
+                        del permuted
 
-                        numerators = {name: np.zeros(width, dtype=np.float64) for name in layer_names}
-                        denominators = {name: np.zeros(width, dtype=np.float64) for name in layer_names}
-                        for group_index, group in enumerate(groups):
-                            for name in layer_names:
-                                numerators[name].fill(0)
-                                denominators[name].fill(0)
-                            for batch_index, batch_id in enumerate(batch_ids):
-                                if group_batch_counts[group_index, batch_index] == 0:
-                                    continue
-                                group_key = (group_index, batch_index)
-                                if group_key not in states:
-                                    continue
-                                group_state = states[group_key]
-                                context = f"group '{group}', batch '{batch_id}'"
-                                try:
-                                    if mode == "group":
-                                        finalized = reducer.finalize(group_state)
-                                    else:
-                                        if reference_batch_counts[batch_index] == 0:
-                                            continue
-                                        reference_key = (reference_code, batch_index)
-                                        if reference_key not in states:
-                                            continue
-                                        reference_state = states[reference_key]
-                                        finalized = reducer.compare(group_state, reference_state)  # type: ignore[misc]
-                                    per_channel = _normalise_reducer_output(
-                                        finalized, width, channels, context=context
-                                    )
-                                except Exception as exc:
-                                    if isinstance(exc, (ValueError, TypeError)) and str(exc).startswith("Reducer"):
-                                        raise
-                                    raise RuntimeError(f"Reducer failed for {context}") from exc
-                                any_positive = False
-                                for name, (batch_values, batch_weights) in per_channel.items():
-                                    positive = batch_weights > 0
-                                    if positive.any():
-                                        any_positive = True
-                                        numerators[name][positive] += (
-                                            batch_values[positive] * batch_weights[positive]
-                                        )
-                                        denominators[name][positive] += batch_weights[positive]
-                                if any_positive:
-                                    batches_used[group_index, batch_index] = True
-
-                            for name in layer_names:
-                                combined_values = np.divide(
-                                    numerators[name],
-                                    denominators[name],
-                                    out=np.full(width, np.nan, dtype=np.float64),
-                                    where=denominators[name] > 0,
-                                )
-                                if name is None:
-                                    out_X[group_index, gene_start:gene_end] = combined_values
-                                    out_layers["weight_sum"][group_index, gene_start:gene_end] = denominators[name]
+                        # Combine batches per group; states iterate in sorted
+                        # (group, batch) order, so each group's batches are
+                        # accumulated in ascending batch order.
+                        numerators = {
+                            name: np.zeros((n_groups, width), dtype=np.float64) for name in layer_names
+                        }
+                        denominators = {
+                            name: np.zeros((n_groups, width), dtype=np.float64) for name in layer_names
+                        }
+                        for (group_index, batch_index), group_state in states.items():
+                            if group_index == reference_code:
+                                continue
+                            context = _pair_context(group_index, batch_index)
+                            try:
+                                if mode == "group":
+                                    finalized = reducer.finalize(group_state)
                                 else:
-                                    out_layers[name][group_index, gene_start:gene_end] = combined_values
-                                    out_layers[f"{name}_weight_sum"][group_index, gene_start:gene_end] = (
-                                        denominators[name]
+                                    reference_state = states.get((reference_code, batch_index))
+                                    if reference_state is None:
+                                        continue
+                                    finalized = reducer.compare(group_state, reference_state)  # type: ignore[misc]
+                                per_channel = _normalise_reducer_output(
+                                    finalized, width, channels, context=context
+                                )
+                            except Exception as exc:
+                                if isinstance(exc, (ValueError, TypeError)) and str(exc).startswith("Reducer"):
+                                    raise
+                                raise RuntimeError(f"Reducer failed for {context}") from exc
+                            for name, (batch_values, batch_weights) in per_channel.items():
+                                positive = batch_weights > 0
+                                if positive.any():
+                                    numerators[name][group_index, positive] += (
+                                        batch_values[positive] * batch_weights[positive]
                                     )
-                                    if name == channels[0]:
-                                        out_X[group_index, gene_start:gene_end] = combined_values
+                                    denominators[name][group_index, positive] += batch_weights[positive]
+                                    batches_used[group_index, batch_index] = True
+                        del states
+
+                        # One block write per layer per gene chunk.
+                        for name in layer_names:
+                            combined_values = np.divide(
+                                numerators[name],
+                                denominators[name],
+                                out=np.full((n_groups, width), np.nan, dtype=np.float64),
+                                where=denominators[name] > 0,
+                            )
+                            if name is None:
+                                out_X[:, gene_start:gene_end] = combined_values
+                                out_layers["weight_sum"][:, gene_start:gene_end] = denominators[name]
+                            else:
+                                out_layers[name][:, gene_start:gene_end] = combined_values
+                                out_layers[f"{name}_weight_sum"][:, gene_start:gene_end] = denominators[name]
+                                if name == channels[0]:
+                                    out_X[:, gene_start:gene_end] = combined_values
 
                         current_chunk += 1
                         if current_chunk % eff_checkpoint_interval == 0 or current_chunk == n_gene_chunks:
@@ -936,41 +931,38 @@ def batch_process(
                 if stream_backed is not backed:
                     stream_backed.file.close()
 
-            untestable = np.all(full_weight <= 0, axis=1)
-            n_batches_used = batches_used.sum(axis=1).astype(np.int64)
-            if untestable.any():
-                examples = [groups[i] for i in np.flatnonzero(untestable)[:5]]
-                _messages.warn(
-                    "tl.batch_process",
-                    f"{int(untestable.sum())} group(s) have no usable batch statistics; "
-                    f"results are NaN. Examples: {examples}",
-                    stacklevel=2,
-                )
-
-            final_obs = pd.DataFrame(
-                {perturbation_column: groups, "n_batches_used": n_batches_used},
-                index=pd.Index(groups, name="perturbation"),
+        untestable = np.all(full_weight <= 0, axis=1)
+        n_batches_used = batches_used.sum(axis=1).astype(np.int64)
+        if untestable.any():
+            examples = [groups[i] for i in np.flatnonzero(untestable)[:5]]
+            _messages.warn(
+                "tl.batch_process",
+                f"{int(untestable.sum())} group(s) have no usable batch statistics; "
+                f"results are NaN. Examples: {examples}",
+                stacklevel=2,
             )
-            with h5py.File(resolved_output, "r+") as f:
-                _update_h5ad_dataframe(f, "obs", final_obs)
-                uns_grp = f.require_group("uns")
-                key = "stratified_n_untestable_perturbations"
-                if key in uns_grp:
-                    del uns_grp[key]
-                ds = uns_grp.create_dataset(key, data=int(untestable.sum()))
-                ds.attrs["encoding-type"] = "numeric-scalar"
-                ds.attrs["encoding-version"] = "0.2.0"
 
-            if checkpoint_path.exists():
-                try:
-                    checkpoint_path.unlink()
-                except Exception:
-                    pass
-        finally:
-            backed.file.close()
+        final_obs = pd.DataFrame(
+            {perturbation_column: groups, "n_batches_used": n_batches_used},
+            index=pd.Index(groups, name="perturbation"),
+        )
+        with h5py.File(resolved_output, "r+") as f:
+            _update_h5ad_dataframe(f, "obs", final_obs)
+            uns_grp = f.require_group("uns")
+            key = "stratified_n_untestable_perturbations"
+            if key in uns_grp:
+                del uns_grp[key]
+            ds = uns_grp.create_dataset(key, data=int(untestable.sum()))
+            ds.attrs["encoding-type"] = "numeric-scalar"
+            ds.attrs["encoding-version"] = "0.2.0"
+
+        if checkpoint_path.exists():
+            try:
+                checkpoint_path.unlink()
+            except Exception:
+                pass
     finally:
-        if _tmp_converted is not None and _tmp_converted.exists():
-            _tmp_converted.unlink()
+        backed.file.close()
 
     if int(verbose) >= 1:
         print(f"[cx] tl.batch_process: Saving → {resolved_output}")
@@ -988,6 +980,7 @@ def _estimate_shape_for_batch_process(
     mode: Literal["group", "comparison"] = "group",
     perturbations: Iterable[str] | None = None,
     reducer: BatchReducer | None = None,
+    format_mismatch_policy: str = "convert",
     **_ignored,
 ) -> dict[str, float]:
     """Disk-usage resolver for :func:`batch_process`, used by
@@ -996,7 +989,8 @@ def _estimate_shape_for_batch_process(
     already runs before pre-sizing its output file's ``X``/``layers``, so the
     estimate can never disagree with the automatic warning emitted inside the
     real call. Results are written directly into the output file (no
-    separate tempdir accumulator), so there is only one location to report.
+    separate tempdir accumulator); a CSR source additionally gets a temporary
+    CSC copy beside the output under the default ``"convert"`` policy.
     """
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
@@ -1023,9 +1017,12 @@ def _estimate_shape_for_batch_process(
     n_groups = max(len(groups), 1)
     channels = reducer.channels if isinstance(reducer, BatchReducer) else None
     n_layer_arrays = 1 + 2 * len(channels) if channels else 2
-    return {
+    estimate = {
         "output": estimate_bytes(n_groups, n_genes, overhead=1.10) * n_layer_arrays,
     }
+    if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csr":
+        estimate["scratch"] = estimate_conversion_bytes(path)
+    return estimate
 
 
 __all__ = ["BatchReducer", "BatchStatistic", "batch_process"]

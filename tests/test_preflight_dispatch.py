@@ -119,13 +119,34 @@ class TestEstimateDiskUsage:
         )
         assert {"tempdir", "output"} <= result.keys()
 
-    def test_wilcoxon_stratified_only_reports_tempdir(self, tmp_path):
-        path = _make_normalised_h5ad(tmp_path, with_batch=True)
+    def test_wilcoxon_stratified_reports_tempdir_and_csc_scratch_copy(self, tmp_path):
+        """A CSR source under the default "convert" policy also needs scratch
+        space beside the output for the temporary CSC copy."""
+        path = _make_normalised_h5ad(tmp_path, with_batch=True)  # written as CSR
         result = estimate_disk_usage(
             "wilcoxon_test", path,
             perturbation_column="perturbation", control_label="control", batch_column="batch",
         )
-        assert result.keys() == {"tempdir"}
+        assert result.keys() == {"tempdir", "scratch"}
+        assert result["scratch"].required_bytes == pytest.approx(2 * path.stat().st_size)
+
+        without_conversion = estimate_disk_usage(
+            "wilcoxon_test", path,
+            perturbation_column="perturbation", control_label="control", batch_column="batch",
+            format_mismatch_policy="warn",
+        )
+        assert without_conversion.keys() == {"tempdir"}
+
+    def test_scratch_is_assessed_at_output_location(self, tmp_path):
+        path = _make_normalised_h5ad(tmp_path)
+        out_dir = tmp_path / "elsewhere"
+        out_dir.mkdir()
+        result = estimate_disk_usage(
+            "batch_process", path, perturbation_column="perturbation", batch_column="batch",
+            output_path=out_dir / "result.h5ad",
+        )
+        assert {"output", "scratch"} <= result.keys()
+        assert str(result["scratch"].path) == str(out_dir)
 
     def test_aggregate_pseudobulk(self, tmp_path):
         path = _make_normalised_h5ad(tmp_path, with_batch=True)
