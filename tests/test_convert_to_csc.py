@@ -310,3 +310,31 @@ def test_conversion_preserves_value_dtype(tmp_path, dtype):
     assert data.dtype == np.dtype(dtype)
     loaded = ad.read_h5ad(out).X.toarray()
     np.testing.assert_array_equal(loaded, dense)
+
+
+def test_interrupted_conversion_leaves_no_output_file(tmp_path, monkeypatch):
+    """A conversion killed while filling the pre-sized output must not leave a
+    structurally valid file with zero-filled bands at output_path."""
+    import crispyx.data as cxd
+
+    src, _ = _make_csr_h5ad(tmp_path)
+    out = tmp_path / "out.h5ad"
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cxd, "_scatter_by_key", boom)
+    with pytest.raises(KeyboardInterrupt):
+        convert_to_csc(src, output_path=out, verbose=False)
+    assert not out.exists()
+    assert list(tmp_path.glob(".*partial")) == []
+
+
+def test_pp_namespace_forwards_memory_limit_gb(tmp_path):
+    import crispyx as cx
+
+    src, dense = _make_csr_h5ad(tmp_path)
+    out = tmp_path / "ns.h5ad"
+    result = cx.pp.convert_to_csc(src, output_path=out, memory_limit_gb=1e-6, verbose=False)
+    result.close()
+    np.testing.assert_array_equal(ad.read_h5ad(out).X.toarray(), dense)

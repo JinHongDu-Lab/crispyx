@@ -97,9 +97,11 @@ crispyx mitigates this for you:
   temporary CSC copy **beside the output file** (bounded memory, honouring
   ``memory_limit_gb``), streamed from there, and the copy is removed before
   returning. This temporarily needs ~2x the source file's size in free disk
-  space at the output location; crispyx warns automatically if that looks
-  tight, and :func:`crispyx.estimate_disk_usage` reports it under
-  ``"scratch"``.
+  space at the output location; if that is not available the call warns and
+  streams from the CSR source instead (the ``"warn"`` behaviour) rather than
+  failing midway, and :func:`crispyx.estimate_disk_usage` reports the need
+  under ``"scratch"`` (pass the same ``output_path``/``output_dir`` you will
+  pass to the real call).
 * :func:`crispyx.normalize_total_log1p` (the opposite mismatch, a CSC
   source) defaults to ``"warn"`` because crispyx writers never produce CSC.
 

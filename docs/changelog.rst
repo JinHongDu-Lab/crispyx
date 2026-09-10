@@ -24,8 +24,22 @@ Version 0.1.3
   (``normalize_total_log1p``, ``batch_process``, and none for
   ``wilcoxon_test``) are replaced by one ``crispyx.data.stream_on_fast_axis``
   helper. ``estimate_disk_usage`` reports the temporary copy under a new
-  ``"scratch"`` location and accepts ``output_path`` to assess it (and
-  ``"output"``) where the file will actually be written.
+  ``"scratch"`` location and assesses it (and ``"output"``) where the file
+  will actually be written -- it resolves ``output_path`` / ``output_dir`` /
+  ``data_name`` exactly as the target function does. When the free space
+  beside the output cannot hold the temporary copy, ``"convert"`` falls back
+  to ``"warn"`` behaviour (one warning naming the shortfall, then streaming
+  from the source) instead of failing with ``ENOSPC`` partway through the
+  conversion. ``format_mismatch_policy`` is validated up front by every
+  entry point (``wilcoxon_test`` previously checked it only after the
+  cached-result return; the disk-usage resolvers silently ignored a typo),
+  and the ``"off"`` policy no longer mutes the process-wide slow-axis
+  logger warning for unrelated later calls -- callers that resolved the
+  format decision pass ``iter_matrix_chunks(..., warn_slow_axis=False)``
+  instead. ``normalize_total_log1p(format_mismatch_policy="convert")`` on a
+  CSC source now copies ``uns`` / ``layers`` / ``obsm`` / ``varm`` / ``obsp``
+  / ``varp`` from the source file rather than from the X-only temporary
+  copy, where they were silently dropped.
 * **``convert_to_csc`` / ``convert_to_csr`` are memory-bounded and
   dtype-preserving.** Previously the whole converted matrix
   (``total_nnz × 8`` bytes) was buffered in RAM before a single write, which
@@ -39,6 +53,12 @@ Version 0.1.3
   silently casting values to ``float32``: the output keeps the source's
   value dtype, so a format change never changes results (the old cast made
   a converted float64 matrix disagree with its source at the 1e-7 level).
+  Because the output is now pre-sized and filled band by band, it is
+  written to a ``.<name>.partial`` file beside ``output_path`` and renamed
+  into place only on completion; an interrupted conversion (Ctrl-C, OOM,
+  ``ENOSPC``) leaves no output file instead of a structurally valid one
+  with zero-filled bands. ``cx.pp.convert_to_csc`` / ``cx.pp.convert_to_csr``
+  accept and forward ``memory_limit_gb`` like the top-level functions.
 * **``batch_process`` inner loop is ``O(n_pairs)`` per gene chunk instead of
   ``O(n_cells)``.** Cells are sorted by ``(group, batch)`` once; each gene
   chunk is then row-permuted once and the reducer's ``update`` is called
@@ -51,7 +71,13 @@ Version 0.1.3
   7 KB row writes per chunk. Results are unchanged (the ``BatchReducer``
   contract is untouched; existing reducers need no change); a synthetic
   4000-group × 6-batch × 120k-cell run went from 25 s to 5.5 s of pure
-  compute.
+  compute. Peak memory stays bounded: rows are gathered per densified slab
+  (never a second full copy of the gene-chunk block), the combined values
+  are divided in place, and the automatic ``chunk_size`` is additionally
+  capped so the ``(n_groups, chunk_size)`` accumulators fit the per-chunk
+  budget. The weight layer the resume fallback scan keys off is written
+  last for each gene chunk, so a chunk the scan reports complete has all
+  of its datasets written.
 * **``wilcoxon_test`` drops ``n_jobs``.** It was accepted but never read on
   any Wilcoxon path (parallelism comes from the numba ``prange`` rank
   kernels, which already use every CPU the process is allowed to run on).

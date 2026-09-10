@@ -181,3 +181,28 @@ class TestEstimateDiskUsage:
         )
         # 5 groups x 500 genes x (3 x 8-byte + 4 x 4-byte arrays) = 200,000 bytes.
         assert result["tempdir"].required_bytes == pytest.approx(5 * 500 * (3 * 8 + 4 * 4))
+
+
+def test_scratch_follows_output_dir_like_the_real_call(tmp_path):
+    path = _make_normalised_h5ad(tmp_path)
+    out_dir = tmp_path / "results"
+    out_dir.mkdir()
+    result = estimate_disk_usage(
+        "wilcoxon_test", path, perturbation_column="perturbation", control_label="control",
+        output_dir=out_dir, data_name="run1",
+    )
+    assert str(result["scratch"].path) == str(out_dir)
+
+
+def test_invalid_policy_raises_instead_of_dropping_scratch(tmp_path):
+    path = _make_normalised_h5ad(tmp_path)
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        estimate_disk_usage(
+            "wilcoxon_test", path, perturbation_column="perturbation", control_label="control",
+            format_mismatch_policy="convrt",
+        )
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        estimate_disk_usage(
+            "batch_process", path, perturbation_column="perturbation", batch_column="batch",
+            format_mismatch_policy="convrt",
+        )

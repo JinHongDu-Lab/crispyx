@@ -25,6 +25,7 @@ from ._checkpoint import (
 )
 from ._disk import estimate_bytes, estimate_conversion_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
+from ._memory import _resolve_memory_limit_bytes
 from .data import (
     AnnData,
     _update_h5ad_dataframe,
@@ -38,6 +39,7 @@ from .data import (
     resolve_data_path,
     resolve_output_path,
     stream_on_fast_axis,
+    validate_format_mismatch_policy,
 )
 
 
@@ -380,11 +382,16 @@ def batch_process(
     statistic_name
         Stable identifier used in output naming and cache metadata.
     chunk_size
-        Genes processed per chunk. Automatically selected when omitted. Also
-        the unit of resumable progress -- see ``resume``.
+        Genes processed per chunk. Automatically selected when omitted, so
+        that both the densified cell slabs and the per-chunk
+        ``(n_groups, chunk_size)`` accumulators (two float64 arrays per output
+        layer) fit the memory budget. Also the unit of resumable progress --
+        see ``resume``.
     cell_chunk_size
-        Cells supplied to each reducer update. Automatically selected when
-        omitted.
+        Cells densified at a time within a gene chunk, i.e. the largest block
+        a reducer ``update`` receives. Each slab is a dense
+        ``cell_chunk_size × chunk_size`` float64 array, so this is the
+        per-chunk working set. Automatically selected when omitted.
     data_name
         Optional input stem override used to construct the output filename.
     output_path
@@ -419,8 +426,10 @@ def batch_process(
           :func:`crispyx.data.convert_to_csc`, honouring ``memory_limit_gb``)
           and stream from that; the temporary file is removed before
           returning. Needs ~2x the source file's size in free disk space
-          there. Run ``cx.pp.convert_to_csc`` once instead if several steps
-          will reuse the file.
+          there; when that is not available the call falls back to
+          ``"warn"`` behaviour with a warning naming the shortfall. Run
+          ``cx.pp.convert_to_csc`` once instead if several steps will reuse
+          the file.
         * ``"warn"``: proceed on the CSR source after one warning that
           quantifies the cost.
         * ``"off"``: proceed silently with no warning.
@@ -521,11 +530,7 @@ def batch_process(
         )
     if mode == "comparison" and reducer.compare is None:
         raise TypeError("reducer.compare is required when mode='comparison'.")
-    if format_mismatch_policy not in ("warn", "convert", "off"):
-        raise ValueError(
-            "format_mismatch_policy must be 'warn', 'convert', or 'off', "
-            f"got {format_mismatch_policy!r}"
-        )
+    validate_format_mismatch_policy(format_mismatch_policy)
     channels = reducer.channels
 
     statistic_name = _safe_statistic_name(statistic_name)
@@ -603,6 +608,15 @@ def batch_process(
                 n_genes,
                 available_memory_gb=memory_limit_gb,
             )
+            # calculate_wilcoxon_chunk_size deliberately ignores n_groups. Here
+            # every gene chunk also holds (n_groups, width) float64 numerator
+            # and denominator accumulators per output layer (so the chunk can
+            # be written as one block per layer); cap the width so they fit
+            # the same 15% per-chunk budget.
+            n_layers = len(channels) if channels else 1
+            accumulator_budget = 0.15 * _resolve_memory_limit_bytes(memory_limit_gb)
+            accumulator_cap = int(accumulator_budget // (2 * n_layers * max(n_groups, 1) * 8))
+            chunk_size = max(1, min(chunk_size, accumulator_cap))
             _messages.vprint(verbose, "tl.batch_process", f"gene chunk_size={chunk_size} (auto)")
         if cell_chunk_size is None:
             cell_chunk_size = calculate_optimal_chunk_size(
@@ -653,6 +667,11 @@ def batch_process(
         n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
         eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
         layer_names: list[str | None] = list(channels) if channels else [None]
+        # The weight layer the resume fallback scan keys off; it is written
+        # last for every gene chunk so a chunk it reports complete has every
+        # other dataset of that chunk already written.
+        scan_layer: str | None = channels[0] if channels else None
+        scan_weight_key = "weight_sum" if scan_layer is None else f"{scan_layer}_weight_sum"
 
         # ---- Resume bookkeeping: gene chunks complete strictly in order. ----
         last_completed_chunk = -1
@@ -676,7 +695,7 @@ def batch_process(
                 # every group's row was fully written for.
                 last_completed_chunk = _find_last_completed_gene_chunk(
                     resolved_output, n_gene_chunks, chunk_size, n_genes,
-                    weight_dataset="layers/weight_sum" if not channels else f"layers/{channels[0]}_weight_sum",
+                    weight_dataset=f"layers/{scan_weight_key}",
                 )
                 if last_completed_chunk >= 0:
                     recovered_via_scan = True
@@ -837,16 +856,19 @@ def batch_process(
                         pbar.update(current_chunk)
                     for slc, block in iter_matrix_chunks(
                         stream_backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
-                        start_chunk=current_chunk,
+                        start_chunk=current_chunk, warn_slow_axis=False,
                     ):
                         gene_start, gene_end = slc.start, slc.stop
                         width = gene_end - gene_start
 
-                        permuted = (block.tocsr() if sp.issparse(block) else np.asarray(block))[order]
+                        # Row-gather per slab (CSR row indexing is O(nnz of the
+                        # selected rows)) so the only per-chunk copies are the
+                        # block itself and one densified slab at a time.
+                        block = block.tocsr() if sp.issparse(block) else np.asarray(block)
                         states: dict[tuple[int, int], Any] = {}
                         for slab_start in range(0, order.size, cell_chunk_size):
                             slab_end = min(slab_start + cell_chunk_size, order.size)
-                            dense = _as_dense(permuted[slab_start:slab_end])
+                            dense = _as_dense(block[order[slab_start:slab_end]])
                             # Segments overlapping [slab_start, slab_end).
                             first = int(np.searchsorted(seg_ends, slab_start, side="right"))
                             last = int(np.searchsorted(seg_starts, slab_end, side="left"))
@@ -862,7 +884,7 @@ def batch_process(
                                         f"Reducer failed for {_pair_context(*key)}"
                                     ) from exc
                                 states[key] = state if replacement is None else replacement
-                        del permuted
+                        del block
 
                         # Combine batches per group; states iterate in sorted
                         # (group, batch) order, so each group's batches are
@@ -902,22 +924,25 @@ def batch_process(
                                     batches_used[group_index, batch_index] = True
                         del states
 
-                        # One block write per layer per gene chunk.
+                        # One block write per layer per gene chunk. The
+                        # numerator is divided in place (no third array); the
+                        # scanned weight layer is written last (see scan_layer).
                         for name in layer_names:
-                            combined_values = np.divide(
-                                numerators[name],
-                                denominators[name],
-                                out=np.full((n_groups, width), np.nan, dtype=np.float64),
-                                where=denominators[name] > 0,
-                            )
+                            values = numerators[name]
+                            weights = denominators[name]
+                            positive = weights > 0
+                            np.divide(values, weights, out=values, where=positive)
+                            values[~positive] = np.nan
                             if name is None:
-                                out_X[:, gene_start:gene_end] = combined_values
-                                out_layers["weight_sum"][:, gene_start:gene_end] = denominators[name]
+                                out_X[:, gene_start:gene_end] = values
                             else:
-                                out_layers[name][:, gene_start:gene_end] = combined_values
-                                out_layers[f"{name}_weight_sum"][:, gene_start:gene_end] = denominators[name]
-                                if name == channels[0]:
-                                    out_X[:, gene_start:gene_end] = combined_values
+                                out_layers[name][:, gene_start:gene_end] = values
+                                if name == scan_layer:
+                                    out_X[:, gene_start:gene_end] = values
+                                if name != scan_layer:
+                                    out_layers[f"{name}_weight_sum"][:, gene_start:gene_end] = weights
+                        out_layers[scan_weight_key][:, gene_start:gene_end] = denominators[scan_layer]
+                        del numerators, denominators
 
                         current_chunk += 1
                         if current_chunk % eff_checkpoint_interval == 0 or current_chunk == n_gene_chunks:
@@ -925,8 +950,7 @@ def batch_process(
                             _save_checkpoint(current_chunk - 1)
                         pbar.update(1)
 
-                    weight_key = "weight_sum" if not channels else f"{channels[0]}_weight_sum"
-                    full_weight = np.asarray(out_layers[weight_key])
+                    full_weight = np.asarray(out_layers[scan_weight_key])
             finally:
                 if stream_backed is not backed:
                     stream_backed.file.close()
@@ -992,6 +1016,7 @@ def _estimate_shape_for_batch_process(
     separate tempdir accumulator); a CSR source additionally gets a temporary
     CSC copy beside the output under the default ``"convert"`` policy.
     """
+    validate_format_mismatch_policy(format_mismatch_policy)
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,

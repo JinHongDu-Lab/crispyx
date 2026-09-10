@@ -49,6 +49,7 @@ from .data import (
     resolve_output_path,
     sort_by_perturbation,
     stream_on_fast_axis,
+    validate_format_mismatch_policy,
     _read_h5_1d,
 )
 from .glm import (
@@ -3885,7 +3886,8 @@ def _wilcoxon_test_streaming(
 
                 dtype_checked_streaming = False
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     if not sp.issparse(block):
                         raise ValueError(
@@ -4340,7 +4342,8 @@ def _wilcoxon_test_stratified(
                 n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose
             ) as pbar:
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     if current_chunk <= last_completed_chunk:
                         current_chunk += 1
@@ -4777,8 +4780,10 @@ def wilcoxon_test(
           via :func:`crispyx.data.convert_to_csc`, honouring
           ``memory_limit_gb``) and stream from that; the temporary file is
           removed before returning. Needs ~2x the source file's size in free
-          disk space there. Run ``cx.pp.convert_to_csc`` once instead if
-          several steps will reuse the file.
+          disk space there; when that is not available the call falls back
+          to ``"warn"`` behaviour with a warning naming the shortfall. Run
+          ``cx.pp.convert_to_csc`` once instead if several steps will reuse
+          the file.
         * ``"warn"``: proceed on the CSR source after one warning that
           quantifies the cost.
         * ``"off"``: proceed silently.
@@ -4807,6 +4812,7 @@ def wilcoxon_test(
         min_pct_pert=min_pct_pert,
         fn_name="wilcoxon_test",
     )
+    validate_format_mismatch_policy(format_mismatch_policy)
 
     path = resolve_data_path(data)
     output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
@@ -5124,7 +5130,8 @@ def _wilcoxon_test_standard(
 
             with _create_progress_context(n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose) as pbar:
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     # Skip already processed chunks on resume
                     if current_chunk <= last_completed_chunk:
@@ -6008,6 +6015,7 @@ def _estimate_shape_for_wilcoxon_test(
     format_mismatch_policy: str = "convert",
     **_ignored,
 ) -> dict[str, float]:
+    validate_format_mismatch_policy(format_mismatch_policy)
     backed = read_backed(path)
     try:
         labels = backed.obs[perturbation_column].astype(str).to_numpy()

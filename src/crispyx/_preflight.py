@@ -19,7 +19,7 @@ from . import data as _data
 from . import de as _de
 from . import pseudobulk as _pseudobulk
 from ._disk import DiskEstimate, assess_bytes
-from .data import AnnData, resolve_data_path
+from .data import AnnData, resolve_data_path, resolve_output_path
 
 _RESOLVERS: dict[str, Callable[..., dict[str, float]]] = {
     "compute_normalized_effects": _pseudobulk._estimate_shape_for_normalized_effects,
@@ -85,9 +85,10 @@ def estimate_disk_usage(
         result file, and ``"scratch"`` for the temporary fast-axis copy a
         ``format_mismatch_policy="convert"`` call writes beside the output.
         Not every function uses all of them; a conversion function like
-        ``convert_to_csc`` only has ``"output"``. Pass ``output_path`` to
-        assess ``"output"``/``"scratch"`` against that location instead of
-        the source file's directory.
+        ``convert_to_csc`` only has ``"output"``. ``"output"`` and
+        ``"scratch"`` are assessed where the target function would write:
+        pass the same ``output_path`` (or ``output_dir``) you will pass to
+        it; with neither, the source file's directory.
 
     Examples
     --------
@@ -110,9 +111,13 @@ def estimate_disk_usage(
     path = resolve_data_path(data)
     required_by_location = resolver(path, **kwargs)
     tempdir = Path(tempfile.gettempdir())
-    output_parent = (
-        Path(kwargs["output_path"]).parent if kwargs.get("output_path") else path.parent
-    )
+    # Same resolution the target functions apply to their own output (the
+    # suffix only affects the filename, never the directory).
+    output_parent = resolve_output_path(
+        path, suffix="estimate",
+        output_path=kwargs.get("output_path"), output_dir=kwargs.get("output_dir"),
+        data_name=kwargs.get("data_name"),
+    ).parent
     return {
         location: assess_bytes(
             required_bytes, tempdir if location in _TEMPDIR_LOCATIONS else output_parent,

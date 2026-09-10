@@ -19,7 +19,13 @@ import scipy.sparse as sp
 
 from . import _messages
 from ._checkpoint import _create_progress_context
-from ._disk import estimate_bytes, estimate_conversion_bytes, estimate_sparse_output_bytes, warn_if_disk_space_low
+from ._disk import (
+    assess_bytes,
+    estimate_bytes,
+    estimate_conversion_bytes,
+    estimate_sparse_output_bytes,
+    warn_if_disk_space_low,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -901,6 +907,37 @@ def _matrix_shape_and_nbytes(path: Path) -> tuple[tuple[int, int], int]:
         return tuple(int(v) for v in x.shape), int(x.nbytes)
 
 
+def validate_format_mismatch_policy(policy: str) -> None:
+    """Raise ``ValueError`` unless ``policy`` is ``'warn'``, ``'convert'`` or ``'off'``.
+
+    Every public entry point that takes ``format_mismatch_policy`` calls this
+    first, so a typo fails immediately -- before a cached result is returned
+    or a disk estimate silently drops its ``"scratch"`` entry.
+    """
+    if policy not in ("warn", "convert", "off"):
+        raise ValueError(
+            "format_mismatch_policy must be 'warn', 'convert', or 'off', "
+            f"got {policy!r}"
+        )
+
+
+def _slow_axis_cost_message(path: Path, *, fmt: str, axis: int, chunk_size: int) -> str:
+    """Quantify what streaming ``path`` off its fast axis costs, with the remedy."""
+    target = "csc" if axis == 1 else "csr"
+    access = "cell (row)" if axis == 0 else "gene (column)"
+    shape, nbytes = _matrix_shape_and_nbytes(path)
+    n_chunks = max(1, (shape[axis] + chunk_size - 1) // chunk_size)
+    gb = nbytes / 1e9
+    return (
+        f"X is stored as {fmt.upper()} but is streamed by {access} chunks, so each "
+        f"of the {n_chunks} chunks re-reads the whole matrix ({gb:.1f} GB of "
+        f"data+indices, ~{gb * n_chunks:.0f} GB in total) and holds it in memory. "
+        f"Pass format_mismatch_policy='convert' to stream from a temporary "
+        f"{target.upper()} copy instead, or run cx.pp.convert_to_{target}(path) "
+        "once if several steps will reuse the file."
+    )
+
+
 @contextmanager
 def stream_on_fast_axis(
     path: Path,
@@ -923,18 +960,21 @@ def stream_on_fast_axis(
 
     * ``"convert"``: write a temporary fast-axis copy under ``scratch_dir``
       (:func:`convert_to_csc` / :func:`convert_to_csr`, output buffers bounded
-      by ``memory_limit_gb``), yield its path, and delete it on exit.
+      by ``memory_limit_gb``), yield its path, and delete it on exit. When the
+      free space under ``scratch_dir`` cannot hold that copy, the call falls
+      back to ``"warn"`` (one :class:`UserWarning` naming the shortfall) rather
+      than failing with ``ENOSPC`` after minutes of I/O.
     * ``"warn"``: yield ``path`` after one :class:`UserWarning` quantifying the
       cost (and the one-time ``crispyx.data`` logger line).
     * ``"off"``: yield ``path`` silently.
 
     A source already stored on its fast axis, or dense, is yielded unchanged.
+    The yielded path holds ``X`` only (plus ``obs``/``var``): read ``uns``,
+    ``layers``, ``obsm`` etc. from the original ``path``. Callers have made the
+    format decision here, so they stream the result with
+    ``iter_matrix_chunks(..., warn_slow_axis=False)``.
     """
-    if policy not in ("warn", "convert", "off"):
-        raise ValueError(
-            "format_mismatch_policy must be 'warn', 'convert', or 'off', "
-            f"got {policy!r}"
-        )
+    validate_format_mismatch_policy(policy)
     if axis not in (0, 1):
         raise ValueError("axis must be 0 (rows) or 1 (columns)")
     path = Path(path)
@@ -943,33 +983,39 @@ def stream_on_fast_axis(
         yield path
         return
 
-    target = "csc" if axis == 1 else "csr"
-    access = "cell (row)" if axis == 0 else "gene (column)"
     if policy == "off":
-        _SLOW_AXIS_WARNED.add((fmt, axis))
         yield path
         return
+
+    target = "csc" if axis == 1 else "csr"
+    access = "cell (row)" if axis == 0 else "gene (column)"
+    scratch_dir = Path(scratch_dir)
+    if policy == "convert":
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        disk = assess_bytes(estimate_conversion_bytes(path), scratch_dir)
+        if not disk.sufficient:
+            _messages.warn(
+                fn_name,
+                f"the temporary {target.upper()} copy needs ~{disk.required_gb:.1f} GB at "
+                f"{disk.path} but only {disk.free_gb:.1f} GB are free; streaming from the "
+                f"{fmt.upper()} source instead (as format_mismatch_policy='warn' would). "
+                f"Point output_path at a volume with more room, or run "
+                f"cx.pp.convert_to_{target}(path) there once. "
+                + _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
+                stacklevel=4,
+            )
+            policy = "warn"
     if policy == "warn":
-        shape, nbytes = _matrix_shape_and_nbytes(path)
-        n_chunks = max(1, (shape[axis] + chunk_size - 1) // chunk_size)
-        gb = nbytes / 1e9
         _messages.warn(
             fn_name,
-            f"X is stored as {fmt.upper()} but is streamed by {access} chunks, so each "
-            f"of the {n_chunks} chunks re-reads the whole matrix ({gb:.1f} GB of "
-            f"data+indices, ~{gb * n_chunks:.0f} GB in total) and holds it in memory. "
-            f"Pass format_mismatch_policy='convert' to stream from a temporary "
-            f"{target.upper()} copy instead, or run cx.pp.convert_to_{target}(path) "
-            "once if several steps will reuse the file.",
+            _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
             stacklevel=4,
         )
-        # One-time logger guardrail; also stops iter_matrix_chunks repeating it.
+        # The one-time logger guardrail, emitted once per process.
         _warn_slow_axis(fmt, axis)
         yield path
         return
 
-    scratch_dir = Path(scratch_dir)
-    scratch_dir.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=scratch_dir, prefix=f".cx_{fn_name}_", suffix=f".{target}.h5ad"
     )
@@ -997,6 +1043,7 @@ def iter_matrix_chunks(
     convert_to_dense: bool = True,
     matrix: np.ndarray | sp.spmatrix | None = None,
     start_chunk: int = 0,
+    warn_slow_axis: bool = True,
 ) -> Iterator[tuple[slice, np.ndarray | sp.spmatrix]]:
     """Yield chunks of ``matrix`` (defaults to ``adata.X``).
 
@@ -1004,6 +1051,9 @@ def iter_matrix_chunks(
     chunking and slow-axis-format dispatch used for ``X``. ``start_chunk``
     skips directly to that 0-indexed chunk (e.g. for resuming a previously
     interrupted run) without reading the skipped chunks from disk.
+    ``warn_slow_axis=False`` suppresses the one-time logger warning about
+    streaming a compressed matrix off its fast axis; callers that already
+    resolved that decision through :func:`stream_on_fast_axis` pass it.
     """
 
     if axis not in (0, 1):
@@ -1011,7 +1061,7 @@ def iter_matrix_chunks(
     if matrix is None:
         matrix = adata.X
     fmt = _detect_backed_sparse_format(matrix)
-    if (fmt == "csc" and axis == 0) or (fmt == "csr" and axis == 1):
+    if warn_slow_axis and ((fmt == "csc" and axis == 0) or (fmt == "csr" and axis == 1)):
         _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
@@ -1593,6 +1643,7 @@ def normalize_total_log1p(
     """
     if not normalize and not log1p:
         raise ValueError("At least one of normalize or log1p must be True")
+    validate_format_mismatch_policy(format_mismatch_policy)
 
     # Resolve input path from various input types
     source_path = resolve_data_path(data, require_exists=True)
@@ -1613,15 +1664,17 @@ def normalize_total_log1p(
 
     # Cell-(row-)streaming below is pathologically slow on CSC; resolve the
     # format mismatch according to policy before touching X. A temporary CSR
-    # copy lives beside the output file, not in $TMPDIR.
+    # copy lives beside the output file, not in $TMPDIR. It carries X only,
+    # so metadata and the non-X slots are always read from the source.
     with stream_on_fast_axis(
         source_path, axis=0, policy=format_mismatch_policy,
         fn_name="pp.normalize_total_log1p", scratch_dir=output_path.parent,
         chunk_size=chunk_size, verbose=verbose,
     ) as stream_path:
         return _normalize_total_log1p_impl(
-            stream_path,
+            source_path,
             output_path,
+            stream_path=stream_path,
             normalize=normalize,
             log1p=log1p,
             target_sum=target_sum,
@@ -1634,23 +1687,30 @@ def _normalize_total_log1p_impl(
     source_path: Path,
     output_path: Path,
     *,
+    stream_path: Path,
     normalize: bool,
     log1p: bool,
     target_sum: float,
     chunk_size: int,
     verbose: int | bool,
 ) -> "AnnData":
-    """Core streaming normalize/log1p implementation (paths already resolved)."""
+    """Core streaming normalize/log1p implementation (paths already resolved).
+
+    ``X`` is streamed from ``stream_path`` (the source itself, or its
+    temporary fast-axis copy); ``obs``/``var``/``uns`` and the copied
+    ``layers``/``obsm``/``varm``/``obsp``/``varp`` slots come from
+    ``source_path``.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     ops = []
     if normalize:
         ops.append("normalize")
     if log1p:
         ops.append("log1p")
     _messages.print_saving(verbose, "pp.normalize_total_log1p", output_path)
-    
-    # First pass: count non-zeros and get metadata
+
+    # Metadata and slot inventory from the source file.
     backed = read_backed(source_path)
     try:
         n_obs = backed.n_obs
@@ -1668,14 +1728,19 @@ def _normalize_total_log1p_impl(
         obsp_keys = list(backed.obsp.keys())
         varp_keys = list(backed.varp.keys())
         has_raw = backed.raw is not None
+    finally:
+        backed.file.close()
 
-        # Count non-zeros per row (after normalization, same sparsity as input)
-        row_nnz = np.zeros(n_obs, dtype=np.int64)
-        total_nnz = 0
-
+    # First pass: count non-zeros per row (after normalization, same
+    # sparsity as input).
+    row_nnz = np.zeros(n_obs, dtype=np.int64)
+    total_nnz = 0
+    backed = read_backed(stream_path)
+    try:
         row_offset = 0
         for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
+            warn_slow_axis=False,
         ):
             csr = _ensure_csr(block)
             counts = np.diff(csr.indptr)
@@ -1764,12 +1829,13 @@ def _normalize_total_log1p_impl(
         )
         grp.create_dataset("indptr", data=indptr)
         grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
-        
-        backed = read_backed(source_path)
+
+        backed = read_backed(stream_path)
         try:
             offset = 0
             for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
+                warn_slow_axis=False,
             ):
                 csr = _ensure_csr(block)
                 
@@ -2182,6 +2248,28 @@ def _scatter_by_key(
     offset[unique_keys] += counts
 
 
+@contextmanager
+def _replace_on_success(output_path: Path) -> Iterator[Path]:
+    """Yield a partial path beside ``output_path``; rename it over
+    ``output_path`` only when the block completes.
+
+    The converters pre-size ``X`` and fill it band by band, so a conversion
+    killed midway (Ctrl-C, OOM, ENOSPC) would otherwise leave a structurally
+    valid file whose unfilled bands read as zeros. Writing to a partial name
+    and renaming on success means ``output_path`` either holds a complete
+    conversion or does not exist; the partial file is removed on any exit
+    that is not a normal completion.
+    """
+    partial = output_path.with_name(f".{output_path.name}.partial")
+    try:
+        yield partial
+    except BaseException:
+        if partial.exists():
+            partial.unlink()
+        raise
+    partial.replace(output_path)
+
+
 def _write_sparse_skeleton(
     output_path: Path,
     obs: pd.DataFrame,
@@ -2365,50 +2453,51 @@ def convert_to_csc(
             f"output buffers need {total_nnz * per_item_bytes / 1e9:.1f} GB; converting in "
             f"{len(bands)} column bands ({len(bands)} passes over the source)",
         )
-    _write_sparse_skeleton(
-        output_path, obs, var, encoding="csc_matrix", shape=(n_obs, n_vars),
-        indptr=indptr, total_nnz=total_nnz, value_dtype=value_dtype, index_dtype=row_dtype,
-    )
-    with h5py.File(output_path, "r+") as dest, _create_progress_context(
-        n_chunks * len(bands), "pp.convert_to_csc (pass 2)", verbose, unit="chunk"
-    ) as pbar:
-        ds_data, ds_indices = dest["X/data"], dest["X/indices"]
-        for c0, c1 in bands:
-            base = int(indptr[c0])
-            band_nnz = int(indptr[c1]) - base
-            band_data = np.empty(band_nnz, dtype=value_dtype)
-            band_rows = np.empty(band_nnz, dtype=row_dtype)
-            # offset[c] = next write position within the band for column c0 + c.
-            # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
-            offset = indptr[c0:c1].astype(np.int64) - base
-            whole = (c0, c1) == (0, n_vars)
-            row_global = 0
-            backed = read_backed(source_path)
-            try:
-                for _slc, block in iter_matrix_chunks(
-                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-                ):
-                    csr = _ensure_csr(block)
-                    n_chunk = csr.shape[0]
-                    if csr.nnz:
-                        cols = csr.indices
-                        vals = csr.data
-                        # Global row index for every non-zero in this chunk.
-                        rows = np.repeat(
-                            np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
-                        ) + row_dtype(row_global)
-                        if not whole:
-                            keep = (cols >= c0) & (cols < c1)
-                            cols, vals, rows = cols[keep], vals[keep], rows[keep]
-                        if cols.size:
-                            _scatter_by_key(cols - c0, vals, rows, offset, band_data, band_rows)
-                    row_global += n_chunk
-                    pbar.update(1)
-            finally:
-                backed.file.close()
-            ds_data[base:base + band_nnz] = band_data
-            ds_indices[base:base + band_nnz] = band_rows
-            del band_data, band_rows
+    with _replace_on_success(output_path) as partial:
+        _write_sparse_skeleton(
+            partial, obs, var, encoding="csc_matrix", shape=(n_obs, n_vars),
+            indptr=indptr, total_nnz=total_nnz, value_dtype=value_dtype, index_dtype=row_dtype,
+        )
+        with h5py.File(partial, "r+") as dest, _create_progress_context(
+            n_chunks * len(bands), "pp.convert_to_csc (pass 2)", verbose, unit="chunk"
+        ) as pbar:
+            ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+            for c0, c1 in bands:
+                base = int(indptr[c0])
+                band_nnz = int(indptr[c1]) - base
+                band_data = np.empty(band_nnz, dtype=value_dtype)
+                band_rows = np.empty(band_nnz, dtype=row_dtype)
+                # offset[c] = next write position within the band for column c0 + c.
+                # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
+                offset = indptr[c0:c1].astype(np.int64) - base
+                whole = (c0, c1) == (0, n_vars)
+                row_global = 0
+                backed = read_backed(source_path)
+                try:
+                    for _slc, block in iter_matrix_chunks(
+                        backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+                    ):
+                        csr = _ensure_csr(block)
+                        n_chunk = csr.shape[0]
+                        if csr.nnz:
+                            cols = csr.indices
+                            vals = csr.data
+                            # Global row index for every non-zero in this chunk.
+                            rows = np.repeat(
+                                np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
+                            ) + row_dtype(row_global)
+                            if not whole:
+                                keep = (cols >= c0) & (cols < c1)
+                                cols, vals, rows = cols[keep], vals[keep], rows[keep]
+                            if cols.size:
+                                _scatter_by_key(cols - c0, vals, rows, offset, band_data, band_rows)
+                        row_global += n_chunk
+                        pbar.update(1)
+                finally:
+                    backed.file.close()
+                ds_data[base:base + band_nnz] = band_data
+                ds_indices[base:base + band_nnz] = band_rows
+                del band_data, band_rows
 
     _messages.print_done(verbose, "pp.convert_to_csc", f"{n_obs} cells × {n_vars} genes")
 
@@ -2575,85 +2664,86 @@ def convert_to_csr(
     col_dtype = np.int32 if n_vars <= np.iinfo(np.int32).max else np.int64
 
     # ------------------------------------------------------------------ Pass 2
-    _write_sparse_skeleton(
-        output_path, obs, var, encoding="csr_matrix", shape=(n_obs, n_vars),
-        indptr=indptr, total_nnz=total_nnz, value_dtype=value_dtype, index_dtype=col_dtype,
-    )
-    if source_is_csc:
-        # Column-chunk reading (fast on CSC), scattered into CSR buffers one
-        # row band at a time -- the transpose of convert_to_csc's pass 2.
-        per_item_bytes = value_dtype.itemsize + np.dtype(col_dtype).itemsize
-        bands = _contiguous_bands(
-            row_nnz,
-            per_item_bytes=per_item_bytes,
-            budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
+    with _replace_on_success(output_path) as partial:
+        _write_sparse_skeleton(
+            partial, obs, var, encoding="csr_matrix", shape=(n_obs, n_vars),
+            indptr=indptr, total_nnz=total_nnz, value_dtype=value_dtype, index_dtype=col_dtype,
         )
-        if len(bands) > 1:
-            _messages.vprint(
-                verbose, "pp.convert_to_csr",
-                f"output buffers need {total_nnz * per_item_bytes / 1e9:.1f} GB; converting in "
-                f"{len(bands)} row bands ({len(bands)} passes over the source)",
+        if source_is_csc:
+            # Column-chunk reading (fast on CSC), scattered into CSR buffers one
+            # row band at a time -- the transpose of convert_to_csc's pass 2.
+            per_item_bytes = value_dtype.itemsize + np.dtype(col_dtype).itemsize
+            bands = _contiguous_bands(
+                row_nnz,
+                per_item_bytes=per_item_bytes,
+                budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
             )
-        with h5py.File(output_path, "r+") as dest, _create_progress_context(
-            n_col_chunks * len(bands), "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
-        ) as pbar:
-            ds_data, ds_indices = dest["X/data"], dest["X/indices"]
-            for r0, r1 in bands:
-                base = int(indptr[r0])
-                band_nnz = int(indptr[r1]) - base
-                band_data = np.empty(band_nnz, dtype=value_dtype)
-                band_cols = np.empty(band_nnz, dtype=col_dtype)
-                # offset[r] = next write position within the band for row r0 + r.
-                offset = indptr[r0:r1].astype(np.int64) - base
-                whole = (r0, r1) == (0, n_obs)
-                col_global = 0
-                backed = read_backed(source_path)
-                try:
-                    for _slc, block in iter_matrix_chunks(
-                        backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-                    ):
-                        csc = sp.csc_matrix(block) if sp.issparse(block) else sp.csc_matrix(np.asarray(block))
-                        n_chunk_cols = csc.shape[1]
-                        if csc.nnz:
-                            rows = csc.indices
-                            vals = csc.data
-                            # Global column index for every non-zero in this chunk.
-                            cols = np.repeat(
-                                np.arange(n_chunk_cols, dtype=col_dtype), np.diff(csc.indptr)
-                            ) + col_dtype(col_global)
-                            if not whole:
-                                keep = (rows >= r0) & (rows < r1)
-                                rows, vals, cols = rows[keep], vals[keep], cols[keep]
-                            if rows.size:
-                                _scatter_by_key(rows - r0, vals, cols, offset, band_data, band_cols)
-                        col_global += n_chunk_cols
-                        pbar.update(1)
-                finally:
-                    backed.file.close()
-                ds_data[base:base + band_nnz] = band_data
-                ds_indices[base:base + band_nnz] = band_cols
-                del band_data, band_cols
-    else:
-        # Row-chunk reading (dense source): every chunk is already in CSR
-        # order, so it is written straight into the output datasets.
-        backed = read_backed(source_path)
-        try:
-            with h5py.File(output_path, "r+") as dest, _create_progress_context(
-                n_row_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
+            if len(bands) > 1:
+                _messages.vprint(
+                    verbose, "pp.convert_to_csr",
+                    f"output buffers need {total_nnz * per_item_bytes / 1e9:.1f} GB; converting in "
+                    f"{len(bands)} row bands ({len(bands)} passes over the source)",
+                )
+            with h5py.File(partial, "r+") as dest, _create_progress_context(
+                n_col_chunks * len(bands), "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
             ) as pbar:
                 ds_data, ds_indices = dest["X/data"], dest["X/indices"]
-                for _slc, block in iter_matrix_chunks(
-                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-                ):
-                    csr = _ensure_csr(block)
-                    if csr.nnz:
-                        dst_start = int(indptr[_slc.start])
-                        dst_end = dst_start + csr.nnz
-                        ds_data[dst_start:dst_end] = csr.data.astype(value_dtype, copy=False)
-                        ds_indices[dst_start:dst_end] = csr.indices.astype(col_dtype, copy=False)
-                    pbar.update(1)
-        finally:
-            backed.file.close()
+                for r0, r1 in bands:
+                    base = int(indptr[r0])
+                    band_nnz = int(indptr[r1]) - base
+                    band_data = np.empty(band_nnz, dtype=value_dtype)
+                    band_cols = np.empty(band_nnz, dtype=col_dtype)
+                    # offset[r] = next write position within the band for row r0 + r.
+                    offset = indptr[r0:r1].astype(np.int64) - base
+                    whole = (r0, r1) == (0, n_obs)
+                    col_global = 0
+                    backed = read_backed(source_path)
+                    try:
+                        for _slc, block in iter_matrix_chunks(
+                            backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                        ):
+                            csc = sp.csc_matrix(block) if sp.issparse(block) else sp.csc_matrix(np.asarray(block))
+                            n_chunk_cols = csc.shape[1]
+                            if csc.nnz:
+                                rows = csc.indices
+                                vals = csc.data
+                                # Global column index for every non-zero in this chunk.
+                                cols = np.repeat(
+                                    np.arange(n_chunk_cols, dtype=col_dtype), np.diff(csc.indptr)
+                                ) + col_dtype(col_global)
+                                if not whole:
+                                    keep = (rows >= r0) & (rows < r1)
+                                    rows, vals, cols = rows[keep], vals[keep], cols[keep]
+                                if rows.size:
+                                    _scatter_by_key(rows - r0, vals, cols, offset, band_data, band_cols)
+                            col_global += n_chunk_cols
+                            pbar.update(1)
+                    finally:
+                        backed.file.close()
+                    ds_data[base:base + band_nnz] = band_data
+                    ds_indices[base:base + band_nnz] = band_cols
+                    del band_data, band_cols
+        else:
+            # Row-chunk reading (dense source): every chunk is already in CSR
+            # order, so it is written straight into the output datasets.
+            backed = read_backed(source_path)
+            try:
+                with h5py.File(partial, "r+") as dest, _create_progress_context(
+                    n_row_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
+                ) as pbar:
+                    ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+                    for _slc, block in iter_matrix_chunks(
+                        backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+                    ):
+                        csr = _ensure_csr(block)
+                        if csr.nnz:
+                            dst_start = int(indptr[_slc.start])
+                            dst_end = dst_start + csr.nnz
+                            ds_data[dst_start:dst_end] = csr.data.astype(value_dtype, copy=False)
+                            ds_indices[dst_start:dst_end] = csr.indices.astype(col_dtype, copy=False)
+                        pbar.update(1)
+            finally:
+                backed.file.close()
 
     _messages.print_done(verbose, "pp.convert_to_csr", f"{n_obs} cells × {n_vars} genes")
 
@@ -2683,6 +2773,7 @@ def _estimate_shape_for_normalize_total_log1p(
     the (nnz-bounded, not separately estimated here) streamed output: it
     calls :func:`convert_to_csr` into a temporary file beside the output.
     """
+    validate_format_mismatch_policy(format_mismatch_policy)
     if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csc":
         return {"scratch": estimate_conversion_bytes(path)}
     return {}

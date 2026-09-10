@@ -631,3 +631,45 @@ def test_normalize_total_log1p_empty_matrix_preserves_slots_and_returns_anndata(
     assert om.X.nnz == 0
     np.testing.assert_allclose(om.obsm["X_pca"], src_backed.obsm["X_pca"])
     assert om.uns["some_key"] == "hello"
+
+
+def test_normalize_convert_policy_keeps_non_x_slots_of_csc_source(tmp_path):
+    """The temporary CSR copy carries X only; uns/layers/obsm must still come
+    from the CSC source and reach the output, exactly as for a CSR source."""
+    from crispyx.data import normalize_total_log1p
+
+    rng = np.random.default_rng(5)
+    n, g = 40, 12
+    X = sp.random(n, g, density=0.3, random_state=5,
+                  data_rvs=lambda s: rng.integers(1, 9, s)).tocsr()
+    X.data = X.data.astype(np.float32)
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(g)])
+    adata = ad.AnnData(X=X.tocsc(), obs=obs, var=var)
+    adata.layers["counts"] = X.copy()
+    adata.obsm["X_pca"] = rng.normal(size=(n, 3))
+    adata.uns["guide_map"] = {"a": "b"}
+    csc_p = tmp_path / "csc_slots.h5ad"
+    adata.write_h5ad(csc_p)
+
+    out = tmp_path / "conv_slots.h5ad"
+    normalize_total_log1p(csc_p, out, format_mismatch_policy="convert", verbose=False)
+    result = ad.read_h5ad(out)
+    assert "counts" in result.layers
+    np.testing.assert_array_equal(result.layers["counts"].toarray(), X.toarray())
+    np.testing.assert_allclose(result.obsm["X_pca"], adata.obsm["X_pca"])
+    assert result.uns["guide_map"] == {"a": "b"}
+
+
+def test_wilcoxon_rejects_bad_policy_before_returning_cached_result(small_adata, tmp_path):
+    path, adata = small_adata
+    norm_path = tmp_path / "small_cached.h5ad"
+    _log_normalise_sparse(adata, norm_path)
+    common = dict(
+        perturbation_column="perturbation", control_label="ctrl",
+        gene_name_column="gene_symbols", chunk_size=2, output_path=tmp_path / "cached.h5ad",
+    )
+    wilcoxon_test(norm_path, **common)
+    assert common["output_path"].exists()
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        wilcoxon_test(norm_path, format_mismatch_policy="convrt", **common)

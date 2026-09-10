@@ -315,7 +315,8 @@ class _PreprocessingNamespace:
         data: str | Path | ad.AnnData,
         *,
         output_path: str | Path | None = None,
-        chunk_size: int = 4096,
+        chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -329,7 +330,11 @@ class _PreprocessingNamespace:
         output_path
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
-            Rows per streaming chunk.  Default 4096.
+            Rows per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); larger
+            matrices are converted in several column bands. Default: detected
+            via psutil. On HPC nodes, pass the SLURM ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -346,6 +351,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
@@ -357,6 +363,7 @@ class _PreprocessingNamespace:
         *,
         output_path: str | Path | None = None,
         chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -371,6 +378,11 @@ class _PreprocessingNamespace:
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
             Rows (or columns for CSC source) per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); a CSC
+            source is converted in several row bands when it does not fit.
+            Default: detected via psutil. On HPC nodes, pass the SLURM
+            ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -387,6 +399,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,

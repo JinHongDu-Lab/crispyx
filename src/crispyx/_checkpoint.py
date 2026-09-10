@@ -155,11 +155,12 @@ def _find_last_completed_gene_chunk(
     Used by ``batch_process``, whose gene chunks are written strictly in
     order (unlike DE's per-candidate resume, where any candidate can
     complete independently): a chunk is "done" once *every* group's row in
-    its column slice of ``weight_dataset`` holds a finite, positive weight
-    (a crash partway through the per-group write loop for a chunk leaves
-    some rows unwritten, and must not be mistaken for a completed chunk).
-    Scanning stops at the first not-fully-written chunk. Returns -1 if none
-    are complete.
+    its column slice of ``weight_dataset`` holds a finite, positive weight.
+    ``batch_process`` writes ``weight_dataset`` last for each chunk, after
+    ``X`` and every other layer, so a chunk this scan reports complete has
+    all of its datasets written; a crash before that final write leaves the
+    slice at its zero fill value and the chunk is redone. Scanning stops at
+    the first not-fully-written chunk. Returns -1 if none are complete.
 
     Known limitation: a group with zero cells for every gene in a chunk has
     a legitimately-zero weight there and looks indistinguishable from

@@ -324,3 +324,26 @@ def test_banded_csc_to_csr_conversion_is_identical_to_single_pass(tmp_path):
             np.testing.assert_array_equal(f["X/data"][:], ref.data)
             assert f["X/data"].dtype == np.float64
         assert get_matrix_storage_format(out) == "csr"
+
+
+def test_interrupted_conversion_leaves_no_output_file(tmp_path, monkeypatch):
+    import crispyx as cx
+    import crispyx.data as cxd
+
+    src, _ = _make_csc_h5ad(tmp_path)
+    out = tmp_path / "out.h5ad"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("killed")
+
+    monkeypatch.setattr(cxd, "_scatter_by_key", boom)
+    with pytest.raises(RuntimeError, match="killed"):
+        convert_to_csr(src, output_path=out, verbose=False)
+    assert not out.exists()
+    assert list(tmp_path.glob(".*partial")) == []
+
+    # The pp namespace accepts memory_limit_gb like the top-level function.
+    monkeypatch.undo()
+    result = cx.pp.convert_to_csr(src, output_path=out, memory_limit_gb=1e-6, verbose=False)
+    result.close()
+    assert out.exists()
