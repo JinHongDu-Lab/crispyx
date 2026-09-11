@@ -1055,6 +1055,32 @@ def test_partial_output_of_a_killed_run_is_not_reused_as_a_cached_result(tmp_pat
     np.testing.assert_allclose(recomputed, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_an_unusable_existing_output_is_overwritten_with_a_warning(tmp_path):
+    """A recompute fills the output in place, so it replaces what is there
+    before it has a result to put in its place -- and if this run is killed
+    too, neither survives. That has to be said out loud: the file may be a
+    perfectly good result from a version before the completion marker."""
+    path, *_ = _write_data(tmp_path, sparse=True)
+    out = tmp_path / "result.h5ad"
+    common = dict(
+        groupby="perturbation", batch_column="batch", mode="group",
+        statistic_name="std", chunk_size=2, cell_chunk_size=20,
+        output_path=out, format_mismatch_policy="off",
+    )
+    cx.batch_process(path, _moment_reducer(), force=True, **common)
+    # What an earlier version left behind: a complete result, no marker.
+    with h5py.File(out, "r+") as f:
+        del f["uns"]["crispyx_run_complete"]
+
+    with pytest.warns(UserWarning, match="overwritten"):
+        cx.batch_process(path, _moment_reducer(), **common)
+
+    # force=True is the user asking for the rerun, so it says nothing.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        cx.batch_process(path, _moment_reducer(), force=True, **common)
+
+
 def test_completed_run_is_still_reused_without_recomputing(tmp_path):
     path, *_ = _write_data(tmp_path, sparse=True)
     out = tmp_path / "cached.h5ad"

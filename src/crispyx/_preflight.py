@@ -49,9 +49,16 @@ def estimate_disk_usage(
 
     This is a standalone, on-demand query -- separate from the automatic
     warning crispyx already emits from inside a real call when its own
-    estimate looks tight. It never touches ``X``: resolvers read only cheap
-    ``obs``/``uns`` metadata in backed mode to reproduce the group/batch
-    counts the real function would compute in its own preamble.
+    estimate looks tight. Resolvers read only cheap ``obs``/``uns`` metadata
+    in backed mode to reproduce the group/batch counts the real function
+    would compute in its own preamble; they never read ``X`` in full. The one
+    exception is ``format_mismatch_policy="auto"`` (the default) on a source
+    stored off the axis the function streams: deciding whether that call
+    would write a temporary fast-axis copy means measuring the filesystem, so
+    the query makes the same bounded 64 MB probe read of ``X`` the real call
+    makes. The measurement is cached per file, so a call made later in the
+    same process does not pay for it again and cannot resolve the decision
+    differently than this query did.
 
     Also available as ``cx.tl.estimate_disk_usage`` for Scanpy-style
     namespace discovery (the same pattern as ``compute_overlap``, which is
@@ -73,9 +80,14 @@ def estimate_disk_usage(
         The subset of the target function's keyword arguments that affect
         group/shape counts (e.g. ``perturbation_column``, ``control_label``,
         ``batch_column``, ``groupby``, ``perturbations``, ``min_cells``).
-        Performance-only keywords the caller might also pass (``chunk_size``,
-        ``memory_limit_gb``, ``verbose``, ``output_path``, ...) are accepted
-        and ignored, since they don't change the estimate.
+        ``format_mismatch_policy`` matters too, as do ``chunk_size`` and
+        ``memory_limit_gb`` through it: those two set how many chunks the run
+        streams, which is what decides whether it converts the source and so
+        whether ``"scratch"`` appears at all. Pass the ones you will pass to
+        the real call; omitted, they resolve the way the real call resolves
+        them.
+        Keywords that genuinely cannot change the estimate (``verbose``,
+        ``n_jobs``, ...) are accepted and ignored.
 
     Returns
     -------

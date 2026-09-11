@@ -40,8 +40,14 @@ Version 0.1.3
   ``"scratch"`` location and assesses it (and ``"output"``) where the file
   will actually be written -- it resolves ``output_path`` / ``output_dir`` /
   ``data_name`` exactly as the target function does, and under ``"auto"`` it
-  runs the same convert-or-stream decision, so the ``"scratch"`` entry
-  appears exactly when the real call would make a copy. When the free space
+  runs the same convert-or-stream decision (including its 64 MB probe read,
+  the one case where the query touches ``X`` at all), so the ``"scratch"``
+  entry appears when the real call would make a copy. Because that decision
+  is a measurement, the measurement is cached per file for the life of the
+  process: the query and the run it describes see one number rather than two,
+  and the probe is paid once. Pass ``chunk_size`` / ``memory_limit_gb`` to
+  the query if you will pass them to the call -- they set the chunk count,
+  which is what the decision turns on. When the free space
   beside the output cannot hold the temporary copy, ``"convert"`` falls back
   to ``"warn"`` behaviour (one warning naming the shortfall, then streaming
   from the source) instead of failing with ``ENOSPC`` partway through the
@@ -56,11 +62,17 @@ Version 0.1.3
   / ``varp`` from the source file rather than from the X-only temporary
   copy, where they were silently dropped. A run killed outright cannot delete
   its temporary copy -- ``SIGKILL`` skips the ``finally`` that would, and
-  ``atexit`` would not fire either -- so each conversion first sweeps the
-  copies in its scratch directory whose owning process is gone (the PID is
-  now part of the ``.cx_<function>_<pid>_*`` name). Otherwise an
-  out-of-memory-killed job left a hidden file the size of its matrix next to
-  the output, forever.
+  ``atexit`` would not fire either -- so every call that sees a mismatched
+  source first sweeps the abandoned copies in its scratch directory (not only
+  the calls that convert: under ``"auto"`` a directory may be swept by runs
+  that never convert again). Otherwise an out-of-memory-killed job left a
+  hidden file the size of its matrix next to the output, forever. A copy is
+  abandoned only once it has gone a day untouched -- a conversion in progress
+  rewrites its copy continuously -- and, for copies this machine wrote, once
+  its owning process is gone. Both the PID and a tag for the host are part of
+  the ``.cx_<function>_<pid>-<host>_*`` name: the scratch directory is the
+  output directory, which a cluster job array shares across nodes, and a PID
+  read on the wrong node says nothing about whether that copy is live.
 * **``batch_process`` no longer returns a killed run's output as a cached
   result.** The output file is created -- with complete ``uns`` metadata and
   a NaN fill -- before the first gene chunk is processed, and a run that died
@@ -70,7 +82,13 @@ Version 0.1.3
   present in 0.1.2 as well). A completion marker is now written after the
   last gene chunk and required by the cache check, so an unfinished output is
   recomputed (or resumed, with ``resume=True``) instead. Outputs written by
-  earlier versions carry no marker and are recomputed once.
+  earlier versions carry no marker and are recomputed once. A recompute fills
+  the output file in place -- that is what lets a killed run resume -- so it
+  replaces the existing file before it has a result to put there; if that
+  rerun is killed too, neither result survives. It now says so in a warning
+  naming the file, which also covers the more familiar case of rerunning with
+  changed parameters. ``force=True`` is the user asking for the rerun and
+  stays silent.
 * **Sizes are reported in a unit that suits them.** Every user-facing disk
   and slow-axis message went through a fixed ``GB`` format, so the
   quantified slow-axis warning read ``0.0 GB of data+indices, ~0 GB in

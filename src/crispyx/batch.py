@@ -518,10 +518,12 @@ def batch_process(
         import crispyx as cx
 
         def initialize_mean(width):
-            return {"sum": np.zeros(width), "count": 0}
+            return {"sum": np.zeros(width, dtype=np.float64), "count": 0}
 
         def update_mean(state, block):
-            state["sum"] += block.sum(axis=0)
+            # Accumulate in float64: block follows the file's dtype, so
+            # block.sum() on a float32 file would sum in float32.
+            state["sum"] += np.asarray(block, dtype=np.float64).sum(axis=0)
             state["count"] += block.shape[0]
 
         def finalize_mean(state):
@@ -728,6 +730,7 @@ def batch_process(
         # ---- Resume bookkeeping: gene chunks complete strictly in order. ----
         last_completed_chunk = -1
         reuse_existing_output = False
+        warned_about_overwrite = False
         checkpoint: dict[str, Any] | None = None
         recovered_via_scan = False
         if resume:
@@ -767,10 +770,11 @@ def batch_process(
                 existing.file.close()
             if not reuse_existing_output:
                 last_completed_chunk = -1
+                warned_about_overwrite = True
                 _messages.warn(
                     "tl.batch_process",
                     "Existing partial output does not match this call's parameters "
-                    "or source; restarting from scratch.",
+                    "or source; restarting from scratch, which overwrites it.",
                     stacklevel=2,
                 )
 
@@ -783,6 +787,25 @@ def batch_process(
         _messages.print_disk_estimate(verbose, "tl.batch_process", _output_disk_estimate)
 
         if not reuse_existing_output:
+            # The run fills the output in place (that is what lets a killed
+            # one resume), so starting over replaces whatever is there before
+            # it has anything to put in its place: if this run is killed too,
+            # neither result survives. Say so rather than let a result
+            # disappear silently -- a complete output from a version before
+            # the completion marker lands here, as does any rerun whose
+            # parameters changed.
+            if resolved_output.exists() and not force and not warned_about_overwrite:
+                _messages.warn(
+                    "tl.batch_process",
+                    f"{resolved_output.name} exists but cannot be reused (it is "
+                    "unfinished, was written by an earlier crispyx version, or "
+                    "does not match this call's parameters), so it is overwritten "
+                    "now and holds a usable result again only once this run "
+                    "finishes. Copy it aside first if you still need it, or pass "
+                    "resume=True to fill it in place from where the last run "
+                    "stopped.",
+                    stacklevel=2,
+                )
             if checkpoint_path.exists():
                 try:
                     checkpoint_path.unlink()

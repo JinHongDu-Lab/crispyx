@@ -114,14 +114,19 @@ crispyx mitigates this for you:
   in free disk space at the output location; if that is not available the call
   warns and streams from the source instead (the ``"warn"`` behaviour) rather
   than failing midway, and :func:`crispyx.estimate_disk_usage` reports the need
-  under ``"scratch"`` (pass the same ``output_path``/``output_dir`` you will
-  pass to the real call -- and note that under ``"auto"`` the ``"scratch"``
-  entry appears only when the real call would convert).
+  under ``"scratch"`` (pass the same ``output_path``/``output_dir``, and the
+  same ``chunk_size``/``memory_limit_gb``, you will pass to the real call --
+  under ``"auto"`` the ``"scratch"`` entry appears when the real call would
+  convert, and the chunk count those arguments set is what that turns on).
 * A run killed outright (``SIGKILL``, an out-of-memory kill, a scheduler
-  timeout) cannot delete its temporary copy. The next conversion writing to
-  the same directory removes the copies of runs that are no longer alive, so
-  they do not accumulate; they are hidden files named ``.cx_<function>_<pid>_*``
-  if you want to clear them by hand.
+  timeout) cannot delete its temporary copy. The next call that reads a
+  mismatched source from the same directory removes copies that have gone a
+  day untouched and whose owning run is gone, so they do not accumulate; they
+  are hidden files named ``.cx_<function>_<pid>-<host>_*`` if you want to
+  clear them by hand sooner. The day-long grace period is what makes this
+  safe when the output directory is shared by several nodes of a cluster job
+  array, where a PID from another node cannot be checked -- a copy still
+  being written is never a day old.
 
 .. code-block:: python
 

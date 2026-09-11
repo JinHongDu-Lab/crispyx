@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os as _os
 import re as _re
+import socket as _socket
 import tempfile
 import time as _time
 from contextlib import contextmanager
@@ -942,14 +943,35 @@ _SLOW_AXIS_MIN_SAVING_SECONDS = 60.0
 #: enough to amortize per-read latency on a network filesystem, small enough
 #: to be free on a local one.
 _THROUGHPUT_PROBE_BYTES = 64 << 20
+#: Measurements already made in this process, keyed by file identity. The
+#: probe itself warms the page cache, so a second probe of the same file
+#: reads far faster than the first: without this, ``estimate_disk_usage``
+#: could report a ``"scratch"`` requirement that the run it describes then
+#: declines, purely because the query went first. Caching makes the two agree
+#: and charges the probe once. Keyed on size and mtime, so rewriting the file
+#: re-measures.
+_THROUGHPUT_CACHE: dict[tuple[str, int, int], float | None] = {}
 
 
 def _measure_read_throughput(path: Path) -> float | None:
     """Bytes per second reading ``X``'s value array, or ``None`` if unmeasurable.
 
     Times a bounded prefix read rather than the whole array, so the probe
-    costs the same on a 50 MB file and a 40 TB one.
+    costs the same on a 50 MB file and a 40 TB one. Measured once per file
+    per process (:data:`_THROUGHPUT_CACHE`).
     """
+    try:
+        stat = path.stat()
+        key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _THROUGHPUT_CACHE:
+        _THROUGHPUT_CACHE[key] = _probe_read_throughput(path)
+    return _THROUGHPUT_CACHE[key]
+
+
+def _probe_read_throughput(path: Path) -> float | None:
+    """One timed prefix read of ``X``; see :func:`_measure_read_throughput`."""
     try:
         with h5py.File(path, "r") as f:
             x = f["X"]
@@ -988,7 +1010,10 @@ def resolve_auto_format_mismatch_policy(
 
     Callers must have established that ``path``'s storage format really is
     mismatched with ``axis``; :func:`estimate_disk_usage` calls this too, so
-    its ``"scratch"`` entry reflects what the real call will do.
+    its ``"scratch"`` entry reflects what the real call will do. Within one
+    process that holds exactly, because the throughput measurement is cached
+    per file; a query and a run in *separate* processes can still resolve
+    differently if the filesystem's speed changed between them.
     """
     shape, nbytes = _matrix_shape_and_nbytes(path)
     n_chunks = max(1, (shape[axis] + chunk_size - 1) // chunk_size)
@@ -1024,9 +1049,11 @@ def scratch_copy_bytes(
     """Disk the temporary fast-axis copy will need, or ``None`` for no copy.
 
     The one place the disk-usage resolvers in ``de.py``, ``batch.py`` and this
-    module ask "will this call convert?", so an estimate can never disagree
-    with what the run then does -- including under ``"auto"``, where the
-    answer depends on measured throughput rather than on the policy alone.
+    module ask "will this call convert?", so an estimate agrees with what the
+    run then does -- including under ``"auto"``, where the answer depends on
+    measured throughput rather than on the policy alone, and so requires the
+    same bounded probe read of the source that the run makes (cached, so the
+    two see one measurement and the estimate is not charged twice).
     """
     validate_format_mismatch_policy(policy)
     path = Path(path)
@@ -1065,9 +1092,21 @@ def _slow_axis_cost_message(path: Path, *, fmt: str, axis: int, chunk_size: int)
 #: writes. Dot-prefixed so it stays out of the way in an output directory,
 #: and distinctive enough that the sweep below can only ever match our own.
 _SCRATCH_PREFIX = ".cx_"
-#: A temporary copy whose owning process is gone is only removed once it is
-#: this old, so a recycled PID cannot make a live run's copy look abandoned.
+#: A temporary copy is only removed once it has gone this long untouched. A
+#: conversion in progress rewrites its copy continuously, so an untouched day
+#: means no live run owns it -- which is what makes the sweep safe even for a
+#: copy whose PID belongs to another machine, and stops a recycled PID from
+#: making a live run's copy look abandoned.
 _STALE_SCRATCH_SECONDS = 24 * 60 * 60
+#: Identifies the machine -- and, under containers, the PID namespace -- that
+#: wrote a copy. ``scratch_dir`` is the *output* directory, which on a cluster
+#: is shared between nodes and in a Nextflow/Snakemake pipeline between
+#: containers, while a PID only means anything on the host that issued it:
+#: without this tag a run on node B reads node A's PID as dead.
+try:
+    _HOST_TAG = _re.sub(r"[^0-9a-z]", "", _socket.gethostname().lower())[:16] or "unknown"
+except OSError:  # pragma: no cover - the platform always knows its own name
+    _HOST_TAG = "unknown"
 
 
 def _process_is_alive(pid: int) -> bool:
@@ -1091,8 +1130,17 @@ def _sweep_stale_scratch_copies(
     The copies are deleted in a ``finally`` block, which a ``SIGKILL`` (an
     out-of-memory kill, a scheduler timeout) skips -- leaving a hidden file
     the size of the source matrix next to the output. Nothing else would ever
-    clean those up: ``atexit`` does not run on ``SIGKILL`` either. So each
-    conversion first sweeps the copies of runs that are demonstrably gone.
+    clean those up: ``atexit`` does not run on ``SIGKILL`` either. So a run
+    that sees a mismatched source first sweeps the copies of runs that are
+    demonstrably gone.
+
+    "Demonstrably" is the whole difficulty: ``scratch_dir`` is the output
+    directory, which a cluster job array shares across nodes, so the owning
+    PID may belong to another machine entirely and say nothing about liveness
+    here. Hence the age guard below, which is the load-bearing one -- a
+    conversion rewrites its copy continuously, so an untouched day rules out
+    every live owner, local or remote. The PID check only refines that for
+    copies this host wrote.
     """
     try:
         entries = list(scratch_dir.glob(f"{_SCRATCH_PREFIX}*"))
@@ -1100,18 +1148,22 @@ def _sweep_stale_scratch_copies(
         return
     now = _time.time()
     for entry in entries:
-        # ".cx_{fn}_{pid}_{random}.{fmt}.h5ad" and its ".partial" sibling.
-        match = _re.match(rf"^{_re.escape(_SCRATCH_PREFIX)}.+?_(\d+)_", entry.name)
+        # ".cx_{fn}_{pid}-{host}_{random}.{fmt}.h5ad" and its ".partial" sibling.
+        match = _re.match(
+            rf"^{_re.escape(_SCRATCH_PREFIX)}.+?_(\d+)-([0-9a-z]+)_", entry.name
+        )
         if match is None:
             continue
-        pid = int(match.group(1))
-        if pid == _os.getpid():
+        pid, host = int(match.group(1)), match.group(2)
+        if pid == _os.getpid() and host == _HOST_TAG:
             continue
         try:
             age = now - entry.stat().st_mtime
         except OSError:
             continue
-        if _process_is_alive(pid) and age < _STALE_SCRATCH_SECONDS:
+        if age < _STALE_SCRATCH_SECONDS:
+            continue
+        if host == _HOST_TAG and _process_is_alive(pid):
             continue
         try:
             entry.unlink()
@@ -1168,9 +1220,16 @@ def stream_on_fast_axis(
         raise ValueError("axis must be 0 (rows) or 1 (columns)")
     path = Path(path)
     fmt = get_matrix_storage_format(path)
+    scratch_dir = Path(scratch_dir)
     if not ((fmt == "csr" and axis == 1) or (fmt == "csc" and axis == 0)):
         yield path
         return
+
+    # Swept on every mismatched source, not only when this call converts:
+    # under "auto" the decision is a fresh measurement, so a run that
+    # converted once (and was killed, leaving a copy) may stream on every
+    # later run and never come back to reclaim it.
+    _sweep_stale_scratch_copies(scratch_dir, fn_name=fn_name, verbose=verbose)
 
     if policy == "auto":
         resolved = resolve_auto_format_mismatch_policy(
@@ -1187,10 +1246,8 @@ def stream_on_fast_axis(
 
     target = "csc" if axis == 1 else "csr"
     access = "cell (row)" if axis == 0 else "gene (column)"
-    scratch_dir = Path(scratch_dir)
     if policy == "convert":
         scratch_dir.mkdir(parents=True, exist_ok=True)
-        _sweep_stale_scratch_copies(scratch_dir, fn_name=fn_name, verbose=verbose)
         disk = assess_bytes(estimate_conversion_bytes(path), scratch_dir)
         if not disk.sufficient:
             _messages.warn(
@@ -1216,11 +1273,11 @@ def stream_on_fast_axis(
         yield path
         return
 
-    # The PID in the name is what lets a later run recognise this copy as
-    # abandoned; see _sweep_stale_scratch_copies.
+    # The PID and host in the name are what let a later run recognise this
+    # copy as abandoned; see _sweep_stale_scratch_copies.
     fd, tmp_name = tempfile.mkstemp(
         dir=scratch_dir,
-        prefix=f"{_SCRATCH_PREFIX}{fn_name}_{_os.getpid()}_",
+        prefix=f"{_SCRATCH_PREFIX}{fn_name}_{_os.getpid()}-{_HOST_TAG}_",
         suffix=f".{target}.h5ad",
     )
     _os.close(fd)
