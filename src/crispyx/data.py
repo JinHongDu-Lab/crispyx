@@ -6,10 +6,11 @@ import logging
 import os as _os
 import re as _re
 import tempfile
+import time as _time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
 import anndata as ad
@@ -24,6 +25,7 @@ from ._disk import (
     estimate_bytes,
     estimate_conversion_bytes,
     estimate_sparse_output_bytes,
+    format_bytes,
     warn_if_disk_space_low,
 )
 
@@ -908,17 +910,138 @@ def _matrix_shape_and_nbytes(path: Path) -> tuple[tuple[int, int], int]:
 
 
 def validate_format_mismatch_policy(policy: str) -> None:
-    """Raise ``ValueError`` unless ``policy`` is ``'warn'``, ``'convert'`` or ``'off'``.
+    """Raise ``ValueError`` unless ``policy`` is one of the four accepted values.
 
     Every public entry point that takes ``format_mismatch_policy`` calls this
     first, so a typo fails immediately -- before a cached result is returned
     or a disk estimate silently drops its ``"scratch"`` entry.
     """
-    if policy not in ("warn", "convert", "off"):
+    if policy not in ("auto", "warn", "convert", "off"):
         raise ValueError(
-            "format_mismatch_policy must be 'warn', 'convert', or 'off', "
+            "format_mismatch_policy must be 'auto', 'warn', 'convert', or 'off', "
             f"got {policy!r}"
         )
+
+
+# --- "auto" policy: is a temporary fast-axis copy worth its own read+write? ---
+#
+# Converting costs one full read of the source plus one full write; streaming
+# off the fast axis costs one full read *per chunk*. Whether that trade pays
+# off is not a property of the data but of the filesystem it sits on: a 500 MB
+# file in page cache re-reads in ~0.1 s, so even 47 chunks are cheaper than the
+# conversion's write, while a 40 GB screen on a network filesystem costs
+# minutes per chunk and the conversion repays itself within a handful.
+# Hence both gates below -- a structural one (enough repeated passes for the
+# extra write to amortize at all) and a measured one (the saving is large in
+# absolute terms, which only a genuinely slow read can produce). The rule errs
+# towards streaming: declining costs at most the projected saving, whereas
+# converting when reads are cheap costs a full write of the matrix.
+_SLOW_AXIS_MIN_CHUNKS = 4
+_SLOW_AXIS_MIN_SAVING_SECONDS = 60.0
+#: Bounded prefix read used to measure the source's read throughput. Big
+#: enough to amortize per-read latency on a network filesystem, small enough
+#: to be free on a local one.
+_THROUGHPUT_PROBE_BYTES = 64 << 20
+
+
+def _measure_read_throughput(path: Path) -> float | None:
+    """Bytes per second reading ``X``'s value array, or ``None`` if unmeasurable.
+
+    Times a bounded prefix read rather than the whole array, so the probe
+    costs the same on a 50 MB file and a 40 TB one.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            x = f["X"]
+            data = x["data"] if isinstance(x, h5py.Group) else x
+            if data.ndim != 1 or data.size == 0:
+                return None
+            itemsize = max(int(data.dtype.itemsize), 1)
+            n_probe = max(1, min(int(data.size), _THROUGHPUT_PROBE_BYTES // itemsize))
+            start = _time.perf_counter()
+            _ = data[:n_probe]
+            elapsed = _time.perf_counter() - start
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+    return (n_probe * itemsize) / max(elapsed, 1e-9)
+
+
+class _AutoPolicy(NamedTuple):
+    """What ``"auto"`` resolved to, and the numbers behind it."""
+
+    policy: str  # "convert" | "warn" | "off"
+    reason: str
+
+
+def resolve_auto_format_mismatch_policy(
+    path: Path, *, axis: int, chunk_size: int
+) -> _AutoPolicy:
+    """Resolve ``format_mismatch_policy="auto"`` for a mismatched source.
+
+    Converts only when the projected cost of *not* converting -- one full
+    re-read of ``X`` per chunk beyond the first -- is both structurally
+    amortizable (:data:`_SLOW_AXIS_MIN_CHUNKS` chunks) and large in absolute
+    terms (:data:`_SLOW_AXIS_MIN_SAVING_SECONDS`). Declining resolves to
+    ``"warn"`` when the projected cost is material anyway (so the user hears
+    about it and can convert the file once, up front) and to ``"off"`` when it
+    is negligible, which keeps small local runs silent.
+
+    Callers must have established that ``path``'s storage format really is
+    mismatched with ``axis``; :func:`estimate_disk_usage` calls this too, so
+    its ``"scratch"`` entry reflects what the real call will do.
+    """
+    shape, nbytes = _matrix_shape_and_nbytes(path)
+    n_chunks = max(1, (shape[axis] + chunk_size - 1) // chunk_size)
+    throughput = _measure_read_throughput(path)
+    if throughput is None:
+        return _AutoPolicy(
+            "warn",
+            "could not measure read throughput for the source; streaming from it "
+            "rather than converting on a guess",
+        )
+    per_chunk_seconds = nbytes / throughput
+    projected_seconds = (n_chunks - 1) * per_chunk_seconds
+    measurement = (
+        f"{n_chunks} chunks x {format_bytes(nbytes)} at "
+        f"{format_bytes(throughput)}/s = {per_chunk_seconds:.2f} s per re-read, "
+        f"{projected_seconds:.1f} s of re-reading beyond the first chunk"
+    )
+    if n_chunks >= _SLOW_AXIS_MIN_CHUNKS and projected_seconds >= _SLOW_AXIS_MIN_SAVING_SECONDS:
+        return _AutoPolicy("convert", f"converting ({measurement})")
+    if projected_seconds >= _SLOW_AXIS_MIN_SAVING_SECONDS:
+        return _AutoPolicy(
+            "warn",
+            f"streaming from the source ({measurement}); fewer than "
+            f"{_SLOW_AXIS_MIN_CHUNKS} chunks, so one conversion would not repay "
+            "its own write",
+        )
+    return _AutoPolicy("off", f"streaming from the source ({measurement})")
+
+
+def scratch_copy_bytes(
+    path: str | Path, *, axis: int, policy: str, chunk_size: int
+) -> float | None:
+    """Disk the temporary fast-axis copy will need, or ``None`` for no copy.
+
+    The one place the disk-usage resolvers in ``de.py``, ``batch.py`` and this
+    module ask "will this call convert?", so an estimate can never disagree
+    with what the run then does -- including under ``"auto"``, where the
+    answer depends on measured throughput rather than on the policy alone.
+    """
+    validate_format_mismatch_policy(policy)
+    path = Path(path)
+    fmt = get_matrix_storage_format(path)
+    if not ((fmt == "csr" and axis == 1) or (fmt == "csc" and axis == 0)):
+        return None
+    if policy in ("warn", "off"):
+        return None
+    if policy == "auto":
+        resolved = resolve_auto_format_mismatch_policy(
+            path, axis=axis, chunk_size=chunk_size
+        )
+        if resolved.policy != "convert":
+            return None
+    return estimate_conversion_bytes(path)
 
 
 def _slow_axis_cost_message(path: Path, *, fmt: str, axis: int, chunk_size: int) -> str:
@@ -927,15 +1050,77 @@ def _slow_axis_cost_message(path: Path, *, fmt: str, axis: int, chunk_size: int)
     access = "cell (row)" if axis == 0 else "gene (column)"
     shape, nbytes = _matrix_shape_and_nbytes(path)
     n_chunks = max(1, (shape[axis] + chunk_size - 1) // chunk_size)
-    gb = nbytes / 1e9
     return (
         f"X is stored as {fmt.upper()} but is streamed by {access} chunks, so each "
-        f"of the {n_chunks} chunks re-reads the whole matrix ({gb:.1f} GB of "
-        f"data+indices, ~{gb * n_chunks:.0f} GB in total) and holds it in memory. "
+        f"of the {n_chunks} chunks re-reads the whole matrix "
+        f"({format_bytes(nbytes)} of data+indices, "
+        f"~{format_bytes(nbytes * n_chunks)} in total) and holds it in memory. "
         f"Pass format_mismatch_policy='convert' to stream from a temporary "
         f"{target.upper()} copy instead, or run cx.pp.convert_to_{target}(path) "
         "once if several steps will reuse the file."
     )
+
+
+#: Prefix of the temporary fast-axis copies :func:`stream_on_fast_axis`
+#: writes. Dot-prefixed so it stays out of the way in an output directory,
+#: and distinctive enough that the sweep below can only ever match our own.
+_SCRATCH_PREFIX = ".cx_"
+#: A temporary copy whose owning process is gone is only removed once it is
+#: this old, so a recycled PID cannot make a live run's copy look abandoned.
+_STALE_SCRATCH_SECONDS = 24 * 60 * 60
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Whether ``pid`` names a running process; ``True`` when unknowable."""
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except (OSError, OverflowError, ValueError):
+        return True  # platform can't tell us -- never delete on a guess
+    return True
+
+
+def _sweep_stale_scratch_copies(
+    scratch_dir: Path, *, fn_name: str, verbose: int | bool = False
+) -> None:
+    """Remove temporary fast-axis copies left behind by dead runs.
+
+    The copies are deleted in a ``finally`` block, which a ``SIGKILL`` (an
+    out-of-memory kill, a scheduler timeout) skips -- leaving a hidden file
+    the size of the source matrix next to the output. Nothing else would ever
+    clean those up: ``atexit`` does not run on ``SIGKILL`` either. So each
+    conversion first sweeps the copies of runs that are demonstrably gone.
+    """
+    try:
+        entries = list(scratch_dir.glob(f"{_SCRATCH_PREFIX}*"))
+    except OSError:
+        return
+    now = _time.time()
+    for entry in entries:
+        # ".cx_{fn}_{pid}_{random}.{fmt}.h5ad" and its ".partial" sibling.
+        match = _re.match(rf"^{_re.escape(_SCRATCH_PREFIX)}.+?_(\d+)_", entry.name)
+        if match is None:
+            continue
+        pid = int(match.group(1))
+        if pid == _os.getpid():
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except OSError:
+            continue
+        if _process_is_alive(pid) and age < _STALE_SCRATCH_SECONDS:
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            continue
+        _messages.vprint(
+            verbose, fn_name,
+            f"removed a temporary copy left by an interrupted run: {entry.name}",
+        )
 
 
 @contextmanager
@@ -958,6 +1143,10 @@ def stream_on_fast_axis(
     one in total, plus the matrix's full size in transient memory. ``policy``
     (the public ``format_mismatch_policy``) decides what to do about that:
 
+    * ``"auto"``: measure what the re-reads would actually cost on this
+      filesystem and convert only when that is worth an extra read and write
+      (see :func:`resolve_auto_format_mismatch_policy`), then behave as the
+      resolved policy below. This is the default everywhere.
     * ``"convert"``: write a temporary fast-axis copy under ``scratch_dir``
       (:func:`convert_to_csc` / :func:`convert_to_csr`, output buffers bounded
       by ``memory_limit_gb``), yield its path, and delete it on exit. When the
@@ -983,6 +1172,15 @@ def stream_on_fast_axis(
         yield path
         return
 
+    if policy == "auto":
+        resolved = resolve_auto_format_mismatch_policy(
+            path, axis=axis, chunk_size=chunk_size
+        )
+        _messages.vprint(
+            verbose, fn_name, f"format_mismatch_policy='auto': {resolved.reason}"
+        )
+        policy = resolved.policy
+
     if policy == "off":
         yield path
         return
@@ -992,12 +1190,14 @@ def stream_on_fast_axis(
     scratch_dir = Path(scratch_dir)
     if policy == "convert":
         scratch_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_scratch_copies(scratch_dir, fn_name=fn_name, verbose=verbose)
         disk = assess_bytes(estimate_conversion_bytes(path), scratch_dir)
         if not disk.sufficient:
             _messages.warn(
                 fn_name,
-                f"the temporary {target.upper()} copy needs ~{disk.required_gb:.1f} GB at "
-                f"{disk.path} but only {disk.free_gb:.1f} GB are free; streaming from the "
+                f"the temporary {target.upper()} copy needs "
+                f"~{format_bytes(disk.required_bytes)} at {disk.path} but only "
+                f"{format_bytes(disk.free_bytes)} are free; streaming from the "
                 f"{fmt.upper()} source instead (as format_mismatch_policy='warn' would). "
                 f"Point output_path at a volume with more room, or run "
                 f"cx.pp.convert_to_{target}(path) there once. "
@@ -1016,8 +1216,12 @@ def stream_on_fast_axis(
         yield path
         return
 
+    # The PID in the name is what lets a later run recognise this copy as
+    # abandoned; see _sweep_stale_scratch_copies.
     fd, tmp_name = tempfile.mkstemp(
-        dir=scratch_dir, prefix=f".cx_{fn_name}_", suffix=f".{target}.h5ad"
+        dir=scratch_dir,
+        prefix=f"{_SCRATCH_PREFIX}{fn_name}_{_os.getpid()}_",
+        suffix=f".{target}.h5ad",
     )
     _os.close(fd)
     tmp_path = Path(tmp_name)
@@ -1568,7 +1772,7 @@ def normalize_total_log1p(
     chunk_size: int = 4096,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-    format_mismatch_policy: Literal["warn", "convert", "off"] = "warn",
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
     verbose: int | bool = True,
 ) -> "AnnData":
     """Stream normalize and/or log-transform an h5ad file without loading it fully into memory.
@@ -1608,8 +1812,13 @@ def normalize_total_log1p(
         How to handle a source stored as CSC, whose row-(cell-)streaming here is
         O(total_nnz) per chunk and can be ~100x slower than CSR:
 
-        * ``"warn"`` (default): proceed but log a single actionable warning.
-        * ``"convert"``: transparently convert the source to CSR in a temporary
+        * ``"auto"`` (default): measure the source's read throughput and
+          convert only when the re-reads would actually cost more than one
+          conversion does -- roughly, a large file on a slow (networked)
+          filesystem streamed in many chunks. See
+          :func:`resolve_auto_format_mismatch_policy`.
+        * ``"warn"``: proceed but log a single actionable warning.
+        * ``"convert"``: always convert the source to CSR in a temporary
           file (bounded-memory two-pass streaming) and stream from that; the
           temporary file is removed before returning.  This calls
           :func:`convert_to_csr` internally, which temporarily needs ~2x the
@@ -2260,7 +2469,11 @@ def _replace_on_success(output_path: Path) -> Iterator[Path]:
     conversion or does not exist; the partial file is removed on any exit
     that is not a normal completion.
     """
-    partial = output_path.with_name(f".{output_path.name}.partial")
+    # Hidden while it is being written, but only one leading dot: the target
+    # may itself be a dot-prefixed scratch copy, and "..cx_x.h5ad.partial"
+    # would not match the stale-copy sweep's pattern.
+    stem = output_path.name if output_path.name.startswith(".") else f".{output_path.name}"
+    partial = output_path.with_name(f"{stem}.partial")
     try:
         yield partial
     except BaseException:
@@ -2765,18 +2978,24 @@ def _estimate_shape_for_conversion(path: str | Path, **_ignored) -> dict[str, fl
 
 
 def _estimate_shape_for_normalize_total_log1p(
-    path: str | Path, *, format_mismatch_policy: str = "warn", **_ignored,
+    path: str | Path,
+    *,
+    format_mismatch_policy: str = "auto",
+    chunk_size: int = 4096,
+    **_ignored,
 ) -> dict[str, float]:
     """Disk-usage resolver for :func:`normalize_total_log1p`.
 
-    Only the ``format_mismatch_policy="convert"`` branch touches disk beyond
-    the (nnz-bounded, not separately estimated here) streamed output: it
-    calls :func:`convert_to_csr` into a temporary file beside the output.
+    Only a conversion touches disk beyond the (nnz-bounded, not separately
+    estimated here) streamed output: it calls :func:`convert_to_csr` into a
+    temporary file beside the output. Whether one happens is
+    :func:`scratch_copy_bytes`'s call, exactly as in the real run.
     """
     validate_format_mismatch_policy(format_mismatch_policy)
-    if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csc":
-        return {"scratch": estimate_conversion_bytes(path)}
-    return {}
+    scratch = scratch_copy_bytes(
+        path, axis=0, policy=format_mismatch_policy, chunk_size=chunk_size
+    )
+    return {} if scratch is None else {"scratch": scratch}
 
 
 def calculate_optimal_chunk_size(

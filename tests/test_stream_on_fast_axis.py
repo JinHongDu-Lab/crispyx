@@ -1,0 +1,266 @@
+"""Tests for the shared slow-axis streaming helper in ``crispyx.data``.
+
+Covers the ``"auto"`` policy's convert-or-stream decision and the sweep that
+reclaims temporary copies left behind by killed runs. The decision depends on
+measured read throughput, so the tests pin the measurement rather than build
+files big enough to be genuinely slow.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import warnings
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+SRC_PATH = PROJECT_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
+import anndata as ad
+import numpy as np
+import pytest
+import scipy.sparse as sp
+
+import crispyx.data as cxd
+from crispyx.data import (
+    _SLOW_AXIS_MIN_CHUNKS,
+    _SLOW_AXIS_MIN_SAVING_SECONDS,
+    _measure_read_throughput,
+    _sweep_stale_scratch_copies,
+    resolve_auto_format_mismatch_policy,
+    scratch_copy_bytes,
+    stream_on_fast_axis,
+)
+
+
+def _write_csr(path: Path, *, n_obs: int = 40, n_vars: int = 60) -> Path:
+    rng = np.random.default_rng(0)
+    X = sp.csr_matrix(rng.poisson(2.0, size=(n_obs, n_vars)).astype(np.float32))
+    ad.AnnData(X).write(path)
+    return path
+
+
+def _pin_throughput(monkeypatch, value):
+    monkeypatch.setattr(cxd, "_measure_read_throughput", lambda path: value)
+
+
+def _throughput_for(path: Path, *, n_chunks: int, seconds: float) -> float:
+    """Throughput at which ``n_chunks`` re-reads of ``path`` cost ``seconds``."""
+    _, nbytes = cxd._matrix_shape_and_nbytes(path)
+    return (n_chunks - 1) * nbytes / seconds
+
+
+class TestAutoDecision:
+    def test_converts_when_the_re_reads_are_expensive(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        chunk_size = 10  # 6 gene chunks
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(path, n_chunks=6, seconds=2 * _SLOW_AXIS_MIN_SAVING_SECONDS),
+        )
+        resolved = resolve_auto_format_mismatch_policy(path, axis=1, chunk_size=chunk_size)
+        assert resolved.policy == "convert"
+        assert "converting" in resolved.reason
+
+    def test_streams_when_the_re_reads_are_cheap(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        _pin_throughput(monkeypatch, 5e9)  # a local SSD / page cache
+        resolved = resolve_auto_format_mismatch_policy(path, axis=1, chunk_size=10)
+        assert resolved.policy == "off"
+
+    def test_never_converts_below_the_chunk_floor(self, tmp_path, monkeypatch):
+        """With too few passes, one conversion cannot repay its own write --
+        however slow the filesystem is. The user still hears about the cost."""
+        path = _write_csr(tmp_path / "csr.h5ad")
+        n_chunks = _SLOW_AXIS_MIN_CHUNKS - 1
+        chunk_size = -(-60 // n_chunks)  # ceil, so exactly n_chunks chunks
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(
+                path, n_chunks=n_chunks, seconds=100 * _SLOW_AXIS_MIN_SAVING_SECONDS
+            ),
+        )
+        resolved = resolve_auto_format_mismatch_policy(path, axis=1, chunk_size=chunk_size)
+        assert resolved.policy == "warn"
+        assert f"fewer than {_SLOW_AXIS_MIN_CHUNKS} chunks" in resolved.reason
+
+    def test_streams_when_throughput_cannot_be_measured(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        _pin_throughput(monkeypatch, None)
+        resolved = resolve_auto_format_mismatch_policy(path, axis=1, chunk_size=10)
+        assert resolved.policy == "warn"
+        assert "could not measure" in resolved.reason
+
+    def test_probe_measures_a_real_file(self, tmp_path):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        throughput = _measure_read_throughput(path)
+        assert throughput is not None and throughput > 0
+
+    def test_probe_reports_unmeasurable_rather_than_raising(self, tmp_path):
+        missing = tmp_path / "nope.h5ad"
+        assert _measure_read_throughput(missing) is None
+
+
+class TestStreamOnFastAxis:
+    def test_auto_converts_end_to_end_and_cleans_up(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        scratch = tmp_path / "scratch"
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(path, n_chunks=6, seconds=2 * _SLOW_AXIS_MIN_SAVING_SECONDS),
+        )
+        with stream_on_fast_axis(
+            path, axis=1, policy="auto", fn_name="demo",
+            scratch_dir=scratch, chunk_size=10,
+        ) as streamed:
+            assert streamed != path
+            assert cxd.get_matrix_storage_format(streamed) == "csc"
+            copy = streamed
+        assert not copy.exists()
+
+    def test_auto_streams_from_the_source_without_warning_when_cheap(
+        self, tmp_path, monkeypatch
+    ):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        _pin_throughput(monkeypatch, 5e9)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with stream_on_fast_axis(
+                path, axis=1, policy="auto", fn_name="demo",
+                scratch_dir=tmp_path / "scratch", chunk_size=10,
+            ) as streamed:
+                assert streamed == path
+
+    def test_auto_warns_when_it_declines_a_cost_worth_knowing_about(
+        self, tmp_path, monkeypatch
+    ):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        n_chunks = _SLOW_AXIS_MIN_CHUNKS - 1
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(
+                path, n_chunks=n_chunks, seconds=100 * _SLOW_AXIS_MIN_SAVING_SECONDS
+            ),
+        )
+        with pytest.warns(UserWarning, match="re-reads the whole matrix"):
+            with stream_on_fast_axis(
+                path, axis=1, policy="auto", fn_name="demo",
+                scratch_dir=tmp_path / "scratch", chunk_size=-(-60 // n_chunks),
+            ) as streamed:
+                assert streamed == path
+
+    def test_matched_format_never_probes(self, tmp_path, monkeypatch):
+        """A CSR source streamed by rows is already on its fast axis; the
+        policy -- and the measurement it would need -- is irrelevant."""
+        path = _write_csr(tmp_path / "csr.h5ad")
+
+        def _boom(_path):  # pragma: no cover - must never run
+            raise AssertionError("throughput probed for a matched format")
+
+        monkeypatch.setattr(cxd, "_measure_read_throughput", _boom)
+        with stream_on_fast_axis(
+            path, axis=0, policy="auto", fn_name="demo",
+            scratch_dir=tmp_path / "scratch", chunk_size=10,
+        ) as streamed:
+            assert streamed == path
+
+    def test_invalid_policy_raises(self, tmp_path):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        with pytest.raises(ValueError, match="format_mismatch_policy"):
+            with stream_on_fast_axis(
+                path, axis=1, policy="atuo", fn_name="demo",
+                scratch_dir=tmp_path, chunk_size=10,
+            ):
+                pass
+
+
+class TestScratchCopyBytes:
+    def test_tracks_the_auto_decision(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        _pin_throughput(monkeypatch, 5e9)
+        assert scratch_copy_bytes(path, axis=1, policy="auto", chunk_size=10) is None
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(path, n_chunks=6, seconds=2 * _SLOW_AXIS_MIN_SAVING_SECONDS),
+        )
+        assert scratch_copy_bytes(
+            path, axis=1, policy="auto", chunk_size=10
+        ) == pytest.approx(2 * path.stat().st_size)
+
+    def test_none_for_a_matched_format_or_a_non_converting_policy(self, tmp_path):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        assert scratch_copy_bytes(path, axis=0, policy="convert", chunk_size=10) is None
+        assert scratch_copy_bytes(path, axis=1, policy="warn", chunk_size=10) is None
+        assert scratch_copy_bytes(path, axis=1, policy="off", chunk_size=10) is None
+
+
+class TestStaleScratchSweep:
+    """A SIGKILL skips the ``finally`` that deletes the temporary copy, so the
+    next conversion in that directory reclaims what dead runs left."""
+
+    def _touch(self, directory: Path, name: str) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        p = directory / name
+        p.write_bytes(b"x")
+        return p
+
+    def _dead_pid(self) -> int:
+        """A PID no process currently holds."""
+        pid = 999_999
+        while cxd._process_is_alive(pid):  # pragma: no cover - practically never loops
+            pid -= 1
+        return pid
+
+    def test_removes_copies_of_dead_runs(self, tmp_path):
+        dead = self._dead_pid()
+        stale = self._touch(tmp_path, f".cx_demo_{dead}_abc123.csc.h5ad")
+        partial = self._touch(tmp_path, f".cx_demo_{dead}_abc123.csc.h5ad.partial")
+        _sweep_stale_scratch_copies(tmp_path, fn_name="demo")
+        assert not stale.exists()
+        assert not partial.exists()
+
+    def test_keeps_copies_of_live_runs(self, tmp_path):
+        live = self._touch(tmp_path, f".cx_demo_{os.getpid()}_abc123.csc.h5ad")
+        other = self._touch(tmp_path, f".cx_demo_{os.getppid()}_def456.csc.h5ad")
+        _sweep_stale_scratch_copies(tmp_path, fn_name="demo")
+        assert live.exists()
+        assert other.exists()
+
+    def test_never_touches_files_it_did_not_write(self, tmp_path):
+        unrelated = self._touch(tmp_path, ".hidden_user_file.h5ad")
+        result = self._touch(tmp_path, "result.h5ad")
+        no_pid = self._touch(tmp_path, ".cx_demo_noise.h5ad")
+        _sweep_stale_scratch_copies(tmp_path, fn_name="demo")
+        assert unrelated.exists() and result.exists() and no_pid.exists()
+
+    def test_sweeps_before_converting(self, tmp_path, monkeypatch):
+        path = _write_csr(tmp_path / "csr.h5ad")
+        scratch = tmp_path / "scratch"
+        stale = self._touch(scratch, f".cx_demo_{self._dead_pid()}_abc123.csc.h5ad")
+        _pin_throughput(
+            monkeypatch,
+            _throughput_for(path, n_chunks=6, seconds=2 * _SLOW_AXIS_MIN_SAVING_SECONDS),
+        )
+        with stream_on_fast_axis(
+            path, axis=1, policy="auto", fn_name="demo",
+            scratch_dir=scratch, chunk_size=10,
+        ):
+            assert not stale.exists()
+
+
+def test_partial_name_of_a_scratch_copy_stays_sweepable(tmp_path):
+    """The converter writes ``<name>.partial`` beside its target; for a
+    dot-prefixed scratch copy that must not become ``..cx_*`` -- the sweep's
+    pattern (and the user's eye) would both miss it."""
+    from crispyx.data import _replace_on_success
+
+    target = tmp_path / ".cx_demo_1234_abc.csc.h5ad"
+    with _replace_on_success(target) as partial:
+        assert partial.name == ".cx_demo_1234_abc.csc.h5ad.partial"
+        partial.write_bytes(b"x")
+    assert target.exists()

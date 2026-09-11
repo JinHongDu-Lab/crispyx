@@ -47,6 +47,7 @@ from .data import (
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    scratch_copy_bytes,
     sort_by_perturbation,
     stream_on_fast_axis,
     validate_format_mismatch_policy,
@@ -93,7 +94,7 @@ from ._checkpoint import (
     _DummyProgress,
 )
 from . import _messages
-from ._disk import estimate_bytes, estimate_conversion_bytes, warn_if_disk_space_low
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _should_use_streaming
 from ._size_factors import (
@@ -4668,7 +4669,7 @@ def wilcoxon_test(
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
     force: bool = False,
-    format_mismatch_policy: Literal["warn", "convert", "off"] = "convert",
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
 ) -> RankGenesGroupsResult:
     """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
 
@@ -4775,13 +4776,19 @@ def wilcoxon_test(
         gene (column) chunks, which on CSR re-reads the *whole* matrix once per
         chunk and holds it in memory -- typically ~100x more I/O than CSC:
 
-        * ``"convert"`` (default): transparently convert the source to CSC in
-          a temporary file beside ``output_path`` (bounded-memory streaming
-          via :func:`crispyx.data.convert_to_csc`, honouring
-          ``memory_limit_gb``) and stream from that; the temporary file is
-          removed before returning. Needs ~2x the source file's size in free
-          disk space there; when that is not available the call falls back
-          to ``"warn"`` behaviour with a warning naming the shortfall. Run
+        * ``"auto"`` (default): measure the source's read throughput and
+          convert only when the re-reads would actually cost more than one
+          conversion does -- roughly, a large file on a slow (networked)
+          filesystem streamed in many chunks. A file that re-reads in
+          milliseconds is streamed as-is, silently. See
+          :func:`crispyx.data.resolve_auto_format_mismatch_policy`.
+        * ``"convert"``: always convert the source to CSC in a temporary file
+          beside ``output_path`` (bounded-memory streaming via
+          :func:`crispyx.data.convert_to_csc`, honouring ``memory_limit_gb``)
+          and stream from that; the temporary file is removed before
+          returning. Needs ~2x the source file's size in free disk space
+          there; when that is not available the call falls back to ``"warn"``
+          behaviour with a warning naming the shortfall. Run
           ``cx.pp.convert_to_csc`` once instead if several steps will reuse
           the file.
         * ``"warn"``: proceed on the CSR source after one warning that
@@ -6012,7 +6019,9 @@ def _estimate_shape_for_wilcoxon_test(
     control_label: str | None = None,
     perturbations: Iterable[str] | None = None,
     batch_column: str | None = None,
-    format_mismatch_policy: str = "convert",
+    format_mismatch_policy: str = "auto",
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
     **_ignored,
 ) -> dict[str, float]:
     validate_format_mismatch_policy(format_mismatch_policy)
@@ -6022,6 +6031,12 @@ def _estimate_shape_for_wilcoxon_test(
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
+        if chunk_size is None:
+            # Same resolution the real call makes, so the scratch decision
+            # below sees the chunk count the run will actually stream.
+            chunk_size = calculate_wilcoxon_chunk_size(
+                backed.n_obs, backed.n_vars, available_memory_gb=memory_limit_gb,
+            )
     finally:
         backed.file.close()
     n_groups = len(candidates)
@@ -6040,10 +6055,13 @@ def _estimate_shape_for_wilcoxon_test(
             estimate_bytes(n_groups, n_genes, itemsize=8) * 6
             + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
         )
-    # A CSR source is first converted to a temporary CSC copy beside the
-    # output (same estimate as the automatic warning inside convert_to_csc).
-    if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csr":
-        estimate["scratch"] = estimate_conversion_bytes(path)
+    # A CSR source may first be converted to a temporary CSC copy beside the
+    # output; scratch_copy_bytes makes that call the same way the run does.
+    scratch = scratch_copy_bytes(
+        path, axis=1, policy=format_mismatch_policy, chunk_size=chunk_size
+    )
+    if scratch is not None:
+        estimate["scratch"] = scratch
     return estimate
 
 

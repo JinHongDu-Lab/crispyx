@@ -18,6 +18,24 @@ from pathlib import Path
 _BYTES_PER_GB = 1e9
 
 
+def format_bytes(n_bytes: float | None) -> str:
+    """Render a byte count with a unit that keeps it readable.
+
+    Every size the package reports -- a 50 MB subset's matrix as much as a
+    40 GB screen's -- goes through here, so the message is informative at
+    both ends instead of rounding a small file to ``0.0 GB``. Uses decimal
+    units (1 GB = 1e9 bytes), matching :attr:`DiskEstimate.required_gb` and
+    the free space ``shutil.disk_usage`` reports.
+    """
+    if n_bytes is None:
+        return "unknown"
+    value = float(n_bytes)
+    for unit, scale in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if abs(value) >= scale:
+            return f"{value / scale:.1f} {unit}"
+    return f"{value:.0f} B"
+
+
 def _safe_resolve(path: str | Path) -> Path:
     """Absolute form of *path* for display and lookup; never raises.
 
@@ -122,10 +140,14 @@ class DiskEstimate:
         return self.free_bytes is None or self.required_bytes <= self.free_bytes * 0.90
 
     def __str__(self) -> str:
+        required = format_bytes(self.required_bytes)
         if self.free_bytes is None:
-            return f"{self.required_gb:.1f} GB required, free space unknown at {self.path}"
+            return f"{required} required, free space unknown at {self.path}"
         verdict = "OK" if self.sufficient else "MAY NOT FIT"
-        return f"{self.required_gb:.1f} GB required, {self.free_gb:.1f} GB free at {self.path} [{verdict}]"
+        return (
+            f"{required} required, {format_bytes(self.free_bytes)} free "
+            f"at {self.path} [{verdict}]"
+        )
 
 
 def assess_bytes(required_bytes: float, path: str | Path) -> DiskEstimate:
@@ -173,16 +195,17 @@ def warn_if_disk_space_low(
 
     if estimate.free_bytes is not None and not estimate.sufficient:
         warnings.warn(
-            f"{label}estimated disk usage ({estimate.required_gb:.1f} GB) leaves less than "
-            f"{min_free_fraction:.0%} free space at {estimate.path} "
-            f"({estimate.free_gb:.1f} GB currently free). The operation may fail "
+            f"{label}estimated disk usage ({format_bytes(estimate.required_bytes)}) "
+            f"leaves less than {min_free_fraction:.0%} free space at {estimate.path} "
+            f"({format_bytes(estimate.free_bytes)} currently free). The operation may fail "
             "with 'No space left on device'. Free up space or point output_path/TMPDIR at a "
             "volume with more room before rerunning.",
             stacklevel=3,
         )
     elif estimate.required_gb > large_file_gb:
         warnings.warn(
-            f"{label}this operation will write approximately {estimate.required_gb:.1f} GB to disk. "
+            f"{label}this operation will write approximately "
+            f"{format_bytes(estimate.required_bytes)} to disk. "
             "Streaming keeps memory bounded, but the on-disk footprint (and the time to write "
             "it) is not -- make sure the output volume has room before running large batches.",
             stacklevel=3,
@@ -195,6 +218,7 @@ __all__ = [
     "DiskEstimate",
     "assess_bytes",
     "estimate_bytes",
+    "format_bytes",
     "estimate_conversion_bytes",
     "estimate_sparse_output_bytes",
     "warn_if_disk_space_low",

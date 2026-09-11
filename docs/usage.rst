@@ -274,16 +274,19 @@ pass:
 
 The result is keyed by filesystem location: ``"tempdir"`` for disk-backed
 intermediate accumulators (usually ``$TMPDIR``), ``"output"`` for the final
-result file, and ``"scratch"`` for the temporary fast-axis copy that
-``format_mismatch_policy="convert"`` writes *beside the output file* (pass
-``output_path`` to have it assessed at that location). Point ``$TMPDIR`` at a
-larger volume if the default location is too small; crispyx respects it since
-``tempfile.*`` reads it automatically, with no code change needed. Whole-file
-conversions (:func:`crispyx.convert_to_csc`, :func:`crispyx.convert_to_csr`,
-and the ``format_mismatch_policy="convert"`` default of ``wilcoxon_test`` and
-``batch_process`` on a CSR source) temporarily need roughly 2× the source
-file's size, since the source and destination coexist until the caller deletes
-the source -- see :ref:`the CSC conversion note below <csc-disk-note>`.
+result file, and ``"scratch"`` for the temporary fast-axis copy that a
+converting ``format_mismatch_policy`` writes *beside the output file* (pass
+``output_path`` to have it assessed at that location). Under the default
+``"auto"`` policy the ``"scratch"`` entry appears only when the real call
+would convert, which the estimate decides exactly as the call does. Point
+``$TMPDIR`` at a larger volume if the default location is too small; crispyx
+respects it since ``tempfile.*`` reads it automatically, with no code change
+needed. Whole-file conversions (:func:`crispyx.convert_to_csc`,
+:func:`crispyx.convert_to_csr`, and a converting ``format_mismatch_policy`` in
+``wilcoxon_test`` or ``batch_process`` on a CSR source) temporarily need
+roughly 2× the source file's size, since the source and destination coexist
+until the caller deletes the source -- see :ref:`the CSC conversion note below
+<csc-disk-note>`.
 
 .. _messaging-and-verbosity:
 

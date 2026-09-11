@@ -15,18 +15,33 @@ Version 0.1.3
   ``n_gene_chunks`` chunks paid a full read of the file (tens of minutes
   per chunk on a network filesystem for a multi-million-cell screen, and
   the matrix's full size in transient RAM). Both functions now take
-  ``format_mismatch_policy`` -- new on ``wilcoxon_test``, and its default on
-  both flips from ``"warn"`` to ``"convert"``: the source is converted once
-  to a temporary CSC copy *beside the output file* (not ``$TMPDIR``) and
-  removed before returning. ``"warn"`` now emits a ``UserWarning`` that
-  quantifies the cost (matrix size × chunk count) instead of only a logger
-  line; ``"off"`` is unchanged. The three hand-rolled copies of this logic
+  ``format_mismatch_policy`` -- new on ``wilcoxon_test`` -- and all three
+  functions that take it (with ``normalize_total_log1p``) default to a new
+  value, ``"auto"``: the source is converted once to a temporary fast-axis
+  copy *beside the output file* (not ``$TMPDIR``), and removed before
+  returning, **when that is measurably cheaper than streaming off the fast
+  axis**. Converting costs one full read plus one full write while streaming
+  costs one full read per chunk, so which wins is a property of the
+  filesystem rather than of the data: ``"auto"`` times a bounded 64 MB prefix
+  read of the source, projects ``(n_gene_chunks - 1) ×`` the implied
+  full-read time, and converts only when that exceeds 60 s and there are at
+  least 4 chunks (fewer cannot repay the extra write however slow the
+  filesystem is). On a 500 MB file on local disk, where a full re-read costs
+  ~0.1 s, this streams as-is and saves the ~5 s an unconditional conversion
+  spent; on the multi-million-cell network-filesystem case it still converts.
+  ``"convert"`` keeps its meaning of *always* convert, and the chosen branch
+  and the numbers behind it are printed at ``verbose>=1``. ``"warn"`` now
+  emits a ``UserWarning`` that quantifies the cost (matrix size × chunk
+  count) instead of only a logger line; ``"off"`` is unchanged. The three
+  hand-rolled copies of this logic
   (``normalize_total_log1p``, ``batch_process``, and none for
   ``wilcoxon_test``) are replaced by one ``crispyx.data.stream_on_fast_axis``
   helper. ``estimate_disk_usage`` reports the temporary copy under a new
   ``"scratch"`` location and assesses it (and ``"output"``) where the file
   will actually be written -- it resolves ``output_path`` / ``output_dir`` /
-  ``data_name`` exactly as the target function does. When the free space
+  ``data_name`` exactly as the target function does, and under ``"auto"`` it
+  runs the same convert-or-stream decision, so the ``"scratch"`` entry
+  appears exactly when the real call would make a copy. When the free space
   beside the output cannot hold the temporary copy, ``"convert"`` falls back
   to ``"warn"`` behaviour (one warning naming the shortfall, then streaming
   from the source) instead of failing with ``ENOSPC`` partway through the
@@ -39,7 +54,30 @@ Version 0.1.3
   instead. ``normalize_total_log1p(format_mismatch_policy="convert")`` on a
   CSC source now copies ``uns`` / ``layers`` / ``obsm`` / ``varm`` / ``obsp``
   / ``varp`` from the source file rather than from the X-only temporary
-  copy, where they were silently dropped.
+  copy, where they were silently dropped. A run killed outright cannot delete
+  its temporary copy -- ``SIGKILL`` skips the ``finally`` that would, and
+  ``atexit`` would not fire either -- so each conversion first sweeps the
+  copies in its scratch directory whose owning process is gone (the PID is
+  now part of the ``.cx_<function>_<pid>_*`` name). Otherwise an
+  out-of-memory-killed job left a hidden file the size of its matrix next to
+  the output, forever.
+* **``batch_process`` no longer returns a killed run's output as a cached
+  result.** The output file is created -- with complete ``uns`` metadata and
+  a NaN fill -- before the first gene chunk is processed, and a run that died
+  before its first checkpoint left exactly that file behind. The next
+  identical call matched its metadata and returned it: an all-NaN result, in
+  milliseconds, with no indication anything was wrong (the behaviour is
+  present in 0.1.2 as well). A completion marker is now written after the
+  last gene chunk and required by the cache check, so an unfinished output is
+  recomputed (or resumed, with ``resume=True``) instead. Outputs written by
+  earlier versions carry no marker and are recomputed once.
+* **Sizes are reported in a unit that suits them.** Every user-facing disk
+  and slow-axis message went through a fixed ``GB`` format, so the
+  quantified slow-axis warning read ``0.0 GB of data+indices, ~0 GB in
+  total`` for anything under a gigabyte -- exactly the messages meant to
+  explain a cost. One ``crispyx._disk.format_bytes`` now scales the unit
+  (``49.3 MB``, ``40.0 GB``) across ``DiskEstimate``, the disk-space
+  warnings, the ``verbose`` disk line, and the slow-axis messages.
 * **``convert_to_csc`` / ``convert_to_csr`` are memory-bounded and
   dtype-preserving.** Previously the whole converted matrix
   (``total_nnz × 8`` bytes) was buffered in RAM before a single write, which
@@ -71,7 +109,16 @@ Version 0.1.3
   7 KB row writes per chunk. Results are unchanged (the ``BatchReducer``
   contract is untouched; existing reducers need no change); a synthetic
   4000-group × 6-batch × 120k-cell run went from 25 s to 5.5 s of pure
-  compute. Peak memory stays bounded: rows are gathered per densified slab
+  compute. One consequence is worth knowing about: a reducer now receives
+  the cells of a ``(group, batch)`` pair in fewer, larger blocks, and a
+  reducer that accumulates in the block's own dtype is *less* accurate on a
+  ``float32`` file for it (summing thousands of float32 rows at once rather
+  than hundreds -- ~3e-6 instead of ~4e-7 against a float64 reference on a
+  17k-cell file). Block sizes were never part of the contract; the
+  ``BatchReducer`` docstring now says so explicitly and shows the
+  ``np.asarray(block, dtype=np.float64)`` that makes a reducer independent of
+  them (and accurate to 1e-14). Peak memory stays bounded: rows are gathered
+  per densified slab
   (never a second full copy of the gene-chunk block), the combined values
   are divided in place, and the automatic ``chunk_size`` is additionally
   capped so the ``(n_groups, chunk_size)`` accumulators fit the per-chunk

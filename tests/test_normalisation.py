@@ -364,9 +364,9 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
 
 
 def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
-    """CSR source: the default "convert" policy streams from a temporary CSC copy
-    beside the output and matches running on the CSR source directly ("off");
-    "warn" emits one quantified UserWarning; the copy never outlives the call."""
+    """CSR source: "convert" streams from a temporary CSC copy beside the
+    output and matches running on the CSR source directly ("off"); "warn"
+    emits one quantified UserWarning; the copy never outlives the call."""
     import logging
 
     import crispyx.data as cxd
@@ -384,7 +384,10 @@ def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
     cxd._SLOW_AXIS_WARNED.clear()
     with caplog.at_level(logging.WARNING, logger="crispyx.data"), warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
-        converted = wilcoxon_test(norm_path, output_path=out_dir / "de.h5ad", **common)
+        converted = wilcoxon_test(
+            norm_path, output_path=out_dir / "de.h5ad",
+            format_mismatch_policy="convert", **common,
+        )
     assert not any("slower" in r.getMessage() for r in caplog.records)
     assert sorted(p.name for p in out_dir.iterdir()) == ["de.h5ad"]
 

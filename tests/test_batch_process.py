@@ -53,6 +53,9 @@ def _moment_reducer() -> cx.BatchReducer:
         return {"n": 0, "mean": np.zeros(width), "m2": np.zeros(width)}
 
     def update(state, block):
+        # Blocks arrive in the stored matrix's dtype and their shape is an
+        # implementation detail, so accumulate in float64 -- see BatchReducer.
+        block = np.asarray(block, dtype=np.float64)
         n_b = block.shape[0]
         if n_b == 0:
             return None
@@ -789,7 +792,7 @@ def test_csr_source_warns_under_warn_policy_but_csc_does_not(tmp_path, caplog):
     assert not any("slower" in r.getMessage() for r in caplog.records)
 
 
-def test_default_policy_converts_csr_source_and_removes_scratch_copy(tmp_path, caplog):
+def test_convert_policy_converts_csr_source_and_removes_scratch_copy(tmp_path, caplog):
     import logging
 
     import crispyx.data as cxd
@@ -802,13 +805,41 @@ def test_default_policy_converts_csr_source_and_removes_scratch_copy(tmp_path, c
         result = cx.batch_process(
             path, _moment_reducer(),
             groupby="perturbation", batch_column="batch", statistic_name="std",
-            chunk_size=2, cell_chunk_size=20,
+            chunk_size=2, cell_chunk_size=20, format_mismatch_policy="convert",
             output_path=out_dir / "result.h5ad", force=True,
         )
     result.close()
     # No slow-axis access happened, and the temporary CSC copy beside the
     # output is gone again.
     assert not any("slower" in r.getMessage() for r in caplog.records)
+    assert sorted(p.name for p in out_dir.iterdir()) == ["result.h5ad"]
+
+
+def test_default_auto_policy_streams_a_small_csr_source_without_converting(
+    tmp_path, monkeypatch
+):
+    """On a file this small the re-reads cost microseconds, so "auto" must not
+    pay for a conversion -- and must not warn about a cost that isn't there."""
+    import crispyx.data as cxd
+
+    path, *_ = _write_data(tmp_path, sparse=True)  # CSR
+    out_dir = tmp_path / "out"
+    calls: list[object] = []
+    real_convert = cxd.convert_to_csc
+    monkeypatch.setattr(
+        cxd, "convert_to_csc",
+        lambda *a, **k: (calls.append(a), real_convert(*a, **k))[1],
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            path, _moment_reducer(),
+            groupby="perturbation", batch_column="batch", statistic_name="std",
+            chunk_size=2, cell_chunk_size=20,
+            output_path=out_dir / "result.h5ad", force=True,
+        )
+    result.close()
+    assert calls == []
     assert sorted(p.name for p in out_dir.iterdir()) == ["result.h5ad"]
 
 
@@ -991,9 +1022,90 @@ def test_convert_policy_falls_back_to_warn_when_scratch_disk_is_short(tmp_path, 
         result = cx.batch_process(
             path, _moment_reducer(), groupby="perturbation", batch_column="batch",
             statistic_name="fallback", chunk_size=2, cell_chunk_size=20,
+            format_mismatch_policy="convert",
             output_path=out_dir / "result.h5ad", force=True,
         )
     values = np.asarray(result.backed.X[:]).copy()
     result.close()
     assert np.isfinite(values).all()
     assert sorted(p.name for p in out_dir.iterdir()) == ["result.h5ad"]
+
+
+def test_partial_output_of_a_killed_run_is_not_reused_as_a_cached_result(tmp_path):
+    """The output file is created, with complete metadata and a NaN fill,
+    before the first gene chunk runs. Only the completion marker distinguishes
+    a finished result from one whose run was killed -- without that check a
+    crashed run's all-NaN file comes back instantly as a "cached result"."""
+    path, X, labels, batches = _write_data(tmp_path, sparse=True)
+    out = tmp_path / "result.h5ad"
+    common = dict(
+        groupby="perturbation", batch_column="batch", mode="group",
+        statistic_name="std", chunk_size=2, cell_chunk_size=20,
+        output_path=out, format_mismatch_policy="off",
+    )
+    expected, *_ = _read_result(cx.batch_process(path, _moment_reducer(), force=True, **common))
+
+    # Simulate the file a killed run leaves: metadata written, marker absent.
+    with h5py.File(out, "r+") as f:
+        del f["uns"]["crispyx_run_complete"]
+        f["X"][:] = np.nan
+
+    recomputed, *_ = _read_result(cx.batch_process(path, _moment_reducer(), **common))
+    assert np.isfinite(recomputed).all()
+    np.testing.assert_allclose(recomputed, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_completed_run_is_still_reused_without_recomputing(tmp_path):
+    path, *_ = _write_data(tmp_path, sparse=True)
+    out = tmp_path / "cached.h5ad"
+    common = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        chunk_size=2, cell_chunk_size=20, output_path=out,
+        format_mismatch_policy="off",
+    )
+    first, *_ = _read_result(cx.batch_process(path, _moment_reducer(), force=True, **common))
+
+    def _explode(state, block):  # pragma: no cover - must never be called
+        raise AssertionError("recomputed a complete cached result")
+
+    reducer = replace(_moment_reducer(), update=_explode)
+    cached, *_ = _read_result(cx.batch_process(path, reducer, **common))
+    np.testing.assert_array_equal(cached, first)
+
+
+def test_float32_source_matches_a_float64_reference(tmp_path):
+    """The library must not itself lose precision on a float32 file: with a
+    reducer that accumulates in float64 (the documented contract), the result
+    matches an in-memory float64 computation whatever the chunking."""
+    rng = np.random.default_rng(5)
+    n_cells, n_genes = 300, 40
+    X = rng.lognormal(size=(n_cells, n_genes)).astype(np.float32)
+    labels = np.array(["ctrl", "A", "B"])[rng.integers(0, 3, n_cells)]
+    batches = np.array(["b1", "b2"])[rng.integers(0, 2, n_cells)]
+    path = tmp_path / "float32.h5ad"
+    ad.AnnData(
+        sp.csr_matrix(X),
+        obs=pd.DataFrame(
+            {"perturbation": labels, "batch": batches},
+            index=[f"cell_{i}" for i in range(n_cells)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)]),
+    ).write(path)
+
+    result = cx.batch_process(
+        path, _moment_reducer(), groupby="perturbation", batch_column="batch",
+        statistic_name="std", chunk_size=7, cell_chunk_size=13,
+        output_path=tmp_path / "std.h5ad", force=True, format_mismatch_policy="off",
+    )
+    actual, _, obs, _ = _read_result(result)
+
+    X64 = X.astype(np.float64)
+    expected = []
+    for group in obs.index.astype(str):
+        values, counts = [], []
+        for batch in ("b1", "b2"):
+            subset = X64[(labels == group) & (batches == batch)]
+            values.append(subset.std(axis=0, ddof=1))
+            counts.append(subset.shape[0])
+        expected.append(np.average(values, axis=0, weights=counts))
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)

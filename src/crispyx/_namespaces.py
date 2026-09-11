@@ -416,7 +416,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 4096,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
-        format_mismatch_policy: str = "warn",
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
         verbose: int | bool = True,
     ) -> AnnData:
         """Stream normalize and/or log-transform an h5ad file.
@@ -440,9 +440,10 @@ class _PreprocessingNamespace:
         data_name
             Custom output name suffix.
         format_mismatch_policy
-            How to handle a CSC source (slow for cell-streaming): 'warn'
-            (default), 'convert' (transparently stream via a temporary CSR
-            copy), or 'off'.
+            How to handle a CSC source (slow for cell-streaming): 'auto'
+            (default; convert only when measurement says the repeated reads
+            cost more than one conversion), 'convert' (always stream via a
+            temporary CSR copy), 'warn', or 'off'.
         verbose
             Print progress.
 
@@ -872,7 +873,7 @@ class _ToolsNamespace:
         force: bool = False,
         resume: bool = False,
         checkpoint_interval: int | None = None,
-        format_mismatch_policy: Literal["warn", "convert", "off"] = "convert",
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
     ) -> AnnData:
         """Compute a streaming gene-wise statistic within biological batches.
 

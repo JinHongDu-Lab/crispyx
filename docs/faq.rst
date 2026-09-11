@@ -67,8 +67,9 @@ just far slower (see below). Two ways to fix that:
    steps that want the same format.
 2. **Let ``format_mismatch_policy`` handle it** for a one-off call, on the
    functions that support it (:func:`crispyx.wilcoxon_test`,
-   :func:`crispyx.batch_process` and :func:`crispyx.normalize_total_log1p`)
-   -- see the next section for the exact options and defaults.
+   :func:`crispyx.batch_process` and :func:`crispyx.normalize_total_log1p`).
+   Its default, ``"auto"``, measures the source and converts only when that
+   is cheaper than streaming off the fast axis -- see the next section.
 
 QC, normalisation, DE, or batch_process is extremely slow on a mismatched file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -92,33 +93,53 @@ crispyx mitigates this for you:
 * **Quality control** automatically dispatches CSC inputs to a
   column-oriented path (including the masks-only ``output_dir=None`` call), so
   no action is needed.
-* :func:`crispyx.wilcoxon_test` and :func:`crispyx.batch_process` default to
-  ``format_mismatch_policy="convert"``: a CSR source is converted once to a
-  temporary CSC copy **beside the output file** (bounded memory, honouring
-  ``memory_limit_gb``), streamed from there, and the copy is removed before
-  returning. This temporarily needs ~2x the source file's size in free disk
-  space at the output location; if that is not available the call warns and
-  streams from the CSR source instead (the ``"warn"`` behaviour) rather than
-  failing midway, and :func:`crispyx.estimate_disk_usage` reports the need
+* :func:`crispyx.wilcoxon_test`, :func:`crispyx.batch_process` and
+  :func:`crispyx.normalize_total_log1p` all default to
+  ``format_mismatch_policy="auto"``, which **measures** the source before
+  deciding. Converting costs one full read plus one full write; streaming off
+  the fast axis costs one full read *per chunk*. Which is cheaper is a
+  property of the filesystem, not of the data: a 500 MB file in page cache
+  re-reads in ~0.1 s, so even 47 chunks beat the conversion's write, while a
+  40 GB screen on Lustre costs minutes per chunk and the conversion repays
+  itself almost immediately. ``"auto"`` times a bounded (64 MB) prefix read of
+  the source, projects ``(n_chunks - 1) x`` the resulting full-read time, and
+  converts only when that projection exceeds 60 s **and** there are at least 4
+  chunks (below that, one conversion cannot repay its own write however slow
+  the filesystem). Runs with ``verbose>=1`` print the decision and the numbers
+  behind it.
+* When ``"auto"`` -- or an explicit ``"convert"`` -- does convert, the source
+  is converted once to a temporary copy **beside the output file** (bounded
+  memory, honouring ``memory_limit_gb``), streamed from there, and the copy is
+  removed before returning. This temporarily needs ~2x the source file's size
+  in free disk space at the output location; if that is not available the call
+  warns and streams from the source instead (the ``"warn"`` behaviour) rather
+  than failing midway, and :func:`crispyx.estimate_disk_usage` reports the need
   under ``"scratch"`` (pass the same ``output_path``/``output_dir`` you will
-  pass to the real call).
-* :func:`crispyx.normalize_total_log1p` (the opposite mismatch, a CSC
-  source) defaults to ``"warn"`` because crispyx writers never produce CSC.
+  pass to the real call -- and note that under ``"auto"`` the ``"scratch"``
+  entry appears only when the real call would convert).
+* A run killed outright (``SIGKILL``, an out-of-memory kill, a scheduler
+  timeout) cannot delete its temporary copy. The next conversion writing to
+  the same directory removes the copies of runs that are no longer alive, so
+  they do not accumulate; they are hidden files named ``.cx_<function>_<pid>_*``
+  if you want to clear them by hand.
 
-  .. code-block:: python
+.. code-block:: python
 
-     # wilcoxon_test / batch_process on a CSR file: converted for you.
-     cx.de.wilcoxon_test(csr_path, ..., memory_limit_gb=128)      # "convert" is the default
+   # "auto" is the default: converted when it pays off, streamed when not.
+   cx.de.wilcoxon_test(csr_path, ..., memory_limit_gb=128)
 
-     # Proceed on the mismatched file after one UserWarning that quantifies
-     # the cost (matrix size x number of chunks) ...
-     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="warn", ...)
+   # Always convert, whatever the measurement says.
+   cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="convert", ...)
 
-     # ... or silently (you have already accounted for the cost).
-     cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="off", ...)
+   # Proceed on the mismatched file after one UserWarning that quantifies
+   # the cost (matrix size x number of chunks) ...
+   cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="warn", ...)
 
-     # normalize_total_log1p takes the same three values for a CSC source.
-     cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
+   # ... or silently (you have already accounted for the cost).
+   cx.tl.batch_process(csr_path, reducer, format_mismatch_policy="off", ...)
+
+   # normalize_total_log1p takes the same four values for a CSC source.
+   cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
 
 For a file you will reuse across several steps that want the same format --
 e.g. Wilcoxon DE *and* ``batch_process`` on the same screen -- convert it once

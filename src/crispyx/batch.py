@@ -23,7 +23,7 @@ from ._checkpoint import (
     _read_checkpoint,
     _write_checkpoint_atomic,
 )
-from ._disk import estimate_bytes, estimate_conversion_bytes, warn_if_disk_space_low
+from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _resolve_memory_limit_bytes
 from .data import (
@@ -32,12 +32,12 @@ from .data import (
     calculate_optimal_chunk_size,
     calculate_wilcoxon_chunk_size,
     ensure_gene_symbol_column,
-    get_matrix_storage_format,
     iter_matrix_chunks,
     read_backed,
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    scratch_copy_bytes,
     stream_on_fast_axis,
     validate_format_mismatch_policy,
 )
@@ -96,9 +96,19 @@ class BatchReducer:
     ``block`` : ``np.ndarray``, shape ``(n_cells, width)``
         Dense array holding just the cells of one ``(group, batch)`` combination
         that fall inside the current cell chunk. Sparse input is densified
-        first. ``n_cells`` is at least 1 and differs between calls; the dtype
-        follows the stored matrix, so cast explicitly if the statistic needs
-        ``float64``.
+        first. ``n_cells`` is at least 1 and differs between calls.
+
+        How the cells of one combination are split across calls is an
+        implementation detail -- it changes with ``cell_chunk_size``, with how
+        the cells happen to be ordered in the file, and between crispyx
+        releases -- so a reducer must not depend on it. The dtype likewise
+        follows the stored matrix, which for a typical counts or normalized
+        file is ``float32``: **accumulate in float64**, or the statistic's
+        accuracy will vary with the block sizes crispyx happens to hand you
+        (summing a few thousand ``float32`` rows at once loses roughly an
+        order of magnitude of precision against summing a few hundred). One
+        ``np.asarray(block, dtype=np.float64)`` at the top of ``update`` is
+        enough; the state arrays below are float64 already.
     ``state`` : any object
         Created fresh for each gene chunk and never shared across gene chunks.
         Within one gene chunk, one state is held per ``(group, batch)`` and is
@@ -120,6 +130,9 @@ class BatchReducer:
             return {"total": np.zeros(width, dtype=np.float64), "n": 0}
 
         def update(state, block):
+            # Accumulate in float64: block follows the file's dtype, and how
+            # many cells arrive per call is not part of the contract.
+            block = np.asarray(block, dtype=np.float64)
             # block is (n_cells, width); summing over cells leaves (width,).
             state["total"] += block.sum(axis=0)
             state["n"] += block.shape[0]
@@ -279,6 +292,45 @@ def _normalise_reducer_output(
     return {None: _normalise_statistic(result, width, context=context)}
 
 
+def _auto_gene_chunk_size(
+    n_obs: int,
+    n_genes: int,
+    *,
+    n_groups: int,
+    channels: tuple[str, ...] | None,
+    memory_limit_gb: float | None,
+) -> int:
+    """Gene chunk width used when the caller does not pass ``chunk_size``.
+
+    Shared with the disk-usage resolver, which has to see the same chunk
+    count the run will stream to decide whether ``"auto"`` converts.
+
+    :func:`calculate_wilcoxon_chunk_size` deliberately ignores ``n_groups``.
+    Here every gene chunk also holds ``(n_groups, width)`` float64 numerator
+    and denominator accumulators per output layer (so the chunk can be
+    written as one block per layer); cap the width so they fit the same 15%
+    per-chunk budget.
+    """
+    chunk_size = calculate_wilcoxon_chunk_size(
+        n_obs, n_genes, available_memory_gb=memory_limit_gb,
+    )
+    n_layers = len(channels) if channels else 1
+    accumulator_budget = 0.15 * _resolve_memory_limit_bytes(memory_limit_gb)
+    accumulator_cap = int(accumulator_budget // (2 * n_layers * max(n_groups, 1) * 8))
+    return max(1, min(chunk_size, accumulator_cap))
+
+
+#: ``uns`` key written after the last gene chunk. Its absence marks an output
+#: whose run never finished -- a killed job leaves a NaN-filled file carrying
+#: complete metadata, which would otherwise read as a valid cached result.
+_COMPLETE_KEY = "crispyx_run_complete"
+
+
+def _run_is_complete(adata: ad.AnnData) -> bool:
+    """Whether ``adata`` carries the marker written after the final gene chunk."""
+    return bool(np.asarray(adata.uns.get(_COMPLETE_KEY, False)).item())
+
+
 def _metadata_matches(adata: ad.AnnData, expected: dict[str, Any]) -> bool:
     for key, expected_value in expected.items():
         actual = adata.uns.get(key)
@@ -321,7 +373,7 @@ def batch_process(
     force: bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
-    format_mismatch_policy: Literal["warn", "convert", "off"] = "convert",
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
 ) -> AnnData:
     """Compute a generic gene-wise statistic within experimental batches.
 
@@ -421,8 +473,14 @@ def batch_process(
         here re-reads the *whole* matrix once per gene chunk and holds it in
         memory -- typically ~100x more I/O than CSC:
 
-        * ``"convert"`` (default): transparently convert the source to CSC in
-          a temporary file beside the output (bounded-memory streaming via
+        * ``"auto"`` (default): measure the source's read throughput and
+          convert only when the re-reads would actually cost more than one
+          conversion does -- roughly, a large file on a slow (networked)
+          filesystem streamed in many chunks. A file that re-reads in
+          milliseconds is streamed as-is, silently. See
+          :func:`crispyx.data.resolve_auto_format_mismatch_policy`.
+        * ``"convert"``: always convert the source to CSC in a temporary file
+          beside the output (bounded-memory streaming via
           :func:`crispyx.data.convert_to_csc`, honouring ``memory_limit_gb``)
           and stream from that; the temporary file is removed before
           returning. Needs ~2x the source file's size in free disk space
@@ -603,20 +661,10 @@ def batch_process(
         n_batches = len(batch_ids)
 
         if chunk_size is None:
-            chunk_size = calculate_wilcoxon_chunk_size(
-                backed.n_obs,
-                n_genes,
-                available_memory_gb=memory_limit_gb,
+            chunk_size = _auto_gene_chunk_size(
+                backed.n_obs, n_genes,
+                n_groups=n_groups, channels=channels, memory_limit_gb=memory_limit_gb,
             )
-            # calculate_wilcoxon_chunk_size deliberately ignores n_groups. Here
-            # every gene chunk also holds (n_groups, width) float64 numerator
-            # and denominator accumulators per output layer (so the chunk can
-            # be written as one block per layer); cap the width so they fit
-            # the same 15% per-chunk budget.
-            n_layers = len(channels) if channels else 1
-            accumulator_budget = 0.15 * _resolve_memory_limit_bytes(memory_limit_gb)
-            accumulator_cap = int(accumulator_budget // (2 * n_layers * max(n_groups, 1) * 8))
-            chunk_size = max(1, min(chunk_size, accumulator_cap))
             _messages.vprint(verbose, "tl.batch_process", f"gene chunk_size={chunk_size} (auto)")
         if cell_chunk_size is None:
             cell_chunk_size = calculate_optimal_chunk_size(
@@ -643,12 +691,16 @@ def batch_process(
             "source_path": str(path.resolve()),
             "source_mtime_ns": int(path.stat().st_mtime_ns),
         }
-        # A checkpoint file means a previous run didn't finish; never treat
-        # that partial output as a complete, reusable cached result.
-        if resolved_output.exists() and not force and not checkpoint_path.exists():
+        # The output file is created -- with all of this metadata and a NaN
+        # fill -- before the first gene chunk runs, so metadata alone cannot
+        # tell a finished result from one whose run was killed. Only the
+        # completion marker, written after the last chunk, can.
+        if resolved_output.exists() and not force:
             existing = ad.read_h5ad(resolved_output, backed="r")
             try:
-                matches = _metadata_matches(existing, expected_metadata)
+                matches = _run_is_complete(existing) and _metadata_matches(
+                    existing, expected_metadata
+                )
             finally:
                 existing.file.close()
             if matches:
@@ -973,12 +1025,21 @@ def batch_process(
         with h5py.File(resolved_output, "r+") as f:
             _update_h5ad_dataframe(f, "obs", final_obs)
             uns_grp = f.require_group("uns")
-            key = "stratified_n_untestable_perturbations"
-            if key in uns_grp:
-                del uns_grp[key]
-            ds = uns_grp.create_dataset(key, data=int(untestable.sum()))
-            ds.attrs["encoding-type"] = "numeric-scalar"
-            ds.attrs["encoding-version"] = "0.2.0"
+
+            def _write_uns_scalar(key: str, value: int) -> None:
+                if key in uns_grp:
+                    del uns_grp[key]
+                ds = uns_grp.create_dataset(key, data=value)
+                ds.attrs["encoding-type"] = "numeric-scalar"
+                ds.attrs["encoding-version"] = "0.2.0"
+
+            _write_uns_scalar(
+                "stratified_n_untestable_perturbations", int(untestable.sum())
+            )
+            # Written last, after every chunk and every other dataset: this is
+            # what marks the output complete for the cache check above.
+            f.flush()
+            _write_uns_scalar(_COMPLETE_KEY, 1)
 
         if checkpoint_path.exists():
             try:
@@ -1004,7 +1065,9 @@ def _estimate_shape_for_batch_process(
     mode: Literal["group", "comparison"] = "group",
     perturbations: Iterable[str] | None = None,
     reducer: BatchReducer | None = None,
-    format_mismatch_policy: str = "convert",
+    format_mismatch_policy: str = "auto",
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
     **_ignored,
 ) -> dict[str, float]:
     """Disk-usage resolver for :func:`batch_process`, used by
@@ -1014,7 +1077,7 @@ def _estimate_shape_for_batch_process(
     estimate can never disagree with the automatic warning emitted inside the
     real call. Results are written directly into the output file (no
     separate tempdir accumulator); a CSR source additionally gets a temporary
-    CSC copy beside the output under the default ``"convert"`` policy.
+    CSC copy beside the output when the policy converts.
     """
     validate_format_mismatch_policy(format_mismatch_policy)
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -1026,7 +1089,7 @@ def _estimate_shape_for_batch_process(
     )
     backed = read_backed(path)
     try:
-        n_genes = backed.n_vars
+        n_obs, n_genes = backed.n_obs, backed.n_vars
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         observed = _unique_strings(labels)
         if mode == "comparison":
@@ -1042,11 +1105,19 @@ def _estimate_shape_for_batch_process(
     n_groups = max(len(groups), 1)
     channels = reducer.channels if isinstance(reducer, BatchReducer) else None
     n_layer_arrays = 1 + 2 * len(channels) if channels else 2
+    if chunk_size is None:
+        chunk_size = _auto_gene_chunk_size(
+            n_obs, n_genes,
+            n_groups=len(groups), channels=channels, memory_limit_gb=memory_limit_gb,
+        )
     estimate = {
         "output": estimate_bytes(n_groups, n_genes, overhead=1.10) * n_layer_arrays,
     }
-    if format_mismatch_policy == "convert" and get_matrix_storage_format(path) == "csr":
-        estimate["scratch"] = estimate_conversion_bytes(path)
+    scratch = scratch_copy_bytes(
+        path, axis=1, policy=format_mismatch_policy, chunk_size=chunk_size
+    )
+    if scratch is not None:
+        estimate["scratch"] = scratch
     return estimate
 
 
