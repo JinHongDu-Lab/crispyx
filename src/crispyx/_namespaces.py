@@ -315,7 +315,8 @@ class _PreprocessingNamespace:
         data: str | Path | ad.AnnData,
         *,
         output_path: str | Path | None = None,
-        chunk_size: int = 4096,
+        chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -329,7 +330,11 @@ class _PreprocessingNamespace:
         output_path
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
-            Rows per streaming chunk.  Default 4096.
+            Rows per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); larger
+            matrices are converted in several column bands. Default: detected
+            via psutil. On HPC nodes, pass the SLURM ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -346,6 +351,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
@@ -357,6 +363,7 @@ class _PreprocessingNamespace:
         *,
         output_path: str | Path | None = None,
         chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -371,6 +378,11 @@ class _PreprocessingNamespace:
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
             Rows (or columns for CSC source) per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); a CSC
+            source is converted in several row bands when it does not fit.
+            Default: detected via psutil. On HPC nodes, pass the SLURM
+            ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -387,6 +399,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
@@ -403,7 +416,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 4096,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
-        format_mismatch_policy: str = "warn",
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
         verbose: int | bool = True,
     ) -> AnnData:
         """Stream normalize and/or log-transform an h5ad file.
@@ -427,9 +440,10 @@ class _PreprocessingNamespace:
         data_name
             Custom output name suffix.
         format_mismatch_policy
-            How to handle a CSC source (slow for cell-streaming): 'warn'
-            (default), 'convert' (transparently stream via a temporary CSR
-            copy), or 'off'.
+            How to handle a CSC source (slow for cell-streaming): 'auto'
+            (default; convert only when measurement says the repeated reads
+            cost more than one conversion), 'convert' (always stream via a
+            temporary CSR copy), 'warn', or 'off'.
         verbose
             Print progress.
 
@@ -857,6 +871,9 @@ class _ToolsNamespace:
         verbose: int | bool = True,
         memory_limit_gb: float | None = None,
         force: bool = False,
+        resume: bool = False,
+        checkpoint_interval: int | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
     ) -> AnnData:
         """Compute a streaming gene-wise statistic within biological batches.
 
@@ -889,6 +906,9 @@ class _ToolsNamespace:
             verbose=verbose,
             memory_limit_gb=memory_limit_gb,
             force=force,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
+            format_mismatch_policy=format_mismatch_policy,
         )
 
     def rank_genes_groups(
@@ -963,9 +983,9 @@ class _ToolsNamespace:
             allowed = {
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
-                "n_jobs",
                 "checkpoint_interval",
                 "batch_column",
+                "format_mismatch_policy",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:

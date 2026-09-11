@@ -274,14 +274,25 @@ pass:
 
 The result is keyed by filesystem location: ``"tempdir"`` for disk-backed
 intermediate accumulators (usually ``$TMPDIR``), ``"output"`` for the final
-result file. Point ``$TMPDIR`` at a larger volume if the default location is
-too small; crispyx respects it since ``tempfile.*`` reads it automatically,
-with no code change needed. Whole-file conversions
-(:func:`crispyx.convert_to_csc`, :func:`crispyx.convert_to_csr`, and
-``normalize_total_log1p(..., format_mismatch_policy="convert")``) temporarily
-need roughly 2× the source file's size, since the source and destination
-coexist until the caller deletes the source -- see :ref:`the CSC conversion
-note below <csc-disk-note>`.
+result file, and ``"scratch"`` for the temporary fast-axis copy that a
+converting ``format_mismatch_policy`` writes *beside the output file* (pass
+``output_path`` to have it assessed at that location). Under the default
+``"auto"`` policy the ``"scratch"`` entry appears when the real call would
+convert, which the estimate decides exactly as the call does -- including the
+bounded 64 MB probe read that decision needs, the one case where the query
+reads ``X`` at all. The measurement is cached per file, so the call that
+follows reuses it rather than re-measuring a file the query just pulled into
+the page cache. Pass ``chunk_size`` and ``memory_limit_gb`` here if you will
+pass them to the call: they set how many chunks it streams, which is what the
+convert-or-stream decision turns on. Point
+``$TMPDIR`` at a larger volume if the default location is too small; crispyx
+respects it since ``tempfile.*`` reads it automatically, with no code change
+needed. Whole-file conversions (:func:`crispyx.convert_to_csc`,
+:func:`crispyx.convert_to_csr`, and a converting ``format_mismatch_policy`` in
+``wilcoxon_test`` or ``batch_process`` on a CSR source) temporarily need
+roughly 2× the source file's size, since the source and destination coexist
+until the caller deletes the source -- see :ref:`the CSC conversion note below
+<csc-disk-note>`.
 
 .. _messaging-and-verbosity:
 

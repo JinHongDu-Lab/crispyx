@@ -16,7 +16,15 @@ if str(SRC_PATH) not in sys.path:
 
 import pytest
 
-from crispyx._messages import print_done, print_reading, print_saving, vprint, warn
+from crispyx._disk import DiskEstimate, format_bytes
+from crispyx._messages import (
+    print_disk_estimate,
+    print_done,
+    print_reading,
+    print_saving,
+    vprint,
+    warn,
+)
 
 
 def _pretend_public_function():
@@ -63,6 +71,35 @@ class TestReadingSavingDone:
         print_saving(0, "pp.x", "p")
         print_done(0, "pp.x", "m")
         assert capsys.readouterr().out == ""
+
+
+class TestFormatBytes:
+    """Sizes must stay readable at both ends of the range the package spans:
+    a 50 MB subset's matrix and a 40 GB screen's."""
+
+    @pytest.mark.parametrize(
+        "n_bytes, expected",
+        [
+            (0, "0 B"),
+            (512, "512 B"),
+            (49_300_000, "49.3 MB"),
+            (492_600_000, "492.6 MB"),
+            (40e9, "40.0 GB"),
+            (3.2e12, "3.2 TB"),
+            (None, "unknown"),
+        ],
+    )
+    def test_scales_the_unit_to_the_value(self, n_bytes, expected):
+        assert format_bytes(n_bytes) == expected
+
+    def test_sub_gigabyte_estimate_does_not_render_as_zero(self, capsys):
+        estimate = DiskEstimate(
+            required_bytes=49_300_000, free_bytes=2.8e12, path=Path("/tmp")
+        )
+        print_disk_estimate(1, "pp.demo", estimate)
+        out = capsys.readouterr().out
+        assert "49.3 MB" in out and "0.0 GB" not in out
+        assert "49.3 MB" in str(estimate)
 
 
 class TestWarn:

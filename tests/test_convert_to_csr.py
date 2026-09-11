@@ -299,3 +299,51 @@ def test_convert_to_csr_warns_when_disk_space_low(tmp_path, monkeypatch):
     result = ad.read_h5ad(out).X
     arr = result.toarray() if sp.issparse(result) else result
     np.testing.assert_array_almost_equal(arr, dense)
+
+
+def test_banded_csc_to_csr_conversion_is_identical_to_single_pass(tmp_path):
+    """Row bands forced by a tiny memory budget give the same CSR file."""
+    rng = np.random.default_rng(1)
+    dense = ((rng.random((40, 25)) < 0.3) * rng.random((40, 25))).astype(np.float64)
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(40)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(25)])
+    src = tmp_path / "src_csc.h5ad"
+    ad.AnnData(sp.csc_matrix(dense), obs=obs, var=var).write(src)
+
+    single = tmp_path / "single.h5ad"
+    banded = tmp_path / "banded.h5ad"
+    convert_to_csr(src, output_path=single, chunk_size=6, verbose=False)
+    convert_to_csr(src, output_path=banded, chunk_size=6, memory_limit_gb=1e-6, verbose=False)
+
+    ref = sp.csr_matrix(dense)
+    ref.sort_indices()
+    for out in (single, banded):
+        with h5py.File(out, "r") as f:
+            np.testing.assert_array_equal(f["X/indptr"][:], ref.indptr)
+            np.testing.assert_array_equal(f["X/indices"][:], ref.indices)
+            np.testing.assert_array_equal(f["X/data"][:], ref.data)
+            assert f["X/data"].dtype == np.float64
+        assert get_matrix_storage_format(out) == "csr"
+
+
+def test_interrupted_conversion_leaves_no_output_file(tmp_path, monkeypatch):
+    import crispyx as cx
+    import crispyx.data as cxd
+
+    src, _ = _make_csc_h5ad(tmp_path)
+    out = tmp_path / "out.h5ad"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("killed")
+
+    monkeypatch.setattr(cxd, "_scatter_by_key", boom)
+    with pytest.raises(RuntimeError, match="killed"):
+        convert_to_csr(src, output_path=out, verbose=False)
+    assert not out.exists()
+    assert list(tmp_path.glob(".*partial")) == []
+
+    # The pp namespace accepts memory_limit_gb like the top-level function.
+    monkeypatch.undo()
+    result = cx.pp.convert_to_csr(src, output_path=out, memory_limit_gb=1e-6, verbose=False)
+    result.close()
+    assert out.exists()

@@ -1,6 +1,162 @@
 Changelog
 =========
 
+Version 0.1.3
+-------------
+
+*Released 2026-09-10.*
+
+* **Gene-streaming functions no longer re-read a CSR source once per gene
+  chunk.** ``wilcoxon_test`` (all three paths: standard, group-batch
+  streaming, batch-stratified) and ``batch_process`` stream ``X`` by gene
+  (column) chunks. On a CSR-stored file -- what every crispyx writer
+  produces -- anndata serves a column slice by reading the *whole*
+  ``data``/``indices`` arrays into memory and filtering, so each of the
+  ``n_gene_chunks`` chunks paid a full read of the file (tens of minutes
+  per chunk on a network filesystem for a multi-million-cell screen, and
+  the matrix's full size in transient RAM). Both functions now take
+  ``format_mismatch_policy`` -- new on ``wilcoxon_test`` -- and all three
+  functions that take it (with ``normalize_total_log1p``) default to a new
+  value, ``"auto"``: the source is converted once to a temporary fast-axis
+  copy *beside the output file* (not ``$TMPDIR``), and removed before
+  returning, **when that is measurably cheaper than streaming off the fast
+  axis**. Converting costs one full read plus one full write while streaming
+  costs one full read per chunk, so which wins is a property of the
+  filesystem rather than of the data: ``"auto"`` times a bounded 64 MB prefix
+  read of the source, projects ``(n_gene_chunks - 1) ×`` the implied
+  full-read time, and converts only when that exceeds 60 s and there are at
+  least 4 chunks (fewer cannot repay the extra write however slow the
+  filesystem is). On a 500 MB file on local disk, where a full re-read costs
+  ~0.1 s, this streams as-is and saves the ~5 s an unconditional conversion
+  spent; on the multi-million-cell network-filesystem case it still converts.
+  ``"convert"`` keeps its meaning of *always* convert, and the chosen branch
+  and the numbers behind it are printed at ``verbose>=1``. ``"warn"`` now
+  emits a ``UserWarning`` that quantifies the cost (matrix size × chunk
+  count) instead of only a logger line; ``"off"`` is unchanged. The three
+  hand-rolled copies of this logic
+  (``normalize_total_log1p``, ``batch_process``, and none for
+  ``wilcoxon_test``) are replaced by one ``crispyx.data.stream_on_fast_axis``
+  helper. ``estimate_disk_usage`` reports the temporary copy under a new
+  ``"scratch"`` location and assesses it (and ``"output"``) where the file
+  will actually be written -- it resolves ``output_path`` / ``output_dir`` /
+  ``data_name`` exactly as the target function does, and under ``"auto"`` it
+  runs the same convert-or-stream decision (including its 64 MB probe read,
+  the one case where the query touches ``X`` at all), so the ``"scratch"``
+  entry appears when the real call would make a copy. Because that decision
+  is a measurement, the measurement is cached per file for the life of the
+  process: the query and the run it describes see one number rather than two,
+  and the probe is paid once. Pass ``chunk_size`` / ``memory_limit_gb`` to
+  the query if you will pass them to the call -- they set the chunk count,
+  which is what the decision turns on. When the free space
+  beside the output cannot hold the temporary copy, ``"convert"`` falls back
+  to ``"warn"`` behaviour (one warning naming the shortfall, then streaming
+  from the source) instead of failing with ``ENOSPC`` partway through the
+  conversion. ``format_mismatch_policy`` is validated up front by every
+  entry point (``wilcoxon_test`` previously checked it only after the
+  cached-result return; the disk-usage resolvers silently ignored a typo),
+  and the ``"off"`` policy no longer mutes the process-wide slow-axis
+  logger warning for unrelated later calls -- callers that resolved the
+  format decision pass ``iter_matrix_chunks(..., warn_slow_axis=False)``
+  instead. ``normalize_total_log1p(format_mismatch_policy="convert")`` on a
+  CSC source now copies ``uns`` / ``layers`` / ``obsm`` / ``varm`` / ``obsp``
+  / ``varp`` from the source file rather than from the X-only temporary
+  copy, where they were silently dropped. A run killed outright cannot delete
+  its temporary copy -- ``SIGKILL`` skips the ``finally`` that would, and
+  ``atexit`` would not fire either -- so every call that sees a mismatched
+  source first sweeps the abandoned copies in its scratch directory (not only
+  the calls that convert: under ``"auto"`` a directory may be swept by runs
+  that never convert again). Otherwise an out-of-memory-killed job left a
+  hidden file the size of its matrix next to the output, forever. A copy is
+  abandoned only once it has gone a day untouched -- a conversion in progress
+  rewrites its copy continuously -- and, for copies this machine wrote, once
+  its owning process is gone. Both the PID and a tag for the host are part of
+  the ``.cx_<function>_<pid>-<host>_*`` name: the scratch directory is the
+  output directory, which a cluster job array shares across nodes, and a PID
+  read on the wrong node says nothing about whether that copy is live.
+* **``batch_process`` no longer returns a killed run's output as a cached
+  result.** The output file is created -- with complete ``uns`` metadata and
+  a NaN fill -- before the first gene chunk is processed, and a run that died
+  before its first checkpoint left exactly that file behind. The next
+  identical call matched its metadata and returned it: an all-NaN result, in
+  milliseconds, with no indication anything was wrong (the behaviour is
+  present in 0.1.2 as well). A completion marker is now written after the
+  last gene chunk and required by the cache check, so an unfinished output is
+  recomputed (or resumed, with ``resume=True``) instead. Outputs written by
+  earlier versions carry no marker and are recomputed once. A recompute fills
+  the output file in place -- that is what lets a killed run resume -- so it
+  replaces the existing file before it has a result to put there; if that
+  rerun is killed too, neither result survives. It now says so in a warning
+  naming the file, which also covers the more familiar case of rerunning with
+  changed parameters. ``force=True`` is the user asking for the rerun and
+  stays silent.
+* **Sizes are reported in a unit that suits them.** Every user-facing disk
+  and slow-axis message went through a fixed ``GB`` format, so the
+  quantified slow-axis warning read ``0.0 GB of data+indices, ~0 GB in
+  total`` for anything under a gigabyte -- exactly the messages meant to
+  explain a cost. One ``crispyx._disk.format_bytes`` now scales the unit
+  (``49.3 MB``, ``40.0 GB``) across ``DiskEstimate``, the disk-space
+  warnings, the ``verbose`` disk line, and the slow-axis messages.
+* **``convert_to_csc`` / ``convert_to_csr`` are memory-bounded and
+  dtype-preserving.** Previously the whole converted matrix
+  (``total_nnz × 8`` bytes) was buffered in RAM before a single write, which
+  made the automatic conversion above unsafe for files near the node's
+  memory. Both converters gain ``memory_limit_gb``: the output buffers use
+  at most half of it, and a matrix that does not fit is converted in
+  contiguous column (CSC) or row (CSR) *bands*, each costing one extra
+  streaming pass over the source -- ``K`` bands for a matrix ``K`` times the
+  budget instead of an OOM. A dense-to-CSR conversion now writes chunk by
+  chunk with no whole-matrix buffer at all. The converters also stop
+  silently casting values to ``float32``: the output keeps the source's
+  value dtype, so a format change never changes results (the old cast made
+  a converted float64 matrix disagree with its source at the 1e-7 level).
+  Because the output is now pre-sized and filled band by band, it is
+  written to a ``.<name>.partial`` file beside ``output_path`` and renamed
+  into place only on completion; an interrupted conversion (Ctrl-C, OOM,
+  ``ENOSPC``) leaves no output file instead of a structurally valid one
+  with zero-filled bands. ``cx.pp.convert_to_csc`` / ``cx.pp.convert_to_csr``
+  accept and forward ``memory_limit_gb`` like the top-level functions.
+* **``batch_process`` inner loop is ``O(n_pairs)`` per gene chunk instead of
+  ``O(n_cells)``.** Cells are sorted by ``(group, batch)`` once; each gene
+  chunk is then row-permuted once and the reducer's ``update`` is called
+  once per contiguous ``(group, batch)`` segment (per densified slab),
+  replacing a mask scan plus a scipy fancy-index per pair per 4096-cell
+  chunk -- which, with tens of thousands of groups, amounted to one call per
+  cell. Combined statistics are written as one ``(n_groups, width)`` block
+  per layer per gene chunk into output datasets whose HDF5 chunks are
+  aligned to the gene chunks, instead of ``n_groups × n_layers`` strided
+  7 KB row writes per chunk. Results are unchanged (the ``BatchReducer``
+  contract is untouched; existing reducers need no change); a synthetic
+  4000-group × 6-batch × 120k-cell run went from 25 s to 5.5 s of pure
+  compute. One consequence is worth knowing about: a reducer now receives
+  the cells of a ``(group, batch)`` pair in fewer, larger blocks, and a
+  reducer that accumulates in the block's own dtype is *less* accurate on a
+  ``float32`` file for it (summing thousands of float32 rows at once rather
+  than hundreds -- ~3e-6 instead of ~4e-7 against a float64 reference on a
+  17k-cell file). Block sizes were never part of the contract; the
+  ``BatchReducer`` docstring now says so explicitly and shows the
+  ``np.asarray(block, dtype=np.float64)`` that makes a reducer independent of
+  them (and accurate to 1e-14). Peak memory stays bounded: rows are gathered
+  per densified slab
+  (never a second full copy of the gene-chunk block), the combined values
+  are divided in place, and the automatic ``chunk_size`` is additionally
+  capped so the ``(n_groups, chunk_size)`` accumulators fit the per-chunk
+  budget. The weight layer the resume fallback scan keys off is written
+  last for each gene chunk, so a chunk the scan reports complete has all
+  of its datasets written.
+* **``wilcoxon_test`` drops ``n_jobs``.** It was accepted but never read on
+  any Wilcoxon path (parallelism comes from the numba ``prange`` rank
+  kernels, which already use every CPU the process is allowed to run on).
+  Also removed from ``rank_genes_groups(method="wilcoxon")``'s accepted
+  keywords. The one-time per-group row lookup in all three Wilcoxon paths
+  is now a single factorize/argsort instead of ``n_groups`` full scans of
+  the label array (minutes at 18k groups × 2M cells).
+* **``normalize_total_log1p(format_mismatch_policy="convert")`` names its
+  output correctly.** The default output name was derived from the
+  temporary CSR copy's random filename instead of the source's.
+* ``cx.tl.batch_process`` now forwards ``resume``, ``checkpoint_interval``
+  and ``format_mismatch_policy`` (previously only reachable via
+  ``cx.batch_process``).
+
 Version 0.1.2
 -------------
 

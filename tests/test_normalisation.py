@@ -15,6 +15,7 @@ if str(SRC_PATH) not in sys.path:
     
 import pytest
 import numpy as np
+import warnings
 import pandas as pd
 import scipy.sparse as sp
 import anndata as ad
@@ -362,57 +363,70 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
         )
 
 
-def test_wilcoxon_test_with_n_jobs(small_adata, tmp_path):
-    """Test that wilcoxon_test works with n_jobs parameter."""
+def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
+    """CSR source: "convert" streams from a temporary CSC copy beside the
+    output and matches running on the CSR source directly ("off"); "warn"
+    emits one quantified UserWarning; the copy never outlives the call."""
+    import logging
+
+    import crispyx.data as cxd
+
     path, adata = small_adata
     norm_path = tmp_path / "small_log_norm_wilcoxon.h5ad"
-    _log_normalise_sparse(adata, norm_path)
+    _log_normalise_sparse(adata, norm_path)  # written as CSR
+    assert cxd.get_matrix_storage_format(norm_path) == "csr"
+    common = dict(
+        perturbation_column="perturbation", control_label="ctrl",
+        gene_name_column="gene_symbols", chunk_size=2,
+    )
 
-    # Run with n_jobs=2
-    results_parallel = wilcoxon_test(
-        norm_path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbols",
-        chunk_size=2,
-        output_dir=tmp_path,
-        data_name="parallel_wilcoxon",
-        n_jobs=2,
-    )
-    
-    # Run without parallelization
-    results_serial = wilcoxon_test(
-        norm_path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbols",
-        chunk_size=2,
-        output_dir=tmp_path,
-        data_name="serial_wilcoxon",
-        n_jobs=1,
-    )
-    
-    # Results should be identical
-    assert set(results_parallel.keys()) == set(results_serial.keys())
-    for label in results_parallel.keys():
-        np.testing.assert_allclose(
-            results_parallel[label].effect_size,
-            results_serial[label].effect_size,
-            rtol=1e-10,
-            atol=1e-10,
+    out_dir = tmp_path / "converted"
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"), warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        converted = wilcoxon_test(
+            norm_path, output_path=out_dir / "de.h5ad",
+            format_mismatch_policy="convert", **common,
         )
-        np.testing.assert_allclose(
-            results_parallel[label].statistic,
-            results_serial[label].statistic,
-            rtol=1e-10,
-            atol=1e-10,
+    assert not any("slower" in r.getMessage() for r in caplog.records)
+    assert sorted(p.name for p in out_dir.iterdir()) == ["de.h5ad"]
+
+    caplog.clear()
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"):
+        native = wilcoxon_test(
+            norm_path, output_path=tmp_path / "native.h5ad",
+            format_mismatch_policy="off", **common,
         )
-        np.testing.assert_allclose(
-            results_parallel[label].pvalue,
-            results_serial[label].pvalue,
-            rtol=1e-10,
-            atol=1e-10,
+    assert not any("slower" in r.getMessage() for r in caplog.records)
+
+    assert set(converted.keys()) == set(native.keys())
+    for label in converted.keys():
+        for field in ("effect_size", "statistic", "pvalue", "pvalue_adj"):
+            np.testing.assert_allclose(
+                getattr(converted[label], field), getattr(native[label], field),
+                rtol=1e-10, atol=1e-10, err_msg=f"{label}.{field}",
+            )
+
+    caplog.clear()
+    cxd._SLOW_AXIS_WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="crispyx.data"), pytest.warns(
+        UserWarning, match=r"wilcoxon_test: X is stored as CSR.*re-reads the whole matrix",
+    ):
+        wilcoxon_test(
+            norm_path, output_path=tmp_path / "warned.h5ad",
+            format_mismatch_policy="warn", **common,
         )
+    assert len([r for r in caplog.records if "slower" in r.getMessage()]) == 1
+
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        wilcoxon_test(
+            norm_path, output_path=tmp_path / "bad.h5ad",
+            format_mismatch_policy="maybe", **common,
+        )
+    # n_jobs was never read by any Wilcoxon path and is gone.
+    with pytest.raises(TypeError, match="n_jobs"):
+        wilcoxon_test(norm_path, output_path=tmp_path / "n_jobs.h5ad", n_jobs=2, **common)
 
 
 def test_deseq2_size_factors_streaming_parity(tmp_path):
@@ -620,3 +634,45 @@ def test_normalize_total_log1p_empty_matrix_preserves_slots_and_returns_anndata(
     assert om.X.nnz == 0
     np.testing.assert_allclose(om.obsm["X_pca"], src_backed.obsm["X_pca"])
     assert om.uns["some_key"] == "hello"
+
+
+def test_normalize_convert_policy_keeps_non_x_slots_of_csc_source(tmp_path):
+    """The temporary CSR copy carries X only; uns/layers/obsm must still come
+    from the CSC source and reach the output, exactly as for a CSR source."""
+    from crispyx.data import normalize_total_log1p
+
+    rng = np.random.default_rng(5)
+    n, g = 40, 12
+    X = sp.random(n, g, density=0.3, random_state=5,
+                  data_rvs=lambda s: rng.integers(1, 9, s)).tocsr()
+    X.data = X.data.astype(np.float32)
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(g)])
+    adata = ad.AnnData(X=X.tocsc(), obs=obs, var=var)
+    adata.layers["counts"] = X.copy()
+    adata.obsm["X_pca"] = rng.normal(size=(n, 3))
+    adata.uns["guide_map"] = {"a": "b"}
+    csc_p = tmp_path / "csc_slots.h5ad"
+    adata.write_h5ad(csc_p)
+
+    out = tmp_path / "conv_slots.h5ad"
+    normalize_total_log1p(csc_p, out, format_mismatch_policy="convert", verbose=False)
+    result = ad.read_h5ad(out)
+    assert "counts" in result.layers
+    np.testing.assert_array_equal(result.layers["counts"].toarray(), X.toarray())
+    np.testing.assert_allclose(result.obsm["X_pca"], adata.obsm["X_pca"])
+    assert result.uns["guide_map"] == {"a": "b"}
+
+
+def test_wilcoxon_rejects_bad_policy_before_returning_cached_result(small_adata, tmp_path):
+    path, adata = small_adata
+    norm_path = tmp_path / "small_cached.h5ad"
+    _log_normalise_sparse(adata, norm_path)
+    common = dict(
+        perturbation_column="perturbation", control_label="ctrl",
+        gene_name_column="gene_symbols", chunk_size=2, output_path=tmp_path / "cached.h5ad",
+    )
+    wilcoxon_test(norm_path, **common)
+    assert common["output_path"].exists()
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        wilcoxon_test(norm_path, format_mismatch_policy="convrt", **common)

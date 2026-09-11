@@ -47,7 +47,10 @@ from .data import (
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    scratch_copy_bytes,
     sort_by_perturbation,
+    stream_on_fast_axis,
+    validate_format_mismatch_policy,
     _read_h5_1d,
 )
 from .glm import (
@@ -409,6 +412,28 @@ def _resolve_candidates(
     if not candidates:
         raise ValueError("No perturbation groups available for differential expression testing")
     return candidates
+
+
+def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, np.ndarray]:
+    """Ascending row indices of every label in ``groups``, in one pass.
+
+    Equivalent to ``{g: np.where(labels == g)[0] for g in groups}`` but
+    ``O(n_cells log n_cells)`` instead of ``O(n_cells * n_groups)`` string
+    comparisons -- minutes versus seconds for ~18k groups over ~2M cells.
+    """
+    codes, uniques = pd.factorize(labels)
+    order = np.argsort(codes, kind="stable")
+    sorted_codes = codes[order]
+    bounds = np.arange(len(uniques) + 1)
+    starts = np.searchsorted(sorted_codes, bounds[:-1], side="left")
+    ends = np.searchsorted(sorted_codes, bounds[1:], side="left")
+    position = {str(label): i for i, label in enumerate(uniques)}
+    empty = np.empty(0, dtype=np.intp)
+    out: dict[str, np.ndarray] = {}
+    for group in groups:
+        i = position.get(str(group))
+        out[group] = order[starts[i]:ends[i]] if i is not None else empty
+    return out
 
 
 def _release_chunk_memory() -> None:
@@ -3858,12 +3883,12 @@ def _wilcoxon_test_streaming(
                 # Precompute integer row indices (faster than boolean indexing
                 # on the dense block: O(n_pert) vs O(n_cells) per group)
                 control_idx = np.where(control_mask)[0]
-                batch_pert_idx = {label: np.where(labels == label)[0]
-                                  for label in batch_candidates}
+                batch_pert_idx = _group_row_indices(labels, batch_candidates)
 
                 dtype_checked_streaming = False
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     if not sp.issparse(block):
                         raise ValueError(
@@ -4217,7 +4242,7 @@ def _wilcoxon_test_stratified(
             batches_with_control = control_batch_counts > 0
 
             # ----- Perturbation cells grouped into (pert, batch) segments -----
-            pert_idx = {label: np.where(labels == label)[0] for label in candidates}
+            pert_idx = _group_row_indices(labels, candidates)
             seg_offsets = [0]
             seg_batch: list[int] = []
             pert_ptr = [0]
@@ -4318,7 +4343,8 @@ def _wilcoxon_test_stratified(
                 n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose
             ) as pbar:
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     if current_chunk <= last_completed_chunk:
                         current_chunk += 1
@@ -4637,13 +4663,13 @@ def wilcoxon_test(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-    n_jobs: int | None = None,
     verbose: int | bool = True,
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
     force: bool = False,
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
 ) -> RankGenesGroupsResult:
     """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
 
@@ -4720,9 +4746,6 @@ def wilcoxon_test(
         Directory for output h5ad file. Defaults to input file's directory.
         Deprecated; use ``output_path`` instead. Will be removed in the
         next major version.
-    n_jobs
-        Number of parallel workers for computing statistics across perturbations.
-        If None, uses all available cores. If 1, runs sequentially.
     verbose
         If True, show a progress bar for gene chunk processing. Requires tqdm.
     resume
@@ -4748,6 +4771,29 @@ def wilcoxon_test(
         If True, rerun the analysis even when the output h5ad file already
         exists. If False (default), load and return the existing result
         instead of rerunning.
+    format_mismatch_policy
+        How to handle a source stored as CSR. The test streams the matrix by
+        gene (column) chunks, which on CSR re-reads the *whole* matrix once per
+        chunk and holds it in memory -- typically ~100x more I/O than CSC:
+
+        * ``"auto"`` (default): measure the source's read throughput and
+          convert only when the re-reads would actually cost more than one
+          conversion does -- roughly, a large file on a slow (networked)
+          filesystem streamed in many chunks. A file that re-reads in
+          milliseconds is streamed as-is, silently. See
+          :func:`crispyx.data.resolve_auto_format_mismatch_policy`.
+        * ``"convert"``: always convert the source to CSC in a temporary file
+          beside ``output_path`` (bounded-memory streaming via
+          :func:`crispyx.data.convert_to_csc`, honouring ``memory_limit_gb``)
+          and stream from that; the temporary file is removed before
+          returning. Needs ~2x the source file's size in free disk space
+          there; when that is not available the call falls back to ``"warn"``
+          behaviour with a warning naming the shortfall. Run
+          ``cx.pp.convert_to_csc`` once instead if several steps will reuse
+          the file.
+        * ``"warn"``: proceed on the CSR source after one warning that
+          quantifies the cost.
+        * ``"off"``: proceed silently.
 
     Returns
     -------
@@ -4755,6 +4801,12 @@ def wilcoxon_test(
         Differential expression results. Access results via dict-like interface:
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
+
+    Notes
+    -----
+    The rank test itself runs in a numba ``prange`` kernel over perturbations
+    and uses every CPU the process is allowed to run on; there is no separate
+    worker-count parameter.
     """
 
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
@@ -4767,6 +4819,7 @@ def wilcoxon_test(
         min_pct_pert=min_pct_pert,
         fn_name="wilcoxon_test",
     )
+    validate_format_mismatch_policy(format_mismatch_policy)
 
     path = resolve_data_path(data)
     output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
@@ -4849,19 +4902,93 @@ def wilcoxon_test(
         )
 
     # =========================================================================
-    # Batch-stratified (van Elteren) dispatch
+    # Dispatch. Every path streams gene chunks (axis=1), which on a CSR source
+    # re-reads the whole matrix once per chunk; stream_on_fast_axis resolves
+    # that per format_mismatch_policy (temporary CSC copy beside the output
+    # by default) before any X access.
     # =========================================================================
-    # When a batch column is supplied the rank statistics are computed
-    # within-batch and combined.  This uses a dedicated standard (memmap) path;
-    # the group-batch streaming optimisation is not applied (result arrays are
-    # memmapped to disk, so RAM stays bounded regardless of n_groups).
-    if batch_column is not None:
-        return _wilcoxon_test_stratified(
-            path,
+    with stream_on_fast_axis(
+        path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
+        scratch_dir=output_path.parent, chunk_size=chunk_size,
+        memory_limit_gb=memory_limit_gb, verbose=verbose,
+    ) as stream_path:
+        # Batch-stratified (van Elteren): rank statistics are computed
+        # within-batch and combined. Dedicated standard (memmap) path; the
+        # group-batch streaming optimisation is not applied (result arrays are
+        # memmapped to disk, so RAM stays bounded regardless of n_groups).
+        if batch_column is not None:
+            return _wilcoxon_test_stratified(
+                stream_path,
+                gene_symbols=gene_symbols,
+                perturbation_column=perturbation_column,
+                control_label=control_label,
+                batch_column=batch_column,
+                candidates=candidates,
+                n_genes=n_genes,
+                chunk_size=chunk_size,
+                min_cells_expressed=min_cells_expressed,
+                min_pct_ctrl=min_pct_ctrl,
+                min_pct_pert=min_pct_pert,
+                min_mean_ctrl=min_mean_ctrl,
+                min_mean_pert=min_mean_pert,
+                tie_correct=tie_correct,
+                corr_method=corr_method,
+                output_path=output_path,
+                checkpoint_path=checkpoint_path,
+                checkpoint_interval=checkpoint_interval,
+                scanpy_format=scanpy_format,
+                verbose=verbose,
+                resume=resume,
+                memory_limit_gb=memory_limit_gb,
+            )
+
+        # Adaptive dispatch: use group-batch streaming for large datasets.
+        use_streaming, _, _, group_batch_size = _should_use_streaming(
+            n_groups, n_genes, memory_limit_gb=memory_limit_gb,
+        )
+
+        # Only stream when multiple batches are actually needed.
+        # If group_batch_size >= n_groups (one batch = all groups), the standard memmap
+        # path is strictly better: memmaps are OS-pageable and glibc returns their pages
+        # before readback, keeping peak ~10 GB.  The streaming path keeps all result arrays
+        # in Python heap and skips malloc_trim, leading to 20-35 GB peaks for mid-size
+        # datasets like Feng-gwsnf (4,955 groups × 32,373 genes).
+        if use_streaming and group_batch_size < n_groups:
+            _messages.vprint(
+                verbose, "wilcoxon_test",
+                f"Strategy — streaming (batch_size={group_batch_size})",
+            )
+            return _wilcoxon_test_streaming(
+                stream_path,
+                gene_symbols=gene_symbols,
+                perturbation_column=perturbation_column,
+                control_label=control_label,
+                candidates=candidates,
+                n_genes=n_genes,
+                chunk_size=chunk_size,
+                min_cells_expressed=min_cells_expressed,
+                min_pct_ctrl=min_pct_ctrl,
+                min_pct_pert=min_pct_pert,
+                min_mean_ctrl=min_mean_ctrl,
+                min_mean_pert=min_mean_pert,
+                tie_correct=tie_correct,
+                corr_method=corr_method,
+                output_path=output_path,
+                checkpoint_path=checkpoint_path,
+                checkpoint_interval=checkpoint_interval,
+                scanpy_format=scanpy_format,
+                verbose=verbose,
+                resume=resume,
+                group_batch_size=group_batch_size,
+                memory_limit_gb=memory_limit_gb,
+            )
+
+        _messages.vprint(verbose, "wilcoxon_test", "Strategy — single-pass")
+        return _wilcoxon_test_standard(
+            stream_path,
             gene_symbols=gene_symbols,
             perturbation_column=perturbation_column,
             control_label=control_label,
-            batch_column=batch_column,
             candidates=candidates,
             n_genes=n_genes,
             chunk_size=chunk_size,
@@ -4881,53 +5008,38 @@ def wilcoxon_test(
             memory_limit_gb=memory_limit_gb,
         )
 
-    # =========================================================================
-    # Adaptive dispatch: use group-batch streaming for large datasets
-    # =========================================================================
-    use_streaming, _, _, group_batch_size = _should_use_streaming(
-        n_groups, n_genes, memory_limit_gb=memory_limit_gb,
-    )
 
-    # Only stream when multiple batches are actually needed.
-    # If group_batch_size >= n_groups (one batch = all groups), the standard memmap
-    # path is strictly better: memmaps are OS-pageable and glibc returns their pages
-    # before readback, keeping peak ~10 GB.  The streaming path keeps all result arrays
-    # in Python heap and skips malloc_trim, leading to 20-35 GB peaks for mid-size
-    # datasets like Feng-gwsnf (4,955 groups × 32,373 genes).
-    if use_streaming and group_batch_size < n_groups:
-        _messages.vprint(
-            verbose, "wilcoxon_test",
-            f"Strategy — streaming (batch_size={group_batch_size})",
-        )
-        return _wilcoxon_test_streaming(
-            path,
-            gene_symbols=gene_symbols,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            candidates=candidates,
-            n_genes=n_genes,
-            chunk_size=chunk_size,
-            min_cells_expressed=min_cells_expressed,
-            min_pct_ctrl=min_pct_ctrl,
-            min_pct_pert=min_pct_pert,
-            min_mean_ctrl=min_mean_ctrl,
-            min_mean_pert=min_mean_pert,
-            tie_correct=tie_correct,
-            corr_method=corr_method,
-            output_path=output_path,
-            checkpoint_path=checkpoint_path,
-            checkpoint_interval=checkpoint_interval,
-            scanpy_format=scanpy_format,
-            verbose=verbose,
-            resume=resume,
-            group_batch_size=group_batch_size,
-            memory_limit_gb=memory_limit_gb,
-        )
+def _wilcoxon_test_standard(
+    path: Path,
+    *,
+    gene_symbols,
+    perturbation_column: str,
+    control_label: str,
+    candidates: list[str],
+    n_genes: int,
+    chunk_size: int,
+    min_cells_expressed: int,
+    min_pct_ctrl: float,
+    min_pct_pert: float,
+    min_mean_ctrl: float,
+    min_mean_pert: float,
+    tie_correct: bool,
+    corr_method: str,
+    output_path: Path,
+    checkpoint_path: Path,
+    checkpoint_interval: int | None,
+    scanpy_format: bool,
+    verbose: int | bool,
+    resume: bool,
+    memory_limit_gb: float | None,
+) -> RankGenesGroupsResult:
+    """Standard single-pass pooled Wilcoxon test with memmapped result arrays.
 
-    # =========================================================================
-    # Standard single-pass path (unchanged for small/medium datasets)
-    # =========================================================================
-    _messages.vprint(verbose, "wilcoxon_test", "Strategy — single-pass")
+    Every group's per-chunk results go into seven ``(n_groups, n_genes)``
+    memmaps under ``tempfile.gettempdir()`` and the h5ad is written from them
+    at the end. Used whenever the group-batch streaming path is not needed.
+    """
+    n_groups = len(candidates)
 
     # For wilcoxon, we track gene chunk progress (not perturbation progress)
     # Resume logic: read checkpoint to get last completed gene chunk
@@ -4973,10 +5085,11 @@ def wilcoxon_test(
         try:
             labels = backed.obs[perturbation_column].astype(str).to_numpy()
             control_mask = labels == control_label
+            control_n = int(control_mask.sum())
             # Precompute integer row indices (faster than boolean indexing
             # on the dense block: O(n_pert) vs O(n_cells) per group)
             control_idx = np.where(control_mask)[0]
-            pert_idx = {label: np.where(labels == label)[0] for label in candidates}
+            pert_idx = _group_row_indices(labels, candidates)
 
             # Pre-build flat perturbation indices and row offsets once
             # (avoids rebuilding inside the per-chunk stacking loop).
@@ -5024,7 +5137,8 @@ def wilcoxon_test(
 
             with _create_progress_context(n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose) as pbar:
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False,
                 ):
                     # Skip already processed chunks on resume
                     if current_chunk <= last_completed_chunk:
@@ -5905,14 +6019,24 @@ def _estimate_shape_for_wilcoxon_test(
     control_label: str | None = None,
     perturbations: Iterable[str] | None = None,
     batch_column: str | None = None,
+    format_mismatch_policy: str = "auto",
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
     **_ignored,
 ) -> dict[str, float]:
+    validate_format_mismatch_policy(format_mismatch_policy)
     backed = read_backed(path)
     try:
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
+        if chunk_size is None:
+            # Same resolution the real call makes, so the scratch decision
+            # below sees the chunk count the run will actually stream.
+            chunk_size = calculate_wilcoxon_chunk_size(
+                backed.n_obs, backed.n_vars, available_memory_gb=memory_limit_gb,
+            )
     finally:
         backed.file.close()
     n_groups = len(candidates)
@@ -5922,16 +6046,23 @@ def _estimate_shape_for_wilcoxon_test(
         estimate_bytes(n_groups, n_genes, itemsize=8) * 5
         + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
     )
-    if batch_column is not None:
-        return {"tempdir": tempdir_bytes}
-    # Without a batch column, large group counts may instead take the
-    # group-batch streaming path, which writes 6 f64 + 2 f32 layers directly
-    # to the output file instead of a tempdir. Report both possible sinks.
-    output_bytes = (
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 6
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+    estimate = {"tempdir": tempdir_bytes}
+    if batch_column is None:
+        # Without a batch column, large group counts may instead take the
+        # group-batch streaming path, which writes 6 f64 + 2 f32 layers
+        # directly to the output file instead of a tempdir. Report both.
+        estimate["output"] = (
+            estimate_bytes(n_groups, n_genes, itemsize=8) * 6
+            + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+        )
+    # A CSR source may first be converted to a temporary CSC copy beside the
+    # output; scratch_copy_bytes makes that call the same way the run does.
+    scratch = scratch_copy_bytes(
+        path, axis=1, policy=format_mismatch_policy, chunk_size=chunk_size
     )
-    return {"tempdir": tempdir_bytes, "output": output_bytes}
+    if scratch is not None:
+        estimate["scratch"] = scratch
+    return estimate
 
 
 def _estimate_shape_for_shrink_lfc(path: Path, **_ignored) -> dict[str, float]:
