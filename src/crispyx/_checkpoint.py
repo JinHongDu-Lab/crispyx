@@ -6,6 +6,8 @@ streaming differential expression tests and by ``batch_process``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -86,6 +88,45 @@ def _read_checkpoint(
         return data
     except (json.JSONDecodeError, IOError, OSError):
         return None
+
+
+def _pack_bool_matrix(matrix: np.ndarray) -> dict:
+    """Encode a boolean matrix compactly for a JSON checkpoint.
+
+    A coordinate list (``np.argwhere(...).tolist()``) costs one nested JSON
+    list per set element, which for ``batch_process``'s ``(n_groups,
+    n_batches)`` grid is tens of thousands of them -- megabytes of
+    pretty-printed JSON and ~1 s of encoding, rewritten after every gene
+    chunk. Packed bits are the same information in ``n_groups * n_batches /
+    8`` bytes.
+    """
+    matrix = np.ascontiguousarray(matrix, dtype=bool)
+    return {
+        "shape": list(matrix.shape),
+        "bits": base64.b64encode(np.packbits(matrix).tobytes()).decode("ascii"),
+    }
+
+
+def _unpack_bool_matrix(payload: object, shape: tuple[int, int]) -> np.ndarray | None:
+    """Decode :func:`_pack_bool_matrix`, or ``None`` if it does not fit ``shape``.
+
+    Returning ``None`` rather than raising lets the caller fall back to its
+    scan-based recovery, which is what any other unusable checkpoint does.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        stored_shape = tuple(int(x) for x in payload["shape"])
+        raw = base64.b64decode(payload["bits"])
+    except (KeyError, TypeError, ValueError, binascii.Error):
+        return None
+    if stored_shape != shape:
+        return None
+    count = shape[0] * shape[1]
+    flat = np.unpackbits(np.frombuffer(raw, dtype=np.uint8))
+    if flat.size < count:
+        return None
+    return flat[:count].astype(bool).reshape(shape)
 
 
 def _scan_h5ad_completed(

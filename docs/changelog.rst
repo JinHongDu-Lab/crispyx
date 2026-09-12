@@ -1,6 +1,47 @@
 Changelog
 =========
 
+Version 0.1.4
+-------------
+
+*Released 2026-09-12.*
+
+* **``batch_process`` no longer reads the whole weight layer into memory to
+  finish a run.** The last step of a run reduced an ``(n_groups, n_genes)``
+  layer -- 5 GB on a screen with ~18k perturbations and ~35k genes -- to one
+  boolean per group, by materialising it in a single allocation. Two
+  production runs were OOM-killed at exactly this point *after* completing
+  every gene chunk, losing roughly two days of compute each. The reduction
+  now streams the layer in gene-chunk slices (following the HDF5 chunking the
+  output is already created with), so the peak is one chunk rather than the
+  whole layer. The reported groups are unchanged.
+* **``batch_process`` resumes on the gene-chunk width its output was written
+  with**, when ``chunk_size`` was auto-selected. That width is derived from
+  the memory budget, so resuming the same run under a different ``--mem``
+  used to pick different chunk boundaries, fail the metadata match, and
+  overwrite the partial output the call was asked to continue. An
+  *explicitly* passed ``chunk_size`` that differs from the stored one still
+  restarts with a warning, as before -- only the auto-selected case follows
+  the file.
+* **The per-``(group, batch)`` combine loop is roughly 2.5x faster.** A
+  scalar ``BatchStatistic.weight`` -- what every reducer in the docs, the
+  tests and practice returns -- was broadcast to one value per gene, then
+  validated and boolean-masked per pair per channel: hundreds of thousands of
+  redundant array allocations per gene chunk. Scalar weights now stay scalar
+  through validation and accumulation, which is bit-identical to the masked
+  path for a positive weight. Two further per-run scans were removed: the
+  cell-to-group mapping is built from the distinct labels rather than with a
+  dict lookup per cell, and the "perturbation contains no cells" check uses a
+  set instead of scanning a list once per group (quadratic in the group
+  count). On a synthetic 18,000-group profile the ``batch_process`` call goes
+  15.5 s -> 7.0 s (600 genes) and 12.3 s -> 4.6 s (1800 genes); results are
+  unchanged.
+* **Resume checkpoints are kilobytes instead of megabytes.** ``batch_process``
+  stored its ``batches_used`` grid as a JSON coordinate list, which at ~18k
+  groups is tens of thousands of nested lists rewritten after every gene
+  chunk. It is now a packed bitmap. Checkpoints written by earlier versions
+  are not readable and fall back to the existing output-file scan.
+
 Version 0.1.3
 -------------
 
