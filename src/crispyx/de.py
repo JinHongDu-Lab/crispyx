@@ -4320,7 +4320,14 @@ def _wilcoxon_test_stratified(
                             "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                         )
 
-            current_chunk = 0
+            # Resume would start at the first unfinished chunk, and
+            # iter_matrix_chunks seeks there rather than reading and
+            # discarding the completed ones. Today this is always 0: resuming
+            # from a checkpoint is refused at the entry point (see the
+            # NotImplementedError in wilcoxon_test) because the partial result
+            # arrays live in a TemporaryDirectory that a killed run takes with
+            # it, so a checkpoint records progress whose data is gone.
+            current_chunk = last_completed_chunk + 1
             n_chunks_processed = 0
             _track_gene_counts = int(verbose) >= 1
             if _track_gene_counts:
@@ -4338,17 +4345,13 @@ def _wilcoxon_test_stratified(
                 _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
 
             with _create_progress_context(
-                n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose
+                n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose,
+                initial=current_chunk,
             ) as pbar:
                 for slc, block in iter_matrix_chunks(
                     backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
-                    warn_slow_axis=False,
+                    start_chunk=current_chunk, warn_slow_axis=False,
                 ):
-                    if current_chunk <= last_completed_chunk:
-                        current_chunk += 1
-                        pbar.update(1)
-                        continue
-
                     if not dtype_checked:
                         if not sp.issparse(block):
                             raise ValueError(
@@ -5116,7 +5119,14 @@ def _wilcoxon_test_standard(
                         )
 
             # Track progress
-            current_chunk = 0
+            # Resume would start at the first unfinished chunk, and
+            # iter_matrix_chunks seeks there rather than reading and
+            # discarding the completed ones. Today this is always 0: resuming
+            # from a checkpoint is refused at the entry point (see the
+            # NotImplementedError in wilcoxon_test) because the partial result
+            # arrays live in a TemporaryDirectory that a killed run takes with
+            # it, so a checkpoint records progress whose data is gone.
+            current_chunk = last_completed_chunk + 1
             n_chunks_processed = 0
             _track_gene_counts = int(verbose) >= 1
             if _track_gene_counts:
@@ -5133,17 +5143,14 @@ def _wilcoxon_test_standard(
                 }
                 _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
 
-            with _create_progress_context(n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose) as pbar:
+            with _create_progress_context(
+                n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose,
+                initial=current_chunk,
+            ) as pbar:
                 for slc, block in iter_matrix_chunks(
                     backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
-                    warn_slow_axis=False,
+                    start_chunk=current_chunk, warn_slow_axis=False,
                 ):
-                    # Skip already processed chunks on resume
-                    if current_chunk <= last_completed_chunk:
-                        current_chunk += 1
-                        pbar.update(1)
-                        continue
-                    
                     if not dtype_checked:
                         if not sp.issparse(block):
                             raise ValueError(
