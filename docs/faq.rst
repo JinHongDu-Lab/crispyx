@@ -127,6 +127,39 @@ crispyx mitigates this for you:
   safe when the output directory is shared by several nodes of a cluster job
   array, where a PID from another node cannot be checked -- a copy still
   being written is never a day old.
+* **The copy lasts for one call only.** That is the right trade for a run
+  that finishes in one go, and the wrong one for a run that does not: with
+  ``resume=True``, every restart rebuilds the whole copy before any new work
+  begins. A job under a scheduler walltime shorter than the computation --
+  say 7.7 h of gene chunks under a 6 h limit -- is *guaranteed* to restart,
+  so it pays the conversion at least twice, and each payment comes out of
+  the next window. crispyx warns once when a resumable call is about to
+  convert. Convert once yourself instead, and point every step at the
+  result (see below); several steps over the same file want this anyway.
+
+Converting once, for resumable or multi-step work
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the same file feeds more than one gene-streaming step, or when a single
+step needs ``resume=True``, do the conversion yourself and keep it:
+
+.. code-block:: python
+
+   import crispyx as cx
+
+   half = "screen_half0.h5ad"                       # CSR, as crispyx writes
+   csc = "screen_half0_csc.h5ad"
+   cx.pp.convert_to_csc(half, output_path=csc, memory_limit_gb=160).close()
+
+   # Both steps now stream their fast axis with no per-call copy at all,
+   # and a resumed run starts on the first unfinished chunk.
+   cx.de.wilcoxon_test(csc, ..., batch_column="batch", memory_limit_gb=160)
+   cx.tl.batch_process(csc, reducer, ..., resume=True, memory_limit_gb=160)
+
+The cost is one persistent file of roughly the source's size, against one
+conversion per call per restart. On a scheduler, also budget the walltime for
+the *whole* computation rather than relying on resume to make up the
+difference.
 
 .. code-block:: python
 

@@ -20,6 +20,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
+from ._memory import _cgroup_memory_limit_bytes, _detected_available_bytes
 from ._checkpoint import _create_progress_context
 from ._disk import (
     assess_bytes,
@@ -1186,6 +1187,7 @@ def stream_on_fast_axis(
     chunk_size: int,
     memory_limit_gb: float | None = None,
     verbose: int | bool = False,
+    resumable: bool = False,
 ) -> Iterator[Path]:
     """Yield the path to stream ``axis`` chunks of ``X`` from.
 
@@ -1214,6 +1216,12 @@ def stream_on_fast_axis(
     ``layers``, ``obsm`` etc. from the original ``path``. Callers have made the
     format decision here, so they stream the result with
     ``iter_matrix_chunks(..., warn_slow_axis=False)``.
+
+    ``resumable`` says the caller was invoked with ``resume=True``. The copy
+    made here lives only for the duration of one call, so a computation that
+    takes more restarts than one -- exactly what ``resume`` exists for --
+    rebuilds it from scratch every time. That is worth one warning: converting
+    the source once, up front, is strictly cheaper for such a run.
     """
     validate_format_mismatch_policy(policy)
     if axis not in (0, 1):
@@ -1288,6 +1296,18 @@ def stream_on_fast_axis(
             f"X is {fmt.upper()}; converting to a temporary {target.upper()} copy for "
             f"{access} streaming → {tmp_path}",
         )
+        if resumable:
+            _messages.warn(
+                fn_name,
+                f"this run is resumable, but the temporary {target.upper()} copy it "
+                f"streams from lives only for this call and is rebuilt from scratch on "
+                f"every resume -- a cost paid once per restart, before any new work "
+                f"starts. Convert the source once instead and pass the converted file: "
+                f"cx.pp.convert_to_{target}(path, output_path=...). "
+                f"format_mismatch_policy='off' streams the source as-is if you would "
+                f"rather pay the re-read.",
+                stacklevel=4,
+            )
         convert = convert_to_csc if target == "csc" else convert_to_csr
         convert(path, output_path=tmp_path, memory_limit_gb=memory_limit_gb, verbose=verbose)
         yield tmp_path
@@ -2448,18 +2468,25 @@ def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     Half of ``memory_limit_gb`` (or of the memory ``psutil`` reports as
     available when it is ``None``); the other half is headroom for the
     per-chunk working set and the caller's own arrays.
+
+    Capped by the process's cgroup ceiling, so a ``memory_limit_gb`` larger
+    than the job's actual allocation cannot size these buffers past what the
+    job may use.
     """
     if memory_limit_gb is None:
         try:
-            import psutil
-            memory_limit_gb = psutil.virtual_memory().available / 1e9
+            memory_limit_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for the conversion buffer budget. "
                 "Install with: pip install psutil"
             )
             memory_limit_gb = 16.0
-    return 0.5 * float(memory_limit_gb) * 1e9
+    budget = 0.5 * float(memory_limit_gb) * 1e9
+    cgroup_limit = _cgroup_memory_limit_bytes()
+    if cgroup_limit is not None:
+        budget = min(budget, 0.5 * cgroup_limit)
+    return budget
 
 
 def _contiguous_bands(
@@ -3092,8 +3119,7 @@ def calculate_optimal_chunk_size(
     """
     if available_memory_gb is None:
         try:
-            import psutil
-            available_memory_gb = psutil.virtual_memory().available / 1e9
+            available_memory_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for chunk size calculation. "
@@ -3173,8 +3199,7 @@ def calculate_optimal_gene_chunk_size(
     """
     if available_memory_gb is None:
         try:
-            import psutil
-            available_memory_gb = psutil.virtual_memory().available / 1e9
+            available_memory_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for chunk size calculation. "
@@ -3302,8 +3327,7 @@ def calculate_wilcoxon_chunk_size(
     """
     if available_memory_gb is None:
         try:
-            import psutil
-            available_memory_gb = psutil.virtual_memory().available / 1e9
+            available_memory_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for Wilcoxon chunk size calculation. "
@@ -3390,8 +3414,7 @@ def calculate_nb_glm_chunk_size(
     """
     if available_memory_gb is None:
         try:
-            import psutil
-            available_memory_gb = psutil.virtual_memory().available / 1e9
+            available_memory_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for NB-GLM chunk size calculation."
@@ -3485,8 +3508,7 @@ def calculate_pca_chunk_size(
     """
     if available_memory_gb is None:
         try:
-            import psutil
-            available_memory_gb = psutil.virtual_memory().available / 1e9
+            available_memory_gb = _detected_available_bytes() / 1e9
         except ImportError:
             logger.warning(
                 "psutil not installed, using default 16GB for PCA chunk size calculation."

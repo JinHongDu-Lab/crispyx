@@ -935,7 +935,7 @@ def batch_process(
         with stream_on_fast_axis(
             path, axis=1, policy=format_mismatch_policy, fn_name="tl.batch_process",
             scratch_dir=resolved_output.parent, chunk_size=chunk_size,
-            memory_limit_gb=memory_limit_gb, verbose=verbose,
+            memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
         ) as stream_path:
             stream_backed = backed if stream_path == path else read_backed(stream_path)
             try:

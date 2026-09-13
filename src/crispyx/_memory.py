@@ -15,8 +15,7 @@ logger = logging.getLogger(__name__)
 def _get_available_memory_mb() -> float:
     """Get available system memory in MB, with fallback."""
     try:
-        import psutil
-        return psutil.virtual_memory().available / 1e6
+        return _detected_available_bytes() / 1e6
     except ImportError:
         return 8000.0  # 8 GB default fallback
 
@@ -110,8 +109,7 @@ def _estimate_max_workers(
     if available_mb is None:
         # Try to get system memory, default to 8 GB if unavailable
         try:
-            import psutil
-            available_mb = psutil.virtual_memory().available / 1e6 * 0.8
+            available_mb = _detected_available_bytes() / 1e6 * 0.8
         except ImportError:
             available_mb = 8000.0  # 8 GB default
     
@@ -132,11 +130,74 @@ def _estimate_max_workers(
     return min(max_workers, cpu_count)
 
 
+#: cgroup files report an "unlimited" ceiling as a sentinel near 2**63 rather
+#: than as an absent file, so anything at or above this is treated as no limit.
+_CGROUP_UNLIMITED = 1 << 62
+
+#: Where a memory ceiling is published, newest layout first, each with the
+#: words that mean "no limit" in that layout. Patched in tests.
+_CGROUP_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("/sys/fs/cgroup/memory.max", ("max",)),                 # cgroup v2
+    ("/sys/fs/cgroup/memory/memory.limit_in_bytes", ()),     # cgroup v1
+)
+
+
+def _cgroup_memory_limit_bytes() -> float | None:
+    """The cgroup memory ceiling this process runs under, or ``None``.
+
+    Slurm, Docker and Kubernetes all cap a job's memory with a cgroup, but
+    ``psutil.virtual_memory()`` reports the *host's* memory. On a shared
+    compute node a job allocated 200 GB can see a machine with far more than
+    that free, and sizing buffers or chunks from what it sees is how an
+    auto-sized run gets OOM-killed while every crispyx budget still looks
+    satisfied. Reading the ceiling costs one small file read.
+    """
+    for path, unlimited_words in _CGROUP_PATHS:
+        try:
+            with open(path) as handle:
+                raw = handle.read().strip()
+        except OSError:
+            continue
+        if raw in unlimited_words:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if 0 < value < _CGROUP_UNLIMITED:
+            return float(value)
+    return None
+
+
+def _detected_available_bytes() -> float:
+    """Memory this process may actually use, in bytes.
+
+    ``psutil.virtual_memory().available`` capped by the cgroup ceiling. Every
+    crispyx auto-sizing path routes its host-memory reading through here so
+    that none of them can budget from memory the job's cgroup will not grant.
+
+    Raises
+    ------
+    ImportError
+        When ``psutil`` is not installed, so callers keep their own default
+        and their own warning.
+    """
+    import psutil
+    available = float(psutil.virtual_memory().available)
+    cgroup_limit = _cgroup_memory_limit_bytes()
+    if cgroup_limit is not None:
+        available = min(available, cgroup_limit)
+    return available
+
+
 def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     """Resolve the effective memory limit in bytes.
 
-    If *memory_limit_gb* is provided, convert it to bytes.
-    Otherwise, query the system with ``psutil`` and fall back to 64 GB.
+    If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
+    the system with ``psutil`` and fall back to 64 GB. Either way the result
+    is capped by the process's cgroup ceiling when there is one, so a budget
+    can never exceed what the job is actually allowed to use -- see
+    :func:`_cgroup_memory_limit_bytes`.
 
     Parameters
     ----------
@@ -149,13 +210,17 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
         Memory budget in bytes.
     """
     if memory_limit_gb is not None:
-        return memory_limit_gb * 1e9
+        budget = memory_limit_gb * 1e9
+    else:
+        try:
+            return _detected_available_bytes()
+        except ImportError:
+            return 64 * 1e9  # conservative default
 
-    try:
-        import psutil
-        return float(psutil.virtual_memory().available)
-    except ImportError:
-        return 64 * 1e9  # conservative default
+    cgroup_limit = _cgroup_memory_limit_bytes()
+    if cgroup_limit is not None:
+        budget = min(budget, cgroup_limit)
+    return budget
 
 
 def _should_use_streaming(

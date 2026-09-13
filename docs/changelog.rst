@@ -36,6 +36,27 @@ Version 0.1.4
   count). On a synthetic 18,000-group profile the ``batch_process`` call goes
   15.5 s -> 7.0 s (600 genes) and 12.3 s -> 4.6 s (1800 genes); results are
   unchanged.
+* **Memory budgets respect a cgroup ceiling.** Every auto-sizing path --
+  gene and cell chunk sizes, the CSR<->CSC conversion buffers, the DE and QC
+  budgets -- sized itself from ``psutil.virtual_memory().available``, which
+  reports the *host's* memory. Under Slurm, Docker or Kubernetes a job
+  allocated 200 GB on a shared node sees a machine with far more than that
+  free, so an auto-sized run could budget past its allocation and be
+  OOM-killed with every crispyx budget still apparently satisfied. All of
+  these now read through one accessor that caps the reading by the cgroup v2
+  (``memory.max``) or v1 (``memory.limit_in_bytes``) ceiling when there is
+  one. An explicit ``memory_limit_gb`` larger than the allocation is capped
+  the same way, so passing ``memory_limit_gb=400`` to a 200 GB job no longer
+  sizes buffers for 400 GB. Nothing changes off a cgroup.
+* **A resumable run is warned when it is about to convert.** The temporary
+  fast-axis copy lives for one call, so a computation that needs several
+  restarts -- which is what ``resume=True`` is for -- rebuilds the whole copy
+  on every one of them, before any new work starts. A job under a walltime
+  shorter than its computation is guaranteed to hit this. ``batch_process``
+  and ``wilcoxon_test`` now emit one ``UserWarning`` when a resumable call
+  converts, pointing at ``cx.pp.convert_to_csc``; ``docs/faq.rst`` gains a
+  section on converting once for resumable or multi-step work. The copy's
+  per-call lifetime is deliberately unchanged.
 * **Resume checkpoints are kilobytes instead of megabytes.** ``batch_process``
   stored its ``batches_used`` grid as a JSON coordinate list, which at ~18k
   groups is tens of thousands of nested lists rewritten after every gene

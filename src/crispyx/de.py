@@ -96,7 +96,7 @@ from ._checkpoint import (
 from . import _messages
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
-from ._memory import _should_use_streaming
+from ._memory import _detected_available_bytes, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -2986,8 +2986,7 @@ def nb_glm_test(
                     available_mb = memory_limit_gb * 1000
                 else:
                     try:
-                        import psutil
-                        available_mb = psutil.virtual_memory().available / 1e6
+                        available_mb = _detected_available_bytes() / 1e6
                     except ImportError:
                         available_mb = 8000.0
                 
@@ -3146,8 +3145,7 @@ def nb_glm_test(
             available_mb = memory_limit_gb * 1000
         else:
             try:
-                import psutil
-                available_mb = psutil.virtual_memory().available / 1e6
+                available_mb = _detected_available_bytes() / 1e6
             except ImportError:
                 available_mb = 8000.0  # 8 GB default
         
@@ -4910,7 +4908,7 @@ def wilcoxon_test(
     with stream_on_fast_axis(
         path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
         scratch_dir=output_path.parent, chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb, verbose=verbose,
+        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
     ) as stream_path:
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined. Dedicated standard (memmap) path; the

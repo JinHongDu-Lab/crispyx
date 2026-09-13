@@ -1379,3 +1379,43 @@ def test_resume_keeps_the_stored_chunk_size_when_it_was_auto_selected(tmp_path):
     reference_values = np.asarray(reference.backed.X[:]).copy()
     reference.close()
     np.testing.assert_allclose(resumed_values, reference_values)
+
+
+def test_resumable_run_warns_that_the_converted_copy_is_rebuilt_each_restart(tmp_path):
+    """resume=True plus a converting policy is a per-restart cost, so it warns.
+
+    The temporary fast-axis copy lives only for one call, so a run that needs
+    several restarts -- which is what resume exists for -- pays the whole
+    conversion again before any new chunk starts.
+    """
+    path, *_ = _write_data(tmp_path, sparse=True)  # CSR
+    common = dict(
+        groupby="perturbation", batch_column="batch", chunk_size=2,
+        cell_chunk_size=20, format_mismatch_policy="convert",
+    )
+    with pytest.warns(UserWarning, match="rebuilt from scratch on every resume"):
+        result = cx.batch_process(
+            path, _moment_reducer(), statistic_name="resumable_csr", resume=True,
+            output_path=tmp_path / "resumable_csr.h5ad", **common,
+        )
+    result.close()
+
+    # Not a resumable run: converting is a one-off, so no warning.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            path, _moment_reducer(), statistic_name="oneshot_csr", force=True,
+            output_path=tmp_path / "oneshot_csr.h5ad", **common,
+        )
+    result.close()
+
+    # A source already on its fast axis converts nothing, so resume is free.
+    convert_to_csc(path, output_path=tmp_path / "csc_src.h5ad", verbose=False).close()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            tmp_path / "csc_src.h5ad", _moment_reducer(),
+            statistic_name="resumable_csc", resume=True,
+            output_path=tmp_path / "resumable_csc.h5ad", **common,
+        )
+    result.close()
