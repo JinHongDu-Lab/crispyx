@@ -36,6 +36,10 @@ Version 0.1.4
   count). On a synthetic 18,000-group profile the ``batch_process`` call goes
   15.5 s -> 7.0 s (600 genes) and 12.3 s -> 4.6 s (1800 genes); results are
   unchanged.
+* A resumed ``batch_process`` progress bar starts at the chunk it resumes
+  from, instead of printing a ``0/total`` line and then jumping. In a log
+  file the old form read as a run that had restarted from nothing and then
+  skipped ahead.
 * **Memory budgets respect a cgroup ceiling.** Every auto-sizing path --
   gene and cell chunk sizes, the CSR<->CSC conversion buffers, the DE and QC
   budgets -- sized itself from ``psutil.virtual_memory().available``, which

@@ -979,13 +979,12 @@ def batch_process(
                     })
 
                 with h5py.File(resolved_output, "r+") as out_f, _create_progress_context(
-                    n_gene_chunks, "tl.batch_process", verbose, unit="gene chunk"
+                    n_gene_chunks, "tl.batch_process", verbose, unit="gene chunk",
+                    initial=last_completed_chunk + 1,
                 ) as pbar:
                     out_X = out_f["X"]
                     out_layers = out_f["layers"]
                     current_chunk = last_completed_chunk + 1
-                    if current_chunk:
-                        pbar.update(current_chunk)
                     for slc, block in iter_matrix_chunks(
                         stream_backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
                         start_chunk=current_chunk, warn_slow_axis=False,

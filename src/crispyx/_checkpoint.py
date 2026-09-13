@@ -341,12 +341,20 @@ def _create_progress_context(
     verbose: int | bool,
     *,
     unit: str = "perturbation",
+    initial: int = 0,
 ) -> "_tqdm | _DummyProgress":
     """Create a progress bar context manager.
 
     Returns tqdm progress bar if verbose>=1 and tqdm is available,
     otherwise returns a dummy context manager.
+
+    ``initial`` is the work a resumed run has already completed. Passing it
+    here rather than calling ``update(initial)`` on a fresh bar matters in a
+    log file: the latter writes a ``0/total`` line and then jumps, which
+    reads as a run that restarted from nothing and then skipped ahead, and
+    has already cost one investigation an afternoon. It also lets tqdm rate
+    the remaining work instead of counting the skipped chunks as instant.
     """
     if int(verbose) >= 1 and HAS_TQDM and total > 0:
-        return _tqdm(total=total, desc=desc, unit=unit)
+        return _tqdm(total=total, desc=desc, unit=unit, initial=initial)
     return _DummyProgress()
