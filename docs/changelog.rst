@@ -64,8 +64,13 @@ Version 0.1.4
   ``batches_used`` grid as a JSON coordinate list: at 17,978 groups x 4
   batches that is 913 KB of pretty-printed JSON, rewritten after every gene
   chunk (the interval is 1 below 100 chunks). Packed as a bitmap it is
-  12 KB. It is now a packed bitmap. Checkpoints written by earlier versions
-  are not readable and fall back to the existing output-file scan.
+  12 KB. **Checkpoints written by earlier versions are not readable.** A run
+  resumed across the upgrade falls back to the existing output-file scan, so
+  no completed gene chunk is recomputed -- but ``obs['n_batches_used']`` then
+  counts only the batches seen after the resume, and a ``UserWarning`` says
+  so. It cannot be reconstructed afterwards, because the weight layer is
+  summed across batches. Finish an in-flight resumable run on the version
+  that started it, or pass ``force=True`` for an exact recount.
 
 Version 0.1.3
 -------------
