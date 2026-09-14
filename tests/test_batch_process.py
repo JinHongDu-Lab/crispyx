@@ -16,7 +16,11 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
-from crispyx._checkpoint import _find_last_completed_gene_chunk
+from crispyx._checkpoint import (
+    _find_last_completed_gene_chunk,
+    _pack_bool_matrix,
+    _unpack_bool_matrix,
+)
 from crispyx.data import convert_to_csc
 
 
@@ -670,7 +674,7 @@ def test_resume_with_nothing_left_preserves_n_batches_used(tmp_path):
     checkpoint_path.write_text(json.dumps({
         "total_gene_chunks": 4,
         "last_gene_chunk": 3,
-        "batches_used": np.argwhere(np.ones((3, 3), dtype=bool)).tolist(),
+        "batches_used": _pack_bool_matrix(np.ones((3, 3), dtype=bool)),
         "method": "batch_process",
         "statistic_name": "std",
         "mode": "group",
@@ -1135,3 +1139,388 @@ def test_float32_source_matches_a_float64_reference(tmp_path):
             counts.append(subset.shape[0])
         expected.append(np.average(values, axis=0, weights=counts))
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+def _sum_reducer(weight_maker) -> cx.BatchReducer:
+    """Per-(group, batch) mean, with the weight built by ``weight_maker(n, width)``."""
+
+    def initialize(width):
+        return {"sum": np.zeros(width), "n": 0}
+
+    def update(state, block):
+        block = np.asarray(block, dtype=np.float64)
+        state["sum"] += block.sum(axis=0)
+        state["n"] += block.shape[0]
+
+    def finalize(state):
+        return cx.BatchStatistic(
+            state["sum"] / state["n"], weight_maker(state["n"], state["sum"].size)
+        )
+
+    return cx.BatchReducer(initialize, update, finalize)
+
+
+def test_scalar_weight_matches_the_same_weight_broadcast_per_gene(tmp_path):
+    """The scalar-weight fast path must be bit-identical to the masked path.
+
+    A scalar weight used to be broadcast to ``(width,)`` and then validated
+    and boolean-masked per (group, batch) pair per channel; it is now kept
+    scalar and applied unmasked. For a positive weight the mask was
+    uniformly true, so the two must agree exactly, not merely closely.
+    """
+    path, *_ = _write_data(tmp_path)
+    common = dict(
+        groupby="perturbation", batch_column="batch", chunk_size=3,
+        cell_chunk_size=4, force=True,
+    )
+    scalar = cx.batch_process(
+        path, _sum_reducer(lambda n, width: float(n)),
+        statistic_name="scalar_w", output_path=tmp_path / "scalar_w.h5ad", **common,
+    )
+    scalar_values, scalar_weights, scalar_obs, _ = _read_result(scalar)
+    scalar.close()
+
+    broadcast = cx.batch_process(
+        path, _sum_reducer(lambda n, width: np.full(width, float(n))),
+        statistic_name="array_w", output_path=tmp_path / "array_w.h5ad", **common,
+    )
+    broadcast_values, broadcast_weights, broadcast_obs, _ = _read_result(broadcast)
+    broadcast.close()
+
+    np.testing.assert_array_equal(scalar_values, broadcast_values)
+    np.testing.assert_array_equal(scalar_weights, broadcast_weights)
+    np.testing.assert_array_equal(
+        scalar_obs["n_batches_used"].to_numpy(), broadcast_obs["n_batches_used"].to_numpy()
+    )
+
+
+def test_zero_scalar_weight_drops_the_batch_like_an_all_zero_vector(tmp_path):
+    """Weight 0 must drop the (group, batch) pair on both weight paths."""
+    path, *_ = _write_data(tmp_path)
+    common = dict(
+        groupby="perturbation", perturbations=["A"], batch_column="batch",
+        chunk_size=3, cell_chunk_size=4, force=True,
+    )
+    # Only batch "b2" carries weight; the other two contribute nothing.
+    def scalar_weight(n, width):
+        return float(n) if n == 6 else 0.0
+
+    def vector_weight(n, width):
+        return np.full(width, float(n) if n == 6 else 0.0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        scalar = cx.batch_process(
+            path, _sum_reducer(scalar_weight),
+            statistic_name="zero_scalar", output_path=tmp_path / "zero_scalar.h5ad", **common,
+        )
+        scalar_values, scalar_weights, scalar_obs, _ = _read_result(scalar)
+        scalar.close()
+        vector = cx.batch_process(
+            path, _sum_reducer(vector_weight),
+            statistic_name="zero_vector", output_path=tmp_path / "zero_vector.h5ad", **common,
+        )
+        vector_values, vector_weights, vector_obs, _ = _read_result(vector)
+        vector.close()
+
+    np.testing.assert_array_equal(scalar_values, vector_values)
+    np.testing.assert_array_equal(scalar_weights, vector_weights)
+    # One batch of "A" has 6 cells, so exactly one batch is counted as used.
+    assert scalar_obs["n_batches_used"].tolist() == [1]
+    assert vector_obs["n_batches_used"].tolist() == [1]
+
+
+@pytest.mark.parametrize("bad", [np.inf, np.nan, -1.0])
+def test_non_finite_or_negative_scalar_weights_are_rejected(tmp_path, bad):
+    """The scalar path must reject the same weights the vector path does."""
+    path, *_ = _write_data(tmp_path)
+    for label, weight_maker in (
+        ("scalar", lambda n, width: float(bad)),
+        ("vector", lambda n, width: np.full(width, float(bad))),
+    ):
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            cx.batch_process(
+                path, _sum_reducer(weight_maker),
+                groupby="perturbation", perturbations=["A"], batch_column="batch",
+                statistic_name=f"bad_{label}", chunk_size=3,
+                output_path=tmp_path / f"bad_{label}.h5ad", force=True,
+            )
+
+
+def test_perturbation_subset_maps_cells_of_excluded_labels_to_no_group(tmp_path):
+    """Cells whose label is not in ``perturbations`` must not join any group.
+
+    The cell-to-group mapping is built from the distinct labels rather than
+    per cell; a label missing from the requested subset has to keep coding
+    as "unusable", the way the per-cell ``dict.get(label, -1)`` did.
+    """
+    path, X, labels, batches = _write_data(tmp_path)
+    subset = cx.batch_process(
+        path, _moment_reducer(), groupby="perturbation", perturbations=["A"],
+        batch_column="batch", statistic_name="subset", chunk_size=3,
+        cell_chunk_size=4, output_path=tmp_path / "subset.h5ad", force=True,
+    )
+    subset_values, _, subset_obs, _ = _read_result(subset)
+    subset.close()
+    assert subset_obs.index.tolist() == ["A"]
+
+    # A file holding only the "A" cells must give the same row: if any "ctrl"
+    # or "B" cell had leaked into group A, these would differ.
+    keep = labels == "A"
+    only_a = tmp_path / "only_a.h5ad"
+    ad.AnnData(
+        sp.csr_matrix(X[keep]),
+        obs=pd.DataFrame(
+            {"perturbation": labels[keep], "batch": batches[keep]},
+            index=[f"cell_{i}" for i in np.flatnonzero(keep)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])]),
+    ).write(only_a)
+    isolated = cx.batch_process(
+        only_a, _moment_reducer(), groupby="perturbation", batch_column="batch",
+        statistic_name="isolated", chunk_size=3, cell_chunk_size=4,
+        output_path=tmp_path / "isolated.h5ad", force=True,
+    )
+    isolated_values, _, _, _ = _read_result(isolated)
+    isolated.close()
+    np.testing.assert_allclose(subset_values, isolated_values)
+
+
+def test_packed_batches_used_round_trips(tmp_path):
+    """The checkpoint's packed bitmap must survive JSON unchanged."""
+    rng = np.random.default_rng(3)
+    matrix = rng.random((37, 5)) < 0.4
+    payload = json.loads(json.dumps(_pack_bool_matrix(matrix)))
+    np.testing.assert_array_equal(_unpack_bool_matrix(payload, (37, 5)), matrix)
+    # A payload that does not describe this run's grid is refused, not guessed.
+    assert _unpack_bool_matrix(payload, (37, 4)) is None
+    assert _unpack_bool_matrix(np.argwhere(matrix).tolist(), (37, 5)) is None
+
+
+def test_untestable_groups_are_found_across_several_weight_slices(tmp_path):
+    """The end-of-run weight reduction reads the layer in gene-chunk slices.
+
+    It must report exactly the groups the whole-layer reduction did, with a
+    chunk_size small enough that several slices are needed and an untestable
+    group sitting alongside testable ones.
+    """
+    X = np.arange(90, dtype=float).reshape(9, 10)
+    obs = pd.DataFrame(
+        {
+            # "B" shares no batch with the control, so it is untestable;
+            # "A" does, so it must survive the same reduction.
+            "perturbation": ["ctrl"] * 3 + ["A"] * 3 + ["B"] * 3,
+            "batch": ["b1"] * 3 + ["b1"] * 3 + ["b2"] * 3,
+        },
+        index=[f"c{i}" for i in range(9)],
+    )
+    path = tmp_path / "mixed.h5ad"
+    ad.AnnData(
+        X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(10)])
+    ).write(path)
+
+    with pytest.warns(UserWarning, match="no usable batch statistics"):
+        result = cx.batch_process(
+            path, _moment_reducer(), groupby="perturbation", reference="ctrl",
+            batch_column="batch", mode="comparison", statistic_name="mixed",
+            chunk_size=3, cell_chunk_size=2,
+            output_path=tmp_path / "mixed_result.h5ad", force=True,
+        )
+    values, weights, obs_result, uns = _read_result(result)
+    result.close()
+
+    assert uns["stratified_n_untestable_perturbations"] == 1
+    row = {label: i for i, label in enumerate(obs_result.index)}
+    assert np.isnan(values[row["B"]]).all()
+    assert np.equal(weights[row["B"]], 0).all()
+    assert not np.isnan(values[row["A"]]).any()
+    assert obs_result["n_batches_used"].tolist() == [1, 0]
+
+
+def test_resume_keeps_the_stored_chunk_size_when_it_was_auto_selected(tmp_path):
+    """An auto chunk_size must follow the output being resumed, not the budget.
+
+    ``chunk_size`` is auto-selected from ``memory_limit_gb``, so resuming
+    under a different memory allocation would pick different gene-chunk
+    boundaries, fail the metadata match, and overwrite the partial output
+    the call was asked to continue.
+    """
+    path, *_ = _write_data(tmp_path)
+    common = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100,
+    )
+    output_path = tmp_path / "resume_auto_cs.h5ad"
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, chunk_size=2, force=True, **common,
+        )
+    with h5py.File(output_path, "r") as f:
+        assert int(np.asarray(f["uns/chunk_size"][()]).item()) == 2
+
+    # Auto chunk_size under a memory budget that would pick a different
+    # width: the run must adopt 2 and continue, with no overwrite warning.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        resumed = cx.batch_process(
+            path, _moment_reducer(), output_path=output_path, resume=True,
+            memory_limit_gb=8.0, **common,
+        )
+    resumed_values = np.asarray(resumed.backed.X[:]).copy()
+    resumed_uns = dict(resumed.backed.uns)
+    resumed.close()
+    assert int(np.asarray(resumed_uns["chunk_size"]).item()) == 2
+
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "resume_auto_ref.h5ad",
+        chunk_size=2, force=True, **common,
+    )
+    reference_values = np.asarray(reference.backed.X[:]).copy()
+    reference.close()
+    np.testing.assert_allclose(resumed_values, reference_values)
+
+
+def test_resumable_run_warns_that_the_converted_copy_is_rebuilt_each_restart(tmp_path):
+    """resume=True plus a converting policy is a per-restart cost, so it warns.
+
+    The temporary fast-axis copy lives only for one call, so a run that needs
+    several restarts -- which is what resume exists for -- pays the whole
+    conversion again before any new chunk starts.
+    """
+    path, *_ = _write_data(tmp_path, sparse=True)  # CSR
+    common = dict(
+        groupby="perturbation", batch_column="batch", chunk_size=2,
+        cell_chunk_size=20, format_mismatch_policy="convert",
+    )
+    with pytest.warns(UserWarning, match="rebuilt from scratch on every resume"):
+        result = cx.batch_process(
+            path, _moment_reducer(), statistic_name="resumable_csr", resume=True,
+            output_path=tmp_path / "resumable_csr.h5ad", **common,
+        )
+    result.close()
+
+    # Not a resumable run: converting is a one-off, so no warning.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            path, _moment_reducer(), statistic_name="oneshot_csr", force=True,
+            output_path=tmp_path / "oneshot_csr.h5ad", **common,
+        )
+    result.close()
+
+    # A source already on its fast axis converts nothing, so resume is free.
+    convert_to_csc(path, output_path=tmp_path / "csc_src.h5ad", verbose=False).close()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = cx.batch_process(
+            tmp_path / "csc_src.h5ad", _moment_reducer(),
+            statistic_name="resumable_csc", resume=True,
+            output_path=tmp_path / "resumable_csc.h5ad", **common,
+        )
+    result.close()
+
+
+def _write_one_batch_per_group(tmp_path: Path) -> Path:
+    """Three groups, three batches, each group present in exactly one batch."""
+    rng = np.random.default_rng(5)
+    labels: list[str] = []
+    batches: list[str] = []
+    rows: list[np.ndarray] = []
+    for index, (group, batch) in enumerate((("A", "b1"), ("B", "b2"), ("C", "b3"))):
+        rows.extend(rng.normal(loc=index, scale=0.5, size=(6, 7)))
+        labels.extend([group] * 6)
+        batches.extend([batch] * 6)
+    X = np.asarray(rows, dtype=np.float64)
+    obs = pd.DataFrame(
+        {"perturbation": labels, "batch": batches},
+        index=[f"cell_{i}" for i in range(X.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])])
+    path = tmp_path / "one_batch_per_group.h5ad"
+    ad.AnnData(sp.csr_matrix(X), obs=obs, var=var).write(path)
+    return path
+
+
+def test_restart_from_scratch_does_not_inherit_the_stale_batches_used_grid(tmp_path):
+    """A resume that restarts from scratch must recount batches, not adopt
+    the discarded run's grid.
+
+    Regression test: the checkpoint was read before the metadata check and
+    never cleared, so the branch that deletes the checkpoint and recreates
+    the output still restored `batches_used` from it -- seeding the fresh
+    run with another run's counts and re-persisting them. The grid's shape
+    check cannot catch this: it passes whenever the groups and batches are
+    unchanged, which is exactly the common mismatch case (a regenerated
+    source, or a different chunk_size).
+    """
+    path = _write_one_batch_per_group(tmp_path)
+    common = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100,
+    )
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "reference_grid.h5ad",
+        chunk_size=3, force=True, **common,
+    )
+    truth = np.asarray(reference.backed.obs["n_batches_used"]).copy()
+    reference.close()
+    assert truth.tolist() == [1, 1, 1]  # each group is in one batch only
+
+    # An earlier run under a different chunk_size, whose checkpoint claims
+    # every group used every batch.
+    output_path = tmp_path / "stale_grid.h5ad"
+    first = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        chunk_size=2, force=True, **common,
+    )
+    first.close()
+    output_path.with_suffix(".progress.json").write_text(json.dumps({
+        "total_gene_chunks": 4,
+        "last_gene_chunk": 1,
+        "batches_used": _pack_bool_matrix(np.ones((3, 3), dtype=bool)),
+        "method": "batch_process",
+        "statistic_name": "std",
+        "mode": "group",
+    }))
+
+    with pytest.warns(UserWarning, match="does not match this call's parameters"):
+        resumed = cx.batch_process(
+            path, _moment_reducer(), output_path=output_path,
+            chunk_size=3, resume=True, **common,
+        )
+    restarted = np.asarray(resumed.backed.obs["n_batches_used"]).copy()
+    resumed.close()
+    np.testing.assert_array_equal(restarted, truth)
+
+    # ... and the count it writes back into the new checkpoint is the real one.
+    reopened = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        chunk_size=3, resume=True, **common,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(reopened.backed.obs["n_batches_used"]), truth
+    )
+    reopened.close()
+
+
+def test_force_overwrites_an_unreadable_output_instead_of_raising(tmp_path):
+    """force=True must not be blocked by the output it is about to replace.
+
+    Regression test: the auto chunk_size path learned to read the stored
+    chunk_size out of an existing output whenever resume=True, before the
+    force check, so force=True on a truncated file (a run killed during the
+    placeholder write) raised out of batch_process instead of overwriting.
+    """
+    path, *_ = _write_data(tmp_path)
+    output_path = tmp_path / "truncated.h5ad"
+    output_path.write_bytes(b"\x89HDF\r\n\x1a\n truncated")
+
+    result = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100, force=True, resume=True,
+    )
+    values = np.asarray(result.backed.X[:]).copy()
+    result.close()
+    assert np.isfinite(values).all()

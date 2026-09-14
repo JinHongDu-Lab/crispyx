@@ -1,6 +1,85 @@
 Changelog
 =========
 
+Version 0.1.4
+-------------
+
+*Released 2026-09-14.*
+
+* **``batch_process`` no longer reads the whole weight layer into memory to
+  finish a run.** The last step of a run reduced an ``(n_groups, n_genes)``
+  layer -- 5 GB on a screen with ~18k perturbations and ~35k genes -- to one
+  boolean per group, by materialising it in a single allocation, at the point
+  in a long run where memory is least available. The reduction now streams
+  the layer in gene-chunk slices (following the HDF5 chunking the
+  output is already created with), so the peak is one chunk rather than the
+  whole layer. The reported groups are unchanged.
+* **``batch_process`` resumes on the gene-chunk width its output was written
+  with**, when ``chunk_size`` was auto-selected. That width is derived from
+  the memory budget, so resuming the same run under a different ``--mem``
+  used to pick different chunk boundaries, fail the metadata match, and
+  overwrite the partial output the call was asked to continue. An
+  *explicitly* passed ``chunk_size`` that differs from the stored one still
+  restarts with a warning, as before -- only the auto-selected case follows
+  the file.
+* **The per-``(group, batch)`` combine loop is roughly 2.5x faster.** A
+  scalar ``BatchStatistic.weight`` -- what every reducer in the docs, the
+  tests and practice returns -- was broadcast to one value per gene, then
+  validated and boolean-masked per pair per channel: hundreds of thousands of
+  redundant array allocations per gene chunk. Scalar weights now stay scalar
+  through validation and accumulation, which is bit-identical to the masked
+  path for a positive weight. Two further per-run scans were removed: the
+  cell-to-group mapping is built from the distinct labels rather than with a
+  dict lookup per cell, and the "perturbation contains no cells" check uses a
+  set instead of scanning a list once per group (quadratic in the group
+  count). On a synthetic 18,000-group profile the ``batch_process`` call goes
+  15.5 s -> 7.0 s (600 genes) and 12.3 s -> 4.6 s (1800 genes); results are
+  unchanged.
+* A resumed ``batch_process`` progress bar starts at the chunk it resumes
+  from, instead of printing a ``0/total`` line and then jumping. In a log
+  file the old form read as a run that had restarted from nothing and then
+  skipped ahead.
+* **Memory budgets respect a cgroup ceiling.** Every auto-sizing path --
+  gene and cell chunk sizes, the CSR<->CSC conversion buffers, the DE and QC
+  budgets -- sized itself from ``psutil.virtual_memory().available``, which
+  reports the *host's* memory. Under Slurm, Docker or Kubernetes a job
+  allocated 200 GB on a shared node sees a machine with far more than that
+  free, so an auto-sized run could budget past its allocation and be
+  OOM-killed with every crispyx budget still apparently satisfied. All of
+  these now read through one accessor that resolves the process's own cgroup
+  from ``/proc/self/cgroup`` -- a Slurm job's ceiling sits several levels
+  below the hierarchy root, which publishes none at all, so reading the root
+  would have found a container's limit and never a job's -- and caps the
+  reading by the tightest cgroup v2 (``memory.max``) or v1
+  (``memory.limit_in_bytes``) ceiling on that path, less the memory the
+  cgroup already holds (reclaimable page cache excluded, so streaming a large
+  h5ad does not shrink the next chunk). An explicit ``memory_limit_gb``
+  larger than what remains is capped the same way, so passing
+  ``memory_limit_gb=400`` to a 200 GB job no longer sizes buffers for
+  400 GB. Nothing changes off a cgroup.
+* **A resumable run is warned when it is about to convert.** The temporary
+  fast-axis copy lives for one call, so a computation that needs several
+  restarts -- which is what ``resume=True`` is for -- rebuilds the whole copy
+  on every one of them, before any new work starts. A job under a walltime
+  shorter than its computation is guaranteed to hit this. ``batch_process``
+  now emits one ``UserWarning`` when a resumable call converts, pointing at
+  ``cx.pp.convert_to_csc``; ``docs/faq.rst`` gains a section on converting
+  once for resumable or multi-step work. ``wilcoxon_test`` does not warn,
+  because it refuses to resume from a checkpoint at all. The copy's per-call
+  lifetime is deliberately unchanged.
+* **Resume checkpoints shrink by ~75x.** ``batch_process`` stored its
+  ``batches_used`` grid as a JSON coordinate list: at 17,978 groups x 4
+  batches that is 913 KB of pretty-printed JSON, rewritten after every gene
+  chunk (the interval is 1 below 100 chunks). Packed as a bitmap it is
+  12 KB. **A checkpoint written by an earlier version keeps its gene-chunk
+  progress but loses its batch record.** A run resumed across the upgrade
+  still restarts on the first unfinished gene chunk, so nothing completed is
+  recomputed -- but ``obs['n_batches_used']`` then counts only the batches
+  seen after the resume, and a ``UserWarning`` says so. It cannot be
+  reconstructed afterwards, because the weight layer is summed across
+  batches. Finish an in-flight resumable run on the version
+  that started it, or pass ``force=True`` for an exact recount.
+
 Version 0.1.3
 -------------
 

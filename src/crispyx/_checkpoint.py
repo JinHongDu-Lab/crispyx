@@ -6,6 +6,8 @@ streaming differential expression tests and by ``batch_process``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -65,8 +67,13 @@ def _read_checkpoint(
     ``required_keys`` distinguishes a valid checkpoint from a corrupted or
     schema-mismatched one; it defaults to the per-candidate DE schema
     (``t_test``/``wilcoxon_test``/``nb_glm_test``). ``batch_process`` uses
-    its own gene-chunk schema and passes
-    ``required_keys=("last_gene_chunk", "total_gene_chunks")``.
+    its own gene-chunk schema and passes ``required_keys=("last_gene_chunk",
+    "total_gene_chunks", "batches_used")``. Presence is all that is checked:
+    a checkpoint written before 0.1.4 carries ``batches_used`` as a
+    coordinate list rather than a packed bitmap, so it is accepted here and
+    resumes on the right gene chunk; only :func:`_unpack_bool_matrix` rejects
+    the payload, leaving the caller to warn that ``obs['n_batches_used']``
+    will undercount.
 
     Returns
     -------
@@ -86,6 +93,45 @@ def _read_checkpoint(
         return data
     except (json.JSONDecodeError, IOError, OSError):
         return None
+
+
+def _pack_bool_matrix(matrix: np.ndarray) -> dict:
+    """Encode a boolean matrix compactly for a JSON checkpoint.
+
+    A coordinate list (``np.argwhere(...).tolist()``) costs one nested JSON
+    list per set element, which for ``batch_process``'s ``(n_groups,
+    n_batches)`` grid is tens of thousands of them -- megabytes of
+    pretty-printed JSON and ~1 s of encoding, rewritten after every gene
+    chunk. Packed bits are the same information in ``n_groups * n_batches /
+    8`` bytes.
+    """
+    matrix = np.ascontiguousarray(matrix, dtype=bool)
+    return {
+        "shape": list(matrix.shape),
+        "bits": base64.b64encode(np.packbits(matrix).tobytes()).decode("ascii"),
+    }
+
+
+def _unpack_bool_matrix(payload: object, shape: tuple[int, int]) -> np.ndarray | None:
+    """Decode :func:`_pack_bool_matrix`, or ``None`` if it does not fit ``shape``.
+
+    Returning ``None`` rather than raising lets the caller fall back to its
+    scan-based recovery, which is what any other unusable checkpoint does.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        stored_shape = tuple(int(x) for x in payload["shape"])
+        raw = base64.b64decode(payload["bits"])
+    except (KeyError, TypeError, ValueError, binascii.Error):
+        return None
+    if stored_shape != shape:
+        return None
+    count = shape[0] * shape[1]
+    flat = np.unpackbits(np.frombuffer(raw, dtype=np.uint8))
+    if flat.size < count:
+        return None
+    return flat[:count].astype(bool).reshape(shape)
 
 
 def _scan_h5ad_completed(
@@ -300,12 +346,20 @@ def _create_progress_context(
     verbose: int | bool,
     *,
     unit: str = "perturbation",
+    initial: int = 0,
 ) -> "_tqdm | _DummyProgress":
     """Create a progress bar context manager.
 
     Returns tqdm progress bar if verbose>=1 and tqdm is available,
     otherwise returns a dummy context manager.
+
+    ``initial`` is the work a resumed run has already completed. Passing it
+    here rather than calling ``update(initial)`` on a fresh bar matters in a
+    log file: the latter writes a ``0/total`` line and then jumps, which
+    reads as a run that restarted from nothing and then skipped ahead, and
+    has already cost one investigation an afternoon. It also lets tqdm rate
+    the remaining work instead of counting the skipped chunks as instant.
     """
     if int(verbose) >= 1 and HAS_TQDM and total > 0:
-        return _tqdm(total=total, desc=desc, unit=unit)
+        return _tqdm(total=total, desc=desc, unit=unit, initial=initial)
     return _DummyProgress()

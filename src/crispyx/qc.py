@@ -17,6 +17,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
+from ._memory import _detected_available_bytes
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
@@ -1772,8 +1773,7 @@ def quality_control_summary(
     # Determine available memory
     if memory_limit_gb is None:
         try:
-            import psutil
-            memory_limit_gb = psutil.virtual_memory().available / 1e9 * 0.5  # Use 50% of available
+            memory_limit_gb = _detected_available_bytes() / 1e9 * 0.5  # Use 50% of available
         except ImportError:
             memory_limit_gb = 8.0
     

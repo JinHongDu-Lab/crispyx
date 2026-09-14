@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -20,7 +21,9 @@ from ._checkpoint import (
     _create_progress_context,
     _find_last_completed_gene_chunk,
     _get_checkpoint_interval,
+    _pack_bool_matrix,
     _read_checkpoint,
+    _unpack_bool_matrix,
     _write_checkpoint_atomic,
 )
 from ._disk import estimate_bytes, warn_if_disk_space_low
@@ -231,7 +234,17 @@ def _normalise_statistic(
     width: int,
     *,
     context: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray | float]:
+    """Validate one finalized statistic into ``(values, weight)``.
+
+    A scalar weight is returned as a Python float rather than broadcast to
+    ``(width,)``. This runs once per ``(group, batch)`` pair per channel --
+    hundreds of thousands of times per gene chunk on a screen with ~18k
+    perturbations -- and every weight in the docs, the tests and the
+    reference reducers is a scalar cell count, so broadcasting it here (and
+    then validating and masking ``width`` copies of one number in the
+    caller) was the single largest cost in the combine loop.
+    """
     if isinstance(result, BatchStatistic):
         values, weight = result.values, result.weight
     else:
@@ -245,8 +258,11 @@ def _normalise_statistic(
         )
     weight_arr = np.asarray(weight, dtype=np.float64)
     if weight_arr.ndim == 0:
-        weight_arr = np.full(width, float(weight_arr), dtype=np.float64)
-    elif weight_arr.ndim != 1 or weight_arr.shape[0] != width:
+        weight_value = float(weight_arr)
+        if not math.isfinite(weight_value) or weight_value < 0:
+            raise ValueError(f"Reducer weights for {context} must be finite and non-negative.")
+        return values_arr, weight_value
+    if weight_arr.ndim != 1 or weight_arr.shape[0] != width:
         raise ValueError(
             f"Reducer weight for {context} must be scalar or have shape ({width},); "
             f"received {weight_arr.shape}."
@@ -262,7 +278,7 @@ def _normalise_reducer_output(
     channels: tuple[str, ...] | None,
     *,
     context: str,
-) -> dict[str | None, tuple[np.ndarray, np.ndarray]]:
+) -> dict[str | None, tuple[np.ndarray, np.ndarray | float]]:
     """Validate and unpack one ``finalize``/``compare`` return value.
 
     Returns a mapping from channel name to ``(values, weight)`` -- with a
@@ -631,7 +647,10 @@ def batch_process(
             groups = _unique_strings(perturbations)
             if mode == "comparison":
                 groups = [g for g in groups if g != control_label]
-        missing_groups = [group for group in groups if group not in observed]
+        # Membership against a set, not the list: a screen has as many groups
+        # as observed labels, so scanning the list per group is quadratic.
+        observed_set = set(observed)
+        missing_groups = [group for group in groups if group not in observed_set]
         if missing_groups:
             raise ValueError(
                 f"Perturbation(s) {missing_groups[:3]}"
@@ -652,16 +671,44 @@ def batch_process(
                 stacklevel=2,
             )
 
-        group_lookup = {group: idx for idx, group in enumerate(groups)}
-        group_codes = np.asarray([group_lookup.get(label, -1) for label in labels], dtype=np.int64)
         reference_code = -2
+        # Map cells to group codes through the distinct labels rather than
+        # per cell: a dict lookup for every one of a few million cells costs
+        # seconds, while there are only as many distinct labels as groups.
+        group_lookup = {group: idx for idx, group in enumerate(groups)}
+        label_codes, label_uniques = pd.factorize(labels)
+        unique_group_codes = np.array(
+            [group_lookup.get(str(label), -1) for label in label_uniques], dtype=np.int64
+        )
         if mode == "comparison":
-            group_codes[labels == control_label] = reference_code
+            unique_group_codes[label_uniques == control_label] = reference_code
+        # A label pandas could not code (-1) indexes the appended sentinel.
+        group_codes = np.append(unique_group_codes, -1)[label_codes]
 
         n_groups = len(groups)
         n_genes = backed.n_vars
         n_batches = len(batch_ids)
 
+        if chunk_size is None and resume and not force and resolved_output.exists():
+            # An auto-selected width depends on the memory budget, so resuming
+            # under a different one would pick different gene-chunk
+            # boundaries, fail the metadata match below, and overwrite the
+            # partial output this call was asked to continue -- discarding
+            # however many days of completed chunks it holds. Continue on the
+            # width that output was written with. Skipped under force=True,
+            # which reads nothing from the existing output -- including when
+            # it is too damaged to open, the case force exists for.
+            existing = ad.read_h5ad(resolved_output, backed="r")
+            try:
+                stored_chunk_size = existing.uns.get("chunk_size")
+            finally:
+                existing.file.close()
+            if stored_chunk_size is not None:
+                chunk_size = int(np.asarray(stored_chunk_size).item())
+                _messages.vprint(
+                    verbose, "tl.batch_process",
+                    f"gene chunk_size={chunk_size} (from {resolved_output.name}, resuming)",
+                )
         if chunk_size is None:
             chunk_size = _auto_gene_chunk_size(
                 backed.n_obs, n_genes,
@@ -736,7 +783,7 @@ def batch_process(
         if resume:
             checkpoint = _read_checkpoint(
                 checkpoint_path,
-                required_keys=("last_gene_chunk", "total_gene_chunks"),
+                required_keys=("last_gene_chunk", "total_gene_chunks", "batches_used"),
             )
             if checkpoint is not None:
                 last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
@@ -770,6 +817,12 @@ def batch_process(
                 existing.file.close()
             if not reuse_existing_output:
                 last_completed_chunk = -1
+                # The checkpoint describes the output being discarded, so its
+                # batches_used grid does not describe the run about to start:
+                # keeping it would seed a from-scratch run with another run's
+                # batch counts (the grid's shape matches whenever groups and
+                # batches are unchanged, which is the common mismatch case).
+                checkpoint = None
                 warned_about_overwrite = True
                 _messages.warn(
                     "tl.batch_process",
@@ -890,7 +943,7 @@ def batch_process(
         with stream_on_fast_axis(
             path, axis=1, policy=format_mismatch_policy, fn_name="tl.batch_process",
             scratch_dir=resolved_output.parent, chunk_size=chunk_size,
-            memory_limit_gb=memory_limit_gb, verbose=verbose,
+            memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
         ) as stream_path:
             stream_backed = backed if stream_path == path else read_backed(stream_path)
             try:
@@ -898,8 +951,20 @@ def batch_process(
                 if checkpoint is not None:
                     # Exact restore: which (group, batch) pairs already
                     # contributed usable weight in the chunks being skipped.
-                    for group_index, batch_index in checkpoint.get("batches_used", []):
-                        batches_used[group_index, batch_index] = True
+                    restored = _unpack_bool_matrix(
+                        checkpoint.get("batches_used"), (n_groups, n_batches)
+                    )
+                    if restored is not None:
+                        batches_used = restored
+                    elif last_completed_chunk >= 0:
+                        _messages.warn(
+                            "tl.batch_process",
+                            "The checkpoint's batches_used record could not be read; "
+                            "obs['n_batches_used'] may undercount batches used only in "
+                            "the skipped chunks. Pass force=True for an exact recount "
+                            "if this matters.",
+                            stacklevel=2,
+                        )
                 elif recovered_via_scan and last_completed_chunk >= 0:
                     _messages.warn(
                         "tl.batch_process",
@@ -914,7 +979,7 @@ def batch_process(
                     _write_checkpoint_atomic(checkpoint_path, {
                         "total_gene_chunks": n_gene_chunks,
                         "last_gene_chunk": chunk_idx,
-                        "batches_used": np.argwhere(batches_used).tolist(),
+                        "batches_used": _pack_bool_matrix(batches_used),
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "method": "batch_process",
                         "statistic_name": statistic_name,
@@ -922,13 +987,12 @@ def batch_process(
                     })
 
                 with h5py.File(resolved_output, "r+") as out_f, _create_progress_context(
-                    n_gene_chunks, "tl.batch_process", verbose, unit="gene chunk"
+                    n_gene_chunks, "tl.batch_process", verbose, unit="gene chunk",
+                    initial=last_completed_chunk + 1,
                 ) as pbar:
                     out_X = out_f["X"]
                     out_layers = out_f["layers"]
                     current_chunk = last_completed_chunk + 1
-                    if current_chunk:
-                        pbar.update(current_chunk)
                     for slc, block in iter_matrix_chunks(
                         stream_backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
                         start_chunk=current_chunk, warn_slow_axis=False,
@@ -990,6 +1054,16 @@ def batch_process(
                                     raise
                                 raise RuntimeError(f"Reducer failed for {context}") from exc
                             for name, (batch_values, batch_weights) in per_channel.items():
+                                if isinstance(batch_weights, float):
+                                    # Scalar weight: the per-gene mask below
+                                    # would be uniformly true, so the masked
+                                    # gathers are pure overhead. Same result,
+                                    # same NaN propagation from batch_values.
+                                    if batch_weights > 0:
+                                        numerators[name][group_index] += batch_values * batch_weights
+                                        denominators[name][group_index] += batch_weights
+                                        batches_used[group_index, batch_index] = True
+                                    continue
                                 positive = batch_weights > 0
                                 if positive.any():
                                     numerators[name][group_index, positive] += (
@@ -1025,12 +1099,23 @@ def batch_process(
                             _save_checkpoint(current_chunk - 1)
                         pbar.update(1)
 
-                    full_weight = np.asarray(out_layers[scan_weight_key])
+                    # Reduce the weight layer in gene-chunk slices rather
+                    # than materialising it: at (18k groups x 35k genes) the
+                    # layer is 5 GB, and reading it whole here has OOM-killed
+                    # runs that had already completed every gene chunk --
+                    # losing days of work at the last step. The slices follow
+                    # the HDF5 chunking the output was created with.
+                    weight_ds = out_layers[scan_weight_key]
+                    untestable = np.ones(n_groups, dtype=bool)
+                    for weight_start in range(0, n_genes, chunk_size):
+                        weight_stop = min(weight_start + chunk_size, n_genes)
+                        untestable &= np.all(
+                            weight_ds[:, weight_start:weight_stop] <= 0, axis=1
+                        )
             finally:
                 if stream_backed is not backed:
                     stream_backed.file.close()
 
-        untestable = np.all(full_weight <= 0, axis=1)
         n_batches_used = batches_used.sum(axis=1).astype(np.int64)
         if untestable.any():
             examples = [groups[i] for i in np.flatnonzero(untestable)[:5]]
