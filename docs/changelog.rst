@@ -4,15 +4,14 @@ Changelog
 Version 0.1.4
 -------------
 
-*Released 2026-09-12.*
+*Released 2026-09-14.*
 
 * **``batch_process`` no longer reads the whole weight layer into memory to
   finish a run.** The last step of a run reduced an ``(n_groups, n_genes)``
   layer -- 5 GB on a screen with ~18k perturbations and ~35k genes -- to one
-  boolean per group, by materialising it in a single allocation. Two
-  production runs were OOM-killed at exactly this point *after* completing
-  every gene chunk, losing roughly two days of compute each. The reduction
-  now streams the layer in gene-chunk slices (following the HDF5 chunking the
+  boolean per group, by materialising it in a single allocation, at the point
+  in a long run where memory is least available. The reduction now streams
+  the layer in gene-chunk slices (following the HDF5 chunking the
   output is already created with), so the peak is one chunk rather than the
   whole layer. The reported groups are unchanged.
 * **``batch_process`` resumes on the gene-chunk width its output was written
@@ -61,10 +60,11 @@ Version 0.1.4
   converts, pointing at ``cx.pp.convert_to_csc``; ``docs/faq.rst`` gains a
   section on converting once for resumable or multi-step work. The copy's
   per-call lifetime is deliberately unchanged.
-* **Resume checkpoints are kilobytes instead of megabytes.** ``batch_process``
-  stored its ``batches_used`` grid as a JSON coordinate list, which at ~18k
-  groups is tens of thousands of nested lists rewritten after every gene
-  chunk. It is now a packed bitmap. Checkpoints written by earlier versions
+* **Resume checkpoints shrink by ~75x.** ``batch_process`` stored its
+  ``batches_used`` grid as a JSON coordinate list: at 17,978 groups x 4
+  batches that is 913 KB of pretty-printed JSON, rewritten after every gene
+  chunk (the interval is 1 below 100 chunks). Packed as a bitmap it is
+  12 KB. It is now a packed bitmap. Checkpoints written by earlier versions
   are not readable and fall back to the existing output-file scan.
 
 Version 0.1.3
