@@ -55,6 +55,7 @@ test = [
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
+    "psutil>=5.9",
 ]
 benchmark = [
     "pertpy>=0.4",
