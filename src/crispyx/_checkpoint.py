@@ -67,8 +67,13 @@ def _read_checkpoint(
     ``required_keys`` distinguishes a valid checkpoint from a corrupted or
     schema-mismatched one; it defaults to the per-candidate DE schema
     (``t_test``/``wilcoxon_test``/``nb_glm_test``). ``batch_process`` uses
-    its own gene-chunk schema and passes
-    ``required_keys=("last_gene_chunk", "total_gene_chunks")``.
+    its own gene-chunk schema and passes ``required_keys=("last_gene_chunk",
+    "total_gene_chunks", "batches_used")``. Presence is all that is checked:
+    a checkpoint written before 0.1.4 carries ``batches_used`` as a
+    coordinate list rather than a packed bitmap, so it is accepted here and
+    resumes on the right gene chunk; only :func:`_unpack_bool_matrix` rejects
+    the payload, leaving the caller to warn that ``obs['n_batches_used']``
+    will undercount.
 
     Returns
     -------

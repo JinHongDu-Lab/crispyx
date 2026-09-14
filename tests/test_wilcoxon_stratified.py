@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import sys
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -421,6 +422,34 @@ class TestWilcoxonResumeGuard:
                 resume=True,
                 **_NO_FILTER,
             )
+
+    def test_resume_does_not_claim_a_conversion_is_rebuilt_each_restart(self, tmp_path):
+        """The convert-once advice is for runs that can resume; this one cannot.
+
+        stream_on_fast_axis warns a resumable caller that its temporary CSC
+        copy is rebuilt on every restart. wilcoxon_test refuses to resume from
+        a checkpoint at all, so passing resume= through to that warning would
+        advertise restarts that cannot happen.
+        """
+        rng = np.random.default_rng(7)
+        counts = rng.poisson(5, (80, 6))
+        labels = ["control"] * 40 + ["pert_0"] * 40
+        batch = [0, 1] * 40
+        path, _ = _make_h5ad(tmp_path, counts, labels, batch)  # CSR: convertible
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            wilcoxon_test(
+                path,
+                perturbation_column="perturbation",
+                control_label="control",
+                batch_column="batch",
+                output_path=tmp_path / "no_resume_warning.h5ad",
+                resume=True,
+                format_mismatch_policy="convert",
+                **_NO_FILTER,
+            )
+        assert not [w for w in caught if "rebuilt from scratch" in str(w.message)]
 
 
 if __name__ == "__main__":

@@ -46,30 +46,38 @@ Version 0.1.4
   allocated 200 GB on a shared node sees a machine with far more than that
   free, so an auto-sized run could budget past its allocation and be
   OOM-killed with every crispyx budget still apparently satisfied. All of
-  these now read through one accessor that caps the reading by the cgroup v2
-  (``memory.max``) or v1 (``memory.limit_in_bytes``) ceiling when there is
-  one. An explicit ``memory_limit_gb`` larger than the allocation is capped
-  the same way, so passing ``memory_limit_gb=400`` to a 200 GB job no longer
-  sizes buffers for 400 GB. Nothing changes off a cgroup.
+  these now read through one accessor that resolves the process's own cgroup
+  from ``/proc/self/cgroup`` -- a Slurm job's ceiling sits several levels
+  below the hierarchy root, which publishes none at all, so reading the root
+  would have found a container's limit and never a job's -- and caps the
+  reading by the tightest cgroup v2 (``memory.max``) or v1
+  (``memory.limit_in_bytes``) ceiling on that path, less the memory the
+  cgroup already holds (reclaimable page cache excluded, so streaming a large
+  h5ad does not shrink the next chunk). An explicit ``memory_limit_gb``
+  larger than what remains is capped the same way, so passing
+  ``memory_limit_gb=400`` to a 200 GB job no longer sizes buffers for
+  400 GB. Nothing changes off a cgroup.
 * **A resumable run is warned when it is about to convert.** The temporary
   fast-axis copy lives for one call, so a computation that needs several
   restarts -- which is what ``resume=True`` is for -- rebuilds the whole copy
   on every one of them, before any new work starts. A job under a walltime
   shorter than its computation is guaranteed to hit this. ``batch_process``
-  and ``wilcoxon_test`` now emit one ``UserWarning`` when a resumable call
-  converts, pointing at ``cx.pp.convert_to_csc``; ``docs/faq.rst`` gains a
-  section on converting once for resumable or multi-step work. The copy's
-  per-call lifetime is deliberately unchanged.
+  now emits one ``UserWarning`` when a resumable call converts, pointing at
+  ``cx.pp.convert_to_csc``; ``docs/faq.rst`` gains a section on converting
+  once for resumable or multi-step work. ``wilcoxon_test`` does not warn,
+  because it refuses to resume from a checkpoint at all. The copy's per-call
+  lifetime is deliberately unchanged.
 * **Resume checkpoints shrink by ~75x.** ``batch_process`` stored its
   ``batches_used`` grid as a JSON coordinate list: at 17,978 groups x 4
   batches that is 913 KB of pretty-printed JSON, rewritten after every gene
   chunk (the interval is 1 below 100 chunks). Packed as a bitmap it is
-  12 KB. **Checkpoints written by earlier versions are not readable.** A run
-  resumed across the upgrade falls back to the existing output-file scan, so
-  no completed gene chunk is recomputed -- but ``obs['n_batches_used']`` then
-  counts only the batches seen after the resume, and a ``UserWarning`` says
-  so. It cannot be reconstructed afterwards, because the weight layer is
-  summed across batches. Finish an in-flight resumable run on the version
+  12 KB. **A checkpoint written by an earlier version keeps its gene-chunk
+  progress but loses its batch record.** A run resumed across the upgrade
+  still restarts on the first unfinished gene chunk, so nothing completed is
+  recomputed -- but ``obs['n_batches_used']`` then counts only the batches
+  seen after the resume, and a ``UserWarning`` says so. It cannot be
+  reconstructed afterwards, because the weight layer is summed across
+  batches. Finish an in-flight resumable run on the version
   that started it, or pass ``force=True`` for an exact recount.
 
 Version 0.1.3

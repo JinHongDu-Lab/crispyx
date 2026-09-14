@@ -20,7 +20,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _cgroup_memory_limit_bytes, _detected_available_bytes
+from ._memory import _cgroup_available_bytes, _detected_available_bytes
 from ._checkpoint import _create_progress_context
 from ._disk import (
     assess_bytes,
@@ -2469,9 +2469,9 @@ def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     available when it is ``None``); the other half is headroom for the
     per-chunk working set and the caller's own arrays.
 
-    Capped by the process's cgroup ceiling, so a ``memory_limit_gb`` larger
-    than the job's actual allocation cannot size these buffers past what the
-    job may use.
+    Capped by what the process's cgroup will still grant, so a
+    ``memory_limit_gb`` larger than the job's remaining allowance cannot size
+    these buffers past what the job may actually allocate.
     """
     if memory_limit_gb is None:
         try:
@@ -2483,9 +2483,9 @@ def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
             )
             memory_limit_gb = 16.0
     budget = 0.5 * float(memory_limit_gb) * 1e9
-    cgroup_limit = _cgroup_memory_limit_bytes()
-    if cgroup_limit is not None:
-        budget = min(budget, 0.5 * cgroup_limit)
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        budget = min(budget, 0.5 * cgroup_available)
     return budget
 
 

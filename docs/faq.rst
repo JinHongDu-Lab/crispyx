@@ -137,30 +137,6 @@ crispyx mitigates this for you:
   convert. Convert once yourself instead, and point every step at the
   result (see below); several steps over the same file want this anyway.
 
-Converting once, for resumable or multi-step work
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-When the same file feeds more than one gene-streaming step, or when a single
-step needs ``resume=True``, do the conversion yourself and keep it:
-
-.. code-block:: python
-
-   import crispyx as cx
-
-   half = "screen_half0.h5ad"                       # CSR, as crispyx writes
-   csc = "screen_half0_csc.h5ad"
-   cx.pp.convert_to_csc(half, output_path=csc, memory_limit_gb=160).close()
-
-   # Both steps now stream their fast axis with no per-call copy at all,
-   # and a resumed run starts on the first unfinished chunk.
-   cx.de.wilcoxon_test(csc, ..., batch_column="batch", memory_limit_gb=160)
-   cx.tl.batch_process(csc, reducer, ..., resume=True, memory_limit_gb=160)
-
-The cost is one persistent file of roughly the source's size, against one
-conversion per call per restart. On a scheduler, also budget the walltime for
-the *whole* computation rather than relying on resume to make up the
-difference.
-
 .. code-block:: python
 
    # "auto" is the default: converted when it pays off, streamed when not.
@@ -179,17 +155,35 @@ difference.
    # normalize_total_log1p takes the same four values for a CSC source.
    cx.pp.normalize_total_log1p(csc_path, out, format_mismatch_policy="convert")
 
-For a file you will reuse across several steps that want the same format --
-e.g. Wilcoxon DE *and* ``batch_process`` on the same screen -- convert it once
-up front instead, so the conversion is not repeated per call:
+Converting once, for resumable or multi-step work
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the same file feeds more than one gene-streaming step -- Wilcoxon DE
+*and* ``batch_process`` on the same screen, say -- or when a single step needs
+``resume=True``, do the conversion yourself and keep it, so it is not repeated
+per call or per restart:
 
 .. code-block:: python
 
-   cx.pp.convert_to_csc(csr_path, output_path=csc_path, memory_limit_gb=128)
+   import crispyx as cx
+
+   half = "screen_half0.h5ad"                       # CSR, as crispyx writes
+   csc = "screen_half0_csc.h5ad"
+   cx.pp.convert_to_csc(half, output_path=csc, memory_limit_gb=160).close()
    # Peak memory is bounded by memory_limit_gb (larger matrices are converted
    # in several bands, one extra pass over the source each). Also needs ~2x
    # the source file's size in free disk space during conversion; check up
-   # front with cx.estimate_disk_usage("convert_to_csc", csr_path).
+   # front with cx.estimate_disk_usage("convert_to_csc", half).
+
+   # Both steps now stream their fast axis with no per-call copy at all,
+   # and a resumed run starts on the first unfinished chunk.
+   cx.de.wilcoxon_test(csc, ..., batch_column="batch", memory_limit_gb=160)
+   cx.tl.batch_process(csc, reducer, ..., resume=True, memory_limit_gb=160)
+
+The cost is one persistent file of roughly the source's size, against one
+conversion per call per restart. On a scheduler, also budget the walltime for
+the *whole* computation rather than relying on resume to make up the
+difference.
 
 ``tomllib`` / ``tomli`` import errors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

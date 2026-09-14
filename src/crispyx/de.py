@@ -4908,10 +4908,14 @@ def wilcoxon_test(
     # that per format_mismatch_policy (temporary CSC copy beside the output
     # by default) before any X access.
     # =========================================================================
+    # No resumable= here: the guard above refuses to resume a Wilcoxon run at
+    # all, so the advice that warning gives -- convert once, because the copy
+    # is rebuilt on every restart -- would be about restarts that cannot
+    # happen. Pass it again if and when Wilcoxon resume lands.
     with stream_on_fast_axis(
         path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
         scratch_dir=output_path.parent, chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
+        memory_limit_gb=memory_limit_gb, verbose=verbose,
     ) as stream_path:
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined. Dedicated standard (memmap) path; the

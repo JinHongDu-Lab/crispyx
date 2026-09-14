@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -130,51 +131,151 @@ def _estimate_max_workers(
     return min(max_workers, cpu_count)
 
 
-#: cgroup files report an "unlimited" ceiling as a sentinel near 2**63 rather
-#: than as an absent file, so anything at or above this is treated as no limit.
+#: cgroup v1 files report an "unlimited" ceiling as a sentinel near 2**63
+#: rather than as an absent file, so anything at or above this is no limit.
 _CGROUP_UNLIMITED = 1 << 62
 
-#: Where a memory ceiling is published, newest layout first, each with the
-#: words that mean "no limit" in that layout. Patched in tests.
-_CGROUP_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("/sys/fs/cgroup/memory.max", ("max",)),                 # cgroup v2
-    ("/sys/fs/cgroup/memory/memory.limit_in_bytes", ()),     # cgroup v1
-)
+#: Where the cgroup hierarchy is mounted, and where this process's place in it
+#: is published. Module constants so a test can point them at a tree it built.
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
+_CGROUP_V2_MOUNT = "/sys/fs/cgroup"
+_CGROUP_V1_MEMORY_MOUNT = "/sys/fs/cgroup/memory"
 
 
-def _cgroup_memory_limit_bytes() -> float | None:
-    """The cgroup memory ceiling this process runs under, or ``None``.
+def _read_cgroup_int(path: Path) -> int | None:
+    """One integer from a cgroup file, or ``None`` when it cannot be used.
+
+    Absent, unreadable, and cgroup v2's ``max`` (its word for "no limit") all
+    read as ``None``; v1's ~2**63 sentinel for the same thing parses fine and
+    is rejected by the caller against :data:`_CGROUP_UNLIMITED`.
+    """
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _read_cgroup_stat(path: Path, key: str) -> int | None:
+    """The value of one ``key value`` line of a cgroup ``memory.stat``."""
+    try:
+        with open(path) as handle:
+            for line in handle:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _cgroup_memory_dirs() -> list[Path]:
+    """Every cgroup directory whose memory ceiling binds this process.
+
+    Reading the hierarchy *root* alone would find a container's limit and
+    nothing else: Docker and Kubernetes put the container in a cgroup
+    namespace, so its own cgroup *is* what ``/sys/fs/cgroup`` shows. Slurm
+    does not -- the job's ceiling sits several levels down, at
+    ``/sys/fs/cgroup/system.slice/slurmstepd.scope/job_<id>/.../memory.max``
+    (v2) or ``/sys/fs/cgroup/memory/slurm/uid_*/job_*/memory.limit_in_bytes``
+    (v1), while the root publishes no limit at all. So the process's own path
+    is resolved from ``/proc/self/cgroup``, and the whole chain up to the
+    mount is returned: a limit anywhere on it binds everything below, so the
+    effective allowance is the tightest of them, not the leaf's.
+
+    Returns leaf-first, and empty off Linux or off a cgroup.
+    """
+    dirs: list[Path] = []
+    try:
+        with open(_PROC_SELF_CGROUP) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return dirs
+    for line in lines:
+        # "<hierarchy-id>:<controllers>:<path>"; v2 is the line with no
+        # controller list, v1 publishes one line per controller group.
+        _, _, rest = line.partition(":")
+        controllers, _, relative = rest.partition(":")
+        if not relative.startswith("/"):
+            continue
+        if not controllers:
+            mount = Path(_CGROUP_V2_MOUNT)
+        elif "memory" in controllers.split(","):
+            mount = Path(_CGROUP_V1_MEMORY_MOUNT)
+        else:
+            continue
+        if not mount.is_dir():
+            continue
+        # Descend as far as the mount actually goes. In a cgroup namespace
+        # /proc/self/cgroup still names the host-side path, none of which
+        # exists under the namespaced mount, so this stops at the mount --
+        # which is exactly the container's own cgroup. Off a namespace it
+        # walks the whole way down to the leaf.
+        leaf = mount
+        for part in relative.split("/"):
+            if not part:
+                continue
+            candidate = leaf / part
+            if not candidate.is_dir():
+                break
+            leaf = candidate
+        for directory in (leaf, *leaf.parents):
+            dirs.append(directory)
+            if directory == mount:
+                break
+    return dirs
+
+
+def _cgroup_available_bytes() -> float | None:
+    """Memory this process's cgroup will still grant it, or ``None``.
 
     Slurm, Docker and Kubernetes all cap a job's memory with a cgroup, but
     ``psutil.virtual_memory()`` reports the *host's* memory. On a shared
     compute node a job allocated 200 GB can see a machine with far more than
     that free, and sizing buffers or chunks from what it sees is how an
     auto-sized run gets OOM-killed while every crispyx budget still looks
-    satisfied. Reading the ceiling costs one small file read.
+    satisfied.
+
+    What is returned is the *headroom* -- ceiling minus what the cgroup
+    already holds -- not the ceiling, because the ceiling is what the job was
+    granted in total, not what is left to allocate: a job holding 150 GB of
+    its 200 GB allocation has 50 GB for the next buffer, and budgeting 200
+    would OOM exactly as budgeting the host's free memory does. Usage counts
+    only the working set (``memory.current`` less ``inactive_file``), since
+    page cache charged to the cgroup by streaming an h5ad is reclaimed under
+    pressure rather than causing it -- subtracting it whole would collapse
+    every chunk size as soon as a large file had been read once.
     """
-    for path, unlimited_words in _CGROUP_PATHS:
-        try:
-            with open(path) as handle:
-                raw = handle.read().strip()
-        except OSError:
+    headroom: float | None = None
+    for directory in _cgroup_memory_dirs():
+        limit = _read_cgroup_int(directory / "memory.max")
+        if limit is not None:  # cgroup v2
+            usage = _read_cgroup_int(directory / "memory.current")
+            reclaimable = _read_cgroup_stat(directory / "memory.stat", "inactive_file")
+        else:  # cgroup v1
+            limit = _read_cgroup_int(directory / "memory.limit_in_bytes")
+            usage = _read_cgroup_int(directory / "memory.usage_in_bytes")
+            reclaimable = _read_cgroup_stat(
+                directory / "memory.stat", "total_inactive_file"
+            )
+        if limit is None or not 0 < limit < _CGROUP_UNLIMITED:
             continue
-        if raw in unlimited_words:
-            continue
-        try:
-            value = int(raw)
-        except ValueError:
-            continue
-        if 0 < value < _CGROUP_UNLIMITED:
-            return float(value)
-    return None
+        working_set = max(0.0, float(usage or 0) - float(reclaimable or 0))
+        free = max(0.0, float(limit) - working_set)
+        headroom = free if headroom is None else min(headroom, free)
+    return headroom
 
 
 def _detected_available_bytes() -> float:
     """Memory this process may actually use, in bytes.
 
-    ``psutil.virtual_memory().available`` capped by the cgroup ceiling. Every
-    crispyx auto-sizing path routes its host-memory reading through here so
-    that none of them can budget from memory the job's cgroup will not grant.
+    ``psutil.virtual_memory().available`` capped by what the cgroup will still
+    grant. Every crispyx auto-sizing path routes its host-memory reading
+    through here so that none of them can budget from memory the job's cgroup
+    will not hand out.
 
     Raises
     ------
@@ -184,9 +285,9 @@ def _detected_available_bytes() -> float:
     """
     import psutil
     available = float(psutil.virtual_memory().available)
-    cgroup_limit = _cgroup_memory_limit_bytes()
-    if cgroup_limit is not None:
-        available = min(available, cgroup_limit)
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        available = min(available, cgroup_available)
     return available
 
 
@@ -195,9 +296,9 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
 
     If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
     the system with ``psutil`` and fall back to 64 GB. Either way the result
-    is capped by the process's cgroup ceiling when there is one, so a budget
-    can never exceed what the job is actually allowed to use -- see
-    :func:`_cgroup_memory_limit_bytes`.
+    is capped by what the process's cgroup will still grant when there is
+    one, so a budget can never exceed what the job may actually allocate --
+    see :func:`_cgroup_available_bytes`.
 
     Parameters
     ----------
@@ -217,9 +318,9 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
         except ImportError:
             return 64 * 1e9  # conservative default
 
-    cgroup_limit = _cgroup_memory_limit_bytes()
-    if cgroup_limit is not None:
-        budget = min(budget, cgroup_limit)
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        budget = min(budget, cgroup_available)
     return budget
 
 

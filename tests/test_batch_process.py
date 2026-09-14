@@ -1419,3 +1419,108 @@ def test_resumable_run_warns_that_the_converted_copy_is_rebuilt_each_restart(tmp
             output_path=tmp_path / "resumable_csc.h5ad", **common,
         )
     result.close()
+
+
+def _write_one_batch_per_group(tmp_path: Path) -> Path:
+    """Three groups, three batches, each group present in exactly one batch."""
+    rng = np.random.default_rng(5)
+    labels: list[str] = []
+    batches: list[str] = []
+    rows: list[np.ndarray] = []
+    for index, (group, batch) in enumerate((("A", "b1"), ("B", "b2"), ("C", "b3"))):
+        rows.extend(rng.normal(loc=index, scale=0.5, size=(6, 7)))
+        labels.extend([group] * 6)
+        batches.extend([batch] * 6)
+    X = np.asarray(rows, dtype=np.float64)
+    obs = pd.DataFrame(
+        {"perturbation": labels, "batch": batches},
+        index=[f"cell_{i}" for i in range(X.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])])
+    path = tmp_path / "one_batch_per_group.h5ad"
+    ad.AnnData(sp.csr_matrix(X), obs=obs, var=var).write(path)
+    return path
+
+
+def test_restart_from_scratch_does_not_inherit_the_stale_batches_used_grid(tmp_path):
+    """A resume that restarts from scratch must recount batches, not adopt
+    the discarded run's grid.
+
+    Regression test: the checkpoint was read before the metadata check and
+    never cleared, so the branch that deletes the checkpoint and recreates
+    the output still restored `batches_used` from it -- seeding the fresh
+    run with another run's counts and re-persisting them. The grid's shape
+    check cannot catch this: it passes whenever the groups and batches are
+    unchanged, which is exactly the common mismatch case (a regenerated
+    source, or a different chunk_size).
+    """
+    path = _write_one_batch_per_group(tmp_path)
+    common = dict(
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100,
+    )
+    reference = cx.batch_process(
+        path, _moment_reducer(), output_path=tmp_path / "reference_grid.h5ad",
+        chunk_size=3, force=True, **common,
+    )
+    truth = np.asarray(reference.backed.obs["n_batches_used"]).copy()
+    reference.close()
+    assert truth.tolist() == [1, 1, 1]  # each group is in one batch only
+
+    # An earlier run under a different chunk_size, whose checkpoint claims
+    # every group used every batch.
+    output_path = tmp_path / "stale_grid.h5ad"
+    first = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        chunk_size=2, force=True, **common,
+    )
+    first.close()
+    output_path.with_suffix(".progress.json").write_text(json.dumps({
+        "total_gene_chunks": 4,
+        "last_gene_chunk": 1,
+        "batches_used": _pack_bool_matrix(np.ones((3, 3), dtype=bool)),
+        "method": "batch_process",
+        "statistic_name": "std",
+        "mode": "group",
+    }))
+
+    with pytest.warns(UserWarning, match="does not match this call's parameters"):
+        resumed = cx.batch_process(
+            path, _moment_reducer(), output_path=output_path,
+            chunk_size=3, resume=True, **common,
+        )
+    restarted = np.asarray(resumed.backed.obs["n_batches_used"]).copy()
+    resumed.close()
+    np.testing.assert_array_equal(restarted, truth)
+
+    # ... and the count it writes back into the new checkpoint is the real one.
+    reopened = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        chunk_size=3, resume=True, **common,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(reopened.backed.obs["n_batches_used"]), truth
+    )
+    reopened.close()
+
+
+def test_force_overwrites_an_unreadable_output_instead_of_raising(tmp_path):
+    """force=True must not be blocked by the output it is about to replace.
+
+    Regression test: the auto chunk_size path learned to read the stored
+    chunk_size out of an existing output whenever resume=True, before the
+    force check, so force=True on a truncated file (a run killed during the
+    placeholder write) raised out of batch_process instead of overwriting.
+    """
+    path, *_ = _write_data(tmp_path)
+    output_path = tmp_path / "truncated.h5ad"
+    output_path.write_bytes(b"\x89HDF\r\n\x1a\n truncated")
+
+    result = cx.batch_process(
+        path, _moment_reducer(), output_path=output_path,
+        groupby="perturbation", batch_column="batch", statistic_name="std",
+        cell_chunk_size=100, force=True, resume=True,
+    )
+    values = np.asarray(result.backed.X[:]).copy()
+    result.close()
+    assert np.isfinite(values).all()

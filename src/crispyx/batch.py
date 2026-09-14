@@ -689,13 +689,15 @@ def batch_process(
         n_genes = backed.n_vars
         n_batches = len(batch_ids)
 
-        if chunk_size is None and resume and resolved_output.exists():
+        if chunk_size is None and resume and not force and resolved_output.exists():
             # An auto-selected width depends on the memory budget, so resuming
             # under a different one would pick different gene-chunk
             # boundaries, fail the metadata match below, and overwrite the
             # partial output this call was asked to continue -- discarding
             # however many days of completed chunks it holds. Continue on the
-            # width that output was written with.
+            # width that output was written with. Skipped under force=True,
+            # which reads nothing from the existing output -- including when
+            # it is too damaged to open, the case force exists for.
             existing = ad.read_h5ad(resolved_output, backed="r")
             try:
                 stored_chunk_size = existing.uns.get("chunk_size")
@@ -815,6 +817,12 @@ def batch_process(
                 existing.file.close()
             if not reuse_existing_output:
                 last_completed_chunk = -1
+                # The checkpoint describes the output being discarded, so its
+                # batches_used grid does not describe the run about to start:
+                # keeping it would seed a from-scratch run with another run's
+                # batch counts (the grid's shape matches whenever groups and
+                # batches are unchanged, which is the common mismatch case).
+                checkpoint = None
                 warned_about_overwrite = True
                 _messages.warn(
                     "tl.batch_process",
