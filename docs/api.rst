@@ -116,8 +116,15 @@ to overwrite.  See :ref:`auto-reload` in the usage guide.
    :undoc-members:
    :show-inheritance:
 
-Negative binomial GLM
-~~~~~~~~~~~~~~~~~~~~~
+GLM fitting
+~~~~~~~~~~~
+
+Batched IRLS for negative binomial and Poisson GLMs.
+:class:`~crispyx.glm.NBGLMBatchFitter` fits an arbitrary dense design;
+:class:`~crispyx.glm.StructuredGLMBatchFitter` exploits the block structure of
+a ``[covariates | one-hot groups]`` design, which is the shape of every
+perturbation screen and of any design carrying a many-level categorical
+covariate.  :func:`~crispyx.glm.fit_nb_glm_batch_auto` chooses between them.
 
 .. automodule:: crispyx.glm
    :members:

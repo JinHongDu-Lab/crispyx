@@ -1,6 +1,103 @@
 Changelog
 =========
 
+Version 0.1.5
+-------------
+
+*Released 2026-09-22.*
+
+This release reworks the GLM solver. Estimates change for lowly-expressed
+genes -- toward, not away from, the reference implementations -- so results
+from 0.1.4 on covariate-adjusted or low-count genes will not reproduce
+exactly. ``nb_glm_test`` keeps its own ``min_mu`` default of 0.5, so the
+DESeq2-compatible path is unchanged.
+
+* **Negative-binomial estimates are no longer biased on lowly-expressed
+  genes.** ``min_mu`` was being applied not only as the floor on the fitted
+  mean that DESeq2 defines, but also as a clamp on the IRLS weights, on the
+  variance, and on several division guards. Clamping the weights inflates the
+  leverage of every cell whose fitted mean falls below the floor: at
+  ``mu = 0.1, alpha = 1`` the correct weight is 0.091 and the clamp made it
+  0.5. The clamped fit did not merely differ from the right answer, it solved
+  a different estimating equation: on genes below one count per cell it left a
+  score of 50-100 where the maximum likelihood estimate has a score of zero,
+  and roughly 40-100 units of excess deviance. The same fits now leave a score
+  of ~1e-6. (The score equation is used here rather than agreement with
+  another implementation because it needs no second implementation, and
+  cross-solver agreement is a poor instrument on sparse count data.)
+  ``min_mu`` now floors the fitted mean and nothing else, and its default on
+  ``NBGLMBatchFitter`` and ``NBGLMFitter`` is 0. ``nb_glm_test`` keeps its own
+  default of 0.5, so the DESeq2-compatible path is unchanged.
+* **(gene, perturbation) pairs with no counts in one arm are no longer given
+  an effect estimate.** A log-link GLM estimates the effect as a difference of
+  log means, so a pair absent from one arm has no finite effect: the
+  likelihood has no interior maximum and the coefficient runs to the boundary.
+  What was reported there came from wherever the fitter stopped, not from the
+  data -- on one such gene the effect was -18.9 with ``min_mu=0`` and -5.1 with
+  ``min_mu=0.5``, and the Wald statistic moved from 0.08 to 32.6 on identical
+  counts, that is from "no evidence" to "wildly significant" purely as an
+  artefact of the mean floor. (The collapse at ``min_mu=0`` is the
+  Hauck-Donner effect: as the coefficient diverges its standard error grows
+  faster still, so the Wald test loses power on the strongest possible
+  signal.) These pairs are now reported as untested -- ``NaN`` effect,
+  statistic and p-value -- exactly as genes with no counts anywhere already
+  were, and are excluded from the multiple-testing correction rather than
+  entering it with artefactual p-values. They are *not* reported as an effect
+  of zero, which would describe a completely silenced gene as unchanged; the
+  observation remains visible in ``pts`` and ``pts_rest``, and
+  ``lfc_shrinkage_type="apeglm"`` still gives a bounded estimate where one is
+  wanted. Controlled by the new ``nb_glm_test`` parameters
+  ``min_cells_ctrl`` and ``min_cells_pert``, both defaulting to 1 -- symmetric,
+  and the exact boundary between an effect that exists and one that does not.
+  They are separate because the informative direction depends on the screen: a
+  knockdown screen (CRISPRi) expects hits abundant in control and depleted in
+  the perturbed arm, so a demanding ``min_cells_ctrl`` beside a permissive
+  ``min_cells_pert`` is the useful setting, and an activation screen (CRISPRa)
+  wants the reverse. Set either to 0 to disable that side.
+* **Two standard-error bugs from the same cause.** ``NBGLMFitter`` floored
+  standard errors at ``sqrt(min_mu)``, forcing every reported standard error
+  to at least 0.707 at the old default, and floored the Cook's-distance
+  leverage denominator at ``min_mu``.
+* **Wide designs are two orders of magnitude faster.** The per-gene Hessian
+  was formed with a three-operand ``numpy.einsum``, which stops routing
+  through BLAS once its intermediate exceeds an internal budget and falls back
+  to a nested loop. Formed with a chunked ``gemm`` instead, ``fit_batch`` on
+  1,000 cells and 500 genes went from 16.05 s to 0.15 s at design width 41 and
+  from 35.38 s to 0.23 s at width 61; below width 21 there is no material
+  difference. Results agree to 7e-12.
+* **New:** ``StructuredGLMBatchFitter``, ``fit_glm_onehot`` and
+  ``detect_onehot_block`` for designs of the form ``[covariates | one-hot
+  groups]`` -- a perturbation screen, or any design with a many-level
+  categorical covariate. The disjoint group supports make the per-gene Hessian
+  arrowhead-structured, so each Newton step goes through the Schur complement
+  of the diagonal block: exact (verified against a dense per-gene solve to
+  1.4e-15) and much cheaper. Measured against the dense fitter at 1,200 cells
+  and 800 genes: 14.2x at 31 covariates and 200 groups, 6.2x at 12 and 100,
+  3.3x at 2 and 50, 2.5x at 12 and 20. It also converges where the dense path
+  does not -- 744 of 800 genes against 31 of 800 on the widest design --
+  because a group carrying no counts has an unbounded coefficient that the
+  group ridge and clip make finite and defined.
+* **New:** ``family="poisson"`` on ``NBGLMBatchFitter``, and
+  ``fixed_dispersion`` on ``fit_batch``. A Poisson fit is now a genuine
+  Poisson fit rather than a negative-binomial fit with a small estimated
+  dispersion.
+* **``nb_glm_test`` with a many-level categorical covariate takes the
+  structured path.** A ``batch``, ``donor`` or ``lane`` covariate is one-hot
+  encoded into the design, so this is the common case rather than an exotic
+  one. Routing is on the measured advantage -- the group columns must
+  outnumber the remaining covariates -- and the intercept and the
+  perturbation column are held out of the group block so that the coefficient
+  under test is never subject to the group clip. Log-fold-changes agree with
+  the dense path to 1e-3.
+* **The IRLS loop itself is sturdier.** Newton steps that increase a gene's
+  deviance are halved rather than accepted; converged genes are frozen and
+  dropped from later iterations; the dispersion is estimated around the IRLS
+  rather than re-estimated inside every iteration, and the model is refitted
+  with it so the returned coefficients and dispersion describe the same model;
+  and the normal equations are solved in a unit-root-mean-square column basis.
+  Convergence now requires both the relative deviance change and the largest
+  coefficient change to fall below ``tol``.
+
 Version 0.1.4
 -------------
 
