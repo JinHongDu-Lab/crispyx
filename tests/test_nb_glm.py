@@ -1176,37 +1176,6 @@ def test_numba_path_reports_the_dispersion_it_fitted_at():
     np.testing.assert_allclose(numba.se, refit.se, rtol=1e-8)
 
 
-def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
-    """A gene whose fit rests on the mean floor must still be reported.
-
-    Where the floor binds, the fitted mean of those cells no longer moves with
-    the coefficients, so they carry no gradient while the normal equations
-    still count them: IRLS proposes a direction the deviance does not fall
-    along, and the line search finds nothing to take.  That says something
-    about the floor, not about the fit, and treating it as a failure to
-    converge would hand ``de.py`` a ``NaN`` p-value for every low-count gene
-    the floor exists for.
-    """
-    rng = np.random.default_rng(5)
-    n, n_genes = 150, 80
-    x1 = (rng.random(n) < 0.06).astype(float)
-    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
-    counts = np.empty((n, n_genes))
-    for g in range(n_genes):
-        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
-        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
-
-    alpha = np.full(n_genes, 0.05)
-    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-6, min_mu=0.5)
-    beta, mu, _, converged, _ = fitter._irls_at_fixed_dispersion(
-        counts, alpha, np.zeros((3, n_genes))
-    )
-
-    on_the_floor = (mu <= 0.5 + 1e-12).any(axis=0)
-    assert on_the_floor.sum() > n_genes // 2, "fixture should exercise the floor"
-    assert converged.all()
-
-
 def _floored_fixture(seed=0, n=300, n_genes=120, alpha=0.3):
     """A screen-shaped fixture whose low-count genes rest on the ``min_mu``
     floor: a geometric expression ladder from 0.02 to 50 counts per cell."""
@@ -1227,6 +1196,66 @@ def _floored_fixture(seed=0, n=300, n_genes=120, alpha=0.3):
 
 def _floor_binds(design, offset, coef, min_mu):
     return (np.exp(design @ coef.T + offset[:, None]) <= min_mu).any(axis=0)
+
+
+def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
+    """A gene whose fit rests on the mean floor must still be reported.
+
+    Where the floor binds, the fitted mean of those cells no longer moves with
+    the coefficients, so they carry no gradient while the normal equations
+    still count them: the Newton step is not a descent direction and the line
+    search finds nothing to take.  That says something about the floor, not
+    about the fit.  Treating it as a failure to converge would hand ``de.py``
+    a ``NaN`` p-value for every low-count gene the floor exists for; freezing
+    the gene where it stands instead -- which is what judging it by how far it
+    moved amounts to -- would report a warm start as a fit.  Such genes take
+    the full Newton step and are judged by DESeq2's deviance ratio.
+    """
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    fitter = NBGLMBatchFitter(design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5)
+    result = fitter.fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3, "fixture should exercise the floor"
+    assert result.converged.all()
+    assert result.n_iter.max() < 200, "no gene should be grinding to the cap"
+
+    # Converged means a fixed point, not merely a gene that stopped moving:
+    # one more iteration from here must not move it.
+    again = fitter.fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+    np.testing.assert_allclose(again.coef, result.coef, rtol=1e-10, atol=1e-12)
+
+
+def test_floored_genes_match_pydeseq2_irls():
+    """The floor exists for DESeq2 compatibility, so that is what it is worth
+    measuring: on the genes it binds on, the coefficients must be PyDESeq2's.
+
+    Judging a floored gene by a descent test it cannot satisfy left it frozen
+    a couple of steps from the answer -- 2.8e-02 away in coefficient, against
+    1.4e-06 on the genes the floor never touches.
+    """
+    pytest.importorskip("pydeseq2")
+    from pydeseq2.utils import irls_solver
+
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    result = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha)
+
+    reference = np.array([
+        irls_solver(counts[:, g], size_factors, design, alpha[g],
+                    min_mu=0.5, beta_tol=1e-12)[0]
+        for g in range(counts.shape[1])
+    ])
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3
+    assert np.max(np.abs(result.coef[binds] - reference[binds])) < 1e-4
 
 
 def test_standard_errors_match_pydeseq2_wald_test():

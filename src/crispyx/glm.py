@@ -3597,8 +3597,22 @@ class NBGLMBatchFitter:
             # would compound the shortening and stall the gene.  A shortened
             # step is accepted only if it beats ``dev_a``, the deviance this
             # iteration started from.
+            on_floor = (
+                np.any(eta_a <= self._eta_min, axis=0)
+                if self.min_mu > 0.0
+                else np.zeros(active.size, dtype=bool)
+            )
+
+            # A gene whose fit rests on the mean floor does not take a
+            # shortened step: a floored cell's fitted mean does not move with
+            # the coefficients, so it carries no gradient while still carrying
+            # its full weight in X'WX, and no step length repairs a direction
+            # the floor has flattened.  Those genes take the full Newton step,
+            # which is what DESeq2's iteration does everywhere -- it has no
+            # line search -- and they are judged below by its deviance ratio.
             ceiling = dev_a + 1e-9 * np.abs(dev_a)
-            worse = dev_new > ceiling
+            rose = dev_new > ceiling
+            worse = rose & ~on_floor
             scale = np.maximum(np.abs(dev_a), 1e-8)
             # Smallest relative deviance increase over the steps tried, which
             # is what decides the fate of a gene that never finds an improving
@@ -3623,11 +3637,14 @@ class NBGLMBatchFitter:
                 dev_new[taken] = dev_half[take]
                 worse[taken] = False
 
-            # No step in the halving range improved these genes.  Keep the
-            # iterate they came in with -- committing the uphill step would
-            # break the monotonicity the deviance convergence test assumes --
-            # and stop working on them.
-            clipped = np.zeros_like(worse)
+            # Genes still rising after the last halving.  Off the floor that
+            # is a real stall -- the deviance is smooth there and the Newton
+            # step is a descent direction, so finding nothing means the fit
+            # has stopped moving: keep the iterate the gene came in with,
+            # since committing the uphill step would break the monotonicity
+            # the convergence test assumes, and stop working on it.  On the
+            # floor it is not a stall and the full step stands.
+            fixed_point = rose & on_floor
             if np.any(worse):
                 keep = np.flatnonzero(worse)
                 beta_new[:, keep] = beta_a[:, keep]
@@ -3635,8 +3652,6 @@ class NBGLMBatchFitter:
                 mu_new[:, keep] = mu_a[:, keep]
                 dev_new[keep] = dev_a[keep]
                 stalled[active[keep]] = True
-                if self.min_mu > 0.0:
-                    clipped = np.any(eta_a <= self._eta_min, axis=0)
 
             relative_change = np.abs(dev_new - dev_a) / scale
             coef_change = np.max(np.abs(beta_new - beta_a), axis=0)
@@ -3651,21 +3666,19 @@ class NBGLMBatchFitter:
             # failure the damping exists to prevent.  It is judged instead by
             # the steps it refused: converged only if none of them could lower
             # the deviance by more than ``tol``.
-            # A gene that took no step moved nowhere, so judging it by how
-            # far it moved would call every stalled gene converged -- the
-            # failure the damping exists to prevent.  It is judged instead by
-            # the steps it refused: converged only if none of them could lower
-            # the deviance by more than ``tol``.  Cells on the fitted-mean
-            # floor are the exception: their mean does not move with the
-            # coefficients so they carry no gradient, yet the normal equations
-            # still count them, and the line search then describes the floor
-            # rather than the fit.  A gene at the ``ETA_MIN``/``ETA_MAX``
-            # clips gets no such exemption -- it is diverging, and saying so
-            # is the useful answer.
-            converged[active] = np.where(
-                worse,
-                (excess < self.tol) | clipped,
-                (relative_change < self.tol) & (coef_change < self.tol),
+            # DESeq2's deviance ratio for the genes the floor is holding, the
+            # descent test for the rest.  The ratio is paired with the same
+            # coefficient-change test the other branch uses: on its own it can
+            # fire on the first step, when a warm start happens to leave the
+            # deviance flat while the coefficients are still moving.
+            converged[active] = np.select(
+                [fixed_point, worse],
+                [
+                    (np.abs(dev_new - dev_a) / (np.abs(dev_new) + 0.1) < self.tol)
+                    & (coef_change < self.tol),
+                    excess < self.tol,
+                ],
+                default=(relative_change < self.tol) & (coef_change < self.tol),
             )
 
             active = np.flatnonzero(~converged & ~stalled)
@@ -5406,8 +5419,18 @@ class StructuredGLMBatchFitter:
             new_mu = np.exp(new_eta)
             new_deviance = deviance_fn.total(new_eta, new_mu)
 
+            on_floor = (
+                np.any(eta_a <= self._eta_min, axis=0)
+                if self.min_mu > 0.0
+                else np.zeros(active.size, dtype=bool)
+            )
+
+            # See NBGLMBatchFitter._irls_at_fixed_dispersion: a gene resting
+            # on the mean floor takes the full Newton step rather than a
+            # shortened one, and is judged by the deviance ratio.
             ceiling = deviance_a + 1e-9 * np.abs(deviance_a)
-            worse = new_deviance > ceiling
+            rose = new_deviance > ceiling
+            worse = rose & ~on_floor
             scale = np.maximum(np.abs(deviance_a), 1e-8)
             excess = (new_deviance - deviance_a) / scale
             step = 1.0
@@ -5433,7 +5456,7 @@ class StructuredGLMBatchFitter:
                 new_deviance[taken] = half_deviance[take]
                 worse[taken] = False
 
-            clipped = np.zeros_like(worse)
+            fixed_point = rose & on_floor
             if np.any(worse):
                 keep = np.flatnonzero(worse)
                 new_features[keep] = features_a[keep]
@@ -5442,8 +5465,6 @@ class StructuredGLMBatchFitter:
                 new_mu[:, keep] = mu_a[:, keep]
                 new_deviance[keep] = deviance_a[keep]
                 stalled[active[keep]] = True
-                if self.min_mu > 0.0:
-                    clipped = np.any(eta_a <= self._eta_min, axis=0)
 
             relative_change = np.abs(new_deviance - deviance_a) / scale
             coef_change = np.maximum(
@@ -5459,13 +5480,17 @@ class StructuredGLMBatchFitter:
             n_iter[active] = iteration
             # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
             # that took no step is judged by the steps it refused.
-            # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
-            # that took no step is judged by the steps it refused, and why a
-            # gene with clipped cells is exempt from that judgement.
-            converged[active] = np.where(
-                worse,
-                (excess < self.tol) | clipped,
-                (relative_change < self.tol) & (coef_change < self.tol),
+            converged[active] = np.select(
+                [fixed_point, worse],
+                [
+                    (
+                        np.abs(new_deviance - deviance_a)
+                        / (np.abs(new_deviance) + 0.1) < self.tol
+                    )
+                    & (coef_change < self.tol),
+                    excess < self.tol,
+                ],
+                default=(relative_change < self.tol) & (coef_change < self.tol),
             )
 
             active = np.flatnonzero(~converged & ~stalled)
