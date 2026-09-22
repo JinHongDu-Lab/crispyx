@@ -4,8 +4,6 @@ Changelog
 Version 0.1.5
 -------------
 
-*Released 2026-09-22.*
-
 This release reworks the GLM solver. Estimates change for lowly-expressed
 genes -- toward, not away from, the reference implementations -- so results
 from 0.1.4 on covariate-adjusted or low-count genes will not reproduce
@@ -49,11 +47,9 @@ DESeq2-compatible path is unchanged.
   wanted. Controlled by the new ``nb_glm_test`` parameters
   ``min_cells_ctrl`` and ``min_cells_pert``, both defaulting to 1 -- symmetric,
   and the exact boundary between an effect that exists and one that does not.
-  They are separate because the informative direction depends on the screen: a
-  knockdown screen (CRISPRi) expects hits abundant in control and depleted in
-  the perturbed arm, so a demanding ``min_cells_ctrl`` beside a permissive
-  ``min_cells_pert`` is the useful setting, and an activation screen (CRISPRa)
-  wants the reverse. Set either to 0 to disable that side.
+  They are separate because the informative direction depends on the screen;
+  ``crispyx._statistics._nonestimable_glm_mask`` documents which asymmetry
+  suits CRISPRi and which suits CRISPRa. Set either to 0 to disable that side.
 * **Two standard-error bugs from the same cause.** ``NBGLMFitter`` floored
   standard errors at ``sqrt(min_mu)``, forcing every reported standard error
   to at least 0.707 at the old default, and floored the Cook's-distance
@@ -90,13 +86,79 @@ DESeq2-compatible path is unchanged.
   under test is never subject to the group clip. Log-fold-changes agree with
   the dense path to 1e-3.
 * **The IRLS loop itself is sturdier.** Newton steps that increase a gene's
-  deviance are halved rather than accepted; converged genes are frozen and
-  dropped from later iterations; the dispersion is estimated around the IRLS
-  rather than re-estimated inside every iteration, and the model is refitted
-  with it so the returned coefficients and dispersion describe the same model;
-  and the normal equations are solved in a unit-root-mean-square column basis.
-  Convergence now requires both the relative deviance change and the largest
-  coefficient change to fall below ``tol``.
+  deviance are shortened rather than accepted (see below); converged genes are
+  frozen and dropped from later iterations; the dispersion is estimated around
+  the IRLS rather than re-estimated inside every iteration, and the model is
+  refitted with it so the returned coefficients and dispersion describe the
+  same model; and the normal equations are solved in a unit-root-mean-square
+  column basis. Convergence now requires both the relative deviance change and
+  the largest coefficient change to fall below ``tol``.
+* **Step shortening does what it says, and the convergence flag means what it
+  says.** Each retry interpolates between the current iterate and the full
+  Newton point, halving the distance, and a shortened step is taken only if it
+  improves on the deviance the iteration started from. Interpolating towards
+  the previously shortened point instead compounds the shortening -- the third
+  retry lands at ``2^-6`` of the step rather than ``2^-3`` -- so a gene needing
+  repeated damping stops moving and is then reported as converged *because*
+  nothing moved, at a point that is not a stationary point of the deviance;
+  ``de.py`` gates on that flag. A gene for which no step in the range improves
+  the deviance is now left where it was and reported as not converged, rather
+  than being moved uphill. The exception is a gene resting on the ``min_mu``
+  floor: the floored cells' means no longer move with the coefficients, so
+  they carry no gradient while the normal equations still count them, and the
+  line search finding nothing to take describes the floor rather than the fit.
+  Such a gene is still reported. A gene that reaches the ``eta`` divergence
+  clips is not exempted, because there "not converged" is the useful answer.
+* **The Numba path for the intercept-plus-perturbation design fits at the
+  dispersion it reports.** The kernel holds the dispersion fixed, and it was
+  being given a placeholder of 0.1 while the dispersion reported beside the
+  result came from a separate estimate made afterwards. On that design the
+  coefficients are the two group means whatever the dispersion is, but the
+  standard errors are not: measured on an overdispersed fixture the reported
+  standard errors were up to 3.9x too small, so every Wald statistic built on
+  them was up to 3.9x too large. The kernel is now run twice, as the
+  NumPy path already was -- once at the dispersion the warm-start means imply,
+  then at the dispersion the fitted means imply -- and its standard errors now
+  match a fit at the reported dispersion to 5e-15.
+* **The negative-binomial deviance no longer loses its value to
+  cancellation.** It was formed as the difference of ``(y + r) log(y + r)``
+  and ``(y + r) log(mu + r)``, each of order ``r n log r``. At the ``alpha``
+  clip floor ``r`` is 1e8, so for a near-Poisson gene the answer was the small
+  difference of two very large sums: the absolute error was 0.1 at 3,000 cells
+  and 182 at 100,000, against a deviance of ~1e5. That is far above the
+  ``1e-6`` relative tolerance the convergence test uses, so such a gene could
+  never converge and its damping was triggered by noise. Evaluated as
+  ``(y + r) log1p((mu - y) / (y + r))`` the same quantities are accurate to
+  7e-7 at 100,000 cells.
+* **``ridge_penalty`` means the same thing whatever the design's column
+  scales.** The normal equations are solved in a preconditioned basis, where a
+  ridge of ``r`` penalises the caller's coefficient ``j`` by
+  ``r * scale_j**2``. The penalty is now divided by the column scale, so a
+  caller who sets ``ridge_penalty`` deliberately gets the penalty they asked
+  for. No effect at the 1e-6 default.
+* **``StructuredGLMBatchFitter.fit_batch`` fits genes in batches**, with a
+  ``gene_batch_size`` argument that matches ``NBGLMBatchFitter``'s and
+  defaults to sizing the ``(n_samples, batch)`` work arrays for ~100 MB. A
+  Newton step holds a dozen of them, which at 3,000 cells and 8,563 genes was
+  around 2 GB. Batching changes nothing numerically beyond the summation order
+  BLAS chooses. The starting point also no longer depends on the design having
+  an exact column of ones: the constant column carries the starting predictor
+  and ``eta`` is derived from the coefficients, so a design with no such
+  column starts from a point its coefficients describe.
+* **Less discarded work in the structured solver.** The negative-binomial path
+  ran a full Poisson fit and an intermediate NB fit only for their fitted
+  means, and computed -- then threw away -- the per-gene standard errors of
+  both; neither now forms them. ``schur_solve`` re-formed the two
+  ``(n_genes, n_features, n_groups)`` arrays that ``schur_complement`` had
+  just built, and the IRLS loops copied the counts of the active gene set
+  twice per iteration, including on the first iteration where the active set
+  is every gene.
+* **``pts`` and ``pts_rest`` are reported for every gene**, not only for the
+  genes an effect was estimated for. They are descriptions of the data rather
+  than inferences from a fit, and they are what makes a pair whose effect is
+  not estimable -- a complete knockdown, expressed in 95% of control cells and
+  none of the perturbed ones -- visible in the output, which the filtering
+  documentation already said they were.
 
 Version 0.1.4
 -------------

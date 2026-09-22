@@ -1705,34 +1705,19 @@ def nb_glm_test(
     min_cells_ctrl, min_cells_pert
         Minimum number of expressing cells required in the control and
         perturbed arms for a (gene, perturbation) pair to be tested. Both
-        default to ``1``.
+        default to ``1``: a pair with no counts at all in one arm has no
+        finite effect to estimate, so it is reported as untested (``NaN``
+        effect, statistic and p-value) and excluded from the multiple-testing
+        correction rather than given a bound-determined estimate. See
+        :func:`crispyx._statistics._nonestimable_glm_mask` for why, and for
+        why the two sides are set separately (CRISPRi and CRISPRa want
+        opposite asymmetries). Set either to ``0`` to disable that side.
 
-        A log-link GLM estimates the effect as a difference of log means, so a
-        pair with no counts at all in one arm has no finite effect: the
-        likelihood has no interior maximum and the coefficient runs to the
-        boundary. What a fitter reports there is set by where it stopped
-        rather than by the data -- on one such gene the fitted effect was
-        -18.9 at ``min_mu=0`` and -5.1 at ``min_mu=0.5``, with the Wald
-        statistic moving from 0.08 to 32.6 on identical counts. Those pairs
-        are reported as untested (``NaN`` effect, statistic and p-value), as
-        genes with no counts anywhere already are, and are excluded from the
-        multiple-testing correction.
-
-        This is deliberately *not* an effect of zero, which would describe a
-        completely silenced gene as unchanged. The observation survives in
-        ``pts`` and ``pts_rest``: a pair expressed in 0% of perturbed and 95%
-        of control cells is plainly visible there. For a finite estimate on
-        such pairs use ``lfc_shrinkage_type="apeglm"``, whose prior keeps the
-        coefficient bounded.
-
-        The two are separate because the informative direction depends on the
-        screen. A knockdown screen (CRISPRi) expects hits abundant in control
-        and depleted in the perturbed arm, so a demanding ``min_cells_ctrl``
-        beside a permissive ``min_cells_pert`` is the useful setting; an
-        activation screen (CRISPRa) wants the reverse. The default of 1 is
-        both symmetric and the exact boundary between an effect that exists
-        and one that does not, so a value below 1 does not weaken the filter,
-        it readmits the artefact. Set either to ``0`` to disable that side.
+        The observation itself is not lost: ``pts`` and ``pts_rest`` are
+        populated for every gene, so a pair expressed in 0% of perturbed and
+        95% of control cells is plainly visible there. For a finite effect
+        estimate on such pairs use ``lfc_shrinkage_type="apeglm"``, whose
+        prior keeps the coefficient bounded.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type

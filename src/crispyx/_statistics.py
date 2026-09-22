@@ -410,23 +410,22 @@ def _nonestimable_glm_mask(
     A log-link GLM estimates the perturbation effect as
     ``log(mean_perturbed) - log(mean_control)``.  When one arm carries no
     counts at all that quantity is infinite: the likelihood has no interior
-    maximum and the coefficient runs to the boundary.  Whatever the fitter
-    then reports is set by where it was stopped, not by the data.  Measured on
-    a gene with 100 perturbed cells and zero counts among them, the fitted
-    effect was -18.9 with ``min_mu=0`` and -5.1 with ``min_mu=0.5`` -- the same
-    data giving answers that differ by a factor of four -- and the Wald
-    statistic went from 0.08 to 32.6, that is from "no evidence" to "wildly
-    significant", purely as an artefact of the mean floor.  (The collapse at
-    ``min_mu=0`` is the Hauck-Donner effect: as the coefficient diverges its
-    standard error grows faster than it does, so the Wald statistic tends to
-    zero on what is the strongest possible signal.)
+    maximum and the coefficient runs to the boundary, so whatever the fitter
+    reports is set by where it was stopped, not by the data.  On one such gene
+    the fitted effect moved by a factor of four with the ``min_mu`` floor
+    alone, and the Wald statistic went from "no evidence" to "wildly
+    significant" on identical counts.  (The first of those is the
+    Hauck-Donner effect: as the coefficient diverges its standard error grows
+    faster still, so the Wald statistic tends to zero on what is the strongest
+    possible signal.)
 
     Such pairs are therefore reported as untested -- ``NaN`` effect, statistic
     and p-value -- exactly as genes with no counts anywhere already are.  This
     is not the same as reporting an effect of zero, which would say "no
     change" about a gene the perturbation may have silenced completely.  The
-    observation itself is preserved in ``pts`` and ``pts_rest``, where a pair
-    expressed in 0% of perturbed and 95% of control cells is plainly visible.
+    observation itself is preserved in ``pts`` and ``pts_rest``, which are
+    populated for every gene, so a pair expressed in 0% of perturbed and 95%
+    of control cells stays visible there.
 
     This complements :func:`_low_expr_in_both_mask`, which drops pairs that are
     jointly low in *both* arms.  A pair that is absent from one arm and
