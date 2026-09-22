@@ -1738,9 +1738,9 @@ def nb_glm_test(
 
         The observation itself is not lost: ``pts`` and ``pts_rest`` are
         populated for every gene, so a pair expressed in 0% of perturbed and
-        95% of control cells is plainly visible there. For a finite effect
-        estimate on such pairs use ``lfc_shrinkage_type="apeglm"``, whose
-        prior keeps the coefficient bounded.
+        95% of control cells is plainly visible there. ``lfc_shrinkage_type``
+        does not change this: an excluded pair is dropped before any fit, so
+        it stays ``NaN`` under ``"apeglm"`` as well.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -2804,8 +2804,13 @@ def nb_glm_test(
             # Build mle_coef matrix (n_params, n_genes) from batch_result
             n_params = 2  # Intercept + perturbation
             mle_coef = np.full((n_params, n_genes), np.nan, dtype=np.float64)
-            mle_coef[0, :] = batch_result.coef[:, 0]  # Intercept
-            mle_coef[1, :] = batch_result.coef[:, 1]  # LFC
+            # Only the genes that were actually fitted have an MLE to shrink.
+            # ``batch_result.coef`` is zero-initialised, so handing it over
+            # whole would give apeGLM a finite starting point for a pair the
+            # filters excluded and return a finite effect for it; the NaN left
+            # here is what the rest of the result already reports for those.
+            mle_coef[0, valid_converged_mask] = batch_result.coef[valid_converged_mask, 0]
+            mle_coef[1, valid_converged_mask] = batch_result.coef[valid_converged_mask, 1]
             
             # Build combined count matrix (control + perturbation)
             if sp.issparse(group_matrix):

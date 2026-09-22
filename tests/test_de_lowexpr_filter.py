@@ -703,6 +703,41 @@ def test_effect_is_never_reported_as_zero_for_an_excluded_pair(tmp_path):
     assert not (lfc[silenced] == 0.0), "an excluded effect must be NaN, not zero"
 
 
+@pytest.mark.parametrize("use_control_cache", [True, False], ids=["cached", "uncached"])
+def test_shrinkage_does_not_resurrect_an_excluded_pair(tmp_path, use_control_cache):
+    """apeGLM shrinks the pairs that were fitted; it does not fit the rest.
+
+    An excluded pair is dropped before any fit, so it has no MLE to shrink.
+    The cached worker handed the shrinkage its zero-initialised coefficients
+    anyway, which came back as a finite effect beside a NaN p-value -- and on
+    both workers the standard error of an untested gene was replaced by the
+    literal 1.0 the per-gene fallback returns.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, data_name=f"apeglm_{use_control_cache}",
+        lfc_shrinkage_type="apeglm", use_control_cache=use_control_cache,
+        verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+    se = np.asarray(ad.read_h5ad(res.result_path).layers["standard_error"]).ravel()
+
+    for gene in ("silenced", "induced", "empty", "sparse_one_sided"):
+        i = index.get(gene)
+        if i is None:
+            continue  # dropped upstream, which is also "not reported"
+        assert np.isnan(pval[i]), f"{gene} should have no p-value"
+        assert np.isnan(lfc[i]), f"{gene} should have no effect estimate under shrinkage"
+        assert np.isnan(se[i]), f"{gene} should have no standard error, not {se[i]}"
+
+    normal = index["normal"]
+    assert np.isfinite(lfc[normal]), "shrinkage must still report the tested genes"
+    assert np.isfinite(se[normal]) and se[normal] > 0
+
+
 def test_min_cells_per_arm_zero_restores_the_previous_behaviour(tmp_path):
     path, names = _separation_adata(tmp_path)
     from crispyx.de import nb_glm_test

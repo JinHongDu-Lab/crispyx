@@ -2096,7 +2096,9 @@ def _fit_gene_apeglm_lbfgsb(
     tol : float
         Convergence tolerance.
     mle_se_j : float
-        MLE standard error for fallback.
+        MLE standard error, returned unchanged whenever this function does not
+        fit the gene.  ``NaN`` there means the gene was never tested, and it
+        stays ``NaN`` rather than becoming a number that looks like a result.
         
     Returns
     -------
@@ -2113,7 +2115,7 @@ def _fit_gene_apeglm_lbfgsb(
     
     # Skip genes with invalid data
     if not np.isfinite(disp) or disp <= 0 or not np.all(np.isfinite(beta_init)):
-        return beta_init, mle_se_j if np.isfinite(mle_se_j) else 1.0, False
+        return beta_init, mle_se_j, False
     
     # Safety check for very low dispersion genes (near-Poisson behavior)
     # With very low dispersion, the NB likelihood becomes flat and optimization
@@ -2121,7 +2123,7 @@ def _fit_gene_apeglm_lbfgsb(
     # it uses per-comparison dispersion which produces more reasonable estimates.
     # For genes with disp < 0.01 and small MLE LFC, return MLE (no shrinkage).
     if disp < 0.01 and abs(beta_init[shrink_index]) < 1.0:
-        return beta_init, mle_se_j if np.isfinite(mle_se_j) else 1.0, True
+        return beta_init, mle_se_j, True
     
     size = 1.0 / disp  # NB size parameter (r in NB(r, p))
     
@@ -2258,7 +2260,7 @@ def _fit_gene_apeglm_lbfgsb(
         inv_hess = np.linalg.inv(XtWX)
         se_map = np.sqrt(max(inv_hess[shrink_index, shrink_index], 1e-10))
     except (np.linalg.LinAlgError, ValueError):
-        se_map = mle_se_j if np.isfinite(mle_se_j) else 1.0
+        se_map = mle_se_j
     
     return beta_map, se_map, converged
 

@@ -27,6 +27,10 @@ DESeq2-compatible path is unchanged.
   as 0.0 or 1.0 to mean "untested". Because a ``NaN`` p-value does not enter
   the Benjamini-Hochberg denominator, adjusted p-values on the genes that
   *were* tested get slightly smaller; that is the correct denominator.
+  ``nb_glm_test`` had one such number left of its own: with
+  ``lfc_shrinkage_type="apeglm"``, an untested gene's standard error was
+  reported as the literal 1.0 that the per-gene shrinkage falls back to. It is
+  ``NaN`` there now as well.
 * **``pts`` and ``pts_rest`` survive the filters.** The Wilcoxon paths zeroed
   the fractions of expressing cells for excluded genes, which is exactly the
   information needed to see that a gene absent from one arm was excluded at
@@ -72,12 +76,13 @@ DESeq2-compatible path is unchanged.
   were, and are excluded from the multiple-testing correction rather than
   entering it with artefactual p-values. They are *not* reported as an effect
   of zero, which would describe a completely silenced gene as unchanged; the
-  observation remains visible in ``pts`` and ``pts_rest``, and
-  ``lfc_shrinkage_type="apeglm"`` still gives a bounded estimate where one is
-  wanted. Controlled by the new ``nb_glm_test`` parameters
-  ``min_cells_ctrl`` and ``min_cells_pert``, both defaulting to 1 -- symmetric,
-  and the exact boundary between an effect that exists and one that does not.
-  They are separate because the informative direction depends on the screen;
+  observation remains visible in ``pts`` and ``pts_rest``. Shrinkage does not
+  reach them either -- an excluded pair is dropped before any fit, so it stays
+  ``NaN`` under ``lfc_shrinkage_type="apeglm"`` too. Controlled by the new
+  ``nb_glm_test`` parameters ``min_cells_ctrl`` and ``min_cells_pert``, both
+  defaulting to 1 -- symmetric, and the exact boundary between an effect that
+  exists and one that does not. They are separate because the informative
+  direction depends on the screen;
   ``crispyx._statistics._nonestimable_glm_mask`` documents which asymmetry
   suits CRISPRi and which suits CRISPRa. Set either to 0 to disable that side.
 * **Two standard-error bugs from the same cause.** ``NBGLMFitter`` floored
