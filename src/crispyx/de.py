@@ -2192,8 +2192,14 @@ def nb_glm_test(
             out=np.zeros(n_genes, dtype=np.float32),
             where=group_n > 0,
         )
-        result["pts"] = np.where(valid_mask, pts, 0.0).astype(np.float32)
-        result["pts_rest"] = np.where(valid_mask, pts_rest_shared, 0.0).astype(np.float32)
+        # Fractions of expressing cells are descriptions of the data, not
+        # inferences from a fit, so they are reported for every gene including
+        # the ones no effect is estimated for.  A pair expressed in 0% of
+        # perturbed and 95% of control cells is a complete knockdown whose
+        # effect is not estimable (see _nonestimable_glm_mask); zeroing these
+        # would leave nothing to see it by.
+        result["pts"] = pts.astype(np.float32)
+        result["pts_rest"] = pts_rest_shared.astype(np.float32)
 
         # Compute mean expression
         if sp.issparse(subset_matrix):
@@ -2469,7 +2475,9 @@ def nb_glm_test(
             out=np.zeros(n_genes, dtype=np.float32),
             where=group_n > 0,
         )
-        result["pts"] = np.where(valid_mask, pts, 0.0).astype(np.float32)
+        # Reported for every gene; see the matching comment in the uncached
+        # path.
+        result["pts"] = pts.astype(np.float32)
         
         # Compute mean expression
         subset_size_factors_group = np.asarray(size_factors)[group_mask]

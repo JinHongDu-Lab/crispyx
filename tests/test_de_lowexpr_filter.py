@@ -662,6 +662,33 @@ def test_excluded_pairs_keep_their_expression_evidence(tmp_path):
     assert pts_rest[induced] == pytest.approx(0.0)
 
 
+def test_excluded_pairs_keep_their_expression_evidence_without_the_control_cache(tmp_path):
+    """The same, on the path that does not use the cached control statistics.
+
+    That path built ``pts`` and ``pts_rest`` behind the validity mask, so the
+    evidence the documentation points at for an excluded pair -- 0% of
+    perturbed cells against 95% of control cells -- was zeroed away on
+    precisely the pairs it was there for.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, use_control_cache=False, verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+
+    silenced = index["silenced"]
+    assert np.isnan(pval[silenced]), "the pair is still untested"
+    assert pts[silenced] == pytest.approx(0.0)
+    assert pts_rest[silenced] > 0.9, "the control arm's expression must remain visible"
+
+    induced = index["induced"]
+    assert pts[induced] > 0.9
+    assert pts_rest[induced] == pytest.approx(0.0)
+
+
 def test_effect_is_never_reported_as_zero_for_an_excluded_pair(tmp_path):
     """Reporting 0 would describe a silenced gene as unchanged."""
     path, names = _separation_adata(tmp_path)
