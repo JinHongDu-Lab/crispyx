@@ -153,6 +153,41 @@ DESeq2-compatible path is unchanged.
   just built, and the IRLS loops copied the counts of the active gene set
   twice per iteration, including on the first iteration where the active set
   is every gene.
+* **Where the ``min_mu`` floor binds, IRLS is run as the fixed-point iteration
+  it is.** A cell held at the fitted-mean floor has ``d mu / d beta = 0``: it
+  contributes nothing to the gradient of the deviance while still contributing
+  its full weight to ``X'WX``, so the Newton step solves one model while the
+  deviance measures another and can point uphill at a good fit. The line
+  search above is the wrong instrument for those genes, and no step length
+  repairs the direction. They now take the full Newton step and are judged by
+  DESeq2's own criterion, ``|dev - dev_old| / (|dev| + 0.1) < tol``, paired
+  with the usual coefficient-change test -- which is what DESeq2, and
+  crispyx's own Numba kernel, have always done. A gene with floored cells that
+  is descending normally keeps the strict test; the floor only decides what a
+  *failed* step means. Measured against PyDESeq2, coefficients on
+  floor-binding genes go from 2.8e-02 away to under 1e-06, every gene
+  converges where one to four used to fall short, the 200-iteration cap stops
+  being reached, and ``min_mu=0.5`` is no longer slower than ``min_mu=0``.
+  On a covariate-adjusted run of a real screen (Adamson, 9,496 genes) this
+  returns 103 genes per perturbation that were being reported as ``NaN``, at
+  3.4 s against 5.7 s. They are not marginal genes -- their median ``pts``
+  in the control arm is 0.69 against 0.30 for the genes already reported, and
+  44 of them reach ``padj < 0.05``. Genes reported before are unchanged to
+  within 2e-05 in log-fold-change.
+* **``min_mu`` no longer reaches the reported standard errors.** The floor
+  steadies the iteration; it is not part of the model whose uncertainty is
+  reported, and DESeq2 keeps it out -- ``irls_solver`` returns an
+  unthresholded ``mu`` and ``wald_test`` rebuilds the weights from it.
+  crispyx built them from the floored mean, which overstates how much a
+  floored cell knows: against PyDESeq2's ``wald_test`` on identical
+  coefficients the standard errors on floor-binding genes were a median of
+  24% and at worst 35% too small, and the Wald statistics correspondingly too
+  large. Rebuilt from the unfloored mean they agree to 0.00%. The weights
+  inside the iteration and the leverage behind Cook's distance keep the floor,
+  as DESeq2 does. This affects ``nb_glm_test`` with covariates, the structured
+  solver and the fitter API; a two-group comparison without covariates already
+  recomputed its standard errors without the floor and is unchanged.
+
 * **``pts`` and ``pts_rest`` are reported for every gene**, not only for the
   genes an effect was estimated for. They are descriptions of the data rather
   than inferences from a fit, and they are what makes a pair whose effect is
