@@ -172,8 +172,13 @@ DESeq2-compatible path is unchanged.
   returns 103 genes per perturbation that were being reported as ``NaN``, at
   3.4 s against 5.7 s. They are not marginal genes -- their median ``pts``
   in the control arm is 0.69 against 0.30 for the genes already reported, and
-  44 of them reach ``padj < 0.05``. Genes reported before are unchanged to
-  within 2e-05 in log-fold-change.
+  44 of them reach ``padj < 0.05``, taking that comparison's hit list from
+  2,094 to 2,150. A gene that did not converge was previously given no result
+  at all -- ``NaN`` effect, statistic, p-value, log-fold-change and standard
+  error -- and was left out of the multiple-testing correction, so this is a
+  change to what is tested, not only to what is estimated. Genes reported
+  before are unchanged to within 2e-05 in log-fold-change, and their adjusted
+  p-values move by a median of -0.3% from the larger correction.
 * **``min_mu`` no longer reaches the reported standard errors.** The floor
   steadies the iteration; it is not part of the model whose uncertainty is
   reported, and DESeq2 keeps it out -- ``irls_solver`` returns an
@@ -187,6 +192,14 @@ DESeq2-compatible path is unchanged.
   as DESeq2 does. This affects ``nb_glm_test`` with covariates, the structured
   solver and the fitter API; a two-group comparison without covariates already
   recomputed its standard errors without the floor and is unchanged.
+
+  End to end through ``nb_glm_test`` the effect is much smaller than those
+  figures suggest, because the dispersion is re-estimated after the fit and
+  absorbs most of the change: on the Adamson run above, p-values for genes
+  reported both before and after moved by a median factor of 1.0000 (10th to
+  90th percentile 0.97 to 1.02), 7 genes lost significance and 19 gained it.
+  The larger figures are what you see with the dispersion held fixed, which is
+  the right way to size the defect but not the change a user sees.
 
 * **``pts`` and ``pts_rest`` are reported for every gene**, not only for the
   genes an effect was estimated for. They are descriptions of the data rather
