@@ -62,6 +62,41 @@ def dense_design(design, groups):
 # the structural claim
 # --------------------------------------------------------------------------
 
+def test_overlapping_group_columns_are_rejected_when_sparse():
+    """The disjointness the whole derivation rests on is checked either way.
+
+    The dense branch raised; the sparse branch silently kept whichever group
+    came last, so ``G'WG`` was not diagonal and the "exact" solve quietly
+    stopped being exact.
+    """
+    dense = np.zeros((4, 2))
+    dense[0, 0] = 1.0
+    dense[1, :] = 1.0  # one cell in two groups
+    dense[2, 1] = 1.0
+
+    with pytest.raises(ValueError, match="disjoint"):
+        OneHotGroups(dense)
+    with pytest.raises(ValueError, match="disjoint"):
+        OneHotGroups(sps.csr_matrix(dense))
+
+
+def test_a_stored_zero_is_not_group_membership():
+    """Sparse membership is the value, not the sparsity pattern."""
+    dense = np.zeros((3, 2))
+    dense[0, 0] = 1.0
+    dense[2, 1] = 1.0
+    # Cell 1 is explicitly stored as a zero in group 0: not a member.
+    sparse = sps.csc_matrix(
+        (np.array([1.0, 0.0, 1.0]), np.array([0, 1, 2]), np.array([0, 2, 3])),
+        shape=(3, 2),
+    )
+    np.testing.assert_array_equal(sparse.toarray(), dense)
+
+    np.testing.assert_array_equal(
+        OneHotGroups(sparse).labels, OneHotGroups(dense).labels
+    )
+
+
 def test_group_block_of_the_hessian_is_diagonal():
     """The premise: disjoint supports make G'WG diagonal."""
     counts, design, groups, _, _, _ = make_screen()

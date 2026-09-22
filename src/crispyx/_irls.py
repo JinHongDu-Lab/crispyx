@@ -328,10 +328,16 @@ class OneHotGroups:
         if sp.issparse(groups):
             matrix = groups.tocsc()
             n, a = matrix.shape
+            # Stored zeros are not membership, so they are dropped before the
+            # supports are compared -- without this an explicit zero would put
+            # a cell in a group it does not belong to.
+            stored = matrix.data != 0
+            rows = matrix.indices[stored]
+            cols = np.repeat(np.arange(a), np.diff(matrix.indptr))[stored]
+            if np.any(np.bincount(rows, minlength=n) > 1):
+                raise ValueError("group columns must have disjoint supports")
             labels = np.full(n, -1, dtype=np.int64)
-            for k in range(a):
-                rows = matrix.indices[matrix.indptr[k]:matrix.indptr[k + 1]]
-                labels[rows] = k
+            labels[rows] = cols
         else:
             dense = np.asarray(groups)
             if dense.ndim != 2:
