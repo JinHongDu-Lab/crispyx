@@ -1205,3 +1205,74 @@ def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
     on_the_floor = (mu <= 0.5 + 1e-12).any(axis=0)
     assert on_the_floor.sum() > n_genes // 2, "fixture should exercise the floor"
     assert converged.all()
+
+
+def _floored_fixture(seed=0, n=300, n_genes=120, alpha=0.3):
+    """A screen-shaped fixture whose low-count genes rest on the ``min_mu``
+    floor: a geometric expression ladder from 0.02 to 50 counts per cell."""
+    rng = np.random.default_rng(seed)
+    design = np.column_stack([
+        np.ones(n), (rng.random(n) < 0.3).astype(float), rng.normal(0, 1, n)
+    ])
+    size_factors = np.exp(rng.normal(0, 0.3, n))
+    beta = np.column_stack([
+        np.log(np.geomspace(0.02, 50, n_genes)),
+        rng.normal(0, 0.5, n_genes),
+        rng.normal(0, 0.3, n_genes),
+    ])
+    mu = size_factors[:, None] * np.exp(design @ beta.T)
+    counts = _generate_nb_counts(rng, mu, alpha).astype(float)
+    return counts, design, size_factors, np.full(n_genes, alpha)
+
+
+def _floor_binds(design, offset, coef, min_mu):
+    return (np.exp(design @ coef.T + offset[:, None]) <= min_mu).any(axis=0)
+
+
+def test_standard_errors_match_pydeseq2_wald_test():
+    """``min_mu`` steadies the iteration and has no place in the covariance.
+
+    DESeq2 keeps it out: ``irls_solver`` returns an unthresholded ``mu`` and
+    ``wald_test`` rebuilds the weights from it.  Building them from the
+    floored mean instead made the standard errors a median of 24% too small on
+    floor-binding genes, and the Wald statistics correspondingly too large.
+    """
+    pytest.importorskip("pydeseq2")
+    from pydeseq2.utils import wald_test
+
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    result = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha)
+
+    ridge = np.diag(np.repeat(1e-6, design.shape[1]))
+    contrast = np.array([0.0, 1.0, 0.0])
+    reference = np.array([
+        wald_test(design, alpha[g], result.coef[g],
+                  size_factors * np.exp(design @ result.coef[g]),
+                  ridge, contrast, 0.0, None)[2]
+        for g in range(counts.shape[1])
+    ])
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3
+    np.testing.assert_allclose(result.se[:, 1], reference, rtol=1e-5)
+
+
+def test_reported_standard_errors_are_invariant_to_the_mean_floor():
+    """Stated directly: the floor may move the coefficients, never the
+    uncertainty attached to them."""
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    coef = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    ).coef.T
+
+    floored = NBGLMBatchFitter(design, offset=offset, min_mu=0.5)
+    free = NBGLMBatchFitter(design, offset=offset, min_mu=0.0)
+    np.testing.assert_array_equal(
+        floored._compute_se_batch(floored._wald_weights(coef, alpha)),
+        free._compute_se_batch(free._wald_weights(coef, alpha)),
+    )

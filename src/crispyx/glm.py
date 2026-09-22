@@ -35,6 +35,7 @@ from .profiling import Profiler, MemoryProfiler, TimingProfiler
 from ._irls import (
     EPS,
     ETA_MAX,
+    ETA_MIN,
     Deviance,
     OneHotGroups,
     eta_floor,
@@ -161,6 +162,10 @@ class ControlStatisticsCache:
     # When these are set, workers don't need the raw control_matrix
     # This reduces per-worker pickle size from ~5GB to ~1MB for large datasets
     frozen_control_W_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control weights
+    # Sum of control weights built from the UNFLOORED mean, for the reported
+    # covariance only.  ``min_mu`` belongs to the iteration, not to the
+    # uncertainty -- see NBGLMBatchFitter._wald_weights.
+    frozen_control_W_wald_sum: np.ndarray | None = None  # Shape: (n_genes,)
     frozen_control_Wz_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control W*z
     frozen_control_mu_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control mu (for dispersion)
     frozen_control_resid_sq_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of (Y-mu)^2 (for dispersion)
@@ -326,6 +331,7 @@ def precompute_control_statistics(
     # Compute frozen control sufficient statistics if requested
     # These allow workers to skip the raw control_matrix entirely
     frozen_control_W_sum = None
+    frozen_control_W_wald_sum = None
     frozen_control_Wz_sum = None
     frozen_control_mu_sum = None
     frozen_control_resid_sq_sum = None
@@ -337,6 +343,12 @@ def precompute_control_statistics(
         # These are the sufficient statistics needed for NB-GLM fitting
         frozen_control_W_sum = control_xtwx_intercept.copy()  # Same as sum of weights
         frozen_control_Wz_sum = control_xtwz_intercept.copy()  # Same as sum of W*z
+        # The same sum without the mean floor, for standard errors only.
+        mu_wald = np.exp(np.clip(beta_intercept[None, :] + offset_col, ETA_MIN, ETA_MAX))
+        frozen_control_W_wald_sum = np.sum(
+            mu_wald * mu_wald / np.maximum(mu_wald + alpha[None, :] * mu_wald * mu_wald, EPS),
+            axis=0,
+        )
         frozen_control_mu_sum = np.sum(mu, axis=0)  # For dispersion updates
         resid = Y - mu
         frozen_control_resid_sq_sum = np.sum(resid * resid, axis=0)  # For dispersion
@@ -369,6 +381,7 @@ def precompute_control_statistics(
         pts_rest=pts_rest.astype(np.float32),
         global_size_factors=global_size_factors,
         frozen_control_W_sum=frozen_control_W_sum,
+        frozen_control_W_wald_sum=frozen_control_W_wald_sum,
         frozen_control_Wz_sum=frozen_control_Wz_sum,
         frozen_control_mu_sum=frozen_control_mu_sum,
         frozen_control_resid_sq_sum=frozen_control_resid_sq_sum,
@@ -523,6 +536,7 @@ def precompute_control_statistics_streaming(
 
     # ---- Final pass: compute frozen sufficient statistics ----
     frozen_W_sum = np.zeros(n_genes, dtype=np.float64)
+    frozen_W_wald_sum = np.zeros(n_genes, dtype=np.float64)
     frozen_Wz_sum = np.zeros(n_genes, dtype=np.float64)
     frozen_mu_sum = np.zeros(n_genes, dtype=np.float64)
     frozen_resid_sq_sum = np.zeros(n_genes, dtype=np.float64)
@@ -542,6 +556,14 @@ def precompute_control_statistics_streaming(
         z_centered = z - off_chunk[:, None]
 
         frozen_W_sum += W.sum(axis=0)
+        # The same sum without the mean floor, for standard errors only.
+        mu_wald = np.exp(
+            np.clip(beta_intercept[None, :] + off_chunk[:, None], ETA_MIN, ETA_MAX)
+        )
+        frozen_W_wald_sum += (
+            mu_wald * mu_wald
+            / np.maximum(mu_wald + alpha[None, :] * mu_wald * mu_wald, EPS)
+        ).sum(axis=0)
         frozen_Wz_sum += (W * z_centered).sum(axis=0)
         frozen_mu_sum += mu.sum(axis=0)
         frozen_resid_sq_sum += (resid * resid).sum(axis=0)
@@ -566,6 +588,7 @@ def precompute_control_statistics_streaming(
         pts_rest=pts_rest,
         global_size_factors=global_size_factors,
         frozen_control_W_sum=frozen_W_sum,
+        frozen_control_W_wald_sum=frozen_W_wald_sum,
         frozen_control_Wz_sum=frozen_Wz_sum,
         frozen_control_mu_sum=frozen_mu_sum,
         frozen_control_resid_sq_sum=frozen_resid_sq_sum,
@@ -3409,7 +3432,7 @@ class NBGLMBatchFitter:
             beta_init = self._poisson_warm_start_batch(Y_valid, beta_init)
 
         def run(alpha_fixed, beta_start):
-            beta_out, se_out, conv_out, iter_out = _irls_batch_numba(
+            beta_out, conv_out, iter_out = _irls_batch_numba(
                 Y_valid,
                 self.design,
                 self.offset,
@@ -3422,7 +3445,7 @@ class NBGLMBatchFitter:
             )
             eta_out = self.offset[:, None] + self.design @ beta_out
             np.clip(eta_out, self._eta_min, ETA_MAX, out=eta_out)
-            return beta_out, se_out, conv_out, iter_out, np.exp(eta_out)
+            return beta_out, conv_out, iter_out, np.exp(eta_out)
 
         # Dispersion from the warm-start means, then a fit with it held fixed.
         mu_start = np.exp(
@@ -3433,7 +3456,7 @@ class NBGLMBatchFitter:
             )
         )
         alpha = self._moments_dispersion_batch(Y_valid, mu_start)
-        beta_result, _, _, first_iters, mu_first = run(alpha, beta_init)
+        beta_result, _, first_iters, mu_first = run(alpha, beta_init)
 
         # Re-estimate from the fitted means and refit, so the returned
         # coefficients, standard errors and dispersion agree.
@@ -3442,10 +3465,14 @@ class NBGLMBatchFitter:
             alpha_final = self._refine_dispersion_cox_reid_batch(
                 Y_valid, mu_first, alpha_final
             )
-        beta_result, se_result, conv_result, second_iters, mu_final = run(
+        beta_result, conv_result, second_iters, mu_final = run(
             alpha_final, beta_result
         )
         iter_result = first_iters + second_iters
+        # Standard errors from the unfloored mean; see _wald_weights.
+        se_result = self._compute_se_batch(
+            self._wald_weights(beta_result, alpha_final)
+        )
 
         # Compute deviance
         dev_valid = self._compute_deviance_batch(Y_valid, mu_final, alpha_final)
@@ -3623,6 +3650,11 @@ class NBGLMBatchFitter:
             # far it moved would call every stalled gene converged -- the
             # failure the damping exists to prevent.  It is judged instead by
             # the steps it refused: converged only if none of them could lower
+            # the deviance by more than ``tol``.
+            # A gene that took no step moved nowhere, so judging it by how
+            # far it moved would call every stalled gene converged -- the
+            # failure the damping exists to prevent.  It is judged instead by
+            # the steps it refused: converged only if none of them could lower
             # the deviance by more than ``tol``.  Cells on the fitted-mean
             # floor are the exception: their mean does not move with the
             # coefficients so they carry no gradient, yet the normal equations
@@ -3739,8 +3771,8 @@ class NBGLMBatchFitter:
             gene_n_iter[batch] = first_iters + second_iters
             gene_deviance[batch] = dev_batch
 
-        # Standard errors from the final weights
-        se_valid = self._compute_se_batch(irls_weights(mu_all, alpha_all))
+        # Standard errors from the unfloored fitted mean; see _wald_weights.
+        se_valid = self._compute_se_batch(self._wald_weights(beta_all, alpha_all))
 
         # Store to output arrays
         coef[valid_indices] = beta_all.T
@@ -3911,8 +3943,10 @@ class NBGLMBatchFitter:
         variance += mu
         np.divide(mu * mu, np.maximum(variance, EPS), out=weights)
         
-        # Compute SE
-        se_valid = self._compute_se_batch(weights)
+        # Compute SE from the unfloored mean; see _wald_weights.
+        se_valid = self._compute_se_batch(
+            self._wald_weights(beta, alpha, cov_offset_valid)
+        )
         
         # Compute deviance
         dev_valid = self._compute_deviance_batch(Y_valid, mu, alpha)
@@ -4129,8 +4163,17 @@ class NBGLMBatchFitter:
         variance += mu
         np.divide(mu * mu, np.maximum(variance, EPS), out=weights)
         
-        # Compute SE
-        se_valid = self._compute_se_batch(weights)
+        # Compute SE from the unfloored mean; see _wald_weights.  The joint
+        # offsets are part of the linear predictor, so they go in too.
+        joint_offset = None
+        if intercept_valid is not None:
+            joint_offset = np.broadcast_to(intercept_valid[None, :], mu.shape).copy()
+        if cov_offset_valid is not None:
+            joint_offset = (
+                cov_offset_valid if joint_offset is None
+                else joint_offset + cov_offset_valid
+            )
+        se_valid = self._compute_se_batch(self._wald_weights(beta, alpha, joint_offset))
         
         # Compute deviance
         dev_valid = self._compute_deviance_batch(Y_valid, mu, alpha)
@@ -4345,6 +4388,42 @@ class NBGLMBatchFitter:
             # Back to the caller's parameterisation.
             return (beta / self._col_scale[None, :]).T  # (n_features, n_genes)
     
+    def _wald_weights(
+        self,
+        beta: np.ndarray,
+        alpha: np.ndarray,
+        extra_offset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """IRLS weights for the reported covariance, from the *unfloored* mean.
+
+        ``min_mu`` stabilises the iteration; it is not part of the model whose
+        uncertainty is being reported, and DESeq2 keeps it out of the Wald
+        standard error -- ``irls_solver`` returns an unthresholded ``mu`` "as
+        in the R code" and ``wald_test`` rebuilds ``W`` from that.  Leaving the
+        floor in overstates how much every floored cell knows: at 0.05 counts
+        per cell it made the standard errors a quarter too small and the Wald
+        statistics correspondingly too large.
+
+        The linear predictor is still clipped, but at the generic
+        ``ETA_MIN``/``ETA_MAX`` divergence bounds rather than at the mean
+        floor, so a diverging gene stays finite.
+
+        Parameters
+        ----------
+        beta
+            Coefficients, shape ``(n_features, n_genes)``.
+        alpha
+            Per-gene dispersion, or ``None``/zeros for Poisson.
+        extra_offset
+            Additional ``(n_samples, n_genes)`` offset, for the callers that
+            fit with a covariate or control offset folded in.
+        """
+        eta = self.design @ beta + self.offset[:, None]
+        if extra_offset is not None:
+            eta = eta + extra_offset
+        np.clip(eta, ETA_MIN, ETA_MAX, out=eta)
+        return irls_weights(np.exp(eta), alpha)
+
     def _compute_se_batch(self, weights: np.ndarray) -> np.ndarray:
         """Compute standard errors for all genes using vectorized operations."""
         X = self.design  # (n_samples, n_features)
@@ -4692,10 +4771,21 @@ class NBGLMBatchFitter:
         #   Mr = M + ridge*I (regularized)
         #   H = inv(Mr)
         #   c = [0, 1] for perturbation effect
-        
-        # Recompute XᵀWX for final weights
-        W_control_sum = np.sum(W_control, axis=0)
-        W_pert_sum = np.sum(W_pert, axis=0)
+        #
+        # The weights are rebuilt from the UNFLOORED mean: ``min_mu`` steadies
+        # the iteration above and has no place in the reported covariance,
+        # which is also what PyDESeq2's wald_test does.  See
+        # NBGLMBatchFitter._wald_weights.
+        mu_c = np.exp(np.clip(beta[0][None, :] + offset_control, ETA_MIN, ETA_MAX))
+        mu_p = np.exp(
+            np.clip(beta[0][None, :] + beta[1][None, :] + offset_pert, ETA_MIN, ETA_MAX)
+        )
+        W_control_sum = np.sum(
+            mu_c * mu_c / np.maximum(mu_c + alpha[None, :] * mu_c * mu_c, EPS), axis=0
+        )
+        W_pert_sum = np.sum(
+            mu_p * mu_p / np.maximum(mu_p + alpha[None, :] * mu_p * mu_p, EPS), axis=0
+        )
         
         # Unregularized M
         M00 = W_control_sum + W_pert_sum
@@ -4856,6 +4946,7 @@ class NBGLMBatchFitter:
         
         # Frozen control sufficient statistics (pre-computed, constant)
         frozen_W_sum = control_cache.frozen_control_W_sum[valid_mask]  # (n_valid,)
+        frozen_W_wald_sum = control_cache.frozen_control_W_wald_sum[valid_mask]
         frozen_Wz_sum = control_cache.frozen_control_Wz_sum[valid_mask]  # (n_valid,)
         
         # For dispersion updates (method of moments)
@@ -4948,12 +5039,23 @@ class NBGLMBatchFitter:
         
         # Compute final standard errors using sandwich estimator
         # For frozen β₀, we use the conditional variance of β₁ given β₀
-        
-        # Recompute XᵀWX for final weights
-        W_pert_sum = np.sum(W_pert, axis=0)
+        #
+        # Both blocks come from the UNFLOORED mean -- the control side was
+        # accumulated that way by the precompute, the perturbed side is rebuilt
+        # here.  See NBGLMBatchFitter._wald_weights.
+        mu_p = np.exp(
+            np.clip(
+                beta_intercept[None, :] + beta_pert[None, :] + offset_pert,
+                ETA_MIN,
+                ETA_MAX,
+            )
+        )
+        W_pert_sum = np.sum(
+            mu_p * mu_p / np.maximum(mu_p + alpha[None, :] * mu_p * mu_p, EPS), axis=0
+        )
         
         # Unregularized M for SE calculation
-        M00 = frozen_W_sum + W_pert_sum
+        M00 = frozen_W_wald_sum + W_pert_sum
         M01 = W_pert_sum
         M11 = W_pert_sum
         
@@ -5356,6 +5458,8 @@ class StructuredGLMBatchFitter:
             deviance[active] = new_deviance
             n_iter[active] = iteration
             # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
+            # that took no step is judged by the steps it refused.
+            # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
             # that took no step is judged by the steps it refused, and why a
             # gene with clipped cells is exempt from that judgement.
             converged[active] = np.where(
@@ -5372,7 +5476,22 @@ class StructuredGLMBatchFitter:
         if final_blocks:
             # Standard errors need the blocks at the converged fit for *every*
             # gene; the iterations only ever formed them for the active subset.
-            gram, cross, diagonal = self._hessian_blocks(irls_weights(mu, alpha))
+            # They are also built from the unfloored mean, because ``min_mu``
+            # steadies the iteration and has no place in the reported
+            # covariance -- see NBGLMBatchFitter._wald_weights.  With no floor
+            # the two weight sets are the same array, so nothing extra is
+            # formed on the default path.
+            weights = irls_weights(mu, alpha)
+            if self.min_mu > 0.0:
+                eta_wald = np.clip(
+                    self.offset[:, None]
+                    + self.design @ beta_features.T
+                    + self.groups.expand(beta_groups),
+                    ETA_MIN,
+                    ETA_MAX,
+                )
+                weights = irls_weights(np.exp(eta_wald), alpha)
+            gram, cross, diagonal = self._hessian_blocks(weights)
             blocks = (cross, diagonal, schur_complement(gram, cross, diagonal))
 
         return (

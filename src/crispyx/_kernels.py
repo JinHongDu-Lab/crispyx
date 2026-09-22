@@ -2038,8 +2038,6 @@ def _irls_batch_numba(
     -------
     beta : (n_features, n_genes)
         Fitted coefficients.
-    se : (n_features, n_genes)
-        Standard errors.
     converged : (n_genes,)
         Convergence flags.
     n_iter : (n_genes,)
@@ -2049,7 +2047,6 @@ def _irls_batch_numba(
     n_features = X.shape[1]
     
     beta = np.copy(beta_init)
-    se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
     converged = np.zeros(n_genes, dtype=nb.boolean)
     n_iter = np.zeros(n_genes, dtype=np.int32)
     
@@ -2127,12 +2124,6 @@ def _irls_batch_numba(
                 if diff < tol:
                     gene_converged = True
                     n_iter[g] = iteration + 1
-                    
-                    # Compute SE
-                    inv_00 = xtwx_11 / det
-                    inv_11 = xtwx_00 / det
-                    se[0, g] = np.sqrt(max(inv_00, 1e-12))
-                    se[1, g] = np.sqrt(max(inv_11, 1e-12))
                     break
             else:
                 # General case: would need matrix operations
@@ -2143,27 +2134,11 @@ def _irls_batch_numba(
         
         if not gene_converged:
             n_iter[g] = max_iter
-            # Compute final SE even if not converged
-            if n_features == 2:
-                xtwx_00 = ridge
-                xtwx_01 = 0.0
-                xtwx_11 = ridge
-                for i in range(n_samples):
-                    w_i = W_g[i]
-                    x1_i = X[i, 1]
-                    xtwx_00 += w_i
-                    xtwx_01 += w_i * x1_i
-                    xtwx_11 += w_i * x1_i * x1_i
-                det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-                if abs(det) < 1e-12:
-                    det = 1e-12
-                se[0, g] = np.sqrt(max(xtwx_11 / det, 1e-12))
-                se[1, g] = np.sqrt(max(xtwx_00 / det, 1e-12))
         
         beta[:, g] = beta_g
         converged[g] = gene_converged
     
-    return beta, se, converged, n_iter
+    return beta, converged, n_iter
 
 
 # =============================================================================
