@@ -37,12 +37,12 @@ def format_bytes(n_bytes: float | None) -> str:
 
 
 def _safe_resolve(path: str | Path) -> Path:
-    """Absolute form of *path* for display and lookup; never raises.
+    """Absolute form of *path* for the free-space lookup; never raises.
 
     Falls back to the unresolved path if resolution itself fails (e.g. a
-    broken symlink or an inaccessible network mount) -- this is only used
-    for a human-readable label and a starting point for the free-space
-    walk-up below, never for correctness.
+    broken symlink or an inaccessible network mount) -- this is only a
+    starting point for the free-space walk-up below, never a correctness
+    requirement.
     """
     try:
         return Path(path).resolve()
@@ -119,6 +119,10 @@ class DiskEstimate:
     an unreachable network mount, a permission error, or some other
     platform-specific quirk. This is a real, expected state on some
     platforms/filesystems, not an error case.
+
+    ``path`` is kept exactly as the caller wrote it, so a caller who passed
+    a relative path sees that relative path echoed back instead of an
+    absolute one carrying their home directory.
     """
 
     required_bytes: float
@@ -155,7 +159,7 @@ def assess_bytes(required_bytes: float, path: str | Path) -> DiskEstimate:
     return DiskEstimate(
         required_bytes=required_bytes,
         free_bytes=_free_bytes_at(path),
-        path=_safe_resolve(path),
+        path=Path(path),
     )
 
 
