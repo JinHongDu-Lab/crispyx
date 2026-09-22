@@ -103,7 +103,7 @@ def gram_batched(
     design: np.ndarray,
     weights: np.ndarray,
     *,
-    ridge: float = 0.0,
+    ridge: float | np.ndarray = 0.0,
     target_mb: float = 64.0,
 ) -> np.ndarray:
     """Per-gene weighted Gram matrices ``X' W_g X``.
@@ -115,7 +115,10 @@ def gram_batched(
     weights
         Per-cell, per-gene IRLS weights, shape ``(n_samples, n_genes)``.
     ridge
-        Added to the diagonal of every gene's matrix.
+        Added to the diagonal of every gene's matrix.  A scalar penalises
+        every column equally; an array of length ``n_features`` gives a
+        per-column penalty, which is what a preconditioned design needs to
+        penalise the caller's parameterisation rather than the scaled one.
     target_mb
         Memory budget for the cell-chunked outer-product buffer.  The buffer is
         ``(chunk, n_features**2)``, so the budget bounds peak memory
@@ -133,10 +136,9 @@ def gram_batched(
     against the weights.  The obvious ``numpy.einsum('ki,kg,kj->gij', X, W, X)``
     is a three-operand contraction that numpy stops routing through BLAS once
     the intermediate exceeds its optimisation budget, at which point it falls
-    back to a nested loop: on this implementation it was 2.5x slower than the
-    ``gemm`` form at ``n_features=21`` but 502x slower at 41 and 1041x at 80,
-    agreeing to 7e-12.  Chunking over cells keeps the ``gemm`` form's peak
-    memory bounded without giving up the BLAS call.
+    back to a nested loop -- orders of magnitude slower here once
+    ``n_features`` passes ~40, for the same values.  Chunking over cells keeps
+    the ``gemm`` form's peak memory bounded without giving up the BLAS call.
     """
     design = np.asarray(design, dtype=np.float64)
     n_samples, n_features = design.shape
@@ -153,7 +155,7 @@ def gram_batched(
         out += weights[start:stop].T @ outer
 
     out = out.reshape(n_genes, n_features, n_features)
-    if ridge:
+    if np.any(ridge):
         idx = np.arange(n_features)
         out[:, idx, idx] += ridge
     return out
@@ -198,12 +200,19 @@ class Deviance:
 
     * Poisson: ``2 (y log y - y eta - y + mu)``
     * negative binomial, size ``r = 1 / alpha``:
-      ``2 (y log y - y eta - (y + r) log(y + r) + (y + r) log(mu + r))``
+      ``2 (y log y - y eta + (y + r) log((mu + r) / (y + r)))``
 
-    Everything not involving ``mu`` is summed once at construction, so each
-    subsequent evaluation costs one logarithm over the matrix rather than
-    three.  Because the NB constant depends on ``r``, a new instance is needed
-    when the dispersion changes.
+    ``sum(y log y)`` does not involve ``mu`` and is taken once at
+    construction, so each subsequent evaluation costs one logarithm over the
+    matrix rather than three.
+
+    The NB term is evaluated as ``(y + r) log1p((mu - y) / (y + r))`` rather
+    than as the difference of ``(y + r) log(y + r)`` and ``(y + r) log(mu +
+    r)``.  Those two are each of order ``r n log r`` -- at the ``alpha`` clip
+    floor ``r`` is ``1e8`` -- while the deviance they differ by is of order
+    the sample size, so subtracting them loses the answer to cancellation: at
+    ``n = 1e5`` the error swamps the ``1e-6`` relative-deviance convergence
+    test, and a near-Poisson gene can never converge.
 
     Parameters
     ----------
@@ -250,8 +259,7 @@ class Deviance:
         if family == "poisson":
             self.const = (ylogy - counts).sum(axis=0)
         else:
-            yr = counts + self.size
-            self.const = (ylogy - yr * np.log(yr)).sum(axis=0)
+            self.const = ylogy.sum(axis=0)
 
     def subset(self, idx: np.ndarray) -> "Deviance":
         """This deviance restricted to genes ``idx``, without recomputing."""
@@ -268,7 +276,7 @@ class Deviance:
         if self.family == "poisson":
             return 2.0 * (self.const - cross + mu.sum(axis=0))
         yr = self.counts + self.size
-        return 2.0 * (self.const - cross + (yr * np.log(mu + self.size)).sum(axis=0))
+        return 2.0 * (self.const - cross + (yr * np.log1p((mu - self.counts) / yr)).sum(axis=0))
 
     def residuals(self, eta: np.ndarray, mu: np.ndarray) -> np.ndarray:
         """Signed deviance residuals, shape ``(n_samples, n_genes)``."""
@@ -280,7 +288,7 @@ class Deviance:
             else:
                 yr = counts + self.size
                 unit = 2.0 * (
-                    ylogy - counts * eta - yr * np.log(yr) + yr * np.log(mu + self.size)
+                    ylogy - counts * eta + yr * np.log1p((mu - counts) / yr)
                 )
         return np.sign(counts - mu) * np.sqrt(np.maximum(unit, 0.0))
 
@@ -372,9 +380,8 @@ class OneHotGroups:
         Both inputs must already be in :meth:`sort` order.  Each group is one
         ``(n_features, n_k) @ (n_k, n_genes)`` matrix product, so the weight
         matrix is read once in total.  Forming this as ``d_X`` separate sparse
-        products instead re-reads the weights ``d_X`` times -- 6.4 GB of
-        traffic at ``n=3,000, n_genes=8,563, d_X=31`` against 0.2 GB, and 7.2x
-        slower measured.
+        products instead re-reads the weights ``d_X`` times, which is where
+        the memory traffic (and the runtime) of this step goes.
         """
         n_features = design_sorted.shape[1]
         n_genes = weights_sorted.shape[1]
@@ -402,7 +409,8 @@ def schur_complement(
 
     Computed as a batched ``gemm`` on a ``(n_genes, n_features, n_groups)``
     layout.  The obvious ``numpy.einsum('kip,kjp,kp->pij', B, B, 1/D)``
-    produces bit-identical values 8.6x slower, because it does not reach BLAS.
+    produces bit-identical values several times slower, because it does not
+    reach BLAS.
     """
     blocks = np.ascontiguousarray(cross.transpose(2, 1, 0))
     scaled = blocks * (1.0 / diagonal).T[:, None, :]
@@ -426,8 +434,8 @@ def schur_solve(
         ba = D^-1 (ra - B' bx)
 
     which replaces a ``(d_X + a)`` dense factorisation per gene with a
-    ``d_X`` one plus a division, and is exact -- verified against a per-gene
-    dense solve to 1.4e-15.
+    ``d_X`` one plus a division, and is exact to rounding -- the tests check
+    it against a per-gene dense solve.
 
     Parameters
     ----------

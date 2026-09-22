@@ -1037,3 +1037,171 @@ def test_the_mean_floor_does_not_move_the_stationary_point_it_defines():
 
     score = _nb_score(counts, design, floored.coef, alpha)
     assert np.max(score[never_binds]) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# IRLS damping
+# ---------------------------------------------------------------------------
+
+def _overshooting_gene():
+    """Counts on which the first full Newton step badly raises the deviance.
+
+    A near-empty perturbation arm beside a large baseline: the first step from
+    ``beta = 0`` overshoots and has to be shortened several times.
+    """
+    rng = np.random.default_rng(11)
+    n = 200
+    x1 = np.zeros(n)
+    x1[:3] = 1.0
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 1.0, size=n)])
+
+    gene = np.random.default_rng(29)
+    beta = np.array([gene.uniform(4, 9), gene.uniform(-8, 8), gene.uniform(-2, 2)])
+    counts = gene.poisson(np.exp(np.clip(design @ beta, -20, 14))).astype(float)
+    return design, counts[:, None]
+
+
+def test_step_halving_takes_the_first_improving_fraction_of_the_newton_step():
+    """A shortened step is ``beta + 2^-k (newton - beta)`` for the smallest
+    ``k`` that lowers the deviance.
+
+    Interpolating towards the previously shortened point instead of towards
+    the full Newton point compounds the shortening -- the third retry lands at
+    ``2^-6`` rather than ``2^-3`` -- which stalls the gene and then reports it
+    as converged because nothing moved.
+    """
+    from crispyx._irls import EPS, ETA_MAX, Deviance, irls_weights
+
+    design, counts = _overshooting_gene()
+    fitter = NBGLMBatchFitter(design, max_iter=1, tol=1e-9, min_mu=0.0)
+    alpha = np.array([0.05])
+    start = np.zeros((3, 1))
+
+    # The full Newton step, formed exactly as the loop forms it.
+    deviance = Deviance(counts, "nb", alpha)
+    eta = np.clip(design @ start, fitter._eta_min, ETA_MAX)
+    mu = np.exp(eta)
+    dev_start = deviance.total(eta, mu)
+    newton = fitter._weighted_least_squares_batch(
+        irls_weights(mu, alpha), eta + (counts - mu) / np.maximum(mu, EPS)
+    )
+
+    def deviance_at(beta):
+        e = np.clip(design @ beta, fitter._eta_min, ETA_MAX)
+        return deviance.total(e, np.exp(e))[0]
+
+    for k in range(9):
+        expected = start + (0.5**k) * (newton - start)
+        if deviance_at(expected) <= dev_start[0] + 1e-9 * abs(dev_start[0]):
+            break
+    assert k >= 3, "this gene no longer exercises repeated halving"
+
+    got, _, _, _, _ = fitter._irls_at_fixed_dispersion(counts, alpha, start)
+    np.testing.assert_allclose(got, expected, rtol=1e-12)
+
+
+def test_irls_never_commits_a_step_that_raises_the_deviance():
+    """Deviance is what the loop minimises and what its convergence test
+    measures, so no iteration may leave a gene worse off than it found it."""
+    rng = np.random.default_rng(5)
+    n, n_genes = 150, 80
+    x1 = (rng.random(n) < 0.06).astype(float)
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
+    counts = np.empty((n, n_genes))
+    for g in range(n_genes):
+        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
+        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
+
+    alpha = np.full(n_genes, 0.05)
+    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-9, min_mu=0.0)
+    start = np.zeros((3, n_genes))
+
+    from crispyx._irls import ETA_MAX, Deviance
+
+    deviance = Deviance(counts, "nb", alpha)
+    eta = np.clip(design @ start, fitter._eta_min, ETA_MAX)
+    dev_start = deviance.total(eta, np.exp(eta))
+
+    _, _, dev_end, _, _ = fitter._irls_at_fixed_dispersion(counts, alpha, start)
+    assert np.all(dev_end <= dev_start + 1e-9 * np.abs(dev_start))
+
+
+def test_a_gene_reported_converged_solves_the_score_equation():
+    """The convergence flag gates what ``de.py`` is willing to report, so a
+    gene that merely stopped moving must not be flagged as converged."""
+    rng = np.random.default_rng(5)
+    n, n_genes = 150, 80
+    x1 = (rng.random(n) < 0.06).astype(float)
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
+    counts = np.empty((n, n_genes))
+    for g in range(n_genes):
+        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
+        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
+
+    alpha = np.full(n_genes, 0.05)
+    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-9, min_mu=0.0)
+    _, mu, _, converged, _ = fitter._irls_at_fixed_dispersion(
+        counts, alpha, np.zeros((3, n_genes))
+    )
+
+    assert converged.any()
+    score = design.T @ ((counts - mu) / (1.0 + alpha * mu))
+    relative = np.max(np.abs(score), axis=0) / np.maximum(counts.sum(axis=0), 1.0)
+    assert np.max(relative[converged]) < 1e-6
+
+
+def test_numba_path_reports_the_dispersion_it_fitted_at():
+    """The 2-feature kernel holds the dispersion fixed, so what it returns has
+    to come from a fit at the dispersion that is reported.
+
+    On an intercept-plus-indicator design the coefficients are the two group
+    means whatever the dispersion is, so the standard errors are where a
+    placeholder dispersion shows up: the IRLS weight ``mu / (1 + alpha mu)``
+    at ``alpha = 0.1`` is several times the weight at a dispersion of 2, and
+    every Wald statistic built on it is wrong by that factor.
+    """
+    rng = np.random.default_rng(7)
+    n, n_genes = 400, 40
+    x1 = (rng.random(n) < 0.35).astype(float)
+    design = np.column_stack([np.ones(n), x1])
+    mu = np.exp(design @ np.c_[rng.uniform(1.0, 3.0, n_genes), rng.normal(0, 0.8, n_genes)].T)
+    counts = _generate_nb_counts(rng, mu, 1.5).astype(float)
+
+    fitter = NBGLMBatchFitter(design, max_iter=50, tol=1e-9, min_mu=0.0)
+    numba = fitter.fit_batch(counts, use_numba=True)
+    refit = fitter.fit_batch(counts, use_numba=False, fixed_dispersion=numba.dispersion)
+
+    assert numba.dispersion.min() > 0.5, "the test needs a dispersion unlike 0.1"
+    np.testing.assert_allclose(numba.coef, refit.coef, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(numba.se, refit.se, rtol=1e-8)
+
+
+def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
+    """A gene whose fit rests on the mean floor must still be reported.
+
+    Where the floor binds, the fitted mean of those cells no longer moves with
+    the coefficients, so they carry no gradient while the normal equations
+    still count them: IRLS proposes a direction the deviance does not fall
+    along, and the line search finds nothing to take.  That says something
+    about the floor, not about the fit, and treating it as a failure to
+    converge would hand ``de.py`` a ``NaN`` p-value for every low-count gene
+    the floor exists for.
+    """
+    rng = np.random.default_rng(5)
+    n, n_genes = 150, 80
+    x1 = (rng.random(n) < 0.06).astype(float)
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
+    counts = np.empty((n, n_genes))
+    for g in range(n_genes):
+        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
+        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
+
+    alpha = np.full(n_genes, 0.05)
+    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-6, min_mu=0.5)
+    beta, mu, _, converged, _ = fitter._irls_at_fixed_dispersion(
+        counts, alpha, np.zeros((3, n_genes))
+    )
+
+    on_the_floor = (mu <= 0.5 + 1e-12).any(axis=0)
+    assert on_the_floor.sum() > n_genes // 2, "fixture should exercise the floor"
+    assert converged.all()

@@ -256,3 +256,88 @@ def test_eta_floor_is_finite_without_a_mean_floor(min_mu):
 def test_eta_floor_never_underflows_exp():
     assert np.exp(eta_floor(1e-300)) > 0.0
     assert eta_floor(1e-300) == ETA_MIN
+
+
+# --------------------------------------------------------------------------
+# NB deviance conditioning
+# --------------------------------------------------------------------------
+
+def _exact_nb_deviance(counts, mu, alpha):
+    """The NB deviance of one gene, summed in 60 decimal digits.
+
+    The point of the reference is that it never forms the difference of two
+    large logarithms, so it is independent of the conditioning question the
+    test is about.
+    """
+    from decimal import Decimal, getcontext
+
+    getcontext().prec = 60
+    size = Decimal(1.0) / Decimal(float(alpha))
+    total = Decimal(0)
+    for y_i, mu_i in zip(counts, mu):
+        y = Decimal(float(y_i))
+        m = Decimal(float(mu_i))
+        if y > 0:
+            total += y * (y / m).ln()
+        total += (y + size) * ((m + size) / (y + size)).ln()
+    return float(2 * total)
+
+
+@pytest.mark.parametrize("alpha", [1e-8, 1e-6, 1e-3])
+def test_nb_deviance_is_accurate_at_a_near_poisson_dispersion(rng, alpha):
+    """The NB deviance must not be lost to cancellation as ``alpha`` shrinks.
+
+    At the ``alpha`` clip floor the size ``1 / alpha`` is 1e8, so the two
+    terms ``(y + r) log(y + r)`` and ``(y + r) log(mu + r)`` are each eight
+    orders of magnitude larger than the deviance they differ by.  Subtracting
+    them loses more than the ``1e-6`` relative convergence tolerance, which
+    leaves such a gene unable to ever converge.
+    """
+    n = 600
+    counts = rng.poisson(5.0, size=(n, 1)).astype(float)
+    mu = 5.0 * np.exp(rng.normal(0, 0.1, size=(n, 1)))
+
+    got = Deviance(counts, "nb", np.array([alpha])).total(np.log(mu), mu)[0]
+    expected = _exact_nb_deviance(counts[:, 0], mu[:, 0], alpha)
+    assert abs(got - expected) < 1e-6 * max(abs(expected), 1.0)
+
+
+def test_nb_deviance_approaches_the_poisson_deviance(rng):
+    """The Poisson deviance is the ``alpha -> 0`` limit, and is exactly what a
+    near-Poisson gene's NB deviance has to reproduce."""
+    n = 400
+    counts = rng.poisson(3.0, size=(n, 3)).astype(float)
+    mu = 3.0 * np.exp(rng.normal(0, 0.1, size=(n, 3)))
+
+    nb = Deviance(counts, "nb", np.full(3, 1e-10)).total(np.log(mu), mu)
+    poisson = Deviance(counts, "poisson").total(np.log(mu), mu)
+    np.testing.assert_allclose(nb, poisson, rtol=1e-7)
+
+
+def test_residuals_stay_consistent_with_the_total_at_a_tiny_dispersion(rng):
+    n = 300
+    counts = rng.poisson(4.0, size=(n, 2)).astype(float)
+    mu = 4.0 * np.exp(rng.normal(0, 0.1, size=(n, 2)))
+    deviance = Deviance(counts, "nb", np.full(2, 1e-8))
+
+    residuals = deviance.residuals(np.log(mu), mu)
+    np.testing.assert_allclose(
+        (residuals**2).sum(axis=0), deviance.total(np.log(mu), mu), rtol=1e-6
+    )
+
+
+# --------------------------------------------------------------------------
+# per-column ridge and pre-sliced subsets
+# --------------------------------------------------------------------------
+
+def test_gram_ridge_accepts_a_per_column_penalty(rng):
+    """A preconditioned design needs a different penalty per column, so that
+    the penalty means the same thing in the caller's parameterisation."""
+    n, p, d = 80, 5, 4
+    design = rng.normal(size=(n, d))
+    weights = rng.random((n, p)) + 0.05
+    ridge = np.array([0.1, 0.5, 2.0, 7.0])
+
+    got = gram_batched(design, weights, ridge=ridge)
+    expected = gram_batched(design, weights) + np.diag(ridge)[None, :, :]
+    np.testing.assert_allclose(got, expected, rtol=1e-12)

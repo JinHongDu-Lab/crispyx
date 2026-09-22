@@ -569,3 +569,42 @@ def test_nb_glm_test_with_many_batches_routes_structured_and_agrees(tmp_path, mo
     )
     # Ranking, which is what a user acts on, must be essentially identical.
     assert np.corrcoef(a[finite], b[finite])[0, 1] > 0.999
+
+
+# --------------------------------------------------------------------------
+# the starting point
+# --------------------------------------------------------------------------
+
+def test_fit_is_unchanged_by_scaling_the_intercept_column():
+    """The starting predictor is carried by whichever column is constant, and
+    ``eta`` is derived from the coefficients, so a design whose intercept is
+    not a column of ones starts from a point its coefficients describe."""
+    counts, design, groups, _, offset, alpha = make_screen(seed=6, n=250, p=25, n_groups=4)
+    scaled = design.copy()
+    scaled[:, 0] = 2.0
+
+    plain = StructuredGLMBatchFitter(design, groups, offset=offset).fit_batch(
+        counts, dispersion=alpha
+    )
+    rescaled = StructuredGLMBatchFitter(scaled, groups, offset=offset).fit_batch(
+        counts, dispersion=alpha
+    )
+
+    np.testing.assert_allclose(rescaled.coef[:, 0] * 2.0, plain.coef[:, 0], rtol=1e-6)
+    np.testing.assert_allclose(rescaled.mu, plain.mu, rtol=1e-6)
+
+
+def test_fit_without_a_constant_column_starts_consistently():
+    """With no intercept column at all the loop must still start from an
+    ``eta`` its coefficients produce, or the first damped step is compared
+    against a deviance that belongs to a different model."""
+    counts, design, groups, _, offset, alpha = make_screen(
+        seed=7, n=200, p=20, n_groups=3, n_covariates=2
+    )
+    no_intercept = design[:, 1:]
+
+    result = StructuredGLMBatchFitter(no_intercept, groups, offset=offset).fit_batch(
+        counts, dispersion=alpha
+    )
+    assert np.all(np.isfinite(result.coef))
+    assert result.converged.mean() > 0.5

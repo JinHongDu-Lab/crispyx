@@ -3267,6 +3267,10 @@ class NBGLMBatchFitter:
         # differ by orders of magnitude does not make X'WX ill-conditioned.
         # Callers see the original parameterisation throughout.
         self._design_scaled, self._col_scale = precondition_columns(self.design)
+        # A ridge of `r` on the scaled coefficients is a ridge of
+        # `r * scale_j**2` on the caller's, so the penalty has to be divided
+        # by the scale to mean what the caller asked for.
+        self._ridge_scaled = self.ridge_penalty / self._col_scale**2
     
     def fit_batch(
         self, 
@@ -3379,6 +3383,14 @@ class NBGLMBatchFitter:
         
         Uses per-gene Numba loops which are more memory efficient than
         vectorized operations across all genes.
+
+        The kernel holds the dispersion fixed, so -- as in
+        :meth:`_fit_batch_numpy_batched` -- it is run twice: once at the
+        dispersion the warm-start means imply, and again at the dispersion the
+        resulting NB means imply.  Fitting once at a placeholder dispersion and
+        reporting a separately estimated one would mean the coefficients,
+        their standard errors and the reported dispersion did not describe the
+        same model.
         """
         n_valid = Y_valid.shape[1]
         n_features = self.n_features
@@ -3397,37 +3409,46 @@ class NBGLMBatchFitter:
         # Poisson warm start
         if self.poisson_init_iter > 0:
             beta_init = self._poisson_warm_start_batch(Y_valid, beta_init)
-        
-        # Initial dispersion (MoM)
-        alpha = np.full(n_valid, 0.1, dtype=np.float64)
-        
-        # Run Numba IRLS
-        beta_result, se_result, conv_result, iter_result = _irls_batch_numba(
-            Y_valid,
-            self.design,
-            self.offset,
-            alpha,
-            beta_init,
-            self.max_iter,
-            self.tol,
-            self.min_mu,
-            self.ridge_penalty,
+
+        def run(alpha_fixed, beta_start):
+            beta_out, se_out, conv_out, iter_out = _irls_batch_numba(
+                Y_valid,
+                self.design,
+                self.offset,
+                alpha_fixed,
+                beta_start,
+                self.max_iter,
+                self.tol,
+                self.min_mu,
+                self.ridge_penalty,
+            )
+            eta_out = self.offset[:, None] + self.design @ beta_out
+            np.clip(eta_out, self._eta_min, ETA_MAX, out=eta_out)
+            return beta_out, se_out, conv_out, iter_out, np.exp(eta_out)
+
+        # Dispersion from the warm-start means, then a fit with it held fixed.
+        mu_start = np.exp(
+            np.clip(
+                self.offset[:, None] + self.design @ beta_init,
+                self._eta_min,
+                ETA_MAX,
+            )
         )
-        
-        # Compute final dispersion using MoM
-        eta_final = self.offset[:, None] + self.design @ beta_result
-        np.clip(eta_final, self._eta_min, ETA_MAX, out=eta_final)
-        mu_final = np.exp(eta_final)
-        
-        resid = Y_valid - mu_final
-        dof = max(self.n_samples - n_features, 1)
-        alpha_final = np.sum((resid * resid - Y_valid) / np.maximum(mu_final * mu_final, EPS), axis=0) / dof
-        alpha_final = np.clip(alpha_final, 1e-8, 1e6)
-        
-        # Cox-Reid refinement if requested
+        alpha = self._moments_dispersion_batch(Y_valid, mu_start)
+        beta_result, _, _, first_iters, mu_first = run(alpha, beta_init)
+
+        # Re-estimate from the fitted means and refit, so the returned
+        # coefficients, standard errors and dispersion agree.
+        alpha_final = self._moments_dispersion_batch(Y_valid, mu_first)
         if self.dispersion_method == "cox-reid":
-            alpha_final = self._refine_dispersion_cox_reid_batch(Y_valid, mu_final, alpha_final)
-        
+            alpha_final = self._refine_dispersion_cox_reid_batch(
+                Y_valid, mu_first, alpha_final
+            )
+        beta_result, se_result, conv_result, second_iters, mu_final = run(
+            alpha_final, beta_result
+        )
+        iter_result = first_iters + second_iters
+
         # Compute deviance
         dev_valid = self._compute_deviance_batch(Y_valid, mu_final, alpha_final)
         
@@ -3479,11 +3500,18 @@ class NBGLMBatchFitter:
           always meant here -- a coefficient tolerance -- while still refusing
           to call a gene converged on a step that raised its deviance.
         * **Step halving.** A Newton step that increases the deviance is
-          halved (up to ``_MAX_STEP_HALVINGS`` times) until it does not, which
-          is what keeps genes with extreme counts from diverging.
-        * **An active set.** A gene that has converged is frozen and dropped
-          from later iterations, so the per-iteration cost follows the number
-          of genes still moving rather than the whole batch.
+          retried at half the distance towards the *same* full Newton point,
+          up to ``_MAX_STEP_HALVINGS`` times, and a shortened step is taken
+          only if it improves on the deviance the iteration started from.
+          This is what keeps genes with extreme counts from diverging.  A gene
+          for which no step in that range improves the deviance is left where
+          it was and reported as not converged, rather than being moved
+          uphill -- unless it is resting on the mean floor, where the line
+          search says nothing about the fit (see the loop).
+        * **An active set.** A gene that has converged -- or that ran out of
+          step halvings -- is frozen and dropped from later iterations, so the
+          per-iteration cost follows the number of genes still moving rather
+          than the whole batch.
 
         Parameters
         ----------
@@ -3512,6 +3540,7 @@ class NBGLMBatchFitter:
         dev = deviance_of.total(eta, mu)
 
         converged = np.zeros(n_genes, dtype=bool)
+        stalled = np.zeros(n_genes, dtype=bool)
         n_iter = np.zeros(n_genes, dtype=np.int32)
         active = np.arange(n_genes)
 
@@ -3526,34 +3555,62 @@ class NBGLMBatchFitter:
 
             weights = irls_weights(mu_a, alpha_a)
             z = eta_a - offset_col + (Y_a - mu_a) / np.maximum(mu_a, EPS)
-            beta_new = self._weighted_least_squares_batch(weights, z)
+            beta_full = self._weighted_least_squares_batch(weights, z)
 
+            beta_new = beta_full.copy()
             eta_new = np.clip(X @ beta_new + offset_col, self._eta_min, ETA_MAX)
             mu_new = np.exp(eta_new)
             dev_new = deviance_a.total(eta_new, mu_new)
 
-            # Halve the step for genes whose deviance increased, recomputing
-            # only those genes.
-            worse = dev_new > dev_a * (1.0 + 1e-9)
+            # Shorten the step for genes whose deviance increased, recomputing
+            # only those genes.  Each retry interpolates between the current
+            # iterate and the full Newton point ``beta_full``, so the step
+            # really does halve; interpolating against ``beta_new`` instead
+            # would compound the shortening and stall the gene.  A shortened
+            # step is accepted only if it beats ``dev_a``, the deviance this
+            # iteration started from.
+            ceiling = dev_a + 1e-9 * np.abs(dev_a)
+            worse = dev_new > ceiling
+            scale = np.maximum(np.abs(dev_a), 1e-8)
+            # Smallest relative deviance increase over the steps tried, which
+            # is what decides the fate of a gene that never finds an improving
+            # one.
+            excess = (dev_new - dev_a) / scale
             step = 1.0
             for _ in range(_MAX_STEP_HALVINGS):
                 if not np.any(worse):
                     break
                 step *= 0.5
                 idx = np.flatnonzero(worse)
-                beta_half = beta_a[:, idx] + step * (beta_new[:, idx] - beta_a[:, idx])
+                beta_half = beta_a[:, idx] + step * (beta_full[:, idx] - beta_a[:, idx])
                 eta_half = np.clip(X @ beta_half + offset_col, self._eta_min, ETA_MAX)
                 mu_half = np.exp(eta_half)
                 dev_half = deviance_a.subset(idx).total(eta_half, mu_half)
-                take = dev_half <= dev_new[idx]
+                excess[idx] = np.minimum(excess[idx], (dev_half - dev_a[idx]) / scale[idx])
+                take = dev_half <= ceiling[idx]
                 taken = idx[take]
                 beta_new[:, taken] = beta_half[:, take]
                 eta_new[:, taken] = eta_half[:, take]
                 mu_new[:, taken] = mu_half[:, take]
                 dev_new[taken] = dev_half[take]
-                worse = dev_new > dev_a * (1.0 + 1e-9)
+                worse[taken] = False
 
-            relative_change = np.abs(dev_new - dev_a) / np.maximum(np.abs(dev_a), 1e-8)
+            # No step in the halving range improved these genes.  Keep the
+            # iterate they came in with -- committing the uphill step would
+            # break the monotonicity the deviance convergence test assumes --
+            # and stop working on them.
+            clipped = np.zeros_like(worse)
+            if np.any(worse):
+                keep = np.flatnonzero(worse)
+                beta_new[:, keep] = beta_a[:, keep]
+                eta_new[:, keep] = eta_a[:, keep]
+                mu_new[:, keep] = mu_a[:, keep]
+                dev_new[keep] = dev_a[keep]
+                stalled[active[keep]] = True
+                if self.min_mu > 0.0:
+                    clipped = np.any(eta_a <= self._eta_min, axis=0)
+
+            relative_change = np.abs(dev_new - dev_a) / scale
             coef_change = np.max(np.abs(beta_new - beta_a), axis=0)
 
             beta[:, active] = beta_new
@@ -3561,9 +3618,24 @@ class NBGLMBatchFitter:
             mu[:, active] = mu_new
             dev[active] = dev_new
             n_iter[active] = iteration
-            converged[active] = (relative_change < self.tol) & (coef_change < self.tol)
+            # A gene that took no step moved nowhere, so judging it by how
+            # far it moved would call every stalled gene converged -- the
+            # failure the damping exists to prevent.  It is judged instead by
+            # the steps it refused: converged only if none of them could lower
+            # the deviance by more than ``tol``.  Cells on the fitted-mean
+            # floor are the exception: their mean does not move with the
+            # coefficients so they carry no gradient, yet the normal equations
+            # still count them, and the line search then describes the floor
+            # rather than the fit.  A gene at the ``ETA_MIN``/``ETA_MAX``
+            # clips gets no such exemption -- it is diverging, and saying so
+            # is the useful answer.
+            converged[active] = np.where(
+                worse,
+                (excess < self.tol) | clipped,
+                (relative_change < self.tol) & (coef_change < self.tol),
+            )
 
-            active = np.flatnonzero(~converged)
+            active = np.flatnonzero(~converged & ~stalled)
             if active.size == 0:
                 break
 
@@ -4250,7 +4322,7 @@ class NBGLMBatchFitter:
             # Per-gene normal equations, formed with BLAS in cell-sized chunks
             # and solved in the preconditioned column basis.
             Xs = self._design_scaled
-            xtwx = gram_batched(Xs, W, ridge=self.ridge_penalty)
+            xtwx = gram_batched(Xs, W, ridge=self._ridge_scaled)
 
             # Compute X^T W z for all genes: (n_genes, n_features)
             Wz = W * y_working  # (n_samples, n_genes)
@@ -4315,7 +4387,7 @@ class NBGLMBatchFitter:
         else:
             # Per-gene normal equations, formed with BLAS in cell-sized chunks
             # and inverted in the preconditioned column basis.
-            xtwx = gram_batched(self._design_scaled, W, ridge=self.ridge_penalty)
+            xtwx = gram_batched(self._design_scaled, W, ridge=self._ridge_scaled)
             
             # Invert all matrices at once and extract diagonal
             se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
@@ -5157,25 +5229,37 @@ class StructuredGLMBatchFitter:
         return np.clip(alpha_grid[np.argmin(-loglik, axis=0)], 1e-8, 1e3)
 
     def _irls(self, counts, alpha):
+        """IRLS to convergence with the dispersion held fixed.
+
+        Damping, convergence and the active set work exactly as in
+        :meth:`NBGLMBatchFitter._irls_at_fixed_dispersion`; see it for why a
+        shortened step always interpolates towards the full Newton point and
+        why a gene that runs out of halvings is left where it was.
+        """
         n_genes = counts.shape[1]
         deviance_of = Deviance(counts, self.family, alpha)
 
-        # Constant starting predictor at each gene's offset-adjusted mean.
+        # Constant starting predictor at each gene's offset-adjusted mean,
+        # carried by whichever design column is a constant (the intercept).
+        # ``eta`` is then derived from the coefficients rather than set beside
+        # them, so a design with no such column starts from a consistent
+        # ``beta = 0`` instead of an ``eta`` the coefficients do not describe.
         mean_counts = counts.mean(axis=0)
         eta_start = np.log(np.maximum(mean_counts, 1e-3) / np.exp(self.offset).mean())
         beta_features = np.zeros((n_genes, self.n_features))
-        intercept = np.flatnonzero(np.all(self.design == 1.0, axis=0))
-        if intercept.size:
-            beta_features[:, intercept[0]] = eta_start
+        constant = np.flatnonzero(
+            np.all(self.design == self.design[0], axis=0) & (self.design[0] != 0.0)
+        )
+        if constant.size:
+            beta_features[:, constant[0]] = eta_start / self.design[0, constant[0]]
         beta_groups = np.zeros((n_genes, self.n_groups))
 
-        eta = np.clip(
-            self.offset[:, None] + eta_start[None, :], self._eta_min, ETA_MAX
-        )
+        eta = self._linear_predictor(beta_features, beta_groups)
         mu = np.exp(eta)
         deviance = deviance_of.total(eta, mu)
 
         converged = np.zeros(n_genes, dtype=bool)
+        stalled = np.zeros(n_genes, dtype=bool)
         n_iter = np.zeros(n_genes, dtype=np.int32)
         active = np.arange(n_genes)
 
@@ -5187,37 +5271,55 @@ class StructuredGLMBatchFitter:
             deviance_fn = deviance_of.subset(active)
             alpha_a = None if alpha is None else alpha[active]
 
-            new_features, new_groups = self._newton_step(
+            full_features, full_groups = self._newton_step(
                 counts_a, eta_a, mu_a, alpha_a
             )
+            new_features = full_features.copy()
+            new_groups = full_groups.copy()
             new_eta = self._linear_predictor(new_features, new_groups)
             new_mu = np.exp(new_eta)
             new_deviance = deviance_fn.total(new_eta, new_mu)
 
-            worse = new_deviance > deviance_a * (1.0 + 1e-9)
+            ceiling = deviance_a + 1e-9 * np.abs(deviance_a)
+            worse = new_deviance > ceiling
+            scale = np.maximum(np.abs(deviance_a), 1e-8)
+            excess = (new_deviance - deviance_a) / scale
             step = 1.0
             for _ in range(_MAX_STEP_HALVINGS):
                 if not np.any(worse):
                     break
                 step *= 0.5
                 idx = np.flatnonzero(worse)
-                half_features = features_a[idx] + step * (new_features[idx] - features_a[idx])
-                half_groups = groups_a[idx] + step * (new_groups[idx] - groups_a[idx])
+                half_features = features_a[idx] + step * (full_features[idx] - features_a[idx])
+                half_groups = groups_a[idx] + step * (full_groups[idx] - groups_a[idx])
                 half_eta = self._linear_predictor(half_features, half_groups)
                 half_mu = np.exp(half_eta)
                 half_deviance = deviance_fn.subset(idx).total(half_eta, half_mu)
-                take = half_deviance <= new_deviance[idx]
+                excess[idx] = np.minimum(
+                    excess[idx], (half_deviance - deviance_a[idx]) / scale[idx]
+                )
+                take = half_deviance <= ceiling[idx]
                 taken = idx[take]
                 new_features[taken] = half_features[take]
                 new_groups[taken] = half_groups[take]
                 new_eta[:, taken] = half_eta[:, take]
                 new_mu[:, taken] = half_mu[:, take]
                 new_deviance[taken] = half_deviance[take]
-                worse = new_deviance > deviance_a * (1.0 + 1e-9)
+                worse[taken] = False
 
-            relative_change = np.abs(new_deviance - deviance_a) / np.maximum(
-                np.abs(deviance_a), 1e-8
-            )
+            clipped = np.zeros_like(worse)
+            if np.any(worse):
+                keep = np.flatnonzero(worse)
+                new_features[keep] = features_a[keep]
+                new_groups[keep] = groups_a[keep]
+                new_eta[:, keep] = eta_a[:, keep]
+                new_mu[:, keep] = mu_a[:, keep]
+                new_deviance[keep] = deviance_a[keep]
+                stalled[active[keep]] = True
+                if self.min_mu > 0.0:
+                    clipped = np.any(eta_a <= self._eta_min, axis=0)
+
+            relative_change = np.abs(new_deviance - deviance_a) / scale
             coef_change = np.maximum(
                 np.max(np.abs(new_features - features_a), axis=1),
                 np.max(np.abs(new_groups - groups_a), axis=1) if self.n_groups else 0.0,
@@ -5229,9 +5331,16 @@ class StructuredGLMBatchFitter:
             mu[:, active] = new_mu
             deviance[active] = new_deviance
             n_iter[active] = iteration
-            converged[active] = (relative_change < self.tol) & (coef_change < self.tol)
+            # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
+            # that took no step is judged by the steps it refused, and why a
+            # gene with clipped cells is exempt from that judgement.
+            converged[active] = np.where(
+                worse,
+                (excess < self.tol) | clipped,
+                (relative_change < self.tol) & (coef_change < self.tol),
+            )
 
-            active = np.flatnonzero(~converged)
+            active = np.flatnonzero(~converged & ~stalled)
             if active.size == 0:
                 break
 
