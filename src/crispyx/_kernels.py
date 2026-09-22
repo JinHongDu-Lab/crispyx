@@ -1989,6 +1989,13 @@ def _wilcoxon_stratified_batch_perts_numba(
         )
 
 
+# Mirrors crispyx._irls.{EPS, ETA_MIN, ETA_MAX}; numba folds module-level
+# floats in at compile time, so they cannot be imported as names here.
+EPS_K = 1e-10
+ETA_MIN_K = -30.0
+ETA_MAX_K = 20.0
+
+
 @nb.njit(parallel=True, cache=True)
 def _irls_batch_numba(
     Y: np.ndarray,
@@ -2046,7 +2053,13 @@ def _irls_batch_numba(
     converged = np.zeros(n_genes, dtype=nb.boolean)
     n_iter = np.zeros(n_genes, dtype=np.int32)
     
-    log_min_mu = np.log(min_mu)
+    # ``min_mu`` floors the fitted mean; clipping eta at log(min_mu) keeps
+    # eta == log(mu), which the working response below relies on.  An unfloored
+    # fit (min_mu == 0) has no such bound, so fall back to the generic clip.
+    if min_mu > 0.0:
+        log_min_mu = max(np.log(min_mu), ETA_MIN_K)
+    else:
+        log_min_mu = ETA_MIN_K
     
     # Parallel loop over genes
     for g in nb.prange(n_genes):
@@ -2065,17 +2078,19 @@ def _irls_batch_numba(
                 eta_i = offset[i]
                 for f in range(n_features):
                     eta_i += X[i, f] * beta_g[f]
-                eta_i = min(max(eta_i, log_min_mu), 20.0)
+                eta_i = min(max(eta_i, log_min_mu), ETA_MAX_K)
                 mu_i = np.exp(eta_i)
                 mu_i = max(mu_i, min_mu)
                 mu_g[i] = mu_i
                 
-                # Weight: W = mu^2 / (mu + alpha * mu^2)
+                # Weight: W = mu^2 / (mu + alpha * mu^2).  The guards are
+                # division guards only -- flooring these at ``min_mu`` would
+                # overstate the leverage of every low-count cell.
                 var_i = mu_i + alpha_g * mu_i * mu_i
-                W_g[i] = (mu_i * mu_i) / max(var_i, min_mu)
+                W_g[i] = (mu_i * mu_i) / max(var_i, EPS_K)
                 
                 # Working response: z = eta + (y - mu) / mu
-                z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, min_mu) - offset[i]
+                z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, EPS_K) - offset[i]
             
             # Solve WLS: beta_new = (X'WX + ridge*I)^{-1} X'Wz
             # For 2-feature case, use direct formula
