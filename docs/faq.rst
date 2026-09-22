@@ -223,6 +223,56 @@ NB-GLM requires CSR format. Convert first:
    adata_csr = cx.pp.convert_to_csr(adata, output_dir="results/")
    result = cx.nb_glm_test(adata_csr, perturbation_column="perturbation")
 
+Top hits by ``logfoldchanges`` are genes expressed in a handful of cells
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``t_test`` and ``wilcoxon_test`` reproduce Scanpy's fold change, which keeps
+the ratio finite with a constant::
+
+   log2((expm1(mean_group) + 1e-9) / (expm1(mean_rest) + 1e-9))
+
+When a gene has no expressing cells in one arm, that arm's term *is* the
+constant, so the ratio becomes ``expm1(mean) / 1e-9``: the magnitude reported
+says how small the constant is, not how large the effect is. Its ceiling is
+``log2(1 / 1e-9) = 29.9``.
+
+The scale of it: split 500 real control cells at random into two arms of 250,
+so that every difference is noise, and roughly 119 of 11,630 genes report
+``|log2FC| > 2``, the largest being 24.9.
+
+**This affects the effect-size column only.** On those same null runs the
+rejection rate is 4.1-4.9% against a nominal 5% at every level of sparsity,
+and no gene comes close to significance -- the smallest ``padj`` is 0.73. The
+p-values are sound; it is ranking or thresholding on ``logfoldchanges`` that
+promotes these genes above every real effect.
+
+``pts`` and ``pts_rest`` -- the fractions of expressing cells in the perturbed
+and control arms -- separate the two cases that look identical in the fold
+change. A gene with ``pts = 0.00`` and ``pts_rest = 0.95`` is a real complete
+knockdown; one with ``pts = 0.00`` and ``pts_rest = 0.02`` was never
+detectable in the first place. To rank on magnitudes that the data actually
+determines, keep the genes both arms can see:
+
+.. code-block:: python
+
+   import numpy as np
+
+   res = cx.wilcoxon_test(path, perturbation_column="perturbation")
+   row = res.groups.index("TARGET1")
+   measurable = (res.pts[row] > 0.05) & (res.pts_rest[row] > 0.05)
+   lfc = np.where(measurable, res.logfoldchanges[row], np.nan)
+   top = res.genes[np.argsort(-np.abs(lfc))]     # NaN sorts last
+
+On one real Adamson perturbation this takes the largest reported ``|log2FC|``
+from 23.6 to 3.0 and brings the targeted gene itself into the top five, at the
+cost of setting aside 2,612 of 11,630 genes as not measurable in both arms.
+
+Genes absent from one arm are excluded by that mask by construction, so look
+for them in ``pts`` / ``pts_rest`` rather than at the top of the fold-change
+ranking. Alternatively, raise ``min_pct_ctrl`` / ``min_pct_pert`` to drop
+sparse genes from the analysis entirely, which also removes them from the
+multiple-testing correction.
+
 HPC / SLURM tips
 ~~~~~~~~~~~~~~~~~
 

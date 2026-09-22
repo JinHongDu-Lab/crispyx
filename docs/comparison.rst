@@ -49,7 +49,10 @@ Example: Wilcoxon DE on a large screen
    sc.tl.rank_genes_groups(adata, groupby="perturbation", method="wilcoxon")
 
 The crispyx result for logfoldchanges, scores, and p-values matches Scanpy
-with Pearson *r* > 0.9999 across all tested datasets.
+with Pearson *r* > 0.9999 across all tested datasets. That includes Scanpy's
+convention for the fold change of a gene absent from one arm, where the
+reported magnitude is set by the formula's ``1e-9`` constant rather than by
+the data; see :doc:`faq` before ranking on ``logfoldchanges``.
 
 crispyx vs Pertpy / PyDESeq2
 -----------------------------
