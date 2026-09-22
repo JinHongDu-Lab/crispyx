@@ -3656,6 +3656,12 @@ class NBGLMBatchFitter:
                 stalled[active[keep]] = True
 
             relative_change = np.abs(dev_new - dev_a) / scale
+            # DESeq2's deviance ratio, for the floor-resting genes below.  It
+            # is formed here, with ``relative_change``, because ``dev_a``
+            # aliases ``dev`` while the whole batch is active: computing it
+            # after ``dev[active] = dev_new`` would compare ``dev_new`` with
+            # itself and make the ratio identically zero.
+            deviance_ratio = np.abs(dev_new - dev_a) / (np.abs(dev_new) + 0.1)
             coef_change = np.max(np.abs(beta_new - beta_a), axis=0)
 
             beta[:, active] = beta_new
@@ -3676,8 +3682,7 @@ class NBGLMBatchFitter:
             converged[active] = np.select(
                 [fixed_point, worse],
                 [
-                    (np.abs(dev_new - dev_a) / (np.abs(dev_new) + 0.1) < self.tol)
-                    & (coef_change < self.tol),
+                    (deviance_ratio < self.tol) & (coef_change < self.tol),
                     excess < self.tol,
                 ],
                 default=(relative_change < self.tol) & (coef_change < self.tol),
@@ -5469,6 +5474,13 @@ class StructuredGLMBatchFitter:
                 stalled[active[keep]] = True
 
             relative_change = np.abs(new_deviance - deviance_a) / scale
+            # Formed before ``deviance[active] = new_deviance`` below, for the
+            # reason given in NBGLMBatchFitter._irls_at_fixed_dispersion:
+            # ``deviance_a`` aliases ``deviance`` while the whole batch is
+            # active, so a ratio read after that write is always zero.
+            deviance_ratio = np.abs(new_deviance - deviance_a) / (
+                np.abs(new_deviance) + 0.1
+            )
             coef_change = np.maximum(
                 np.max(np.abs(new_features - features_a), axis=1),
                 np.max(np.abs(new_groups - groups_a), axis=1) if self.n_groups else 0.0,
@@ -5485,11 +5497,7 @@ class StructuredGLMBatchFitter:
             converged[active] = np.select(
                 [fixed_point, worse],
                 [
-                    (
-                        np.abs(new_deviance - deviance_a)
-                        / (np.abs(new_deviance) + 0.1) < self.tol
-                    )
-                    & (coef_change < self.tol),
+                    (deviance_ratio < self.tol) & (coef_change < self.tol),
                     excess < self.tol,
                 ],
                 default=(relative_change < self.tol) & (coef_change < self.tol),
