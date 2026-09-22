@@ -396,3 +396,72 @@ def _compute_mom_dispersion_batched(
         disp[g_start:g_end] = np.clip(numerator / dof, 1e-8, 1e6)
     
     return disp
+
+
+def _nonestimable_glm_mask(
+    *,
+    pert_expr_counts: np.ndarray,
+    control_expr_counts: np.ndarray,
+    min_cells_ctrl: int = 1,
+    min_cells_pert: int = 1,
+) -> np.ndarray:
+    """Flag (gene, perturbation) pairs whose GLM effect is not estimable.
+
+    A log-link GLM estimates the perturbation effect as
+    ``log(mean_perturbed) - log(mean_control)``.  When one arm carries no
+    counts at all that quantity is infinite: the likelihood has no interior
+    maximum and the coefficient runs to the boundary.  Whatever the fitter
+    then reports is set by where it was stopped, not by the data.  Measured on
+    a gene with 100 perturbed cells and zero counts among them, the fitted
+    effect was -18.9 with ``min_mu=0`` and -5.1 with ``min_mu=0.5`` -- the same
+    data giving answers that differ by a factor of four -- and the Wald
+    statistic went from 0.08 to 32.6, that is from "no evidence" to "wildly
+    significant", purely as an artefact of the mean floor.  (The collapse at
+    ``min_mu=0`` is the Hauck-Donner effect: as the coefficient diverges its
+    standard error grows faster than it does, so the Wald statistic tends to
+    zero on what is the strongest possible signal.)
+
+    Such pairs are therefore reported as untested -- ``NaN`` effect, statistic
+    and p-value -- exactly as genes with no counts anywhere already are.  This
+    is not the same as reporting an effect of zero, which would say "no
+    change" about a gene the perturbation may have silenced completely.  The
+    observation itself is preserved in ``pts`` and ``pts_rest``, where a pair
+    expressed in 0% of perturbed and 95% of control cells is plainly visible.
+
+    This complements :func:`_low_expr_in_both_mask`, which drops pairs that are
+    jointly low in *both* arms.  A pair that is absent from one arm and
+    abundant in the other passes that filter -- correctly, since it carries
+    real signal -- and is caught here instead.
+
+    The two thresholds are separate because the informative direction depends
+    on the screen.  In a knockdown screen (CRISPRi) the expected hit is
+    abundant in control and depleted in the perturbed arm, so the useful
+    setting is a demanding ``min_cells_ctrl`` -- evidence the gene is really
+    expressed at baseline -- beside a permissive ``min_cells_pert``.  An
+    activation screen (CRISPRa) wants the reverse.  Both default to 1, which
+    is symmetric and is also the exact boundary between an effect that exists
+    and one that does not; a threshold below 1 does not describe a weaker
+    filter, it readmits the artefact.
+
+    Parameters
+    ----------
+    pert_expr_counts, control_expr_counts
+        Number of cells with non-zero expression per gene, shape (n_genes,).
+    min_cells_ctrl
+        Minimum expressing cells required in the *control* arm. Default 1.
+    min_cells_pert
+        Minimum expressing cells required in the *perturbed* arm. Default 1.
+
+    Returns
+    -------
+    ndarray of bool, shape (n_genes,)
+        ``True`` for pairs that should not be given an effect estimate.
+    """
+    control_floor = max(int(min_cells_ctrl), 0)
+    pert_floor = max(int(min_cells_pert), 0)
+    flagged = np.zeros(np.shape(pert_expr_counts), dtype=bool)
+    if control_floor:
+        flagged |= np.asarray(control_expr_counts) < control_floor
+    if pert_floor:
+        flagged |= np.asarray(pert_expr_counts) < pert_floor
+    return flagged

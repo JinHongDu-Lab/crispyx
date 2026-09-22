@@ -58,6 +58,7 @@ from .glm import (
     NBGLMBatchFitter,
     ControlStatisticsCache,
     build_design_matrix,
+    fit_nb_glm_batch_auto,
     estimate_covariate_effects_streaming,
     estimate_dispersion_map,
     estimate_global_dispersion_streaming,
@@ -109,6 +110,7 @@ from ._statistics import (
     _compute_se_batched,
     _compute_mom_dispersion_batched,
     _low_expr_in_both_mask,
+    _nonestimable_glm_mask,
 )
 from ._memory import (
     _estimate_max_workers,
@@ -1538,6 +1540,8 @@ def nb_glm_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
+    min_cells_ctrl: int = 1,
+    min_cells_pert: int = 1,
     min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
@@ -1698,6 +1702,37 @@ def nb_glm_test(
         ``effect`` / ``logfc`` / ``se``; ``pts`` and ``mean`` remain populated.
     min_mean_pert
         Minimum mean expression for the *perturbed* side. Default ``0.005``.
+    min_cells_ctrl, min_cells_pert
+        Minimum number of expressing cells required in the control and
+        perturbed arms for a (gene, perturbation) pair to be tested. Both
+        default to ``1``.
+
+        A log-link GLM estimates the effect as a difference of log means, so a
+        pair with no counts at all in one arm has no finite effect: the
+        likelihood has no interior maximum and the coefficient runs to the
+        boundary. What a fitter reports there is set by where it stopped
+        rather than by the data -- on one such gene the fitted effect was
+        -18.9 at ``min_mu=0`` and -5.1 at ``min_mu=0.5``, with the Wald
+        statistic moving from 0.08 to 32.6 on identical counts. Those pairs
+        are reported as untested (``NaN`` effect, statistic and p-value), as
+        genes with no counts anywhere already are, and are excluded from the
+        multiple-testing correction.
+
+        This is deliberately *not* an effect of zero, which would describe a
+        completely silenced gene as unchanged. The observation survives in
+        ``pts`` and ``pts_rest``: a pair expressed in 0% of perturbed and 95%
+        of control cells is plainly visible there. For a finite estimate on
+        such pairs use ``lfc_shrinkage_type="apeglm"``, whose prior keeps the
+        coefficient bounded.
+
+        The two are separate because the informative direction depends on the
+        screen. A knockdown screen (CRISPRi) expects hits abundant in control
+        and depleted in the perturbed arm, so a demanding ``min_cells_ctrl``
+        beside a permissive ``min_cells_pert`` is the useful setting; an
+        activation screen (CRISPRa) wants the reverse. The default of 1 is
+        both symmetric and the exact boundary between an effect that exists
+        and one that does not, so a value below 1 does not weaken the filter,
+        it readmits the artefact. Set either to ``0`` to disable that side.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -1988,6 +2023,8 @@ def nb_glm_test(
         min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
+        min_cells_ctrl: int,
+        min_cells_pert: int,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -2115,6 +2152,16 @@ def nb_glm_test(
             min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
+        # A pair with no counts in one arm has no finite effect to estimate;
+        # see _nonestimable_glm_mask.  Excluded here rather than fitted, so it
+        # is reported as untested instead of carrying a bound-determined
+        # effect and an artefactual p-value into the FDR correction.
+        valid_mask = valid_mask & ~_nonestimable_glm_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_expr_counts,
+            min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert,
+        )
         valid_indices = np.where(valid_mask)[0]
 
         # Initialize result arrays
@@ -2163,9 +2210,19 @@ def nb_glm_test(
         # Fit valid genes
         fit_matrix = subset_matrix[:, valid_mask]
         
-        batch_fitter = NBGLMBatchFitter(
+        # A categorical covariate (batch, donor, lane) is one-hot encoded into
+        # the design, which makes the per-gene Hessian arrowhead-structured.
+        # fit_nb_glm_batch_auto takes the structured path when the number of
+        # levels makes it worthwhile and the dense path otherwise; either way
+        # the result is in the column order of `design`.  The intercept and the
+        # perturbation column are protected from the group block because the
+        # perturbation coefficient is the quantity under test and must not be
+        # subject to the group-coefficient clip.
+        batch_result = fit_nb_glm_batch_auto(
             design,
+            fit_matrix,
             offset=subset_offset,
+            protected_columns=(0, perturbation_column_index),
             max_iter=max_iter,
             tol=tol,
             poisson_init_iter=poisson_init_iter,
@@ -2173,8 +2230,6 @@ def nb_glm_test(
             min_mu=min_mu,
             min_total_count=min_total_count,
         )
-        
-        batch_result = batch_fitter.fit_batch(fit_matrix)
 
         # Extract results
         result["converged"][valid_indices] = batch_result.converged
@@ -2335,6 +2390,8 @@ def nb_glm_test(
         min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
+        min_cells_ctrl: int,
+        min_cells_pert: int,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -2445,6 +2502,13 @@ def nb_glm_test(
             min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
+        # See the matching comment in the uncached path.
+        valid_mask = valid_mask & ~_nonestimable_glm_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_cache.control_expr_counts,
+            min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert,
+        )
         result["n_tested"] = int(valid_mask.sum())
 
         if not np.any(valid_mask):
@@ -3414,6 +3478,8 @@ def nb_glm_test(
                             min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
+                            min_cells_ctrl=min_cells_ctrl,
+                            min_cells_pert=min_cells_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -3453,6 +3519,8 @@ def nb_glm_test(
                             min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
+                            min_cells_ctrl=min_cells_ctrl,
+                            min_cells_pert=min_cells_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -3509,6 +3577,8 @@ def nb_glm_test(
                                 min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
+                                min_cells_ctrl=min_cells_ctrl,
+                                min_cells_pert=min_cells_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3540,6 +3610,8 @@ def nb_glm_test(
                                 min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
+                                min_cells_ctrl=min_cells_ctrl,
+                                min_cells_pert=min_cells_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
