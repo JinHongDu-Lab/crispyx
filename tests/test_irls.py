@@ -341,3 +341,16 @@ def test_gram_ridge_accepts_a_per_column_penalty(rng):
     got = gram_batched(design, weights, ridge=ridge)
     expected = gram_batched(design, weights) + np.diag(ridge)[None, :, :]
     np.testing.assert_allclose(got, expected, rtol=1e-12)
+
+
+def test_subset_accepts_already_sliced_counts(rng):
+    """Passing counts the caller already holds must not change the result."""
+    counts = rng.poisson(3.0, size=(50, 6)).astype(float)
+    alpha = rng.random(6) + 0.1
+    deviance = Deviance(counts, "nb", alpha)
+    idx = np.array([1, 4, 5])
+    mu = rng.random((50, 3)) + 0.5
+
+    fresh = deviance.subset(idx).total(np.log(mu), mu)
+    reused = deviance.subset(idx, counts[:, idx]).total(np.log(mu), mu)
+    np.testing.assert_array_equal(fresh, reused)

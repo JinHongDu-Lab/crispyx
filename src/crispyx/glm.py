@@ -3260,8 +3260,6 @@ class NBGLMBatchFitter:
         self.min_total_count = min_total_count
         self.ridge_penalty = ridge_penalty
         
-        # Precompute X^T X for efficiency
-        self._xtx = self.design.T @ self.design
         # The normal equations are solved in a unit-root-mean-square column
         # basis and the coefficients are mapped back, so a design whose columns
         # differ by orders of magnitude does not make X'WX ill-conditioned.
@@ -3545,13 +3543,16 @@ class NBGLMBatchFitter:
         active = np.arange(n_genes)
 
         for iteration in range(1, self.max_iter + 1):
-            Y_a = Y[:, active]
-            beta_a = beta[:, active]
-            eta_a = eta[:, active]
-            mu_a = mu[:, active]
-            dev_a = dev[active]
-            deviance_a = deviance_of.subset(active)
-            alpha_a = None if alpha is None else alpha[active]
+            # On the first iteration every gene is active; slicing then would
+            # copy the whole batch four times over to no purpose.
+            whole = active.size == n_genes
+            Y_a = Y if whole else Y[:, active]
+            beta_a = beta if whole else beta[:, active]
+            eta_a = eta if whole else eta[:, active]
+            mu_a = mu if whole else mu[:, active]
+            dev_a = dev if whole else dev[active]
+            deviance_a = deviance_of if whole else deviance_of.subset(active, Y_a)
+            alpha_a = None if alpha is None else (alpha if whole else alpha[active])
 
             weights = irls_weights(mu_a, alpha_a)
             z = eta_a - offset_col + (Y_a - mu_a) / np.maximum(mu_a, EPS)
@@ -5174,8 +5175,24 @@ class StructuredGLMBatchFitter:
         # Cells reordered so each group is a contiguous block, for the
         # per-group BLAS products in OneHotGroups.cross.
         self._design_sorted = self.groups.sort(self.design)
+        self._poisson: "StructuredGLMBatchFitter | None" = None
 
     # -- internals ---------------------------------------------------------
+
+    def _poisson_twin(self) -> "StructuredGLMBatchFitter":
+        """A Poisson fitter over the same design, for the warm-start means.
+
+        Built once and reused, so fitting the genes in batches does not
+        rebuild the group layout per batch.
+        """
+        if self._poisson is None:
+            self._poisson = StructuredGLMBatchFitter(
+                self.design, self.groups.matrix, offset=self.offset,
+                family="poisson", max_iter=self.max_iter, tol=self.tol,
+                ridge=self.ridge, ridge_group=self.ridge_group,
+                clip_group=self.clip_group, min_mu=self.min_mu,
+            )
+        return self._poisson
 
     def _linear_predictor(self, beta_features, beta_groups):
         eta = self.offset[:, None] + self.design @ beta_features.T
@@ -5228,13 +5245,17 @@ class StructuredGLMBatchFitter:
             loglik[index] -= 0.5 * self._log_det_hessian(irls_weights(mu, value))
         return np.clip(alpha_grid[np.argmin(-loglik, axis=0)], 1e-8, 1e3)
 
-    def _irls(self, counts, alpha):
+    def _irls(self, counts, alpha, *, final_blocks: bool = True):
         """IRLS to convergence with the dispersion held fixed.
 
         Damping, convergence and the active set work exactly as in
         :meth:`NBGLMBatchFitter._irls_at_fixed_dispersion`; see it for why a
         shortened step always interpolates towards the full Newton point and
         why a gene that runs out of halvings is left where it was.
+
+        ``final_blocks=False`` skips the terminal Hessian blocks, which exist
+        only so that standard errors can reuse the factorisation.  A fit whose
+        means are wanted for a dispersion estimate does not need them.
         """
         n_genes = counts.shape[1]
         deviance_of = Deviance(counts, self.family, alpha)
@@ -5264,12 +5285,15 @@ class StructuredGLMBatchFitter:
         active = np.arange(n_genes)
 
         for iteration in range(1, self.max_iter + 1):
-            counts_a = counts[:, active]
-            eta_a, mu_a = eta[:, active], mu[:, active]
-            features_a, groups_a = beta_features[active], beta_groups[active]
-            deviance_a = deviance[active]
-            deviance_fn = deviance_of.subset(active)
-            alpha_a = None if alpha is None else alpha[active]
+            whole = active.size == n_genes
+            counts_a = counts if whole else counts[:, active]
+            eta_a = eta if whole else eta[:, active]
+            mu_a = mu if whole else mu[:, active]
+            features_a = beta_features if whole else beta_features[active]
+            groups_a = beta_groups if whole else beta_groups[active]
+            deviance_a = deviance if whole else deviance[active]
+            deviance_fn = deviance_of if whole else deviance_of.subset(active, counts_a)
+            alpha_a = None if alpha is None else (alpha if whole else alpha[active])
 
             full_features, full_groups = self._newton_step(
                 counts_a, eta_a, mu_a, alpha_a
@@ -5344,14 +5368,16 @@ class StructuredGLMBatchFitter:
             if active.size == 0:
                 break
 
-        # Standard errors need the blocks at the converged fit for *every*
-        # gene; the iterations only ever formed them for the active subset.
-        gram, cross, diagonal = self._hessian_blocks(irls_weights(mu, alpha))
-        schur = schur_complement(gram, cross, diagonal)
+        blocks = None
+        if final_blocks:
+            # Standard errors need the blocks at the converged fit for *every*
+            # gene; the iterations only ever formed them for the active subset.
+            gram, cross, diagonal = self._hessian_blocks(irls_weights(mu, alpha))
+            blocks = (cross, diagonal, schur_complement(gram, cross, diagonal))
 
         return (
             beta_features, beta_groups, eta, mu, deviance, converged, n_iter,
-            (cross, diagonal, schur),
+            blocks,
         )
 
     def _moments_dispersion(self, counts, mu):
@@ -5372,6 +5398,7 @@ class StructuredGLMBatchFitter:
         dispersion: ArrayLike | None = None,
         return_mu: bool = True,
         return_dev_resid: bool = True,
+        gene_batch_size: int | Literal["auto"] | None = "auto",
     ) -> StructuredGLMResult:
         """Fit one GLM per gene.
 
@@ -5387,6 +5414,12 @@ class StructuredGLMBatchFitter:
         return_mu, return_dev_resid
             Whether to return the ``(n_samples, n_genes)`` fitted means and
             deviance residuals.  Both are large; skip what is not needed.
+        gene_batch_size
+            Genes fitted at a time.  A Newton step holds a dozen
+            ``(n_samples, batch)`` work arrays, so this is what bounds peak
+            memory; ``"auto"`` sizes it for ~100 MB of them, as
+            :class:`NBGLMBatchFitter` does.  ``None`` fits every gene in one
+            batch.  (``counts`` itself is held whole either way.)
         """
         counts = np.asarray(
             counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
@@ -5395,29 +5428,65 @@ class StructuredGLMBatchFitter:
             raise ValueError(f"counts must have shape ({self.n_samples}, n_genes)")
         n_genes = counts.shape[1]
 
-        if self.family == "poisson":
-            alpha = None
-        elif dispersion is not None:
+        alpha = None
+        if self.family == "nb" and dispersion is not None:
             alpha = np.asarray(dispersion, dtype=np.float64).ravel()
             if alpha.shape != (n_genes,):
                 raise ValueError(
                     f"dispersion must have shape ({n_genes},), got {alpha.shape}"
                 )
-        else:
-            poisson = StructuredGLMBatchFitter(
-                self.design, self.groups.matrix, offset=self.offset, family="poisson",
-                max_iter=self.max_iter, tol=self.tol, ridge=self.ridge,
-                ridge_group=self.ridge_group, clip_group=self.clip_group,
-                min_mu=self.min_mu,
+
+        if gene_batch_size == "auto":
+            gene_batch_size = _estimate_gene_batch_size_fitter(
+                self.n_samples, n_genes, n_work_arrays=12, target_mb=100.0
             )
-            poisson_fit = poisson.fit_batch(counts, return_mu=True, return_dev_resid=False)
+        elif gene_batch_size is None:
+            gene_batch_size = n_genes
+        gene_batch_size = max(1, int(gene_batch_size))
+
+        n_coef = self.n_features + self.n_groups
+        out = StructuredGLMResult(
+            coef=np.zeros((n_genes, n_coef), dtype=np.float64),
+            se=np.full((n_genes, n_coef), np.inf, dtype=np.float64),
+            dispersion=np.zeros(n_genes, dtype=np.float64),
+            deviance=np.full(n_genes, np.nan, dtype=np.float64),
+            converged=np.zeros(n_genes, dtype=bool),
+            n_iter=np.zeros(n_genes, dtype=np.int32),
+            mu=np.empty((self.n_samples, n_genes)) if return_mu else None,
+            dev_resid=np.empty((self.n_samples, n_genes)) if return_dev_resid else None,
+        )
+
+        for start in range(0, n_genes, gene_batch_size):
+            batch = slice(start, min(start + gene_batch_size, n_genes))
+            self._fit_genes(
+                counts[:, batch],
+                None if alpha is None else alpha[batch],
+                out,
+                batch,
+                return_mu=return_mu,
+                return_dev_resid=return_dev_resid,
+            )
+        return out
+
+    def _fit_genes(
+        self, counts, alpha, out, batch, *, return_mu, return_dev_resid
+    ) -> None:
+        """Fit one batch of genes, writing into ``out[batch]``."""
+        if self.family == "nb" and alpha is None:
             # Mirror the dense fitter: a first dispersion from the Poisson
             # means, an NB fit with it held fixed, then the dispersion that
             # the fitted NB means imply.  The final fit below then uses that,
             # so the returned coefficients and dispersion describe the same
-            # model rather than being one step out of step.
-            alpha = self._moments_dispersion(counts, poisson_fit.mu)
-            _, _, _, first_mu, _, _, _, _ = self._irls(counts, alpha)
+            # model rather than being one step out of step.  Neither
+            # intermediate fit needs standard errors, so neither forms the
+            # blocks they would come from.
+            _, _, _, poisson_mu, _, _, _, _ = self._poisson_twin()._irls(
+                counts, None, final_blocks=False
+            )
+            alpha = self._moments_dispersion(counts, poisson_mu)
+            _, _, _, first_mu, _, _, _, _ = self._irls(
+                counts, alpha, final_blocks=False
+            )
             alpha = self._moments_dispersion(counts, first_mu)
             if self.dispersion_method == "cox-reid":
                 alpha = self._refine_dispersion_cox_reid(counts, first_mu, alpha)
@@ -5428,25 +5497,23 @@ class StructuredGLMBatchFitter:
         ) = self._irls(counts, alpha)
 
         feature_variance, group_variance = schur_variances(schur, cross, diagonal)
-        se = np.c_[
+
+        out.coef[batch] = np.c_[beta_features, beta_groups]
+        out.se[batch] = np.c_[
             np.sqrt(np.maximum(feature_variance, 0.0)),
             np.sqrt(np.maximum(group_variance, 0.0)),
         ]
-
-        dev_resid = None
+        if alpha is not None:
+            out.dispersion[batch] = alpha
+        out.deviance[batch] = deviance
+        out.converged[batch] = converged
+        out.n_iter[batch] = n_iter
+        if return_mu:
+            out.mu[:, batch] = mu
         if return_dev_resid:
-            dev_resid = Deviance(counts, self.family, alpha).residuals(eta, mu)
-
-        return StructuredGLMResult(
-            coef=np.c_[beta_features, beta_groups],
-            se=se,
-            dispersion=np.zeros(n_genes) if alpha is None else alpha,
-            deviance=deviance,
-            converged=converged,
-            n_iter=n_iter,
-            mu=mu if return_mu else None,
-            dev_resid=dev_resid,
-        )
+            out.dev_resid[:, batch] = Deviance(
+                counts, self.family, alpha
+            ).residuals(eta, mu)
 
     def counterfactual_means(
         self,
@@ -5502,11 +5569,13 @@ def fit_glm_onehot(
     """
     return_mu = kwargs.pop("return_mu", True)
     return_dev_resid = kwargs.pop("return_dev_resid", True)
+    gene_batch_size = kwargs.pop("gene_batch_size", "auto")
     fitter = StructuredGLMBatchFitter(
         design, groups, offset=offset, family=family, **kwargs
     )
     return fitter.fit_batch(
-        counts, dispersion=dispersion, return_mu=return_mu, return_dev_resid=return_dev_resid
+        counts, dispersion=dispersion, return_mu=return_mu,
+        return_dev_resid=return_dev_resid, gene_batch_size=gene_batch_size,
     )
 
 

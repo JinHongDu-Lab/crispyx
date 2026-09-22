@@ -261,10 +261,14 @@ class Deviance:
         else:
             self.const = ylogy.sum(axis=0)
 
-    def subset(self, idx: np.ndarray) -> "Deviance":
-        """This deviance restricted to genes ``idx``, without recomputing."""
+    def subset(self, idx: np.ndarray, counts: np.ndarray | None = None) -> "Deviance":
+        """This deviance restricted to genes ``idx``, without recomputing.
+
+        ``counts`` may be passed when the caller already holds
+        ``self.counts[:, idx]``, to avoid making that copy twice.
+        """
         return Deviance(
-            self.counts[:, idx],
+            self.counts[:, idx] if counts is None else counts,
             self.family,
             _const=self.const[idx],
             _size=None if self.size is None else self.size[:, idx],
@@ -402,6 +406,15 @@ class OneHotGroups:
         return out
 
 
+def _arrowhead_blocks(
+    cross: np.ndarray, diagonal: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``B`` and ``B D^-1`` in the ``(n_genes, n_features, n_groups)`` layout
+    that the batched matrix products below want."""
+    blocks = np.ascontiguousarray(cross.transpose(2, 1, 0))
+    return blocks, blocks * (1.0 / diagonal).T[:, None, :]
+
+
 def schur_complement(
     gram: np.ndarray, cross: np.ndarray, diagonal: np.ndarray
 ) -> np.ndarray:
@@ -412,8 +425,7 @@ def schur_complement(
     produces bit-identical values several times slower, because it does not
     reach BLAS.
     """
-    blocks = np.ascontiguousarray(cross.transpose(2, 1, 0))
-    scaled = blocks * (1.0 / diagonal).T[:, None, :]
+    blocks, scaled = _arrowhead_blocks(cross, diagonal)
     return gram - np.matmul(scaled, blocks.transpose(0, 2, 1))
 
 
@@ -457,10 +469,10 @@ def schur_solve(
         that standard errors can reuse the factorisation.
     """
     inverse_diagonal = 1.0 / diagonal                        # (a, p)
-    # (p, d_X, a): the layout the batched matrix products below want.
-    blocks = np.ascontiguousarray(cross.transpose(2, 1, 0))
-    scaled = blocks * inverse_diagonal.T[:, None, :]
-    schur = schur_complement(gram, cross, diagonal)
+    blocks, scaled = _arrowhead_blocks(cross, diagonal)
+    # Inlined rather than calling schur_complement, which would re-form both
+    # (n_genes, d_X, a) arrays a second time.
+    schur = gram - np.matmul(scaled, blocks.transpose(0, 2, 1))
     rhs = rhs_features - np.matmul(scaled, rhs_groups.T[:, :, None])[:, :, 0]
     beta_features = np.linalg.solve(schur, rhs[:, :, None])[:, :, 0]
     beta_groups = (

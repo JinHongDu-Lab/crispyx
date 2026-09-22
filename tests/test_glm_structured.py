@@ -572,8 +572,42 @@ def test_nb_glm_test_with_many_batches_routes_structured_and_agrees(tmp_path, mo
 
 
 # --------------------------------------------------------------------------
-# the starting point
+# gene batching and the starting point
 # --------------------------------------------------------------------------
+
+def test_gene_batching_does_not_change_the_fit():
+    """Batching bounds the work arrays; it is not a numerical choice.
+
+    The batches differ only in the shape of the matrices handed to BLAS, which
+    is free to sum them in a different order, so the agreement is to rounding
+    rather than bit-exact.  A deviance residual is the square root of a unit
+    deviance, which amplifies that for a residual near zero.
+    """
+    counts, design, groups, _, offset, _ = make_screen(seed=4, n=300, p=40, n_groups=6)
+    fitter = StructuredGLMBatchFitter(design, groups, offset=offset)
+
+    whole = fitter.fit_batch(counts, gene_batch_size=None)
+    batched = fitter.fit_batch(counts, gene_batch_size=7)
+
+    np.testing.assert_allclose(batched.coef, whole.coef, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(batched.se, whole.se, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(batched.dispersion, whole.dispersion, rtol=1e-12)
+    np.testing.assert_allclose(batched.deviance, whole.deviance, rtol=1e-10)
+    np.testing.assert_allclose(batched.mu, whole.mu, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(batched.dev_resid, whole.dev_resid, rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(batched.converged, whole.converged)
+
+
+def test_gene_batching_carries_a_supplied_dispersion_through():
+    counts, design, groups, _, offset, alpha = make_screen(seed=5, n=200, p=30, n_groups=4)
+    fitter = StructuredGLMBatchFitter(design, groups, offset=offset)
+
+    whole = fitter.fit_batch(counts, dispersion=alpha, gene_batch_size=None)
+    batched = fitter.fit_batch(counts, dispersion=alpha, gene_batch_size=9)
+
+    np.testing.assert_array_equal(batched.dispersion, alpha)
+    np.testing.assert_allclose(batched.coef, whole.coef, rtol=1e-12, atol=1e-12)
+
 
 def test_fit_is_unchanged_by_scaling_the_intercept_column():
     """The starting predictor is carried by whichever column is constant, and
