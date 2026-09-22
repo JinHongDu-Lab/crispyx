@@ -1989,6 +1989,13 @@ def _wilcoxon_stratified_batch_perts_numba(
         )
 
 
+# Mirrors crispyx._irls.{EPS, ETA_MIN, ETA_MAX}; numba folds module-level
+# floats in at compile time, so they cannot be imported as names here.
+EPS_K = 1e-10
+ETA_MIN_K = -30.0
+ETA_MAX_K = 20.0
+
+
 @nb.njit(parallel=True, cache=True)
 def _irls_batch_numba(
     Y: np.ndarray,
@@ -2031,8 +2038,6 @@ def _irls_batch_numba(
     -------
     beta : (n_features, n_genes)
         Fitted coefficients.
-    se : (n_features, n_genes)
-        Standard errors.
     converged : (n_genes,)
         Convergence flags.
     n_iter : (n_genes,)
@@ -2042,11 +2047,16 @@ def _irls_batch_numba(
     n_features = X.shape[1]
     
     beta = np.copy(beta_init)
-    se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
     converged = np.zeros(n_genes, dtype=nb.boolean)
     n_iter = np.zeros(n_genes, dtype=np.int32)
     
-    log_min_mu = np.log(min_mu)
+    # ``min_mu`` floors the fitted mean; clipping eta at log(min_mu) keeps
+    # eta == log(mu), which the working response below relies on.  An unfloored
+    # fit (min_mu == 0) has no such bound, so fall back to the generic clip.
+    if min_mu > 0.0:
+        log_min_mu = max(np.log(min_mu), ETA_MIN_K)
+    else:
+        log_min_mu = ETA_MIN_K
     
     # Parallel loop over genes
     for g in nb.prange(n_genes):
@@ -2065,17 +2075,19 @@ def _irls_batch_numba(
                 eta_i = offset[i]
                 for f in range(n_features):
                     eta_i += X[i, f] * beta_g[f]
-                eta_i = min(max(eta_i, log_min_mu), 20.0)
+                eta_i = min(max(eta_i, log_min_mu), ETA_MAX_K)
                 mu_i = np.exp(eta_i)
                 mu_i = max(mu_i, min_mu)
                 mu_g[i] = mu_i
                 
-                # Weight: W = mu^2 / (mu + alpha * mu^2)
+                # Weight: W = mu^2 / (mu + alpha * mu^2).  The guards are
+                # division guards only -- flooring these at ``min_mu`` would
+                # overstate the leverage of every low-count cell.
                 var_i = mu_i + alpha_g * mu_i * mu_i
-                W_g[i] = (mu_i * mu_i) / max(var_i, min_mu)
+                W_g[i] = (mu_i * mu_i) / max(var_i, EPS_K)
                 
                 # Working response: z = eta + (y - mu) / mu
-                z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, min_mu) - offset[i]
+                z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, EPS_K) - offset[i]
             
             # Solve WLS: beta_new = (X'WX + ridge*I)^{-1} X'Wz
             # For 2-feature case, use direct formula
@@ -2112,12 +2124,6 @@ def _irls_batch_numba(
                 if diff < tol:
                     gene_converged = True
                     n_iter[g] = iteration + 1
-                    
-                    # Compute SE
-                    inv_00 = xtwx_11 / det
-                    inv_11 = xtwx_00 / det
-                    se[0, g] = np.sqrt(max(inv_00, 1e-12))
-                    se[1, g] = np.sqrt(max(inv_11, 1e-12))
                     break
             else:
                 # General case: would need matrix operations
@@ -2128,27 +2134,11 @@ def _irls_batch_numba(
         
         if not gene_converged:
             n_iter[g] = max_iter
-            # Compute final SE even if not converged
-            if n_features == 2:
-                xtwx_00 = ridge
-                xtwx_01 = 0.0
-                xtwx_11 = ridge
-                for i in range(n_samples):
-                    w_i = W_g[i]
-                    x1_i = X[i, 1]
-                    xtwx_00 += w_i
-                    xtwx_01 += w_i * x1_i
-                    xtwx_11 += w_i * x1_i * x1_i
-                det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-                if abs(det) < 1e-12:
-                    det = 1e-12
-                se[0, g] = np.sqrt(max(xtwx_11 / det, 1e-12))
-                se[1, g] = np.sqrt(max(xtwx_00 / det, 1e-12))
         
         beta[:, g] = beta_g
         converged[g] = gene_converged
     
-    return beta, se, converged, n_iter
+    return beta, converged, n_iter
 
 
 # =============================================================================

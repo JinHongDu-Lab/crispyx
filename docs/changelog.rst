@@ -1,6 +1,248 @@
 Changelog
 =========
 
+Version 0.1.5
+-------------
+
+This release reworks the GLM solver. Estimates change for lowly-expressed
+genes -- toward, not away from, the reference implementations -- so results
+from 0.1.4 on covariate-adjusted or low-count genes will not reproduce
+exactly. ``nb_glm_test`` keeps its own ``min_mu`` default of 0.5, so the
+DESeq2-compatible path is unchanged.
+
+* **A filtered gene is now reported the same way everywhere: untested.**
+  ``nb_glm_test`` already reported an excluded (gene, perturbation) pair as
+  ``NaN`` throughout; ``t_test`` and ``wilcoxon_test`` did not. Depending on
+  which of the three Wilcoxon paths ran, a gene dropped by
+  ``min_cells_expressed`` came back with ``p = 1.0`` and a fold change of
+  exactly 0.0 -- "tested, no change", asserted about a gene nobody tested --
+  or with a ``NaN`` p-value beside that same 0.0, and ``t_test`` returned a
+  ``NaN`` p-value beside a finite fold change and effect size. Worse, a gene
+  excluded for one perturbation but tested for another picked up that other
+  perturbation's default ``p = 1.0``, so a result row depended on which
+  perturbations happened to be in the same run. All three Wilcoxon paths and
+  ``t_test`` now write ``NaN`` to every column derived from the comparison --
+  ``score``, ``pvalue``, ``pvalue_adj``, ``u_statistic``, ``logfoldchanges``,
+  ``effect_size`` -- for every gene they did not test, and nothing is spelled
+  as 0.0 or 1.0 to mean "untested". Because a ``NaN`` p-value does not enter
+  the Benjamini-Hochberg denominator, adjusted p-values on the genes that
+  *were* tested get slightly smaller; that is the correct denominator.
+  ``nb_glm_test`` had one such number left of its own: with
+  ``lfc_shrinkage_type="apeglm"``, an untested gene's standard error was
+  reported as the literal 1.0 that the per-gene shrinkage falls back to. It is
+  ``NaN`` there now as well.
+* **``pts`` and ``pts_rest`` survive the filters.** The Wilcoxon paths zeroed
+  the fractions of expressing cells for excluded genes, which is exactly the
+  information needed to see that a gene absent from one arm was excluded at
+  all. They are descriptions of the data, not of the comparison, and are now
+  reported for every gene, as ``t_test`` and ``nb_glm_test`` already did.
+* **``t_test`` no longer folds untested cells into the last perturbation.**
+  With an explicit ``perturbations=`` subset, every cell belonging to a
+  perturbation outside that subset was accumulated into the last tested
+  group's sums, means, variances and cell count, because the unselected
+  labels code to ``-1`` and ``-1`` indexes the last row. Testing one
+  perturbation out of three therefore compared control against that
+  perturbation *plus both untested ones*. Only ``t_test`` was affected;
+  ``wilcoxon_test`` and ``nb_glm_test`` select cells by label.
+* **Negative-binomial estimates are no longer biased on lowly-expressed
+  genes.** ``min_mu`` was being applied not only as the floor on the fitted
+  mean that DESeq2 defines, but also as a clamp on the IRLS weights, on the
+  variance, and on several division guards. Clamping the weights inflates the
+  leverage of every cell whose fitted mean falls below the floor: at
+  ``mu = 0.1, alpha = 1`` the correct weight is 0.091 and the clamp made it
+  0.5. The clamped fit did not merely differ from the right answer, it solved
+  a different estimating equation: on genes below one count per cell it left a
+  score of 50-100 where the maximum likelihood estimate has a score of zero,
+  and roughly 40-100 units of excess deviance. The same fits now leave a score
+  of ~1e-6. (The score equation is used here rather than agreement with
+  another implementation because it needs no second implementation, and
+  cross-solver agreement is a poor instrument on sparse count data.)
+  ``min_mu`` now floors the fitted mean and nothing else, and its default on
+  ``NBGLMBatchFitter`` and ``NBGLMFitter`` is 0. ``nb_glm_test`` keeps its own
+  default of 0.5, so the DESeq2-compatible path is unchanged.
+* **(gene, perturbation) pairs with no counts in one arm are no longer given
+  an effect estimate.** A log-link GLM estimates the effect as a difference of
+  log means, so a pair absent from one arm has no finite effect: the
+  likelihood has no interior maximum and the coefficient runs to the boundary.
+  What was reported there came from wherever the fitter stopped, not from the
+  data -- on one such gene the effect was -18.9 with ``min_mu=0`` and -5.1 with
+  ``min_mu=0.5``, and the Wald statistic moved from 0.08 to 32.6 on identical
+  counts, that is from "no evidence" to "wildly significant" purely as an
+  artefact of the mean floor. (The collapse at ``min_mu=0`` is the
+  Hauck-Donner effect: as the coefficient diverges its standard error grows
+  faster still, so the Wald test loses power on the strongest possible
+  signal.) These pairs are now reported as untested -- ``NaN`` effect,
+  statistic and p-value -- exactly as genes with no counts anywhere already
+  were, and are excluded from the multiple-testing correction rather than
+  entering it with artefactual p-values. They are *not* reported as an effect
+  of zero, which would describe a completely silenced gene as unchanged; the
+  observation remains visible in ``pts`` and ``pts_rest``. Shrinkage does not
+  reach them either -- an excluded pair is dropped before any fit, so it stays
+  ``NaN`` under ``lfc_shrinkage_type="apeglm"`` too. Controlled by the new
+  ``nb_glm_test`` parameters ``min_cells_ctrl`` and ``min_cells_pert``, both
+  defaulting to 1 -- symmetric, and the exact boundary between an effect that
+  exists and one that does not. They are separate because the informative
+  direction depends on the screen;
+  ``crispyx._statistics._nonestimable_glm_mask`` documents which asymmetry
+  suits CRISPRi and which suits CRISPRa. Set either to 0 to disable that side.
+* **Two standard-error bugs from the same cause.** ``NBGLMFitter`` floored
+  standard errors at ``sqrt(min_mu)``, forcing every reported standard error
+  to at least 0.707 at the old default, and floored the Cook's-distance
+  leverage denominator at ``min_mu``.
+* **Wide designs are two orders of magnitude faster.** The per-gene Hessian
+  was formed with a three-operand ``numpy.einsum``, which stops routing
+  through BLAS once its intermediate exceeds an internal budget and falls back
+  to a nested loop. Formed with a chunked ``gemm`` instead, ``fit_batch`` on
+  1,000 cells and 500 genes went from 16.05 s to 0.15 s at design width 41 and
+  from 35.38 s to 0.23 s at width 61; below width 21 there is no material
+  difference. Results agree to 7e-12.
+* **New:** ``StructuredGLMBatchFitter``, ``fit_glm_onehot`` and
+  ``detect_onehot_block`` for designs of the form ``[covariates | one-hot
+  groups]`` -- a perturbation screen, or any design with a many-level
+  categorical covariate. The disjoint group supports make the per-gene Hessian
+  arrowhead-structured, so each Newton step goes through the Schur complement
+  of the diagonal block: exact (verified against a dense per-gene solve to
+  1.4e-15) and much cheaper. Measured against the dense fitter at 1,200 cells
+  and 800 genes: 14.2x at 31 covariates and 200 groups, 6.2x at 12 and 100,
+  3.3x at 2 and 50, 2.5x at 12 and 20. It also converges where the dense path
+  does not -- 744 of 800 genes against 31 of 800 on the widest design --
+  because a group carrying no counts has an unbounded coefficient that the
+  group ridge and clip make finite and defined.
+* **New:** ``family="poisson"`` on ``NBGLMBatchFitter``, and
+  ``fixed_dispersion`` on ``fit_batch``. A Poisson fit is now a genuine
+  Poisson fit rather than a negative-binomial fit with a small estimated
+  dispersion.
+* **``nb_glm_test`` with a many-level categorical covariate takes the
+  structured path.** A ``batch``, ``donor`` or ``lane`` covariate is one-hot
+  encoded into the design, so this is the common case rather than an exotic
+  one. Routing is on the measured advantage -- the group columns must
+  outnumber the remaining covariates -- and the intercept and the
+  perturbation column are held out of the group block so that the coefficient
+  under test is never subject to the group clip. Log-fold-changes agree with
+  the dense path to 1e-3.
+* **The IRLS loop itself is sturdier.** Newton steps that increase a gene's
+  deviance are shortened rather than accepted (see below); converged genes are
+  frozen and dropped from later iterations; the dispersion is estimated around
+  the IRLS rather than re-estimated inside every iteration, and the model is
+  refitted with it so the returned coefficients and dispersion describe the
+  same model; and the normal equations are solved in a unit-root-mean-square
+  column basis. Convergence now requires both the relative deviance change and
+  the largest coefficient change to fall below ``tol``.
+* **Step shortening does what it says, and the convergence flag means what it
+  says.** Each retry interpolates between the current iterate and the full
+  Newton point, halving the distance, and a shortened step is taken only if it
+  improves on the deviance the iteration started from. Interpolating towards
+  the previously shortened point instead compounds the shortening -- the third
+  retry lands at ``2^-6`` of the step rather than ``2^-3`` -- so a gene needing
+  repeated damping stops moving and is then reported as converged *because*
+  nothing moved, at a point that is not a stationary point of the deviance;
+  ``de.py`` gates on that flag. A gene for which no step in the range improves
+  the deviance is now left where it was and reported as not converged, rather
+  than being moved uphill. The exception is a gene resting on the ``min_mu``
+  floor: the floored cells' means no longer move with the coefficients, so
+  they carry no gradient while the normal equations still count them, and the
+  line search finding nothing to take describes the floor rather than the fit.
+  Such a gene is still reported. A gene that reaches the ``eta`` divergence
+  clips is not exempted, because there "not converged" is the useful answer.
+* **The Numba path for the intercept-plus-perturbation design fits at the
+  dispersion it reports.** The kernel holds the dispersion fixed, and it was
+  being given a placeholder of 0.1 while the dispersion reported beside the
+  result came from a separate estimate made afterwards. On that design the
+  coefficients are the two group means whatever the dispersion is, but the
+  standard errors are not: measured on an overdispersed fixture the reported
+  standard errors were up to 3.9x too small, so every Wald statistic built on
+  them was up to 3.9x too large. The kernel is now run twice, as the
+  NumPy path already was -- once at the dispersion the warm-start means imply,
+  then at the dispersion the fitted means imply -- and its standard errors now
+  match a fit at the reported dispersion to 5e-15.
+* **The negative-binomial deviance no longer loses its value to
+  cancellation.** It was formed as the difference of ``(y + r) log(y + r)``
+  and ``(y + r) log(mu + r)``, each of order ``r n log r``. At the ``alpha``
+  clip floor ``r`` is 1e8, so for a near-Poisson gene the answer was the small
+  difference of two very large sums: the absolute error was 0.1 at 3,000 cells
+  and 182 at 100,000, against a deviance of ~1e5. That is far above the
+  ``1e-6`` relative tolerance the convergence test uses, so such a gene could
+  never converge and its damping was triggered by noise. Evaluated as
+  ``(y + r) log1p((mu - y) / (y + r))`` the same quantities are accurate to
+  7e-7 at 100,000 cells.
+* **``ridge_penalty`` means the same thing whatever the design's column
+  scales.** The normal equations are solved in a preconditioned basis, where a
+  ridge of ``r`` penalises the caller's coefficient ``j`` by
+  ``r * scale_j**2``. The penalty is now divided by the column scale, so a
+  caller who sets ``ridge_penalty`` deliberately gets the penalty they asked
+  for. No effect at the 1e-6 default.
+* **``StructuredGLMBatchFitter.fit_batch`` fits genes in batches**, with a
+  ``gene_batch_size`` argument that matches ``NBGLMBatchFitter``'s and
+  defaults to sizing the ``(n_samples, batch)`` work arrays for ~100 MB. A
+  Newton step holds a dozen of them, which at 3,000 cells and 8,563 genes was
+  around 2 GB. Batching changes nothing numerically beyond the summation order
+  BLAS chooses. The starting point also no longer depends on the design having
+  an exact column of ones: the constant column carries the starting predictor
+  and ``eta`` is derived from the coefficients, so a design with no such
+  column starts from a point its coefficients describe.
+* **Less discarded work in the structured solver.** The negative-binomial path
+  ran a full Poisson fit and an intermediate NB fit only for their fitted
+  means, and computed -- then threw away -- the per-gene standard errors of
+  both; neither now forms them. ``schur_solve`` re-formed the two
+  ``(n_genes, n_features, n_groups)`` arrays that ``schur_complement`` had
+  just built, and the IRLS loops copied the counts of the active gene set
+  twice per iteration, including on the first iteration where the active set
+  is every gene.
+* **Where the ``min_mu`` floor binds, IRLS is run as the fixed-point iteration
+  it is.** A cell held at the fitted-mean floor has ``d mu / d beta = 0``: it
+  contributes nothing to the gradient of the deviance while still contributing
+  its full weight to ``X'WX``, so the Newton step solves one model while the
+  deviance measures another and can point uphill at a good fit. The line
+  search above is the wrong instrument for those genes, and no step length
+  repairs the direction. They now take the full Newton step and are judged by
+  DESeq2's own criterion, ``|dev - dev_old| / (|dev| + 0.1) < tol``, paired
+  with the usual coefficient-change test -- which is what DESeq2, and
+  crispyx's own Numba kernel, have always done. A gene with floored cells that
+  is descending normally keeps the strict test; the floor only decides what a
+  *failed* step means. Measured against PyDESeq2, coefficients on
+  floor-binding genes go from 2.8e-02 away to under 1e-06, every gene
+  converges where one to four used to fall short, the 200-iteration cap stops
+  being reached, and ``min_mu=0.5`` is no longer slower than ``min_mu=0``.
+  On a covariate-adjusted run of a real screen (Adamson, 9,496 genes) this
+  returns 103 genes per perturbation that were being reported as ``NaN``, at
+  3.4 s against 5.7 s. They are not marginal genes -- their median ``pts``
+  in the control arm is 0.69 against 0.30 for the genes already reported, and
+  44 of them reach ``padj < 0.05``, taking that comparison's hit list from
+  2,094 to 2,150. A gene that did not converge was previously given no result
+  at all -- ``NaN`` effect, statistic, p-value, log-fold-change and standard
+  error -- and was left out of the multiple-testing correction, so this is a
+  change to what is tested, not only to what is estimated. Genes reported
+  before are unchanged to within 2e-05 in log-fold-change, and their adjusted
+  p-values move by a median of -0.3% from the larger correction.
+* **``min_mu`` no longer reaches the reported standard errors.** The floor
+  steadies the iteration; it is not part of the model whose uncertainty is
+  reported, and DESeq2 keeps it out -- ``irls_solver`` returns an
+  unthresholded ``mu`` and ``wald_test`` rebuilds the weights from it.
+  crispyx built them from the floored mean, which overstates how much a
+  floored cell knows: against PyDESeq2's ``wald_test`` on identical
+  coefficients the standard errors on floor-binding genes were a median of
+  24% and at worst 35% too small, and the Wald statistics correspondingly too
+  large. Rebuilt from the unfloored mean they agree to 0.00%. The weights
+  inside the iteration and the leverage behind Cook's distance keep the floor,
+  as DESeq2 does. This affects ``nb_glm_test`` with covariates, the structured
+  solver and the fitter API; a two-group comparison without covariates already
+  recomputed its standard errors without the floor and is unchanged.
+
+  End to end through ``nb_glm_test`` the effect is much smaller than those
+  figures suggest, because the dispersion is re-estimated after the fit and
+  absorbs most of the change: on the Adamson run above, p-values for genes
+  reported both before and after moved by a median factor of 1.0000 (10th to
+  90th percentile 0.97 to 1.02), 7 genes lost significance and 19 gained it.
+  The larger figures are what you see with the dispersion held fixed, which is
+  the right way to size the defect but not the change a user sees.
+
+* **``pts`` and ``pts_rest`` are reported for every gene**, not only for the
+  genes an effect was estimated for. They are descriptions of the data rather
+  than inferences from a fit, and they are what makes a pair whose effect is
+  not estimable -- a complete knockdown, expressed in 95% of control cells and
+  none of the perturbed ones -- visible in the output, which the filtering
+  documentation already said they were.
+
 Version 0.1.4
 -------------
 

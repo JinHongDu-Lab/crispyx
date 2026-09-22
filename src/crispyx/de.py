@@ -58,6 +58,7 @@ from .glm import (
     NBGLMBatchFitter,
     ControlStatisticsCache,
     build_design_matrix,
+    fit_nb_glm_batch_auto,
     estimate_covariate_effects_streaming,
     estimate_dispersion_map,
     estimate_global_dispersion_streaming,
@@ -109,6 +110,7 @@ from ._statistics import (
     _compute_se_batched,
     _compute_mom_dispersion_batched,
     _low_expr_in_both_mask,
+    _nonestimable_glm_mask,
 )
 from ._memory import (
     _estimate_max_workers,
@@ -994,7 +996,10 @@ def t_test(
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
     min_cells_expressed
-        Minimum total cells (control + perturbation) expressing a gene for testing.
+        Minimum total cells (control + perturbation) expressing a gene for
+        testing. Genes below this threshold are untested: ``NaN`` in
+        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``pts`` / ``pts_rest`` still populated.
     min_pct_ctrl
         Minimum fraction of expressing cells for the *control* side. A gene is
         excluded only when *both* the control side *and* the perturbed side are
@@ -1059,6 +1064,18 @@ def t_test(
         Differential expression results. Access results via dict-like interface:
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
+
+    Notes
+    -----
+    ``logfoldchanges`` follows scanpy's formula,
+    ``log2((expm1(mean_group) + 1e-9) / (expm1(mean_rest) + 1e-9))``. When a
+    gene has no expressing cells in one arm, that arm's term *is* the
+    constant, so the magnitude reported is set by the constant -- its ceiling
+    is ``log2(1 / 1e-9) = 29.9`` -- and not by the data. The p-values are
+    unaffected, but ranking on ``logfoldchanges`` puts such genes above every
+    real effect. ``pts`` / ``pts_rest`` tell them apart: a complete knockdown
+    has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
+    near zero.
     """
 
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
@@ -1140,6 +1157,10 @@ def t_test(
             slice_codes = label_codes[slc]
             csr = sp.csr_matrix(block)
             for code in np.unique(slice_codes):
+                # Cells of a perturbation this run does not test are coded -1,
+                # which would index the last group's row.
+                if code < 0:
+                    continue
                 row_mask = slice_codes == code
                 group_block = csr[row_mask, :]
                 # Expression count: number of nonzero per gene
@@ -1360,10 +1381,11 @@ def t_test(
                 np.log2(lfc_work_buffer, out=lfc_work_buffer)
                 lfc_buffer[slot] = lfc_work_buffer.astype(np.float32)
 
-                # Mask effect / lfc to NaN for genes excluded by per-condition
-                # low-expression filter so downstream tools see them as untested.
-                if low_both.any():
-                    invalid = low_both
+                # Untested genes carry NaN in every column derived from the
+                # comparison; reporting 0 would assert "no change" about a gene
+                # nobody tested.  pts / pts_rest describe the data and stay.
+                if not valid.all():
+                    invalid = ~valid
                     effect_buffer[slot][invalid] = np.nan
                     lfc_buffer[slot][invalid] = np.nan
 
@@ -1538,6 +1560,8 @@ def nb_glm_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
+    min_cells_ctrl: int = 1,
+    min_cells_pert: int = 1,
     min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
@@ -1679,7 +1703,10 @@ def nb_glm_test(
         limit per-iteration memory when working with large sparse matrices. Set
         to ``None`` to process each chunk without additional batching.
     min_cells_expressed
-        Minimum total cells (control + perturbation) expressing a gene for testing.
+        Minimum total cells (control + perturbation) expressing a gene for
+        testing. Genes below this threshold are untested: ``NaN`` in
+        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``pts`` / ``pts_rest`` still populated.
     min_total_count
         Minimum total count across all cells for a gene to be tested.
     min_pct_ctrl
@@ -1698,6 +1725,22 @@ def nb_glm_test(
         ``effect`` / ``logfc`` / ``se``; ``pts`` and ``mean`` remain populated.
     min_mean_pert
         Minimum mean expression for the *perturbed* side. Default ``0.005``.
+    min_cells_ctrl, min_cells_pert
+        Minimum number of expressing cells required in the control and
+        perturbed arms for a (gene, perturbation) pair to be tested. Both
+        default to ``1``: a pair with no counts at all in one arm has no
+        finite effect to estimate, so it is reported as untested (``NaN``
+        effect, statistic and p-value) and excluded from the multiple-testing
+        correction rather than given a bound-determined estimate. See
+        :func:`crispyx._statistics._nonestimable_glm_mask` for why, and for
+        why the two sides are set separately (CRISPRi and CRISPRa want
+        opposite asymmetries). Set either to ``0`` to disable that side.
+
+        The observation itself is not lost: ``pts`` and ``pts_rest`` are
+        populated for every gene, so a pair expressed in 0% of perturbed and
+        95% of control cells is plainly visible there. ``lfc_shrinkage_type``
+        does not change this: an excluded pair is dropped before any fit, so
+        it stays ``NaN`` under ``"apeglm"`` as well.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -1988,6 +2031,8 @@ def nb_glm_test(
         min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
+        min_cells_ctrl: int,
+        min_cells_pert: int,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -2115,6 +2160,16 @@ def nb_glm_test(
             min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
+        # A pair with no counts in one arm has no finite effect to estimate;
+        # see _nonestimable_glm_mask.  Excluded here rather than fitted, so it
+        # is reported as untested instead of carrying a bound-determined
+        # effect and an artefactual p-value into the FDR correction.
+        valid_mask = valid_mask & ~_nonestimable_glm_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_expr_counts,
+            min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert,
+        )
         valid_indices = np.where(valid_mask)[0]
 
         # Initialize result arrays
@@ -2145,8 +2200,14 @@ def nb_glm_test(
             out=np.zeros(n_genes, dtype=np.float32),
             where=group_n > 0,
         )
-        result["pts"] = np.where(valid_mask, pts, 0.0).astype(np.float32)
-        result["pts_rest"] = np.where(valid_mask, pts_rest_shared, 0.0).astype(np.float32)
+        # Fractions of expressing cells are descriptions of the data, not
+        # inferences from a fit, so they are reported for every gene including
+        # the ones no effect is estimated for.  A pair expressed in 0% of
+        # perturbed and 95% of control cells is a complete knockdown whose
+        # effect is not estimable (see _nonestimable_glm_mask); zeroing these
+        # would leave nothing to see it by.
+        result["pts"] = pts.astype(np.float32)
+        result["pts_rest"] = pts_rest_shared.astype(np.float32)
 
         # Compute mean expression
         if sp.issparse(subset_matrix):
@@ -2163,9 +2224,19 @@ def nb_glm_test(
         # Fit valid genes
         fit_matrix = subset_matrix[:, valid_mask]
         
-        batch_fitter = NBGLMBatchFitter(
+        # A categorical covariate (batch, donor, lane) is one-hot encoded into
+        # the design, which makes the per-gene Hessian arrowhead-structured.
+        # fit_nb_glm_batch_auto takes the structured path when the number of
+        # levels makes it worthwhile and the dense path otherwise; either way
+        # the result is in the column order of `design`.  The intercept and the
+        # perturbation column are protected from the group block because the
+        # perturbation coefficient is the quantity under test and must not be
+        # subject to the group-coefficient clip.
+        batch_result = fit_nb_glm_batch_auto(
             design,
+            fit_matrix,
             offset=subset_offset,
+            protected_columns=(0, perturbation_column_index),
             max_iter=max_iter,
             tol=tol,
             poisson_init_iter=poisson_init_iter,
@@ -2173,8 +2244,6 @@ def nb_glm_test(
             min_mu=min_mu,
             min_total_count=min_total_count,
         )
-        
-        batch_result = batch_fitter.fit_batch(fit_matrix)
 
         # Extract results
         result["converged"][valid_indices] = batch_result.converged
@@ -2335,6 +2404,8 @@ def nb_glm_test(
         min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
+        min_cells_ctrl: int,
+        min_cells_pert: int,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -2412,7 +2483,9 @@ def nb_glm_test(
             out=np.zeros(n_genes, dtype=np.float32),
             where=group_n > 0,
         )
-        result["pts"] = np.where(valid_mask, pts, 0.0).astype(np.float32)
+        # Reported for every gene; see the matching comment in the uncached
+        # path.
+        result["pts"] = pts.astype(np.float32)
         
         # Compute mean expression
         subset_size_factors_group = np.asarray(size_factors)[group_mask]
@@ -2445,6 +2518,13 @@ def nb_glm_test(
             min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
+        # See the matching comment in the uncached path.
+        valid_mask = valid_mask & ~_nonestimable_glm_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_cache.control_expr_counts,
+            min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert,
+        )
         result["n_tested"] = int(valid_mask.sum())
 
         if not np.any(valid_mask):
@@ -2724,8 +2804,13 @@ def nb_glm_test(
             # Build mle_coef matrix (n_params, n_genes) from batch_result
             n_params = 2  # Intercept + perturbation
             mle_coef = np.full((n_params, n_genes), np.nan, dtype=np.float64)
-            mle_coef[0, :] = batch_result.coef[:, 0]  # Intercept
-            mle_coef[1, :] = batch_result.coef[:, 1]  # LFC
+            # Only the genes that were actually fitted have an MLE to shrink.
+            # ``batch_result.coef`` is zero-initialised, so handing it over
+            # whole would give apeGLM a finite starting point for a pair the
+            # filters excluded and return a finite effect for it; the NaN left
+            # here is what the rest of the result already reports for those.
+            mle_coef[0, valid_converged_mask] = batch_result.coef[valid_converged_mask, 0]
+            mle_coef[1, valid_converged_mask] = batch_result.coef[valid_converged_mask, 1]
             
             # Build combined count matrix (control + perturbation)
             if sp.issparse(group_matrix):
@@ -3414,6 +3499,8 @@ def nb_glm_test(
                             min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
+                            min_cells_ctrl=min_cells_ctrl,
+                            min_cells_pert=min_cells_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -3453,6 +3540,8 @@ def nb_glm_test(
                             min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
+                            min_cells_ctrl=min_cells_ctrl,
+                            min_cells_pert=min_cells_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -3509,6 +3598,8 @@ def nb_glm_test(
                                 min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
+                                min_cells_ctrl=min_cells_ctrl,
+                                min_cells_pert=min_cells_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3540,6 +3631,8 @@ def nb_glm_test(
                                 min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
+                                min_cells_ctrl=min_cells_ctrl,
+                                min_cells_pert=min_cells_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3867,7 +3960,7 @@ def _wilcoxon_test_streaming(
             batch_effect = np.zeros((bs, n_genes), dtype=np.float64)
             batch_u = np.zeros((bs, n_genes), dtype=np.float64)
             batch_z = np.zeros((bs, n_genes), dtype=np.float64)
-            batch_p = np.ones((bs, n_genes), dtype=np.float64)
+            batch_p = np.full((bs, n_genes), np.nan, dtype=np.float64)
             batch_lfc = np.zeros((bs, n_genes), dtype=np.float64)
             batch_pts = np.zeros((bs, n_genes), dtype=np.float32)
             batch_pts_rest = np.zeros((bs, n_genes), dtype=np.float32)
@@ -3934,7 +4027,6 @@ def _wilcoxon_test_streaming(
                     # per-condition low-expression filter (drop genes that are
                     # jointly low in BOTH groups by both pct and mean).
                     valid_masks = []
-                    low_both_masks = []
                     for idx in range(bs):
                         ge = pert_expr_counts[idx]
                         gm = pert_means[idx]
@@ -3952,7 +4044,6 @@ def _wilcoxon_test_streaming(
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                         )
-                        low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)
 
                     any_valid = np.zeros(n_chunk_genes, dtype=bool)
@@ -4036,35 +4127,33 @@ def _wilcoxon_test_streaming(
                         gm = pert_means[idx]
                         np_ = pert_n_cells[idx]
                         valid = valid_masks[idx]
-                        low_both = low_both_masks[idx]
 
+                        # pts describes the data, not the comparison, so it is
+                        # reported for untested genes too -- the only way to see
+                        # an untested 0%-vs-95% knockdown.
                         pts = np.divide(
                             ge, float(np_),
                             out=np.zeros_like(ge, dtype=float),
                             where=np_ > 0,
                         )
-                        pts = np.where(valid, pts, 0.0)
-                        pts_rest = np.where(valid, control_pts_chunk, 0.0)
                         lfc = np.log2((np.expm1(gm) + 1e-9) / control_mean_expm1)
-                        lfc = np.where(valid, lfc, 0.0)
-                        # Mark genes excluded by the per-condition filter as
-                        # NaN so downstream tools see them as untested.
-                        if low_both.any():
-                            lfc = np.where(low_both, np.nan, lfc)
+                        lfc = np.where(valid, lfc, np.nan)
 
                         gene_pos = np.arange(slc.start, slc.stop)
                         batch_lfc[idx, gene_pos] = lfc
                         batch_pts[idx, gene_pos] = pts
-                        batch_pts_rest[idx, gene_pos] = pts_rest
+                        batch_pts_rest[idx, gene_pos] = control_pts_chunk
 
-                        # Mark stat / pvalue / effect / u / z as NaN for genes
-                        # excluded by the low-expression filter.
-                        if low_both.any():
-                            low_pos = slc.start + np.where(low_both)[0]
-                            batch_u[idx, low_pos] = np.nan
-                            batch_z[idx, low_pos] = np.nan
-                            batch_p[idx, low_pos] = np.nan
-                            batch_effect[idx, low_pos] = np.nan
+                        # Applied per row after the block write: the kernel
+                        # leaves its defaults in the columns it skips, and a
+                        # gene excluded here may be tested for another
+                        # perturbation in the same block.
+                        if not valid.all():
+                            invalid_pos = slc.start + np.where(~valid)[0]
+                            batch_u[idx, invalid_pos] = np.nan
+                            batch_z[idx, invalid_pos] = np.nan
+                            batch_p[idx, invalid_pos] = np.nan
+                            batch_effect[idx, invalid_pos] = np.nan
             finally:
                 backed.file.close()
 
@@ -4396,7 +4485,6 @@ def _wilcoxon_test_stratified(
 
                     # ----- Per-condition low-expression filter (pooled) -----
                     valid_masks = []
-                    low_both_masks = []
                     for idx, label in enumerate(candidates):
                         group_expr = pert_expr_counts[idx]
                         group_mean = pert_means[idx]
@@ -4414,7 +4502,6 @@ def _wilcoxon_test_stratified(
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                         )
-                        low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)
 
                     rank_valid_masks = [
@@ -4509,32 +4596,33 @@ def _wilcoxon_test_stratified(
                     all_expr = np.array(pert_expr_counts)
                     all_means = np.array(pert_means)
                     all_n = np.array(pert_n_cells, dtype=np.float64)
-                    valid_arr = np.array(valid_masks)
 
                     n_col = all_n[:, np.newaxis]
-                    raw_pts = np.where(n_col > 0, all_expr / n_col, 0.0)
-                    chunk_pts[:] = np.where(valid_arr, raw_pts, 0.0).astype(np.float32)
-                    chunk_pts_rest[:] = np.where(
-                        valid_arr, control_pts[np.newaxis, :], 0.0
-                    ).astype(np.float32)
+                    # pts describes the data, not the comparison, so it is
+                    # reported for untested genes too -- the only way to see an
+                    # untested 0%-vs-95% knockdown.
+                    chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
+                    chunk_pts_rest[:] = control_pts[np.newaxis, :]
 
                     raw_lfc = np.log2(
                         (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
                     )
-                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, 0.0)
 
-                    low_both_arr = np.array(low_both_masks)
-                    if low_both_arr.any():
-                        chunk_u[low_both_arr] = np.nan
-                        chunk_z[low_both_arr] = np.nan
-                        chunk_p[low_both_arr] = np.nan
-                        chunk_effect[low_both_arr] = np.nan
-                        chunk_lfc[low_both_arr] = np.nan
-                    if n_untestable_perts:
-                        chunk_u[untestable_pert_mask, :] = np.nan
-                        chunk_z[untestable_pert_mask, :] = np.nan
-                        chunk_p[untestable_pert_mask, :] = np.nan
-                        chunk_effect[untestable_pert_mask, :] = np.nan
+                    # Untested genes carry NaN in every column derived from the
+                    # comparison.  Two masks, because only the rank test is
+                    # stratified: the test columns follow rank_valid_masks,
+                    # which also zeroes perturbations sharing no batch with the
+                    # control, while the pooled logfoldchanges follows the
+                    # pooled filter alone.
+                    valid_arr = np.array(valid_masks)
+                    rank_valid_arr = np.array(rank_valid_masks)
+                    invalid_arr = ~rank_valid_arr
+                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                    if invalid_arr.any():
+                        chunk_u[invalid_arr] = np.nan
+                        chunk_z[invalid_arr] = np.nan
+                        chunk_p[invalid_arr] = np.nan
+                        chunk_effect[invalid_arr] = np.nan
 
                     u_matrix[:, slc] = chunk_u
                     pvalue_matrix[:, slc] = chunk_p
@@ -4546,7 +4634,8 @@ def _wilcoxon_test_stratified(
 
                     del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
                     del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
-                    del pert_n_cells, valid_masks, rank_valid_masks, low_both_masks, low_both_arr
+                    del pert_n_cells, valid_masks, rank_valid_masks
+                    del valid_arr, rank_valid_arr, invalid_arr
                     if n_valid_genes > 0:
                         del all_valid_dense, control_dense, ctrl_flats, ctrl_flat
                         del ctrl_starts, ctrl_nnz, ctrl_nz, ctrl_tie
@@ -4710,8 +4799,10 @@ def wilcoxon_test(
         all cells; only the rank test is stratified. When ``None`` (default) the
         standard pooled Wilcoxon test is used.
     min_cells_expressed
-        Minimum total cells (control + perturbation) expressing a gene for testing.
-        Genes below this threshold are assigned p-value=1 and effect_size=0.
+        Minimum total cells (control + perturbation) expressing a gene for
+        testing. Genes below this threshold are untested: ``NaN`` in
+        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``pts`` / ``pts_rest`` still populated.
     min_pct_ctrl
         Minimum fraction of expressing cells for the *control* side. A gene is
         excluded only when *both* sides are jointly low. Default ``0.01``.
@@ -4808,6 +4899,16 @@ def wilcoxon_test(
     The rank test itself runs in a numba ``prange`` kernel over perturbations
     and uses every CPU the process is allowed to run on; there is no separate
     worker-count parameter.
+
+    ``logfoldchanges`` follows scanpy's formula,
+    ``log2((expm1(mean_group) + 1e-9) / (expm1(mean_rest) + 1e-9))``. When a
+    gene has no expressing cells in one arm, that arm's term *is* the
+    constant, so the magnitude reported is set by the constant -- its ceiling
+    is ``log2(1 / 1e-9) = 29.9`` -- and not by the data. The p-values are
+    unaffected, but ranking on ``logfoldchanges`` puts such genes above every
+    real effect. ``pts`` / ``pts_rest`` tell them apart: a complete knockdown
+    has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
+    near zero.
     """
 
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
@@ -5205,7 +5306,6 @@ def _wilcoxon_test_standard(
                     # shared per-condition low-expression filter (drop genes
                     # that are jointly low in BOTH groups by both pct and mean).
                     valid_masks = []
-                    low_both_masks = []
                     for idx, label in enumerate(candidates):
                         group_expr = pert_expr_counts[idx]
                         group_mean = pert_means[idx]
@@ -5223,7 +5323,6 @@ def _wilcoxon_test_standard(
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                         )
-                        low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)
 
                     # Accumulate per-perturbation valid gene counts for verbose output
@@ -5313,26 +5412,27 @@ def _wilcoxon_test_standard(
                     valid_arr = np.array(valid_masks)             # (n_groups, n_chunk_genes)
 
                     n_col = all_n[:, np.newaxis]                  # (n_groups, 1)
-                    raw_pts = np.where(n_col > 0, all_expr / n_col, 0.0)
-                    chunk_pts[:] = np.where(valid_arr, raw_pts, 0.0).astype(np.float32)
-                    chunk_pts_rest[:] = np.where(
-                        valid_arr, control_pts[np.newaxis, :], 0.0
-                    ).astype(np.float32)
+                    # pts describes the data, not the comparison, so it is
+                    # reported for untested genes too -- the only way to see an
+                    # untested 0%-vs-95% knockdown.
+                    chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
+                    chunk_pts_rest[:] = control_pts[np.newaxis, :]
 
                     raw_lfc = np.log2(
                         (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
                     )
-                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, 0.0)
 
-                    # Mark genes excluded by the per-condition low-expression
-                    # filter as NaN so downstream tools see them as untested.
-                    low_both_arr = np.array(low_both_masks)  # (n_groups, n_chunk_genes)
-                    if low_both_arr.any():
-                        chunk_u[low_both_arr] = np.nan
-                        chunk_z[low_both_arr] = np.nan
-                        chunk_p[low_both_arr] = np.nan
-                        chunk_effect[low_both_arr] = np.nan
-                        chunk_lfc[low_both_arr] = np.nan
+                    # Untested genes carry NaN in every column derived from the
+                    # comparison.  Masked after the block write: the kernel
+                    # leaves its defaults in the columns it skips, and a gene
+                    # excluded here may be tested for another perturbation.
+                    invalid_arr = ~valid_arr
+                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                    if invalid_arr.any():
+                        chunk_u[invalid_arr] = np.nan
+                        chunk_z[invalid_arr] = np.nan
+                        chunk_p[invalid_arr] = np.nan
+                        chunk_effect[invalid_arr] = np.nan
 
                     # 13. Write results to memmap — vectorized 2-D slice
                     # (7 calls instead of 7 × n_groups; better cache locality)
@@ -5348,7 +5448,7 @@ def _wilcoxon_test_standard(
                     # (prevents glibc arena fragmentation across many gene chunks)
                     del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
                     del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
-                    del pert_n_cells, valid_masks, low_both_masks, low_both_arr
+                    del pert_n_cells, valid_masks, valid_arr, invalid_arr
                     if n_valid_genes > 0:
                         del all_valid_dense, control_dense
                         del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z, ctrl_tie_sums

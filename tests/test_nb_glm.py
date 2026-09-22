@@ -22,7 +22,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from crispyx.glm import NBGLMFitter, build_design_matrix
+from crispyx.glm import NBGLMBatchFitter, NBGLMFitter, build_design_matrix
 from crispyx.de import nb_glm_test
 
 
@@ -69,10 +69,13 @@ def test_nb_glm_fitter_matches_statsmodels():
     family = sm.families.NegativeBinomial(alpha=alpha)
     sm_res = sm.GLM(y, design, family=family).fit()
 
-    # L-BFGS-B and statsmodels' IRLS produce similar but not identical results
-    # Relaxed tolerance to account for different optimization approaches
-    np.testing.assert_allclose(result.coef, sm_res.params, rtol=0.25, atol=0.02)
-    np.testing.assert_allclose(result.se, sm_res.bse, rtol=0.25, atol=0.02)
+    # NBGLMFitter maximises the likelihood with L-BFGS-B while statsmodels uses
+    # IRLS, so the coefficients agree only to the optimiser's own accuracy
+    # (max |dB| 9.5e-3 here); the relative bound is set by a coefficient whose
+    # true value is 0.046.  Standard errors come from the same closed-form
+    # inverse Hessian in both and agree far more tightly.
+    np.testing.assert_allclose(result.coef, sm_res.params, rtol=0.05, atol=0.015)
+    np.testing.assert_allclose(result.se, sm_res.bse, rtol=0.01, atol=1e-3)
 
 
 def test_nb_glm_fitter_matches_statsmodels_for_well_expressed_genes():
@@ -268,9 +271,12 @@ def test_nb_glm_agrees_with_statsmodels_and_deseq2():
         sm_coef = sm_res.params[1]
         deseq_coef = deseq_results[gene_idx]
 
-        np.testing.assert_allclose(nb_coef, sm_coef, rtol=5e-2, atol=5e-2)
-        # Relaxed tolerance for PyDESeq2 due to API changes in newer versions
-        # that may use different priors or estimation methods
+        # Same model, same dispersion, both by IRLS: these agree to ~2e-10.
+        np.testing.assert_allclose(nb_coef, sm_coef, rtol=1e-6, atol=1e-6)
+        # PyDESeq2 differs by construction, not by solver accuracy: it fits MAP
+        # dispersions against a trend and applies a coefficient prior, neither
+        # of which this unshrunk MLE has.  The bound stays loose for that
+        # reason, not because the IRLS is imprecise.
         np.testing.assert_allclose(nb_coef, deseq_coef, rtol=0.7, atol=0.4)
 
         well_expressed += 1
@@ -751,3 +757,551 @@ def test_memory_adaptive_dispersion():
     if np.sum(valid) > 5:
         r, _ = pearsonr(np.log(disp1[valid]), np.log(disp2[valid]))
         assert r > 0.90, f"Correlation {r:.3f} < 0.90 between dense and streaming modes"
+
+#: Counts per group below which an NB GLM coefficient is not meaningfully
+#: determined, so cross-solver agreement measures the data rather than the fit.
+_MIN_GROUP_COUNTS = 10
+
+
+def _wide_design_fixture(seed=0, n=400, p=60):
+    """Counts and a 6-column design spanning 0.05 to 50 counts per cell."""
+    rng = np.random.default_rng(seed)
+    lab = rng.integers(0, 5, size=n)
+    dummies = np.stack([(lab == k).astype(float) for k in range(1, 5)], axis=1)
+    design = np.c_[np.ones(n), rng.normal(size=n), dummies]
+    beta = np.c_[
+        np.log(np.geomspace(0.05, 50.0, p)),
+        rng.normal(0, 0.3, p),
+        rng.normal(0, 0.8, (p, 4)),
+    ]
+    alpha = np.full(p, 0.3)
+    mu = np.exp(design @ beta.T)
+    counts = rng.negative_binomial(1.0 / alpha, 1.0 / (1.0 + alpha * mu)).astype(float)
+    return counts, design, lab
+
+
+def test_batch_fitter_general_path_matches_statsmodels_where_the_fit_is_determined():
+    """The batch fitter's general (non-2-feature) path is an exact NB IRLS.
+
+    Regression guard for the IRLS weights being clamped at the fitted-mean
+    floor.  That clamp inflated the leverage of every cell whose fitted mean
+    fell below ``min_mu`` -- at mu=0.1, alpha=1 the true weight is 0.091 and a
+    0.5 clamp made it 0.5 -- and pushed the median coefficient error on genes
+    below one count per cell to ~0.27.
+
+    Agreement is asserted only where the likelihood actually determines the
+    coefficients: every group carrying at least ``_MIN_GROUP_COUNTS`` counts
+    and a dispersion off its clip boundary.  statsmodels is not a gold
+    standard for sparse count data -- on a group with one count in eighty
+    cells the coefficient is barely identified and both solvers simply stop
+    somewhere on the way down, so a disagreement there measures the data, not
+    the solver.  The sparse tail is checked for sanity instead, below.
+    """
+    counts, design, lab = _wide_design_fixture()
+
+    fitter = NBGLMBatchFitter(
+        design, max_iter=100, tol=1e-10, min_mu=0.0, dispersion_method="moments"
+    )
+    result = fitter.fit_batch(counts, gene_batch_size=None, use_numba=False)
+
+    compared = 0
+    worst = 0.0
+    for gene in range(counts.shape[1]):
+        per_group = np.array([counts[lab == k, gene].sum() for k in range(5)])
+        if per_group.min() < _MIN_GROUP_COUNTS or result.dispersion[gene] <= 1e-6:
+            continue
+        # Give statsmodels the dispersion crispyx converged to, so that only
+        # the IRLS differs between the two.
+        family = sm.families.NegativeBinomial(alpha=float(result.dispersion[gene]))
+        sm_fit = sm.GLM(counts[:, gene], design, family=family).fit(maxiter=500)
+        if not np.all(np.isfinite(sm_fit.params)):
+            continue
+        worst = max(worst, float(np.max(np.abs(result.coef[gene] - sm_fit.params))))
+        compared += 1
+
+    assert compared >= 30, f"expected a decent number of determined genes, got {compared}"
+    assert worst < 1e-5, f"max |dB| vs statsmodels was {worst:.2e}"
+
+
+def test_sparse_genes_stay_finite_and_bounded():
+    """The under-determined tail must degrade gracefully, not blow up.
+
+    Genes whose groups carry almost no counts have coefficients that the data
+    barely pins down (the limit is -inf for an empty group).  There is no
+    reference to agree with; what matters is that the solver returns finite,
+    bounded numbers and reports its convergence honestly.
+    """
+    counts, design, lab = _wide_design_fixture()
+    fitter = NBGLMBatchFitter(
+        design, max_iter=100, tol=1e-10, min_mu=0.0, dispersion_method="moments"
+    )
+    result = fitter.fit_batch(counts, gene_batch_size=None, use_numba=False)
+
+    sparse = np.array([
+        min(counts[lab == k, gene].sum() for k in range(5)) < _MIN_GROUP_COUNTS
+        for gene in range(counts.shape[1])
+    ])
+    assert sparse.any(), "fixture should contain an under-determined tail"
+
+    assert np.all(np.isfinite(result.coef)), "coefficients must stay finite"
+    assert np.all(np.isfinite(result.dispersion))
+    # ETA_MAX bounds the linear predictor, so no coefficient can run away.
+    assert np.max(np.abs(result.coef[sparse])) < 50.0
+
+
+def test_sparse_genes_are_not_dominated_by_the_mean_floor():
+    """``min_mu`` must floor the fitted mean and nothing else.
+
+    With the floor applied to the weights as well, raising ``min_mu`` from 0 to
+    0.5 moved sparse-gene coefficients by order 0.1-0.3.  As a pure mean floor
+    it still has *some* effect on an expressed gene -- cells with a small
+    fitted mean exist in any gene -- but three orders of magnitude less.
+    """
+    counts, design, _ = _wide_design_fixture()
+    expressed = counts.mean(axis=0) >= 5.0
+    assert expressed.sum() >= 10
+
+    fits = {}
+    for min_mu in (0.0, 0.5):
+        fitter = NBGLMBatchFitter(
+            design, max_iter=100, tol=1e-10, min_mu=min_mu, dispersion_method="moments"
+        )
+        fits[min_mu] = fitter.fit_batch(counts, gene_batch_size=None, use_numba=False).coef
+
+    shift = np.max(np.abs(fits[0.0][expressed] - fits[0.5][expressed]))
+    assert shift < 1e-3, f"mean floor moved well-expressed coefficients by {shift:.2e}"
+
+
+# --------------------------------------------------------------------------
+# families and fixed dispersion
+# --------------------------------------------------------------------------
+
+def test_poisson_family_matches_statsmodels_poisson():
+    """``family='poisson'`` is a real Poisson fit, not NB with a small alpha.
+
+    The distinction matters: an NB fit with an estimated dispersion uses
+    weights ``mu / (1 + alpha mu)``, which differ from the Poisson weights
+    ``mu`` by however large the estimated dispersion happens to be.
+    """
+    rng = np.random.default_rng(3)
+    n, p = 400, 40
+    design = np.c_[np.ones(n), rng.normal(size=n), rng.binomial(1, 0.5, n).astype(float)]
+    beta = np.c_[np.log(np.geomspace(1.0, 60.0, p)), rng.normal(0, 0.3, p), rng.normal(0, 0.5, p)]
+    counts = rng.poisson(np.exp(design @ beta.T)).astype(float)
+
+    fitter = NBGLMBatchFitter(design, max_iter=100, tol=1e-12, min_mu=0.0, family="poisson")
+    result = fitter.fit_batch(counts, gene_batch_size=None)
+
+    assert np.all(result.dispersion == 0.0), "a Poisson fit has no dispersion"
+
+    worst = 0.0
+    for gene in range(p):
+        sm_fit = sm.GLM(counts[:, gene], design, family=sm.families.Poisson()).fit()
+        worst = max(worst, float(np.max(np.abs(result.coef[gene] - sm_fit.params))))
+    assert worst < 1e-7, f"max |dB| vs statsmodels Poisson was {worst:.2e}"
+
+
+def test_poisson_family_differs_from_the_nb_fit_on_overdispersed_data():
+    """Sanity check that the family argument is actually doing something."""
+    rng = np.random.default_rng(4)
+    n, p = 300, 20
+    design = np.c_[np.ones(n), rng.binomial(1, 0.5, n).astype(float)]
+    mu = np.exp(design @ np.c_[np.log(np.full(p, 20.0)), np.full(p, 0.8)].T)
+    counts = rng.negative_binomial(2.0, 2.0 / (2.0 + mu)).astype(float)
+
+    common = dict(max_iter=100, tol=1e-10, min_mu=0.0)
+    pois = NBGLMBatchFitter(design, family="poisson", **common).fit_batch(counts, gene_batch_size=None)
+    nb = NBGLMBatchFitter(design, family="nb", **common).fit_batch(counts, gene_batch_size=None)
+
+    assert np.all(nb.dispersion > 0.1), "data is overdispersed; NB should find it"
+    # Coefficients are similar (both are consistent) but the standard errors
+    # are not: Poisson understates them when the data are overdispersed.
+    assert np.median(pois.se[:, 1]) < 0.75 * np.median(nb.se[:, 1])
+
+
+def test_fixed_dispersion_is_honoured_and_matches_statsmodels():
+    """``fixed_dispersion`` holds alpha at the caller's value."""
+    rng = np.random.default_rng(5)
+    n, p = 350, 30
+    design = np.c_[np.ones(n), rng.normal(size=n), rng.binomial(1, 0.4, n).astype(float)]
+    beta = np.c_[np.log(np.geomspace(2.0, 80.0, p)), rng.normal(0, 0.3, p), rng.normal(0, 0.5, p)]
+    alpha = np.full(p, 0.25)
+    mu = np.exp(design @ beta.T)
+    counts = rng.negative_binomial(1.0 / alpha, 1.0 / (1.0 + alpha * mu)).astype(float)
+
+    fitter = NBGLMBatchFitter(design, max_iter=100, tol=1e-12, min_mu=0.0)
+    result = fitter.fit_batch(counts, gene_batch_size=None, fixed_dispersion=alpha)
+
+    np.testing.assert_allclose(result.dispersion, alpha, rtol=0, atol=0)
+
+    worst = 0.0
+    for gene in range(p):
+        family = sm.families.NegativeBinomial(alpha=float(alpha[gene]))
+        sm_fit = sm.GLM(counts[:, gene], design, family=family).fit(maxiter=500)
+        worst = max(worst, float(np.max(np.abs(result.coef[gene] - sm_fit.params))))
+    # The floor here is statsmodels' own convergence (its default deviance
+    # tolerance is 1e-8), not this fitter's.
+    assert worst < 1e-6, f"max |dB| vs statsmodels was {worst:.2e}"
+
+
+def test_fixed_dispersion_shape_is_validated():
+    design = np.c_[np.ones(20), np.arange(20.0)]
+    counts = np.abs(np.arange(40.0).reshape(20, 2)) + 1.0
+    fitter = NBGLMBatchFitter(design, min_mu=0.0)
+    with pytest.raises(ValueError, match="fixed_dispersion must have shape"):
+        fitter.fit_batch(counts, fixed_dispersion=np.array([0.1, 0.2, 0.3]))
+
+
+def test_unknown_family_is_rejected():
+    with pytest.raises(ValueError, match="family must be 'nb' or 'poisson'"):
+        NBGLMBatchFitter(np.ones((5, 1)), family="gaussian")
+
+
+def _nb_score(counts, design, coef, alpha):
+    """Score of the NB log-likelihood at ``coef``, per gene.
+
+    For NB with size ``r = 1/alpha`` and a log link,
+    ``s_j(beta) = sum_i x_ij (y_i - mu_i) / (1 + alpha mu_i)``, which is zero
+    exactly at the maximum likelihood estimate.  Returns ``max_j |s_j|``.
+    """
+    mu = np.exp(np.clip(design @ coef.T, -30.0, 20.0))
+    residual = (counts - mu) / (1.0 + alpha[None, :] * mu)
+    return np.abs(design.T @ residual).max(axis=0)
+
+
+def test_fitted_coefficients_solve_the_score_equation_on_sparse_genes():
+    """A reference-free correctness check, for where references are unreliable.
+
+    Cross-solver comparison is the wrong instrument on lowly-expressed count
+    data: the fits are hard, and a disagreement says the two implementations
+    differ without saying which is right.  The score equation needs no second
+    implementation -- it *defines* the maximum likelihood estimate -- so it
+    works precisely where statsmodels does not.
+
+    This is the regression guard for clamping the IRLS weights at the
+    fitted-mean floor.  That clamp does not merely perturb the answer; it
+    solves a different estimating equation, and the coefficients it returns
+    are not a stationary point of the likelihood at all.  Measured on this
+    fixture the clamped fit left a score of ~50-100 and roughly 40-100 units
+    of excess deviance on genes below one count per cell, against ~1e-6 here.
+
+    The dispersion is held fixed so that all genes are fitting the same model
+    the score is written for.
+    """
+    counts, design, lab = _wide_design_fixture(n=800, p=200)
+    alpha = np.full(counts.shape[1], 0.3)
+
+    fitter = NBGLMBatchFitter(design, max_iter=200, tol=1e-12, min_mu=0.0)
+    result = fitter.fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+
+    score = _nb_score(counts, design, result.coef, alpha)
+
+    # Only genes whose MLE exists: a group with no counts has a coefficient
+    # running to -inf, where no bounded stationary point exists to find.
+    determined = np.array([
+        min(counts[lab == k, gene].sum() for k in range(5)) >= _MIN_GROUP_COUNTS
+        for gene in range(counts.shape[1])
+    ])
+    sparse = counts.mean(axis=0) < 0.5
+    checked = determined & sparse
+    assert checked.sum() >= 10, f"fixture should have sparse determined genes, got {checked.sum()}"
+
+    assert np.max(score[checked]) < 1e-3, (
+        f"sparse genes are not at a stationary point: max|score| = {np.max(score[checked]):.2e}"
+    )
+    assert np.max(score[determined]) < 1e-3, (
+        f"max|score| over all determined genes = {np.max(score[determined]):.2e}"
+    )
+
+
+def test_the_mean_floor_does_not_move_the_stationary_point_it_defines():
+    """``min_mu`` changes the model, so it must change it *consistently*.
+
+    With a floor the fitted mean is ``max(exp(eta), min_mu)``, which is a
+    different estimating equation -- that is the point of the floor.  What
+    must not happen is the floor leaking into the weights, which leaves the
+    fit solving neither equation.  Checked here by confirming that a floored
+    fit still solves the score equation on the genes the floor never binds on.
+    """
+    counts, design, lab = _wide_design_fixture(n=800, p=200)
+    alpha = np.full(counts.shape[1], 0.3)
+
+    floored = NBGLMBatchFitter(design, max_iter=200, tol=1e-12, min_mu=0.5).fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+    mu = np.exp(np.clip(design @ floored.coef.T, -30.0, 20.0))
+    never_binds = (mu.min(axis=0) > 0.5) & (counts.mean(axis=0) >= 5.0)
+    assert never_binds.sum() >= 5
+
+    score = _nb_score(counts, design, floored.coef, alpha)
+    assert np.max(score[never_binds]) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# IRLS damping
+# ---------------------------------------------------------------------------
+
+def _overshooting_gene():
+    """Counts on which the first full Newton step badly raises the deviance.
+
+    A near-empty perturbation arm beside a large baseline: the first step from
+    ``beta = 0`` overshoots and has to be shortened several times.
+    """
+    rng = np.random.default_rng(11)
+    n = 200
+    x1 = np.zeros(n)
+    x1[:3] = 1.0
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 1.0, size=n)])
+
+    gene = np.random.default_rng(29)
+    beta = np.array([gene.uniform(4, 9), gene.uniform(-8, 8), gene.uniform(-2, 2)])
+    counts = gene.poisson(np.exp(np.clip(design @ beta, -20, 14))).astype(float)
+    return design, counts[:, None]
+
+
+def test_step_halving_takes_the_first_improving_fraction_of_the_newton_step():
+    """A shortened step is ``beta + 2^-k (newton - beta)`` for the smallest
+    ``k`` that lowers the deviance.
+
+    Interpolating towards the previously shortened point instead of towards
+    the full Newton point compounds the shortening -- the third retry lands at
+    ``2^-6`` rather than ``2^-3`` -- which stalls the gene and then reports it
+    as converged because nothing moved.
+    """
+    from crispyx._irls import EPS, ETA_MAX, Deviance, irls_weights
+
+    design, counts = _overshooting_gene()
+    fitter = NBGLMBatchFitter(design, max_iter=1, tol=1e-9, min_mu=0.0)
+    alpha = np.array([0.05])
+    start = np.zeros((3, 1))
+
+    # The full Newton step, formed exactly as the loop forms it.
+    deviance = Deviance(counts, "nb", alpha)
+    eta = np.clip(design @ start, fitter._eta_min, ETA_MAX)
+    mu = np.exp(eta)
+    dev_start = deviance.total(eta, mu)
+    newton = fitter._weighted_least_squares_batch(
+        irls_weights(mu, alpha), eta + (counts - mu) / np.maximum(mu, EPS)
+    )
+
+    def deviance_at(beta):
+        e = np.clip(design @ beta, fitter._eta_min, ETA_MAX)
+        return deviance.total(e, np.exp(e))[0]
+
+    for k in range(9):
+        expected = start + (0.5**k) * (newton - start)
+        if deviance_at(expected) <= dev_start[0] + 1e-9 * abs(dev_start[0]):
+            break
+    assert k >= 3, "this gene no longer exercises repeated halving"
+
+    got, _, _, _, _ = fitter._irls_at_fixed_dispersion(counts, alpha, start)
+    np.testing.assert_allclose(got, expected, rtol=1e-12)
+
+
+def test_irls_never_commits_a_step_that_raises_the_deviance():
+    """Deviance is what the loop minimises and what its convergence test
+    measures, so no iteration may leave a gene worse off than it found it."""
+    rng = np.random.default_rng(5)
+    n, n_genes = 150, 80
+    x1 = (rng.random(n) < 0.06).astype(float)
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
+    counts = np.empty((n, n_genes))
+    for g in range(n_genes):
+        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
+        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
+
+    alpha = np.full(n_genes, 0.05)
+    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-9, min_mu=0.0)
+    start = np.zeros((3, n_genes))
+
+    from crispyx._irls import ETA_MAX, Deviance
+
+    deviance = Deviance(counts, "nb", alpha)
+    eta = np.clip(design @ start, fitter._eta_min, ETA_MAX)
+    dev_start = deviance.total(eta, np.exp(eta))
+
+    _, _, dev_end, _, _ = fitter._irls_at_fixed_dispersion(counts, alpha, start)
+    assert np.all(dev_end <= dev_start + 1e-9 * np.abs(dev_start))
+
+
+def test_a_gene_reported_converged_solves_the_score_equation():
+    """The convergence flag gates what ``de.py`` is willing to report, so a
+    gene that merely stopped moving must not be flagged as converged."""
+    rng = np.random.default_rng(5)
+    n, n_genes = 150, 80
+    x1 = (rng.random(n) < 0.06).astype(float)
+    design = np.column_stack([np.ones(n), x1, rng.normal(0, 2.0, size=n)])
+    counts = np.empty((n, n_genes))
+    for g in range(n_genes):
+        beta = np.array([rng.uniform(2, 8), rng.uniform(-8, 8), rng.uniform(-2, 2)])
+        counts[:, g] = rng.poisson(np.exp(np.clip(design @ beta, -20, 14)))
+
+    alpha = np.full(n_genes, 0.05)
+    fitter = NBGLMBatchFitter(design, max_iter=40, tol=1e-9, min_mu=0.0)
+    _, mu, _, converged, _ = fitter._irls_at_fixed_dispersion(
+        counts, alpha, np.zeros((3, n_genes))
+    )
+
+    assert converged.any()
+    score = design.T @ ((counts - mu) / (1.0 + alpha * mu))
+    relative = np.max(np.abs(score), axis=0) / np.maximum(counts.sum(axis=0), 1.0)
+    assert np.max(relative[converged]) < 1e-6
+
+
+def test_numba_path_reports_the_dispersion_it_fitted_at():
+    """The 2-feature kernel holds the dispersion fixed, so what it returns has
+    to come from a fit at the dispersion that is reported.
+
+    On an intercept-plus-indicator design the coefficients are the two group
+    means whatever the dispersion is, so the standard errors are where a
+    placeholder dispersion shows up: the IRLS weight ``mu / (1 + alpha mu)``
+    at ``alpha = 0.1`` is several times the weight at a dispersion of 2, and
+    every Wald statistic built on it is wrong by that factor.
+    """
+    rng = np.random.default_rng(7)
+    n, n_genes = 400, 40
+    x1 = (rng.random(n) < 0.35).astype(float)
+    design = np.column_stack([np.ones(n), x1])
+    mu = np.exp(design @ np.c_[rng.uniform(1.0, 3.0, n_genes), rng.normal(0, 0.8, n_genes)].T)
+    counts = _generate_nb_counts(rng, mu, 1.5).astype(float)
+
+    fitter = NBGLMBatchFitter(design, max_iter=50, tol=1e-9, min_mu=0.0)
+    numba = fitter.fit_batch(counts, use_numba=True)
+    refit = fitter.fit_batch(counts, use_numba=False, fixed_dispersion=numba.dispersion)
+
+    assert numba.dispersion.min() > 0.5, "the test needs a dispersion unlike 0.1"
+    np.testing.assert_allclose(numba.coef, refit.coef, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(numba.se, refit.se, rtol=1e-8)
+
+
+def _floored_fixture(seed=0, n=300, n_genes=120, alpha=0.3):
+    """A screen-shaped fixture whose low-count genes rest on the ``min_mu``
+    floor: a geometric expression ladder from 0.02 to 50 counts per cell."""
+    rng = np.random.default_rng(seed)
+    design = np.column_stack([
+        np.ones(n), (rng.random(n) < 0.3).astype(float), rng.normal(0, 1, n)
+    ])
+    size_factors = np.exp(rng.normal(0, 0.3, n))
+    beta = np.column_stack([
+        np.log(np.geomspace(0.02, 50, n_genes)),
+        rng.normal(0, 0.5, n_genes),
+        rng.normal(0, 0.3, n_genes),
+    ])
+    mu = size_factors[:, None] * np.exp(design @ beta.T)
+    counts = _generate_nb_counts(rng, mu, alpha).astype(float)
+    return counts, design, size_factors, np.full(n_genes, alpha)
+
+
+def _floor_binds(design, offset, coef, min_mu):
+    return (np.exp(design @ coef.T + offset[:, None]) <= min_mu).any(axis=0)
+
+
+def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
+    """A gene whose fit rests on the mean floor must still be reported.
+
+    Where the floor binds, the fitted mean of those cells no longer moves with
+    the coefficients, so they carry no gradient while the normal equations
+    still count them: the Newton step is not a descent direction and the line
+    search finds nothing to take.  That says something about the floor, not
+    about the fit.  Treating it as a failure to converge would hand ``de.py``
+    a ``NaN`` p-value for every low-count gene the floor exists for; freezing
+    the gene where it stands instead -- which is what judging it by how far it
+    moved amounts to -- would report a warm start as a fit.  Such genes take
+    the full Newton step and are judged by DESeq2's deviance ratio.
+    """
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    fitter = NBGLMBatchFitter(design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5)
+    result = fitter.fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3, "fixture should exercise the floor"
+    assert result.converged.all()
+    assert result.n_iter.max() < 200, "no gene should be grinding to the cap"
+
+    # Converged means a fixed point, not merely a gene that stopped moving:
+    # one more iteration from here must not move it.
+    again = fitter.fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    )
+    np.testing.assert_allclose(again.coef, result.coef, rtol=1e-10, atol=1e-12)
+
+
+def test_floored_genes_match_pydeseq2_irls():
+    """The floor exists for DESeq2 compatibility, so that is what it is worth
+    measuring: on the genes it binds on, the coefficients must be PyDESeq2's.
+
+    Judging a floored gene by a descent test it cannot satisfy left it frozen
+    a couple of steps from the answer -- 2.8e-02 away in coefficient, against
+    1.4e-06 on the genes the floor never touches.
+    """
+    pytest.importorskip("pydeseq2")
+    from pydeseq2.utils import irls_solver
+
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    result = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha)
+
+    reference = np.array([
+        irls_solver(counts[:, g], size_factors, design, alpha[g],
+                    min_mu=0.5, beta_tol=1e-12)[0]
+        for g in range(counts.shape[1])
+    ])
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3
+    assert np.max(np.abs(result.coef[binds] - reference[binds])) < 1e-4
+
+
+def test_standard_errors_match_pydeseq2_wald_test():
+    """``min_mu`` steadies the iteration and has no place in the covariance.
+
+    DESeq2 keeps it out: ``irls_solver`` returns an unthresholded ``mu`` and
+    ``wald_test`` rebuilds the weights from it.  Building them from the
+    floored mean instead made the standard errors a median of 24% too small on
+    floor-binding genes, and the Wald statistics correspondingly too large.
+    """
+    pytest.importorskip("pydeseq2")
+    from pydeseq2.utils import wald_test
+
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    result = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha)
+
+    ridge = np.diag(np.repeat(1e-6, design.shape[1]))
+    contrast = np.array([0.0, 1.0, 0.0])
+    reference = np.array([
+        wald_test(design, alpha[g], result.coef[g],
+                  size_factors * np.exp(design @ result.coef[g]),
+                  ridge, contrast, 0.0, None)[2]
+        for g in range(counts.shape[1])
+    ])
+    binds = _floor_binds(design, offset, result.coef, 0.5)
+    assert binds.sum() > counts.shape[1] // 3
+    np.testing.assert_allclose(result.se[:, 1], reference, rtol=1e-5)
+
+
+def test_reported_standard_errors_are_invariant_to_the_mean_floor():
+    """Stated directly: the floor may move the coefficients, never the
+    uncertainty attached to them."""
+    counts, design, size_factors, alpha = _floored_fixture()
+    offset = np.log(size_factors)
+    coef = NBGLMBatchFitter(
+        design, offset=offset, max_iter=200, tol=1e-10, min_mu=0.5
+    ).fit_batch(
+        counts, gene_batch_size=None, use_numba=False, fixed_dispersion=alpha
+    ).coef.T
+
+    floored = NBGLMBatchFitter(design, offset=offset, min_mu=0.5)
+    free = NBGLMBatchFitter(design, offset=offset, min_mu=0.0)
+    np.testing.assert_array_equal(
+        floored._compute_se_batch(floored._wald_weights(coef, alpha)),
+        free._compute_se_batch(free._wald_weights(coef, alpha)),
+    )

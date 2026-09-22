@@ -517,3 +517,377 @@ def test_wilcoxon_filtered_genes_are_nan_not_one(tmp_path):
     assert np.isnan(pvals[3]), f"Expected NaN for filtered gene 3, got {pvals[3]}"
     assert pvals[3] != 1.0, "Filtered gene p-value must be NaN, not 1.0"
 
+
+
+# ---------------------------------------------------------------------------
+# Estimability filter for the NB-GLM effect (_nonestimable_glm_mask)
+# ---------------------------------------------------------------------------
+
+from crispyx._statistics import _nonestimable_glm_mask  # noqa: E402
+
+
+def test_nonestimable_mask_flags_either_empty_arm():
+    flagged = _nonestimable_glm_mask(
+        pert_expr_counts=np.array([0, 5, 3, 0, 1]),
+        control_expr_counts=np.array([9, 0, 4, 0, 1]),
+    )
+    np.testing.assert_array_equal(flagged, [True, True, False, True, False])
+
+
+def test_nonestimable_mask_thresholds_are_independent():
+    """CRISPRi wants a demanding control side, CRISPRa a demanding perturbed
+    side, so the two thresholds must be settable separately."""
+    pert = np.array([1, 4, 9])
+    control = np.array([9, 9, 9])
+
+    crispri = _nonestimable_glm_mask(
+        pert_expr_counts=pert, control_expr_counts=control,
+        min_cells_ctrl=5, min_cells_pert=1,
+    )
+    np.testing.assert_array_equal(crispri, [False, False, False])
+
+    crispra = _nonestimable_glm_mask(
+        pert_expr_counts=pert, control_expr_counts=control,
+        min_cells_ctrl=1, min_cells_pert=5,
+    )
+    np.testing.assert_array_equal(crispra, [True, True, False])
+
+
+def test_nonestimable_mask_control_side_alone():
+    flagged = _nonestimable_glm_mask(
+        pert_expr_counts=np.array([9, 9]),
+        control_expr_counts=np.array([2, 9]),
+        min_cells_ctrl=5, min_cells_pert=0,
+    )
+    np.testing.assert_array_equal(flagged, [True, False])
+
+
+def test_nonestimable_mask_can_be_disabled():
+    flagged = _nonestimable_glm_mask(
+        pert_expr_counts=np.array([0, 0]),
+        control_expr_counts=np.array([0, 9]),
+        min_cells_ctrl=0, min_cells_pert=0,
+    )
+    np.testing.assert_array_equal(flagged, [False, False])
+
+
+def _separation_adata(tmp_path):
+    """Genes spanning estimable, non-estimable and empty."""
+    rng = np.random.default_rng(0)
+    n, n_genes = 200, 6
+    perturbed = np.zeros(n, dtype=bool)
+    perturbed[: n // 2] = True
+    counts = rng.negative_binomial(5, 5 / (5 + 30.0), size=(n, n_genes)).astype(np.float32)
+    counts[perturbed, 1] = 0          # silenced by the perturbation
+    counts[~perturbed, 2] = 0         # induced by the perturbation
+    counts[:, 3] = 0                  # no counts anywhere
+    counts[perturbed, 4] = 0
+    counts[np.flatnonzero(perturbed)[0], 4] = 1   # one count: MLE exists
+    names = ["normal", "silenced", "induced", "empty", "one_count", "sparse_one_sided"]
+    counts[:, 5] = 0
+    counts[np.flatnonzero(perturbed)[:3], 5] = 1  # counts in one arm only
+
+    obs = pd.DataFrame(
+        {"perturbation": np.where(perturbed, "g1", "control")},
+        index=[f"c{i}" for i in range(n)],
+    )
+    path = tmp_path / "separation.h5ad"
+    ad.AnnData(X=counts, obs=obs, var=pd.DataFrame(index=names)).write_h5ad(path)
+    return path, names
+
+
+def _by_gene(result, names):
+    genes = np.asarray(result.genes).ravel()
+    index = {g: i for i, g in enumerate(genes)}
+    return (
+        index,
+        np.asarray(result.logfoldchanges).ravel(),
+        np.asarray(result.statistics).ravel(),
+        np.asarray(result.pvalues).ravel(),
+        np.asarray(result.pts).ravel(),
+        np.asarray(result.pts_rest).ravel(),
+    )
+
+
+def test_nb_glm_does_not_estimate_effects_for_one_sided_pairs(tmp_path):
+    """A pair absent from one arm gets no effect, statistic or p-value.
+
+    The log-link GLM effect is a difference of log means, so with one arm at
+    zero it has no finite maximiser and whatever the fitter returns is set by
+    where it stopped.  Such pairs are reported as untested, exactly as genes
+    with no counts anywhere already are.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+
+    for gene in ("silenced", "induced", "empty", "sparse_one_sided"):
+        i = index.get(gene)
+        if i is None:
+            continue  # dropped upstream, which is also "not reported"
+        assert np.isnan(lfc[i]), f"{gene} should have no effect estimate"
+        assert np.isnan(stat[i]), f"{gene} should have no statistic"
+        assert np.isnan(pval[i]), f"{gene} should have no p-value"
+
+    # Genes whose effect is identified are still tested.
+    for gene in ("normal", "one_count"):
+        i = index[gene]
+        assert np.isfinite(lfc[i]), f"{gene} should still be tested"
+        assert np.isfinite(stat[i])
+
+
+def test_excluded_pairs_keep_their_expression_evidence(tmp_path):
+    """Untested is not the same as unremarkable: pts must still show it."""
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+
+    silenced = index["silenced"]
+    assert np.isnan(lfc[silenced])
+    assert pts[silenced] == pytest.approx(0.0)
+    assert pts_rest[silenced] > 0.9, "the control arm's expression must remain visible"
+
+    induced = index["induced"]
+    assert pts[induced] > 0.9
+    assert pts_rest[induced] == pytest.approx(0.0)
+
+
+def test_excluded_pairs_keep_their_expression_evidence_without_the_control_cache(tmp_path):
+    """The same, on the path that does not use the cached control statistics.
+
+    That path built ``pts`` and ``pts_rest`` behind the validity mask, so the
+    evidence the documentation points at for an excluded pair -- 0% of
+    perturbed cells against 95% of control cells -- was zeroed away on
+    precisely the pairs it was there for.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, use_control_cache=False, verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+
+    silenced = index["silenced"]
+    assert np.isnan(pval[silenced]), "the pair is still untested"
+    assert pts[silenced] == pytest.approx(0.0)
+    assert pts_rest[silenced] > 0.9, "the control arm's expression must remain visible"
+
+    induced = index["induced"]
+    assert pts[induced] > 0.9
+    assert pts_rest[induced] == pytest.approx(0.0)
+
+
+def test_effect_is_never_reported_as_zero_for_an_excluded_pair(tmp_path):
+    """Reporting 0 would describe a silenced gene as unchanged."""
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+    silenced = index["silenced"]
+    assert not (lfc[silenced] == 0.0), "an excluded effect must be NaN, not zero"
+
+
+@pytest.mark.parametrize("use_control_cache", [True, False], ids=["cached", "uncached"])
+def test_shrinkage_does_not_resurrect_an_excluded_pair(tmp_path, use_control_cache):
+    """apeGLM shrinks the pairs that were fitted; it does not fit the rest.
+
+    An excluded pair is dropped before any fit, so it has no MLE to shrink.
+    The cached worker handed the shrinkage its zero-initialised coefficients
+    anyway, which came back as a finite effect beside a NaN p-value -- and on
+    both workers the standard error of an untested gene was replaced by the
+    literal 1.0 the per-gene fallback returns.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, data_name=f"apeglm_{use_control_cache}",
+        lfc_shrinkage_type="apeglm", use_control_cache=use_control_cache,
+        verbose=False,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+    se = np.asarray(ad.read_h5ad(res.result_path).layers["standard_error"]).ravel()
+
+    for gene in ("silenced", "induced", "empty", "sparse_one_sided"):
+        i = index.get(gene)
+        if i is None:
+            continue  # dropped upstream, which is also "not reported"
+        assert np.isnan(pval[i]), f"{gene} should have no p-value"
+        assert np.isnan(lfc[i]), f"{gene} should have no effect estimate under shrinkage"
+        assert np.isnan(se[i]), f"{gene} should have no standard error, not {se[i]}"
+
+    normal = index["normal"]
+    assert np.isfinite(lfc[normal]), "shrinkage must still report the tested genes"
+    assert np.isfinite(se[normal]) and se[normal] > 0
+
+
+def test_min_cells_per_arm_zero_restores_the_previous_behaviour(tmp_path):
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    res = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control",
+        output_dir=tmp_path, data_name="disabled", verbose=False,
+        min_cells_ctrl=0, min_cells_pert=0,
+    )
+    index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
+    silenced = index["silenced"]
+    assert np.isfinite(lfc[silenced]), "the filter should be switchable off"
+    assert np.isfinite(stat[silenced])
+
+
+def test_asymmetric_thresholds_reach_nb_glm_test(tmp_path):
+    """A demanding control threshold drops pairs a symmetric one would keep.
+
+    The "one_count" gene has a single expressing perturbed cell and a fully
+    expressed control arm: estimable, and tested by default.  Requiring more
+    perturbed cells -- what an activation screen would want -- excludes it,
+    while requiring more control cells does not.
+    """
+    path, names = _separation_adata(tmp_path)
+    from crispyx.de import nb_glm_test
+
+    def effect(**kwargs):
+        res = nb_glm_test(
+            path, perturbation_column="perturbation", control_label="control",
+            output_dir=tmp_path, verbose=False, **kwargs,
+        )
+        index, lfc, *_ = _by_gene(res, names)
+        return lfc[index["one_count"]]
+
+    assert np.isfinite(effect(data_name="sym")), "estimable by default"
+    assert np.isnan(effect(data_name="strict_pert", min_cells_pert=5))
+    assert np.isfinite(effect(data_name="strict_ctrl", min_cells_ctrl=5))
+
+
+# ---------------------------------------------------------------------------
+# One meaning for "untested": NaN in every column derived from the comparison
+# ---------------------------------------------------------------------------
+
+def _make_dataset_partly_tested(tmp_path: Path):
+    """A gene that ``min_cells_expressed`` excludes for KO1 but not for KO2.
+
+    Two of the 80 control cells express it, so the control side is not "low"
+    and the joint low-expression filter leaves it alone; only the total
+    expressing-cell count separates the two perturbations.
+    """
+    rng = np.random.default_rng(3)
+    n = 80
+    counts = np.zeros((3 * n, 3), dtype=np.float64)
+    # gene 0: expressed everywhere
+    counts[:, 0] = rng.poisson(20, 3 * n)
+    # gene 1: 2 control cells, none in KO1, 30 in KO2
+    counts[[0, 1], 1] = 8.0
+    counts[2 * n : 2 * n + 30, 1] = rng.poisson(10, 30) + 1
+    # gene 2: expressed everywhere
+    counts[:, 2] = rng.poisson(6, 3 * n)
+
+    obs = pd.DataFrame(
+        {"perturbation": ["ctrl"] * n + ["KO1"] * n + ["KO2"] * n},
+        index=[f"cell_{i}" for i in range(3 * n)],
+    )
+    var = pd.DataFrame(index=[f"gene{i}" for i in range(3)])
+    adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata)
+    adata.X = sp.csr_matrix(adata.X)
+    path = tmp_path / "partly_tested.h5ad"
+    adata.write(path)
+    return path
+
+
+_UNTESTED_KW = dict(
+    perturbation_column="perturbation",
+    control_label="ctrl",
+    min_cells_expressed=10,
+)
+
+
+def _assert_untested_is_uniform(res, row):
+    """No column derived from the comparison may disagree about testedness."""
+    pvals = np.asarray(res.pvalues[row])
+    lfc = np.asarray(res.logfoldchanges[row])
+    stat = np.asarray(res.statistics[row])
+    eff = np.asarray(res.effect_size[row])
+    untested = np.isnan(pvals)
+    assert untested.any(), "fixture should exclude at least one gene"
+    for name, col in (("logfoldchanges", lfc), ("statistics", stat), ("effect_size", eff)):
+        assert np.isnan(col[untested]).all(), f"{name} is finite where the p-value is NaN"
+        assert np.isfinite(col[~untested]).all(), f"{name} is NaN where the p-value is not"
+    # Nothing is spelled as "tested, no change".
+    assert not (pvals[untested] == 1.0).any()
+    assert not (lfc[untested] == 0.0).any()
+    # Expression fractions describe the data and survive exclusion.
+    assert np.isfinite(res.pts[row]).all()
+    assert np.isfinite(res.pts_rest[row]).all()
+    assert res.pts_rest[row][untested].max() > 0
+
+
+@pytest.mark.parametrize("fn", ["wilcoxon_test", "t_test"])
+def test_untested_genes_are_nan_in_every_derived_column(tmp_path, fn):
+    path = _make_dataset_partly_tested(tmp_path)
+    res = getattr(cx, fn)(path, output_dir=tmp_path, data_name=fn, **_UNTESTED_KW)
+    ko1 = res.groups.index("KO1")
+    assert np.isnan(res.pvalues[ko1][1]), "gene1 should be excluded for KO1"
+    _assert_untested_is_uniform(res, ko1)
+    # The same gene is tested for KO2, which has enough expressing cells.
+    ko2 = res.groups.index("KO2")
+    assert np.isfinite(res.pvalues[ko2][1])
+    assert np.isfinite(res.logfoldchanges[ko2][1])
+
+
+@pytest.mark.parametrize("fn", ["wilcoxon_test", "t_test"])
+def test_a_row_does_not_depend_on_the_other_perturbations_in_the_run(tmp_path, fn):
+    """A gene excluded here must not inherit a p-value from another row's block."""
+    path = _make_dataset_partly_tested(tmp_path)
+    both = getattr(cx, fn)(path, output_dir=tmp_path, data_name=f"{fn}_both", **_UNTESTED_KW)
+    alone = getattr(cx, fn)(
+        path, output_dir=tmp_path, data_name=f"{fn}_alone",
+        perturbations=["KO1"], **_UNTESTED_KW,
+    )
+    row_both = both.groups.index("KO1")
+    row_alone = alone.groups.index("KO1")
+    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(both, attr)[row_both]),
+            np.asarray(getattr(alone, attr)[row_alone]),
+            atol=1e-10,
+            err_msg=f"{attr} for KO1 changed with the run's composition",
+        )
+
+
+def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
+    path = _make_dataset_partly_tested(tmp_path)
+    standard = cx.wilcoxon_test(
+        path, output_dir=tmp_path, data_name="std", memory_limit_gb=128, **_UNTESTED_KW
+    )
+    streaming = cx.wilcoxon_test(
+        path, output_dir=tmp_path, data_name="stream", memory_limit_gb=1e-7, **_UNTESTED_KW
+    )
+    assert np.isnan(standard.pvalues).any()
+    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size", "pts", "pts_rest"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(standard, attr)),
+            np.asarray(getattr(streaming, attr)),
+            atol=1e-10,
+            err_msg=f"{attr} differs between the standard and streaming paths",
+        )
+    _assert_untested_is_uniform(standard, standard.groups.index("KO1"))
+    _assert_untested_is_uniform(streaming, streaming.groups.index("KO1"))
