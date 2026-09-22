@@ -740,3 +740,119 @@ def test_asymmetric_thresholds_reach_nb_glm_test(tmp_path):
     assert np.isfinite(effect(data_name="sym")), "estimable by default"
     assert np.isnan(effect(data_name="strict_pert", min_cells_pert=5))
     assert np.isfinite(effect(data_name="strict_ctrl", min_cells_ctrl=5))
+
+
+# ---------------------------------------------------------------------------
+# One meaning for "untested": NaN in every column derived from the comparison
+# ---------------------------------------------------------------------------
+
+def _make_dataset_partly_tested(tmp_path: Path):
+    """A gene that ``min_cells_expressed`` excludes for KO1 but not for KO2.
+
+    Two of the 80 control cells express it, so the control side is not "low"
+    and the joint low-expression filter leaves it alone; only the total
+    expressing-cell count separates the two perturbations.
+    """
+    rng = np.random.default_rng(3)
+    n = 80
+    counts = np.zeros((3 * n, 3), dtype=np.float64)
+    # gene 0: expressed everywhere
+    counts[:, 0] = rng.poisson(20, 3 * n)
+    # gene 1: 2 control cells, none in KO1, 30 in KO2
+    counts[[0, 1], 1] = 8.0
+    counts[2 * n : 2 * n + 30, 1] = rng.poisson(10, 30) + 1
+    # gene 2: expressed everywhere
+    counts[:, 2] = rng.poisson(6, 3 * n)
+
+    obs = pd.DataFrame(
+        {"perturbation": ["ctrl"] * n + ["KO1"] * n + ["KO2"] * n},
+        index=[f"cell_{i}" for i in range(3 * n)],
+    )
+    var = pd.DataFrame(index=[f"gene{i}" for i in range(3)])
+    adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata)
+    adata.X = sp.csr_matrix(adata.X)
+    path = tmp_path / "partly_tested.h5ad"
+    adata.write(path)
+    return path
+
+
+_UNTESTED_KW = dict(
+    perturbation_column="perturbation",
+    control_label="ctrl",
+    min_cells_expressed=10,
+)
+
+
+def _assert_untested_is_uniform(res, row):
+    """No column derived from the comparison may disagree about testedness."""
+    pvals = np.asarray(res.pvalues[row])
+    lfc = np.asarray(res.logfoldchanges[row])
+    stat = np.asarray(res.statistics[row])
+    eff = np.asarray(res.effect_size[row])
+    untested = np.isnan(pvals)
+    assert untested.any(), "fixture should exclude at least one gene"
+    for name, col in (("logfoldchanges", lfc), ("statistics", stat), ("effect_size", eff)):
+        assert np.isnan(col[untested]).all(), f"{name} is finite where the p-value is NaN"
+        assert np.isfinite(col[~untested]).all(), f"{name} is NaN where the p-value is not"
+    # Nothing is spelled as "tested, no change".
+    assert not (pvals[untested] == 1.0).any()
+    assert not (lfc[untested] == 0.0).any()
+    # Expression fractions describe the data and survive exclusion.
+    assert np.isfinite(res.pts[row]).all()
+    assert np.isfinite(res.pts_rest[row]).all()
+    assert res.pts_rest[row][untested].max() > 0
+
+
+@pytest.mark.parametrize("fn", ["wilcoxon_test", "t_test"])
+def test_untested_genes_are_nan_in_every_derived_column(tmp_path, fn):
+    path = _make_dataset_partly_tested(tmp_path)
+    res = getattr(cx, fn)(path, output_dir=tmp_path, data_name=fn, **_UNTESTED_KW)
+    ko1 = res.groups.index("KO1")
+    assert np.isnan(res.pvalues[ko1][1]), "gene1 should be excluded for KO1"
+    _assert_untested_is_uniform(res, ko1)
+    # The same gene is tested for KO2, which has enough expressing cells.
+    ko2 = res.groups.index("KO2")
+    assert np.isfinite(res.pvalues[ko2][1])
+    assert np.isfinite(res.logfoldchanges[ko2][1])
+
+
+@pytest.mark.parametrize("fn", ["wilcoxon_test", "t_test"])
+def test_a_row_does_not_depend_on_the_other_perturbations_in_the_run(tmp_path, fn):
+    """A gene excluded here must not inherit a p-value from another row's block."""
+    path = _make_dataset_partly_tested(tmp_path)
+    both = getattr(cx, fn)(path, output_dir=tmp_path, data_name=f"{fn}_both", **_UNTESTED_KW)
+    alone = getattr(cx, fn)(
+        path, output_dir=tmp_path, data_name=f"{fn}_alone",
+        perturbations=["KO1"], **_UNTESTED_KW,
+    )
+    row_both = both.groups.index("KO1")
+    row_alone = alone.groups.index("KO1")
+    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(both, attr)[row_both]),
+            np.asarray(getattr(alone, attr)[row_alone]),
+            atol=1e-10,
+            err_msg=f"{attr} for KO1 changed with the run's composition",
+        )
+
+
+def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
+    path = _make_dataset_partly_tested(tmp_path)
+    standard = cx.wilcoxon_test(
+        path, output_dir=tmp_path, data_name="std", memory_limit_gb=128, **_UNTESTED_KW
+    )
+    streaming = cx.wilcoxon_test(
+        path, output_dir=tmp_path, data_name="stream", memory_limit_gb=1e-7, **_UNTESTED_KW
+    )
+    assert np.isnan(standard.pvalues).any()
+    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size", "pts", "pts_rest"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(standard, attr)),
+            np.asarray(getattr(streaming, attr)),
+            atol=1e-10,
+            err_msg=f"{attr} differs between the standard and streaming paths",
+        )
+    _assert_untested_is_uniform(standard, standard.groups.index("KO1"))
+    _assert_untested_is_uniform(streaming, streaming.groups.index("KO1"))

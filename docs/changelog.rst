@@ -10,6 +10,36 @@ from 0.1.4 on covariate-adjusted or low-count genes will not reproduce
 exactly. ``nb_glm_test`` keeps its own ``min_mu`` default of 0.5, so the
 DESeq2-compatible path is unchanged.
 
+* **A filtered gene is now reported the same way everywhere: untested.**
+  ``nb_glm_test`` already reported an excluded (gene, perturbation) pair as
+  ``NaN`` throughout; ``t_test`` and ``wilcoxon_test`` did not. Depending on
+  which of the three Wilcoxon paths ran, a gene dropped by
+  ``min_cells_expressed`` came back with ``p = 1.0`` and a fold change of
+  exactly 0.0 -- "tested, no change", asserted about a gene nobody tested --
+  or with a ``NaN`` p-value beside that same 0.0, and ``t_test`` returned a
+  ``NaN`` p-value beside a finite fold change and effect size. Worse, a gene
+  excluded for one perturbation but tested for another picked up that other
+  perturbation's default ``p = 1.0``, so a result row depended on which
+  perturbations happened to be in the same run. All three Wilcoxon paths and
+  ``t_test`` now write ``NaN`` to every column derived from the comparison --
+  ``score``, ``pvalue``, ``pvalue_adj``, ``u_statistic``, ``logfoldchanges``,
+  ``effect_size`` -- for every gene they did not test, and nothing is spelled
+  as 0.0 or 1.0 to mean "untested". Because a ``NaN`` p-value does not enter
+  the Benjamini-Hochberg denominator, adjusted p-values on the genes that
+  *were* tested get slightly smaller; that is the correct denominator.
+* **``pts`` and ``pts_rest`` survive the filters.** The Wilcoxon paths zeroed
+  the fractions of expressing cells for excluded genes, which is exactly the
+  information needed to see that a gene absent from one arm was excluded at
+  all. They are descriptions of the data, not of the comparison, and are now
+  reported for every gene, as ``t_test`` and ``nb_glm_test`` already did.
+* **``t_test`` no longer folds untested cells into the last perturbation.**
+  With an explicit ``perturbations=`` subset, every cell belonging to a
+  perturbation outside that subset was accumulated into the last tested
+  group's sums, means, variances and cell count, because the unselected
+  labels code to ``-1`` and ``-1`` indexes the last row. Testing one
+  perturbation out of three therefore compared control against that
+  perturbation *plus both untested ones*. Only ``t_test`` was affected;
+  ``wilcoxon_test`` and ``nb_glm_test`` select cells by label.
 * **Negative-binomial estimates are no longer biased on lowly-expressed
   genes.** ``min_mu`` was being applied not only as the floor on the fitted
   mean that DESeq2 defines, but also as a clamp on the IRLS weights, on the
