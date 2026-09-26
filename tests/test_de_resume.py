@@ -231,6 +231,37 @@ def test_wilcoxon_killed_while_writing_leaves_no_output(screen, tmp_path, monkey
     _assert_same_result(reference, out)
 
 
+def test_streaming_wilcoxon_restarts_when_its_work_file_is_unreadable(screen, tmp_path, monkeypatch, streaming):
+    reference = tmp_path / "reference.h5ad"
+    _run("wilcoxon", screen, reference)
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 1)
+        with pytest.raises(Interrupted):
+            _run("wilcoxon", screen, out)
+    (_resume_dir(out) / "result.h5ad").write_bytes(b"killed mid-write")
+    _run("wilcoxon", screen, out, resume=True)
+    _assert_same_result(reference, out)
+
+
+def test_t_test_checkpoints_once_a_batch_crosses_the_interval(screen, tmp_path, monkeypatch):
+    # Batches of 4 never land on a multiple of 3 before the last one.
+    saved: list[int] = []
+    real_save = ResumableRun.save
+
+    def save(self, **progress):
+        saved.append(len(progress["completed"]))
+        real_save(self, **progress)
+
+    monkeypatch.setattr(ResumableRun, "save", save)
+    monkeypatch.setattr(de, "_resolve_n_jobs", lambda n_jobs: 4)
+    de.t_test(
+        screen / "norm.h5ad", perturbation_column="perturbation", control_label="control",
+        verbose=False, output_path=tmp_path / "result.h5ad", checkpoint_interval=3,
+    )
+    assert saved[0] == 4
+
+
 def test_t_test_failed_perturbation_is_nan_not_significant(screen, tmp_path):
     out = tmp_path / "result.h5ad"
     result = _run("t_test", screen, out, perturbations=["P0", "absent"])

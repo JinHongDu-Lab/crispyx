@@ -4,7 +4,7 @@ Changelog
 Version 0.1.6
 -------------
 
-*Unreleased.* Set the release date when the version is published.
+*Released 2026-09-26.*
 
 This release makes crispyx outputs smaller without changing any computed
 value: every number the DE functions stored before is stored now, bit for

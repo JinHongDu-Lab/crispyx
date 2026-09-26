@@ -351,23 +351,32 @@ def file_tracks_order(f: h5py.File) -> bool:
 # Parallel decoding for streaming reads
 # ---------------------------------------------------------------------------
 
-#: Decode threads for streaming reads. One thread inflates ~300-400 MB/s and
-#: throughput scales with threads, so use every available CPU (up to 32):
-#: the caller is blocked on the read anyway. The threads form one pool shared
-#: by every reader in the process, so nested or concurrent streams never
-#: start more than this many.
-DECODE_THREADS = min(32, joblib.cpu_count())
+def _decode_thread_count() -> int:
+    """Threads for streaming decodes: every available CPU (up to 32), since
+    one thread inflates only ~300-400 MB/s and the caller is blocked on the
+    read anyway. ``OMP_NUM_THREADS`` caps it; joblib sets that in its worker
+    processes, so a pool of workers does not start a full pool each."""
+    n = min(32, joblib.cpu_count())
+    try:
+        return max(1, min(n, int(os.environ["OMP_NUM_THREADS"])))
+    except (KeyError, ValueError):
+        return n
 
+
+# One pool shared by every reader in the process, so nested or concurrent
+# streams never start more threads than it has.
 _decode_pool: ThreadPoolExecutor | None = None
+_decode_threads = 0
 _decode_pool_lock = threading.Lock()
 
 
-def _shared_decode_pool() -> ThreadPoolExecutor:
-    global _decode_pool
+def _shared_decode_pool() -> tuple[ThreadPoolExecutor, int]:
+    global _decode_pool, _decode_threads
     with _decode_pool_lock:
         if _decode_pool is None:
-            _decode_pool = ThreadPoolExecutor(DECODE_THREADS, thread_name_prefix="crispyx-inflate")
-        return _decode_pool
+            _decode_threads = _decode_thread_count()
+            _decode_pool = ThreadPoolExecutor(_decode_threads, thread_name_prefix="crispyx-inflate")
+        return _decode_pool, _decode_threads
 
 
 def _forget_decode_pool() -> None:
@@ -419,10 +428,10 @@ def read_rows(ds: h5py.Dataset, start: int, stop: int) -> np.ndarray:
     stop = min(stop, ds.shape[0])
     if stop <= start:
         return ds[start:stop]
-    pool = _shared_decode_pool()
+    pool, n_threads = _shared_decode_pool()
     # Chunks in flight: enough to keep every thread busy, few enough that a
     # read never holds a second full copy of the block it returns.
-    window = 2 * DECODE_THREADS
+    window = 2 * n_threads
     shuffle = deflate_shuffle(ds)
     rows = ds.chunks[0]
     tail = (0,) * (ds.ndim - 1)

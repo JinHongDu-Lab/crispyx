@@ -49,8 +49,7 @@ def _write_checkpoint_atomic(
     try:
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
-        # Atomic rename
-        os.rename(tmp_path, checkpoint_path)
+        os.replace(tmp_path, checkpoint_path)  # atomic, and overwrites on Windows too
     except Exception:
         # Clean up temp file on error
         if tmp_path.exists():

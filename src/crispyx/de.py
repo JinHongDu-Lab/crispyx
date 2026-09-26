@@ -1099,13 +1099,9 @@ def t_test(
     resume
         If True, continue an interrupted run from its last checkpoint,
         skipping the perturbations it had finished.
-        Partial results are kept beside the output, in a hidden
-        ``.<output name>.resume`` directory, together with the checkpoint
-        ``<output>.progress.json``; both are removed once the output is
-        written. A run resumes only from a checkpoint written by a call with
-        the same input file, perturbations and result-affecting parameters;
-        any other checkpoint is discarded and the run starts over. A
-        completed output is loaded as usual (unless ``force=True``).
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of perturbations between checkpoint saves. Auto-determined if None.
     corr_method
@@ -1437,6 +1433,7 @@ def t_test(
     newly_failed: list[str] = []
     completed_set = set(completed_labels)
     n_processed = 0
+    n_at_last_save = 0
         
     # Helper to save checkpoint
     def _save_t_test_checkpoint() -> None:
@@ -1453,9 +1450,6 @@ def t_test(
         with _create_progress_context(len(candidates_to_run), "t-test DE", verbose) as pbar:
             for batch_start in range(0, n_groups, batch_size):
                 batch_labels = candidates[batch_start : batch_start + batch_size]
-                # Filter to only labels that need processing
-                batch_to_run = [l for l in batch_labels if l not in completed_set]
-                    
                 for local_idx, label in enumerate(batch_labels):
                     if label in completed_set:
                         continue
@@ -1484,9 +1478,11 @@ def t_test(
                     pbar.update(1)
                     logger.debug(f"Completed perturbation: {label}")
                     
-                # Save checkpoint after each batch
-                if len(batch_to_run) > 0 and n_processed % eff_checkpoint_interval == 0:
+                # A batch completes several perturbations, so save once the
+                # interval is crossed rather than on exact multiples.
+                if n_processed - n_at_last_save >= eff_checkpoint_interval:
                     _save_t_test_checkpoint()
+                    n_at_last_save = n_processed
             
         # Final checkpoint
         _save_t_test_checkpoint()
@@ -1541,12 +1537,11 @@ def t_test(
     adata.uns["perturbation_column"] = perturbation_column
     adata.uns["pvalue_correction"] = corr_method
     _messages.print_saving(verbose, "t_test", output_path)
-    adata.write(output_path)
-    
-    # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format:
-        _write_rank_genes_groups_hdf5(output_path, result)
-    
+    with _replace_on_success(output_path) as partial:
+        adata.write(partial)
+        if scanpy_format:
+            _write_rank_genes_groups_hdf5(partial, result)
+
     run.discard()  # the output is complete; the checkpoint and partial arrays are not needed
     result.result = AnnData(output_path)
     return result
@@ -1819,13 +1814,9 @@ def nb_glm_test(
     resume
         If True, continue an interrupted run from its last checkpoint,
         skipping the perturbations it had finished.
-        Partial results are kept beside the output, in a hidden
-        ``.<output name>.resume`` directory, together with the checkpoint
-        ``<output>.progress.json``; both are removed once the output is
-        written. A run resumes only from a checkpoint written by a call with
-        the same input file, perturbations and result-affecting parameters;
-        any other checkpoint is discarded and the run starts over. A
-        completed output is loaded as usual (unless ``force=True``).
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of perturbations to process between checkpoint saves. If None,
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
@@ -2917,54 +2908,6 @@ def nb_glm_test(
     # Create index mappings
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
-    shape = (n_groups, n_genes)
-    _nb_glm_disk_estimate = warn_if_disk_space_low(
-        _nb_glm_disk_bytes(*shape),
-        output_path,
-        context="nb_glm_test",
-    )
-    _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
-    # Per-perturbation results live beside the output until the run finishes,
-    # so an interrupted run resumes from its last checkpoint.
-    run = ResumableRun(
-        output_path,
-        checkpoint_path,
-        fingerprint=_de_fingerprint(path, call_args, method="nb_glm", candidates=candidates, n_genes=n_genes),
-        arrays={
-            "statistic": (shape, np.float64, np.nan),
-            "pvalue": (shape, np.float64, np.nan),
-            "pvalue_adj": (shape, np.float64, np.nan),
-            "logfoldchange": (shape, np.float64, np.nan),
-            "logfoldchange_raw": (shape, np.float64, np.nan),
-            "intercept": (shape, np.float64, np.nan),  # MLE intercept for shrink_lfc
-            "standard_error": (shape, np.float64, np.nan),
-            "dispersion": (shape, np.float64, np.nan),
-            "dispersion_raw": (shape, np.float64, np.nan),
-            "dispersion_trend": (shape, np.float64, np.nan),
-            "pts": (shape, np.float32, 0),
-            "iterations": (shape, np.int32, 0),
-            "converged": (shape, np.bool_, False),
-        },
-        resume=resume,
-    )
-    # Earlier failures are retried, so only completions carry over.
-    completed_labels: list[str] = run.progress.get("completed", [])
-    candidates_to_run = [c for c in candidates if c not in set(completed_labels)]
-    if run.resumed:
-        _messages.vprint(verbose, "nb_glm_test", f"Resuming: {len(completed_labels)}/{n_groups} perturbations already done")
-    statistic_memmap = run.arrays["statistic"]
-    pvalue_memmap = run.arrays["pvalue"]
-    logfc_memmap = run.arrays["logfoldchange"]
-    logfc_raw_memmap = run.arrays["logfoldchange_raw"]
-    intercept_memmap = run.arrays["intercept"]
-    se_memmap = run.arrays["standard_error"]
-    pts_memmap = run.arrays["pts"]
-    dispersion_memmap = run.arrays["dispersion"]
-    dispersion_raw_memmap = run.arrays["dispersion_raw"]
-    dispersion_trend_memmap = run.arrays["dispersion_trend"]
-    iter_memmap = run.arrays["iterations"]
-    convergence_memmap = run.arrays["converged"]
-
     # Load control cells matrix once (all genes)
     # For very large control groups, skip loading and use streaming path
     control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
@@ -3150,6 +3093,60 @@ def nb_glm_test(
             "Switching to streaming control statistics for frozen control mode "
             f"(avoids {control_matrix_gb * 4:.1f} GB dense IRLS peak)."
         )
+
+    shape = (n_groups, n_genes)
+    _nb_glm_disk_estimate = warn_if_disk_space_low(
+        _nb_glm_disk_bytes(*shape),
+        output_path,
+        context="nb_glm_test",
+    )
+    _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
+    # Per-perturbation results live beside the output until the run finishes,
+    # so an interrupted run resumes from its last checkpoint.
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        # freeze_control is resolved from free memory above; a resume must
+        # fit the remaining rows with the same model as the saved ones.
+        fingerprint=_de_fingerprint(
+            path, call_args, method="nb_glm", candidates=candidates, n_genes=n_genes,
+            frozen_control=bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control)),
+            streaming_control=bool(use_streaming_control),
+        ),
+        arrays={
+            "statistic": (shape, np.float64, np.nan),
+            "pvalue": (shape, np.float64, np.nan),
+            "pvalue_adj": (shape, np.float64, np.nan),
+            "logfoldchange": (shape, np.float64, np.nan),
+            "logfoldchange_raw": (shape, np.float64, np.nan),
+            "intercept": (shape, np.float64, np.nan),  # MLE intercept for shrink_lfc
+            "standard_error": (shape, np.float64, np.nan),
+            "dispersion": (shape, np.float64, np.nan),
+            "dispersion_raw": (shape, np.float64, np.nan),
+            "dispersion_trend": (shape, np.float64, np.nan),
+            "pts": (shape, np.float32, 0),
+            "iterations": (shape, np.int32, 0),
+            "converged": (shape, np.bool_, False),
+        },
+        resume=resume,
+    )
+    # Earlier failures are retried, so only completions carry over.
+    completed_labels: list[str] = run.progress.get("completed", [])
+    candidates_to_run = [c for c in candidates if c not in set(completed_labels)]
+    if run.resumed:
+        _messages.vprint(verbose, "nb_glm_test", f"Resuming: {len(completed_labels)}/{n_groups} perturbations already done")
+    statistic_memmap = run.arrays["statistic"]
+    pvalue_memmap = run.arrays["pvalue"]
+    logfc_memmap = run.arrays["logfoldchange"]
+    logfc_raw_memmap = run.arrays["logfoldchange_raw"]
+    intercept_memmap = run.arrays["intercept"]
+    se_memmap = run.arrays["standard_error"]
+    pts_memmap = run.arrays["pts"]
+    dispersion_memmap = run.arrays["dispersion"]
+    dispersion_raw_memmap = run.arrays["dispersion_raw"]
+    dispersion_trend_memmap = run.arrays["dispersion_trend"]
+    iter_memmap = run.arrays["iterations"]
+    convergence_memmap = run.arrays["converged"]
         
     # Memory estimation for joblib parallel execution
     # IMPORTANT: joblib's loky backend serializes (pickles) all function arguments
@@ -3803,13 +3800,6 @@ def nb_glm_test(
     else:
         adata.uns["profiling"] = "NA"
 
-    # output_path already resolved earlier for checkpoint
-    if int(verbose) >= 1:
-        print(f"[cx] nb_glm_test: Saving \u2192 {output_path}")
-    adata.write(output_path)
-    
-    run.discard()  # the output is complete; the checkpoint and partial arrays are not needed
-
     result = RankGenesGroupsResult(
         genes=gene_symbols,
         groups=candidates,
@@ -3827,15 +3817,23 @@ def nb_glm_test(
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
-        result=AnnData(output_path),
+        result=None,
     )
+    _messages.print_saving(verbose, "nb_glm_test", output_path)
+    with _replace_on_success(output_path) as partial:
+        adata.write(partial)
+        if scanpy_format:
+            _write_rank_genes_groups_hdf5(partial, result)
 
-    # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format:
-        _write_rank_genes_groups_hdf5(output_path, result)
-        # Reload to pick up the new uns structure
-        result.result = AnnData(output_path)
-    
+    # Unmap the partial arrays before deleting them (Windows cannot delete a
+    # mapped file).
+    del (
+        statistic_memmap, pvalue_memmap, pvalue_adj_memmap, logfc_memmap, logfc_raw_memmap,
+        intercept_memmap, se_memmap, pts_memmap, dispersion_memmap, dispersion_raw_memmap,
+        dispersion_trend_memmap, iter_memmap, convergence_memmap, _write_result_to_memmap,
+    )
+    run.discard()  # the output is complete; the checkpoint and partial arrays are not needed
+    result.result = AnnData(output_path)
     return result
 
 
@@ -3867,20 +3865,17 @@ def _create_streaming_scaffold(
         _create_array(hf, "X", shape=(n_groups, n_genes), dtype="float64",
                       chunks=(min(group_batch_size, n_groups), n_genes))
 
-        layer_names = ["z_score", "pvalue", "pvalue_adj", "logfoldchanges",
-                       "u_statistic", "pts"]
         layer_dtypes = {
             "z_score": "float64", "pvalue": "float64", "pvalue_adj": "float64",
             "logfoldchanges": "float64", "u_statistic": "float64",
             "pts": "float32",
         }
         layers_group = hf.require_group("layers")
-        for name in layer_names:
+        for name, dtype in layer_dtypes.items():
             _create_array(
-                layers_group, name, shape=(n_groups, n_genes), dtype=layer_dtypes[name],
+                layers_group, name, shape=(n_groups, n_genes), dtype=dtype,
                 chunks=(min(group_batch_size, n_groups), n_genes),
             )
-
 
 
 def _wilcoxon_test_streaming(
@@ -3930,8 +3925,8 @@ def _wilcoxon_test_streaming(
     # Pre-create h5ad scaffold with obs/var/uns and empty layer datasets
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    # pts_rest (the control arm's detection rate) is per gene; it is filled
-    # in place as gene chunks stream past.
+    # pts_rest (the control arm's detection rate) is per gene; the first
+    # group batch fills it.
     var = pd.DataFrame({"pts_rest": np.zeros(n_genes, dtype=np.float32)}, index=gene_symbols)
     _wilcoxon_disk_estimate = warn_if_disk_space_low(
         _wilcoxon_disk_bytes(n_groups, n_genes),
@@ -3948,8 +3943,14 @@ def _wilcoxon_test_streaming(
         requires=("result.h5ad",),
     )
     work_path = run.directory / "result.h5ad"
-    last_completed_batch = run.progress.get("last_group_batch", -1)
-    if run.resumed:
+    resumed = run.resumed
+    if resumed:
+        try:
+            h5py.File(work_path, "r+").close()
+        except OSError:  # a kill mid-write left it unreadable; start over
+            resumed = False
+    last_completed_batch = run.progress.get("last_group_batch", -1) if resumed else -1
+    if resumed:
         _messages.vprint(verbose, "wilcoxon_test", f"Resuming at group batch {last_completed_batch + 1}/{n_batches}")
     else:
         _create_streaming_scaffold(
@@ -4009,7 +4010,8 @@ def _wilcoxon_test_streaming(
             batch_p = np.full((bs, n_genes), np.nan, dtype=np.float64)
             batch_lfc = np.zeros((bs, n_genes), dtype=np.float64)
             batch_pts = np.zeros((bs, n_genes), dtype=np.float32)
-            pts_rest_vector = np.zeros(n_genes, dtype=np.float32)
+            # The control arm is the same for every batch.
+            pts_rest_vector = np.zeros(n_genes, dtype=np.float32) if batch_idx == 0 else None
 
             # Stream gene chunks from backed file
             backed = read_backed(path)
@@ -4046,12 +4048,13 @@ def _wilcoxon_test_streaming(
                         else np.zeros(n_chunk_genes, dtype=np.float64)
                     )
                     control_mean_expm1 = np.expm1(control_mean) + 1e-9
-                    control_pts_chunk = np.divide(
-                        control_expr, control_n,
-                        out=np.zeros_like(control_expr, dtype=float),
-                        where=control_n > 0,
-                    )
-                    pts_rest_vector[slc] = control_pts_chunk
+                    if pts_rest_vector is not None:
+                        np.divide(
+                            control_expr, control_n,
+                            out=pts_rest_vector[slc],
+                            where=control_n > 0,
+                            casting="unsafe",
+                        )
 
                     # Pre-compute perturbation summary stats from sparse
                     pert_expr_counts = []
@@ -4217,7 +4220,8 @@ def _wilcoxon_test_streaming(
                 hf["layers/logfoldchanges"][sl, :] = batch_lfc
                 hf["layers/u_statistic"][sl, :] = batch_u
                 hf["layers/pts"][sl, :] = batch_pts
-                hf["var/pts_rest"][:] = pts_rest_vector
+                if pts_rest_vector is not None:
+                    hf["var/pts_rest"][:] = pts_rest_vector
 
             del batch_effect, batch_u, batch_z, batch_p, batch_lfc
             del batch_pts, batch_pvalue_adj
@@ -4871,13 +4875,9 @@ def wilcoxon_test(
         first unfinished gene chunk (or perturbation batch, on the streaming
         path). The resolved ``chunk_size`` is part of the call's identity, so
         pass the same value (or leave both on auto with the same memory).
-        Partial results are kept beside the output, in a hidden
-        ``.<output name>.resume`` directory, together with the checkpoint
-        ``<output>.progress.json``; both are removed once the output is
-        written. A run resumes only from a checkpoint written by a call with
-        the same input file, perturbations and result-affecting parameters;
-        any other checkpoint is discarded and the run starts over. A
-        completed output is loaded as usual (unless ``force=True``).
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of gene chunks between checkpoint saves. If None, auto-determined
         based on dataset size.

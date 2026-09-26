@@ -421,3 +421,11 @@ def test_streaming_reads_share_one_decode_pool(tmp_path):
         pool = _h5codec._decode_pool
         assert np.array_equal(_h5codec.read_rows(f["d"], 5, 395), f["d"][5:395])
         assert _h5codec._decode_pool is pool
+
+
+def test_decode_threads_respect_omp_num_threads(monkeypatch):
+    # joblib sets OMP_NUM_THREADS in its workers to split the CPUs among them.
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    assert _h5codec._decode_thread_count() == min(2, _h5codec.joblib.cpu_count())
+    monkeypatch.delenv("OMP_NUM_THREADS")
+    assert _h5codec._decode_thread_count() == min(32, _h5codec.joblib.cpu_count())
