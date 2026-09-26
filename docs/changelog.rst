@@ -1,8 +1,8 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.1.6
+-------------
 
 *Unreleased.* Set the release date when the version is published.
 
