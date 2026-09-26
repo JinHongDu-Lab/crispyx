@@ -69,9 +69,10 @@ class TestEstimateDiskUsage:
         result = estimate_disk_usage(
             "t_test", path, perturbation_column="perturbation", control_label="control",
         )
-        assert "tempdir" in result
-        assert isinstance(result["tempdir"], DiskEstimate)
-        assert result["tempdir"].required_bytes > 0
+        # DE partial results live beside the output (resumable), not in $TMPDIR.
+        assert "tempdir" not in result
+        assert isinstance(result["output"], DiskEstimate)
+        assert result["output"].required_bytes > 0
 
     def test_accepts_function_object(self, tmp_path):
         path = _make_normalised_h5ad(tmp_path)
@@ -82,7 +83,7 @@ class TestEstimateDiskUsage:
             cx.t_test, path, perturbation_column="perturbation", control_label="control",
         )
         assert by_name.keys() == by_ref.keys()
-        assert by_name["tempdir"].required_bytes == by_ref["tempdir"].required_bytes
+        assert by_name["output"].required_bytes == by_ref["output"].required_bytes
 
     def test_batch_column_adds_tempdir_entry(self, tmp_path):
         path = _make_normalised_h5ad(tmp_path, with_batch=True)
@@ -112,14 +113,14 @@ class TestEstimateDiskUsage:
         )
         assert result["output"].required_bytes == pytest.approx(2 * path.stat().st_size)
 
-    def test_wilcoxon_reports_both_possible_sinks_without_batch(self, tmp_path):
+    def test_wilcoxon_reports_the_output_location(self, tmp_path):
         path = _make_normalised_h5ad(tmp_path)
         result = estimate_disk_usage(
             "wilcoxon_test", path, perturbation_column="perturbation", control_label="control",
         )
-        assert {"tempdir", "output"} <= result.keys()
+        assert result.keys() == {"output"}
 
-    def test_wilcoxon_stratified_reports_tempdir_and_csc_scratch_copy(self, tmp_path):
+    def test_wilcoxon_stratified_reports_output_and_csc_scratch_copy(self, tmp_path):
         """A CSR source that will be converted also needs scratch space beside
         the output for the temporary CSC copy."""
         path = _make_normalised_h5ad(tmp_path, with_batch=True)  # written as CSR
@@ -128,7 +129,7 @@ class TestEstimateDiskUsage:
             perturbation_column="perturbation", control_label="control", batch_column="batch",
             format_mismatch_policy="convert",
         )
-        assert result.keys() == {"tempdir", "scratch"}
+        assert result.keys() == {"output", "scratch"}
         assert result["scratch"].required_bytes == pytest.approx(2 * path.stat().st_size)
 
         without_conversion = estimate_disk_usage(
@@ -136,7 +137,7 @@ class TestEstimateDiskUsage:
             perturbation_column="perturbation", control_label="control", batch_column="batch",
             format_mismatch_policy="warn",
         )
-        assert without_conversion.keys() == {"tempdir"}
+        assert without_conversion.keys() == {"output"}
 
     def test_auto_policy_estimate_tracks_the_decision_the_run_will_make(self, tmp_path):
         """Under "auto" the scratch entry appears only when the run would
@@ -171,7 +172,7 @@ class TestEstimateDiskUsage:
         result = cx.estimate_disk_usage(
             "t_test", path, perturbation_column="perturbation", control_label="control",
         )
-        assert "tempdir" in result
+        assert "output" in result
 
     def test_reachable_via_tl_namespace_and_matches_top_level(self, tmp_path):
         """cx.tl.estimate_disk_usage is the same function as cx.estimate_disk_usage."""
@@ -190,8 +191,8 @@ class TestEstimateDiskUsage:
         result = estimate_disk_usage(
             "t_test", path, perturbation_column="perturbation", control_label="control",
         )
-        # 5 groups x 500 genes x (3 x 8-byte + 4 x 4-byte arrays) = 200,000 bytes.
-        assert result["tempdir"].required_bytes == pytest.approx(5 * 500 * (3 * 8 + 4 * 4))
+        # Partial arrays + final h5ad: 5 groups x 500 genes x (7 x 8-byte + 6 x 4-byte).
+        assert result["output"].required_bytes == pytest.approx(5 * 500 * (7 * 8 + 6 * 4))
 
 
 def test_scratch_follows_output_dir_like_the_real_call(tmp_path):

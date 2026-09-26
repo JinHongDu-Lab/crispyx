@@ -16,16 +16,13 @@ from .data import (
     convert_to_csc,
     convert_to_csr,
     downsample_counts,
-    ensure_gene_symbol_column,
     normalize_total_log1p,
     read_backed,
     resolve_control_label,
     resolve_data_path,
-    resolve_output_path,
 )
 from .de import (
     RankGenesGroupsResult,
-    _adjust_pvalue_matrix,
     nb_glm_test,
     shrink_lfc,
     t_test,
@@ -85,95 +82,6 @@ def _infer_control_label(
     finally:
         backed.file.close()
     return resolve_control_label(labels, None)
-
-
-def _t_test_results_to_rank_genes(
-    path: Path,
-    results,
-    *,
-    gene_name_column: str | None,
-    perturbation_column: str,
-    control_label: str,
-    corr_method: str,
-    output_dir: str | Path | None,
-    data_name: str | None,
-) -> RankGenesGroupsResult:
-    groups = list(results.keys())
-    if groups:
-        first = results[groups[0]]
-        genes = first.genes
-        effect_matrix = np.vstack([results[group].effect_size for group in groups])
-        statistic_matrix = np.vstack([results[group].statistic for group in groups])
-        pvalue_matrix = np.vstack([results[group].pvalue for group in groups])
-        result_view = first.result
-    else:
-        backed = read_backed(path)
-        try:
-            if gene_name_column is None:
-                genes = backed.var_names.astype(str)
-            else:
-                genes = ensure_gene_symbol_column(backed, gene_name_column)
-        finally:
-            backed.file.close()
-        effect_matrix = np.zeros((0, genes.size), dtype=float)
-        statistic_matrix = np.zeros_like(effect_matrix)
-        pvalue_matrix = np.ones_like(effect_matrix)
-        result_path = resolve_output_path(
-            path,
-            suffix="t_test_de",
-            output_dir=output_dir,
-            data_name=data_name,
-        )
-        result_view = AnnData(result_path)
-
-    if corr_method not in {"benjamini-hochberg", "bonferroni"}:
-        raise ValueError(
-            "corr_method must be 'benjamini-hochberg' or 'bonferroni' for t-tests"
-        )
-
-    pvalue_adj = (
-        _adjust_pvalue_matrix(pvalue_matrix, corr_method)
-        if pvalue_matrix.size
-        else np.zeros_like(pvalue_matrix)
-    )
-    order = (
-        np.argsort(-np.abs(statistic_matrix), axis=1, kind="mergesort")
-        if statistic_matrix.size
-        else np.zeros(statistic_matrix.shape, dtype=int)
-    )
-    zeros = np.zeros_like(statistic_matrix)
-
-    result = RankGenesGroupsResult(
-        genes=genes,
-        groups=groups,
-        statistics=statistic_matrix,
-        pvalues=pvalue_matrix,
-        pvalues_adj=pvalue_adj,
-        logfoldchanges=effect_matrix,
-        effect_size=effect_matrix,
-        u_statistics=zeros,
-        pts=zeros,
-        pts_rest=zeros,
-        order=order,
-        groupby=perturbation_column,
-        method="t_test",
-        control_label=control_label,
-        tie_correct=False,
-        pvalue_correction=corr_method,
-        result=result_view,
-    )
-    if result.result is not None:
-        memory = result.result.to_memory()
-        memory.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-        memory.uns["genes"] = genes.to_numpy()
-        memory.uns["method"] = "t_test"
-        memory.uns["control_label"] = control_label
-        memory.uns["tie_correct"] = False
-        memory.uns["pvalue_correction"] = corr_method
-        memory.write(result.result.path)
-        result.result.close()
-        result.result = AnnData(result.result.path)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1057,24 +965,15 @@ class _ToolsNamespace:
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
-            results = t_test(
+            result = t_test(
                 path,
+                corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
             )
-            mapped = _t_test_results_to_rank_genes(
-                path,
-                results,
-                gene_name_column=gene_name_column,
-                perturbation_column=perturbation_column,
-                control_label=control,
-                corr_method=corr_method,
-                output_dir=output_dir,
-                data_name=data_name,
-            )
-            if mapped.result is None:
+            if result.result is None:
                 raise RuntimeError("t-test did not produce an AnnData result.")
-            return mapped.result
+            return result.result
 
         raise ValueError(
             f"Unsupported differential expression method: {method}. "

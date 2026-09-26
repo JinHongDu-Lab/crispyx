@@ -1,6 +1,112 @@
 Changelog
 =========
 
+Version 0.1.6
+-------------
+
+*Released 2026-09-26.*
+
+This release makes crispyx outputs smaller without changing any computed
+value: every number the DE functions stored before is stored now, bit for
+bit, just not more than once. The on-disk layout of the DE results changes,
+so code that reads the layers below directly needs updating; results loaded
+through crispyx (``RankGenesGroupsResult``, ``cx.pl``, ``shrink_lfc``) are
+unaffected.
+
+* **New: ``cx.compress_h5ad(src, dst)``** losslessly re-encodes any
+  ``.h5ad`` with HDF5's built-in gzip + shuffle filters, verifies it byte for
+  byte, and only then puts it in place (``dst=src`` replaces the source).
+  Chunks are compressed on every core, memory stays bounded, and the result
+  opens in any HDF5 reader without plugins. Single-cell matrices shrink to
+  ~15-30 % of their size and dense DE matrices to ~55-75 %. See
+  :ref:`compress-h5ad`.
+* **Compressed inputs stream several times faster.** When a backed matrix is
+  stored with gzip (with or without shuffle) and streamed along its fast axis,
+  crispyx now reads the compressed chunks directly and inflates them on a
+  thread pool instead of on the calling thread: 8-10x faster than before on
+  the files measured, with identical blocks. Uncompressed files take the same
+  path as before.
+* **``nb_glm_test`` output is ~40 % smaller** (about half with
+  ``lfc_base="ln"``), with a matching drop in write time and peak memory:
+
+  - ``layers['logfoldchanges']`` is gone -- it was always identical to
+    ``X``. ``layers['logfoldchange_raw']`` is written only when ``X`` is
+    shrunk (``lfc_shrinkage_type="apeglm"`` or after ``shrink_lfc``);
+    otherwise the MLE fold change *is* ``X``.
+  - With ``lfc_base="ln"``, ``logfoldchange_raw_ln`` / ``standard_error_ln``
+    are no longer written, since the main layers are already on the ln
+    scale.
+  - A global dispersion (the default ``dispersion_scope="global"``) is one
+    value per gene, now stored once as ``var['dispersion']`` and
+    ``var['dispersion_trend']`` instead of three identical-row matrices
+    (``dispersion_raw`` was a third copy). A per-comparison dispersion keeps
+    its three layers.
+  - ``converged`` is stored as ``bool`` and ``iterations`` as the narrowest
+    integer type that holds its largest value (both were float32).
+* **``pts_rest`` is a ``var`` column in every DE output.** It is the control
+  arm's detection rate -- one value per gene -- and was repeated for every
+  perturbation in ``t_test``, ``wilcoxon_test`` (all three paths) and
+  ``nb_glm_test``. ``RankGenesGroupsResult.pts_rest`` still has one row per
+  perturbation, and ``scanpy_format=True`` still writes scanpy's per-group
+  array.
+* **``shrink_lfc``** no longer duplicates ``X`` as ``layers['logfoldchanges']``.
+  It writes the MLE fold change to ``logfoldchange_raw`` (and, with an ln
+  base, the MLE standard error to ``standard_error_ln``) before replacing
+  ``X`` and ``standard_error`` with their shrunk values.
+* **``batch_process`` with ``channels``** no longer writes the first channel
+  twice: it is ``X``, and later channels are ``layers[name]``.
+* **``resume=True`` now resumes interrupted DE runs, in every method and
+  path.** Partial results used to live in a temporary directory that an
+  interrupted run took with it, so ``nb_glm_test`` returned an all-``NaN``
+  row for every perturbation its checkpoint marked as done (``t_test`` the
+  same with zeros), and ``wilcoxon_test`` refused to resume at all. The
+  partial arrays now live beside the output in a hidden
+  ``.<output name>.resume`` directory, removed on success, and the
+  checkpoint records a fingerprint of the call (input file, perturbations and
+  result-affecting parameters). A run resumes only from its own checkpoint --
+  anything else is discarded and the run starts over -- and a resumed run's
+  output is bit-identical to an uninterrupted one. Memory and chunking
+  settings (``memory_limit_gb``, ``max_dense_fraction``, ``cell_chunk_size``,
+  ``chunk_size``, ``irls_batch_size``) are not part of the fingerprint, so a
+  run killed for memory resumes with a lower limit; a different chunk size
+  sums cells in a different order, so the rows fitted after such a resume
+  can differ in the last bits. Every ``wilcoxon_test`` path writes its
+  file under a partial name and renames it into place, so a file at the
+  output path is always complete: an interrupted run used to leave a
+  half-filled output that the next call loaded as a finished result. Disk estimates for
+  the DE functions are now reported under ``"output"`` instead of
+  ``"tempdir"``.
+* **``t_test`` reports ``NaN`` for a perturbation it could not test** (e.g.
+  one named in ``perturbations`` with no cells), as ``nb_glm_test`` does. It
+  used to report ``pvalue = 0`` for every gene of it. ``t_test`` also
+  rejects an unknown ``corr_method`` before reading the data, not after a
+  full pass over it.
+* **``n_jobs`` follows joblib in ``t_test`` and ``nb_glm_test``**, capped at
+  the CPUs the process may use (affinity mask and cgroup quota): ``None``
+  and ``-1`` use them all, ``-2`` all but one, and ``0`` is an error.
+* **``cx.tl.rank_genes_groups(method="t-test")`` returns ``t_test``'s own
+  result**, like the other methods. It used to rebuild the result, storing
+  the mean difference as ``logfoldchanges``, zeroing ``pts`` and
+  ``pts_rest``, and rewriting the file with per-group arrays several times
+  its size. ``t_test`` gains ``corr_method`` (``"benjamini-hochberg"`` or
+  ``"bonferroni"``) for it to pass through.
+* **Reloading an existing ``t_test`` result keeps its effect size.** The
+  reloaded ``effect_size`` was the fold change.
+* **Wilcoxon results store their ``uns`` metadata where anndata reads it.**
+  It was written as HDF5 attributes, so ``adata.uns`` came back empty and
+  ``cx.pl.materialize_rank_genes_groups`` lost the method, groupby and
+  reference.
+* **``t_test`` no longer writes result matrices it then throws away.** It
+  wrote eight ``uns/rank_genes_groups/full`` matrices during the run that the
+  final write truncated.
+* **Streaming ``wilcoxon_test``** no longer builds an
+  ``n_perturbations x n_genes`` placeholder matrix in memory before writing
+  its output.
+* **Temporary files no longer leak on failure.** The QC gene-filter cache in
+  ``$TMPDIR`` (about the size of the kept cells' matrix) was removed only
+  after gene filtering succeeded, and ``sort_by_perturbation`` left its
+  ``.meta.h5ad`` file behind on error.
+
 Version 0.1.5
 -------------
 

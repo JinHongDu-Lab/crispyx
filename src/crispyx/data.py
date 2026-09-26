@@ -20,7 +20,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _cgroup_available_bytes, _detected_available_bytes
+from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context
 from ._disk import (
     assess_bytes,
@@ -1346,15 +1346,58 @@ def iter_matrix_chunks(
         _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
+    read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
     for start in range(start_chunk * chunk_size, length, chunk_size):
         end = min(start + chunk_size, length)
-        if axis == 0:
+        if read_block is not None:
+            block = read_block(start, end)
+        elif axis == 0:
             block = matrix[start:end]
         else:
             block = matrix[:, start:end]
         if convert_to_dense:
             block = _to_dense(block)
         yield slice(start, end), block
+
+
+def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars: int):
+    """``read_block`` for a deflate-compressed backed matrix streamed along
+    its fast axis, else ``None``.
+
+    ``read_block(start, end)`` returns exactly what ``matrix[start:end]``
+    (rows) or ``matrix[:, start:end]`` (columns) would, but inflates the
+    compressed HDF5 chunks on a thread pool instead of on the calling thread.
+    Uncompressed files and every other access pattern keep the plain slicing
+    path.
+    """
+    from ._h5codec import read_rows, supports_parallel_read
+
+    if isinstance(matrix, h5py.Dataset):
+        if axis != 0 or matrix.ndim != 2 or not supports_parallel_read(matrix):
+            return None
+        return lambda start, end: read_rows(matrix, start, end)
+
+    fast = (fmt == "csr" and axis == 0) or (fmt == "csc" and axis == 1)
+    group = getattr(matrix, "group", None)
+    if not fast or not isinstance(group, h5py.Group):
+        return None
+    data_ds, indices_ds = group["data"], group["indices"]
+    if not (supports_parallel_read(data_ds) and supports_parallel_read(indices_ds)):
+        return None
+    indptr = group["indptr"][:]
+    # Build blocks with the same class anndata's own slicing returns.
+    probe = matrix[0:1] if axis == 0 else matrix[:, 0:1]
+    cls = type(probe)
+
+    def read_block(start: int, end: int):
+        lo, hi = int(indptr[start]), int(indptr[end])
+        shape = (end - start, n_vars) if axis == 0 else (n_obs, end - start)
+        return cls(
+            (read_rows(data_ds, lo, hi), read_rows(indices_ds, lo, hi), indptr[start : end + 1] - lo),
+            shape=shape,
+        )
+
+    return read_block
 
 
 def _to_dense(matrix: np.ndarray) -> np.ndarray:
@@ -3047,6 +3090,127 @@ def convert_to_csr(
     return AnnData(output_path)
 
 
+def compress_h5ad(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    level: int = 4,
+    verify: bool = True,
+    n_jobs: int = -1,
+    overwrite: bool = False,
+    verbose: int | bool = False,
+) -> dict[str, Any]:
+    """Losslessly re-encode an ``.h5ad`` (or any HDF5) file with gzip + shuffle.
+
+    Every dataset of at least 1024 fixed-width elements -- ``X`` in any
+    layout, layers, obsm/varm/obsp/varp, dataframe columns, ``uns`` arrays --
+    is rewritten with HDF5's built-in shuffle and deflate filters in ~1 MiB
+    chunks. Nothing else changes: the same groups, datasets, dtypes, shapes,
+    sparse layout, links and attributes (values, types and order). The walk
+    is independent of AnnData, so it applies to any ``.h5ad`` layout,
+    including entries AnnData itself would not round-trip. Small datasets
+    and variable-length strings are copied as they are.
+
+    Any HDF5 reader decodes the result without plugins: anndata/scanpy
+    (in memory and ``backed="r"``), crispyx, R (rhdf5, zellkonverter,
+    anndata-R), ``h5ls``. Chunks are compressed on ``n_jobs`` threads, so a
+    single file uses every core; memory stays at a few MiB per thread
+    regardless of the file size. Rewriting the file also reclaims space
+    freed by in-place edits (e.g. rerunning ``pp.pca`` on the same file),
+    which HDF5 never returns on its own.
+
+    Typical ratios: ~0.15-0.3 for a single-cell matrix and 0.55-0.75 for
+    dense effect or DE matrices. Reading a compressed file costs
+    decompression time. crispyx's streaming readers inflate its chunks on a
+    thread pool, several times faster than h5py's single-threaded decoding,
+    but still slower than an uncompressed read from the page cache. On fast
+    local disks, compress files for archiving or sharing rather than inputs
+    you are about to stream repeatedly; on HDD or network storage the smaller
+    file often reads faster.
+
+    Parameters
+    ----------
+    src
+        Source ``.h5ad`` file. It is only read.
+    dst
+        Destination path. Passing ``dst=src`` (with ``overwrite=True``)
+        replaces the source in place, but only after the new file is
+        complete and verified; the source is never left half-written.
+    level
+        Deflate level, 1-9.
+    verify
+        Re-read both files through h5py and compare every group, attribute
+        and dataset bit for bit before the destination is put in place. Costs
+        roughly one extra read of both files.
+    n_jobs
+        Compression threads; ``-1`` uses every core.
+    overwrite
+        Allow replacing an existing ``dst``.
+    verbose
+        Show progress.
+
+    Returns
+    -------
+    dict
+        ``src_bytes``, ``dst_bytes``, ``ratio`` (``dst_bytes / src_bytes``)
+        and ``verified``.
+
+    Examples
+    --------
+    >>> cx.compress_h5ad(OUTPUT_DIR / "screen.h5ad", OUTPUT_DIR / "screen.gz.h5ad")
+    >>> cx.compress_h5ad(path, path, overwrite=True)  # in place, after verification
+    """
+    from . import _h5codec
+
+    src, dst = Path(src), Path(dst)
+    if not 1 <= level <= 9:
+        raise ValueError(f"level must be between 1 and 9, got {level}")
+    if not src.exists():
+        raise FileNotFoundError(f"compress_h5ad: {src} does not exist")
+    if dst.exists() and not overwrite:
+        raise FileExistsError(f"compress_h5ad: {dst} exists; pass overwrite=True to replace it")
+    n_threads = _resolve_n_jobs(n_jobs)
+    src_bytes = src.stat().st_size
+
+    # Worst case the output is as large as the source, and both coexist.
+    estimate = warn_if_disk_space_low(src_bytes, dst, context="compress_h5ad")
+    _messages.print_disk_estimate(verbose, "compress_h5ad", estimate)
+    _messages.print_saving(verbose, "compress_h5ad", dst)
+
+    with _h5codec.open_source(src) as fsrc:
+        logical = 0
+
+        def _count(_name, obj):
+            nonlocal logical
+            if isinstance(obj, h5py.Dataset) and obj.shape is not None:
+                logical += obj.size * obj.dtype.itemsize
+
+        fsrc.visititems(_count)
+        tracks_order = _h5codec.file_tracks_order(fsrc)
+
+    passes = 2 if verify else 1
+    with _replace_on_success(dst) as partial:
+        with _create_progress_context(
+            max(1, round(passes * logical / 1e6)), "compress_h5ad", verbose, unit="MB",
+        ) as pbar:
+            def on_bytes(n: int) -> None:
+                pbar.update(n / 1e6)
+
+            with _h5codec.open_source(src) as fsrc, h5py.File(partial, "w", track_order=tracks_order) as fdst:
+                _h5codec.copy_tree(fsrc, fdst, level=level, n_threads=n_threads, on_bytes=on_bytes)
+            if verify:
+                with _h5codec.open_source(src) as fsrc, h5py.File(partial, "r") as fdst:
+                    _h5codec.verify_tree(fsrc, fdst, on_bytes=on_bytes)
+
+    dst_bytes = dst.stat().st_size
+    ratio = dst_bytes / src_bytes if src_bytes else float("nan")
+    _messages.print_done(
+        verbose, "compress_h5ad",
+        f"{format_bytes(src_bytes)} → {format_bytes(dst_bytes)} (ratio {ratio:.2f})",
+    )
+    return {"src_bytes": src_bytes, "dst_bytes": dst_bytes, "ratio": ratio, "verified": verify}
+
+
 # ---------------------------------------------------------------------------
 # Disk-usage resolvers for crispyx.estimate_disk_usage() (see _preflight.py).
 # ---------------------------------------------------------------------------
@@ -4309,19 +4473,18 @@ def _write_sorted_dense(
         var=var,
         uns=uns,
     )
-    adata_meta.write(temp_path)
-    
-    # Copy metadata from temp to main file  
-    with h5py.File(temp_path, 'r') as src:
-        with h5py.File(output_path, 'a') as dst:
-            for key in ['obs', 'var', 'uns']:
-                if key in src:
-                    if key in dst:
-                        del dst[key]
-                    src.copy(key, dst)
-    
-    # Cleanup temp file
-    temp_path.unlink()
+    try:
+        adata_meta.write(temp_path)
+        # Copy metadata from temp to main file
+        with h5py.File(temp_path, 'r') as src:
+            with h5py.File(output_path, 'a') as dst:
+                for key in ['obs', 'var', 'uns']:
+                    if key in src:
+                        if key in dst:
+                            del dst[key]
+                        src.copy(key, dst)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 
@@ -4439,17 +4602,17 @@ def _write_sorted_sparse(
         var=var,
         uns=uns,
     )
-    adata_meta.write(temp_path)
-
-    with h5py.File(temp_path, "r") as src:
-        with h5py.File(output_path, "a") as dst:
-            for key in ["obs", "var", "uns"]:
-                if key in src:
-                    if key in dst:
-                        del dst[key]
-                    src.copy(key, dst)
-
-    temp_path.unlink()
+    try:
+        adata_meta.write(temp_path)
+        with h5py.File(temp_path, "r") as src:
+            with h5py.File(output_path, "a") as dst:
+                for key in ["obs", "var", "uns"]:
+                    if key in src:
+                        if key in dst:
+                            del dst[key]
+                        src.copy(key, dst)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def get_perturbation_slice(

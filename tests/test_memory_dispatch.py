@@ -270,32 +270,36 @@ def _make_nb_glm_h5ad(tmp_path: Path) -> Path:
         {"perturbation": [f"pert_{i}" for i in range(n_groups)]},
         index=[f"g{i}" for i in range(n_groups)],
     )
-    var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
+    # Layout of an unshrunk nb_glm_test result with a global dispersion:
+    # X is the LFC, per-gene dispersion and pts_rest live in var.
+    var = pd.DataFrame(
+        {
+            "pts_rest": rng.uniform(size=n_genes).astype(np.float32),
+            "dispersion": np.abs(rng.standard_normal(n_genes)) + 0.1,
+        },
+        index=[f"gene{i}" for i in range(n_genes)],
+    )
     lfc = rng.standard_normal((n_groups, n_genes)).astype(np.float64)
     se = np.abs(rng.standard_normal((n_groups, n_genes))).astype(np.float64) + 0.1
-    disp = np.abs(rng.standard_normal((n_groups, n_genes))).astype(np.float64) + 0.1
     adata = ad.AnnData(
         X=lfc.copy(),
         obs=obs,
         var=var,
         layers={
-            "logfoldchanges": lfc.copy(),
-            "logfoldchange_raw": lfc.copy(),
             "logfoldchange_raw_ln": lfc * np.log(2),
             "standard_error": se.copy(),
             "standard_error_ln": se * np.log(2),
-            "dispersion": disp.copy(),
             "intercept": rng.standard_normal((n_groups, n_genes)),
-            "fitted_intercept": rng.standard_normal((n_groups, n_genes)),
-            "pvalues": rng.uniform(size=(n_groups, n_genes)),
-            "pvalues_adj": rng.uniform(size=(n_groups, n_genes)),
-            "statistics": rng.standard_normal((n_groups, n_genes)),
+            "pvalue": rng.uniform(size=(n_groups, n_genes)),
+            "pvalue_adj": rng.uniform(size=(n_groups, n_genes)),
+            "z_score": rng.standard_normal((n_groups, n_genes)),
+            "pts": rng.uniform(size=(n_groups, n_genes)).astype(np.float32),
         },
     )
     adata.uns["control_label"] = "control"
     adata.uns["perturbation_column"] = "perturbation"
     adata.uns["lfc_base"] = "log2"
-    adata.uns["de_method"] = "nb_glm"
+    adata.uns["method"] = "nb_glm"
     adata.uns["lfc_shrinkage_type"] = "none"
     path = tmp_path / "nb_glm_result.h5ad"
     adata.write(path)

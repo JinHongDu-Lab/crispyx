@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 import anndata as ad
 import h5py
@@ -287,29 +287,40 @@ def _materialize_rank_genes_groups_from_layers(
         if score_layer is None:
             raise KeyError("No score layer found for rank_genes_groups materialization")
 
-        layer_map = {
-            "scores": score_layer,
-            "logfoldchanges": pick_layer(["logfoldchange", "logfoldchanges"]),
-            "pvals": pick_layer(["pvalue", "pvals"]),
-            "pvals_adj": pick_layer(["pvalue_adj", "pvals_adj"]),
-            "pts": pick_layer(["pts"]),
-            "pts_rest": pick_layer(["pts_rest"]),
-        }
+        # Each metric is a per-group row: a layer, X (NB-GLM stores the LFC
+        # only as X), or a per-gene var column shared by every group
+        # (pts_rest describes the control arm).
+        def layer_row(name: str):
+            return lambda idx: np.asarray(backed.layers[name][idx]).ravel()
 
-        arrays_by_metric: dict[str, list[np.ndarray]] = {key: [] for key in layer_map if layer_map[key]}
+        def x_row(idx: int) -> np.ndarray:
+            return np.asarray(backed.X[idx]).ravel()
+
+        rows: dict[str, Callable[[int], np.ndarray]] = {"scores": layer_row(score_layer)}
+        lfc_layer = pick_layer(["logfoldchange", "logfoldchanges"])
+        if lfc_layer is not None:
+            rows["logfoldchanges"] = layer_row(lfc_layer)
+        elif backed.uns.get("method") == "nb_glm":
+            rows["logfoldchanges"] = x_row
+        for metric, options in (("pvals", ["pvalue", "pvals"]), ("pvals_adj", ["pvalue_adj", "pvals_adj"]), ("pts", ["pts"])):
+            name = pick_layer(options)
+            if name is not None:
+                rows[metric] = layer_row(name)
+        if "pts_rest" in backed.var:
+            pts_rest = backed.var["pts_rest"].to_numpy()
+            rows["pts_rest"] = lambda idx: pts_rest
+
+        arrays_by_metric: dict[str, list[np.ndarray]] = {key: [] for key in rows}
         name_arrays: list[np.ndarray] = []
 
         for idx in group_indices:
-            scores = np.asarray(backed.layers[score_layer][idx]).ravel()
+            scores = rows["scores"](idx)
             order = np.argsort(-np.abs(scores), kind="mergesort")
             if n_genes is not None:
                 order = order[:n_genes]
             name_arrays.append(genes[order].astype(str))
-            for metric, layer_name in layer_map.items():
-                if layer_name is None:
-                    continue
-                values = np.asarray(backed.layers[layer_name][idx]).ravel()
-                arrays_by_metric[metric].append(np.take(values, order))
+            for metric, row in rows.items():
+                arrays_by_metric[metric].append(np.take(row(idx), order))
     finally:
         backed.file.close()
 

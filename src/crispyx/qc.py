@@ -806,6 +806,13 @@ def _filter_genes_with_cache(
                 row_offset += size
                 chunk_idx += 1
                 pbar.update(1)
+    except BaseException:
+        # The caller cleans the cache up only once it has been handed back;
+        # a failure while filling it would otherwise leak a cache the size of
+        # the kept cells' matrix in $TMPDIR.
+        if chunk_cache is not None:
+            chunk_cache.cleanup()
+        raise
     finally:
         backed.file.close()
     

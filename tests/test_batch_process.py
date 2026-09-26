@@ -725,10 +725,10 @@ def test_multi_channel_output_populates_layers_and_x(tmp_path):
         output_path=tmp_path / "multi_channel.h5ad", force=True,
     )
     backed = result.backed
-    assert set(backed.layers.keys()) & {"mean_diff", "se", "mean_diff_weight_sum", "se_weight_sum"} == {
-        "mean_diff", "se", "mean_diff_weight_sum", "se_weight_sum",
-    }
-    np.testing.assert_allclose(np.asarray(backed.X[:]), np.asarray(backed.layers["mean_diff"][:]))
+    # The first channel is X; it is not duplicated as a layer. AnnData 0.13
+    # exposes X itself as layers[None], so only named layers are compared.
+    layer_keys = {key for key in backed.layers.keys() if key is not None}
+    assert layer_keys == {"se", "mean_diff_weight_sum", "se_weight_sum"}
     assert backed.uns["channels"].tolist() == ["mean_diff", "se"]
     assert np.all(np.asarray(backed.layers["se"][:]) >= 0)
     result.close()
@@ -964,14 +964,14 @@ def test_scanned_weight_layer_is_written_last_per_gene_chunk(tmp_path, monkeypat
         force=True, format_mismatch_policy="off",
     )
     result.close()
-    chunk_writes = [w for w in writes if w in ("/X", "/layers/mean", "/layers/n",
+    chunk_writes = [w for w in writes if w in ("/X", "/layers/n",
                                                "/layers/mean_weight_sum", "/layers/n_weight_sum")]
     n_chunks = 3  # 7 genes, chunk_size 3
-    assert len(chunk_writes) == 5 * n_chunks
+    assert len(chunk_writes) == 4 * n_chunks
     for i in range(n_chunks):
-        per_chunk = chunk_writes[5 * i:5 * (i + 1)]
+        per_chunk = chunk_writes[4 * i:4 * (i + 1)]
         assert per_chunk[-1] == "/layers/mean_weight_sum"
-        assert set(per_chunk) == {"/X", "/layers/mean", "/layers/n",
+        assert set(per_chunk) == {"/X", "/layers/n",
                                   "/layers/mean_weight_sum", "/layers/n_weight_sum"}
 
 

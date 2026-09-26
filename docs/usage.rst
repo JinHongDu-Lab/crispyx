@@ -243,12 +243,15 @@ Disk space
 
 crispyx's memory savings come from streaming, but several operations trade
 RAM for **disk**: the per-``(perturbation, batch)`` accumulator described
-above, the intermediate result arrays used by ``cx.tl.t_test`` /
+above, the partial result arrays of ``cx.tl.t_test`` /
 ``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test``, and whole-file CSR↔CSC
-conversions. ``cx.tl.batch_process`` writes results directly into its output
-file as each gene chunk finishes rather than using a separate disk-backed
-accumulator, so its ``"output"`` disk estimate already accounts for the full
-footprint (see ``resume`` below for what that also enables). crispyx warns
+conversions. The DE functions keep their partial results beside the output
+(in a hidden ``.<output name>.resume`` directory, removed on success) rather
+than in ``$TMPDIR``, so an interrupted run can continue with ``resume=True``;
+their ``"output"`` estimate covers those arrays plus the final file.
+``cx.tl.batch_process`` writes results directly into its output file as each
+gene chunk finishes, so its ``"output"`` estimate likewise accounts for the
+full footprint (see ``resume`` below for what that also enables). crispyx warns
 automatically -- without
 blocking the call -- if free space on the relevant filesystem looks tight or
 the write is unusually large. There is no configurable disk budget analogous
@@ -293,6 +296,39 @@ needed. Whole-file conversions (:func:`crispyx.convert_to_csc`,
 roughly 2× the source file's size, since the source and destination coexist
 until the caller deletes the source -- see :ref:`the CSC conversion note below
 <csc-disk-note>`.
+
+.. _compress-h5ad:
+
+Compressing results
+~~~~~~~~~~~~~~~~~~~
+
+crispyx writes every ``.h5ad`` uncompressed, so the next step can stream it
+at full speed. To shrink a file you are keeping -- for archiving, sharing, or
+a data deposit -- re-encode it losslessly with :func:`crispyx.compress_h5ad`:
+
+.. code-block:: python
+
+   cx.compress_h5ad("screen_normalized.h5ad", "screen_normalized.gz.h5ad")
+   cx.compress_h5ad(path, path, overwrite=True)  # in place, after verification
+
+Every large numeric dataset (``X`` in any layout, layers, obsm/varm/obsp,
+dataframe columns, ``uns`` arrays) is rewritten with HDF5's built-in gzip and
+shuffle filters; groups, dtypes, shapes, sparse layout and attributes are
+unchanged, and ``verify=True`` (the default) compares every byte before the
+destination is put in place. Any HDF5 reader opens the result without plugins
+(anndata/scanpy, R, ``h5ls``). The copy is independent of AnnData, so it
+applies to any ``.h5ad``, including ones not written by crispyx. Chunks are
+compressed on ``n_jobs`` threads (every core by default), and memory stays
+bounded regardless of file size.
+
+Typical ratios are ~0.15-0.3 for single-cell matrices (counts or
+log-normalized) and ~0.55-0.75 for dense effect and DE matrices, whose
+mantissas are close to random. crispyx streams a compressed input with its
+chunks inflated on a thread pool, several times faster than h5py's own
+single-threaded decoding, but still slower than an uncompressed read from
+the page cache: keep the files you are about to stream repeatedly
+uncompressed on fast local disks, and compress what you archive or ship. On
+HDD or network storage the smaller file often reads faster.
 
 .. _messaging-and-verbosity:
 

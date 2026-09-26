@@ -360,15 +360,21 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct_wald",
         min_cells_expressed=0,
     )
-    wald_wrapped_uns = wald_wrapped.uns["rank_genes_groups"].load()
-    wald_wrapped_full = wald_wrapped_uns["full"]
-    wrapped_groups = list(wald_wrapped_uns["names"].dtype.names)
+    # The wrapper returns t_test's own result file: the same layers, values
+    # and per-gene pts_rest, not a rebuilt copy.
+    wald_mem = wald_wrapped.to_memory()
+    wrapped_groups = wald_mem.obs_names.tolist()
+    assert wrapped_groups == list(wald_direct.groups)
     direct_effect = np.vstack([wald_direct[group].effect_size for group in wrapped_groups])
     direct_stat = np.vstack([wald_direct[group].statistic for group in wrapped_groups])
     direct_p = np.vstack([wald_direct[group].pvalue for group in wrapped_groups])
-    np.testing.assert_allclose(wald_wrapped_full["logfoldchanges"], direct_effect)
-    np.testing.assert_allclose(wald_wrapped_full["scores"], direct_stat)
-    np.testing.assert_allclose(wald_wrapped_full["pvals"], direct_p)
+    np.testing.assert_array_equal(wald_mem.X, direct_effect)
+    np.testing.assert_array_equal(wald_mem.layers["z_score"], direct_stat)
+    np.testing.assert_array_equal(wald_mem.layers["pvalue"], direct_p)
+    np.testing.assert_array_equal(wald_mem.layers["logfoldchanges"], wald_direct.logfoldchanges)
+    np.testing.assert_array_equal(wald_mem.layers["pts"], wald_direct.pts)
+    np.testing.assert_array_equal(wald_mem.var["pts_rest"].to_numpy(), wald_direct.pts_rest[0])
+    assert (wald_mem.var["pts_rest"] > 0).any()
 
     wilcoxon_input = _log_normalise_sparse(qc_wrapped_mem)
     wilcoxon_path = tmp_path / "qc_filtered_wilcoxon_norm.h5ad"

@@ -10,7 +10,20 @@ import logging
 import os
 from pathlib import Path
 
+import joblib
+
 logger = logging.getLogger(__name__)
+
+
+def _resolve_n_jobs(n_jobs: int | None) -> int:
+    """Worker count for a joblib-style ``n_jobs``, capped at the CPUs this
+    process may use (affinity mask and cgroup quota, via joblib).
+
+    ``None`` means every available CPU, as the DE functions document;
+    negative values count back from it (``-1`` = all); ``0`` is an error.
+    """
+    cpus = joblib.cpu_count()
+    return min(joblib.effective_n_jobs(-1 if n_jobs is None else n_jobs), cpus)
 
 
 def _get_available_memory_mb() -> float:

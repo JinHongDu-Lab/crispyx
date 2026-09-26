@@ -6,7 +6,6 @@ import gc
 import dataclasses
 import logging
 import os
-import tempfile
 import warnings
 import threading
 import time
@@ -52,6 +51,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    _replace_on_success,
 )
 from .glm import (
     NBGLMFitter,
@@ -86,10 +86,8 @@ from ._kernels import (
     _ZERO_PARTITION_THRESHOLD,
 )
 from ._checkpoint import (
-    _write_checkpoint_atomic,
-    _read_checkpoint,
-    _scan_h5ad_completed,
-    _get_resumable_candidates,
+    ResumableRun,
+    run_fingerprint,
     _get_checkpoint_interval,
     _create_progress_context,
     _DummyProgress,
@@ -97,7 +95,7 @@ from ._checkpoint import (
 from . import _messages
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
-from ._memory import _detected_available_bytes, _should_use_streaming
+from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -330,28 +328,27 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         }
 
 
-def _load_existing_nb_glm_result(
+def _load_layered_de_result(
     output_path: Path,
     candidates: list[str],
     gene_symbols: list[str],
     perturbation_column: str,
     control_label: str,
     corr_method: str,
+    method: str,
 ) -> "RankGenesGroupsResult":
-    """Load an existing NB-GLM result from an h5ad file.
-    
-    Used when resume=True and all perturbations are already completed.
-    """
+    """Load an existing ``t_test`` or ``nb_glm_test`` result from its h5ad file."""
     adata = ad.read_h5ad(output_path)
-    
-    # NB-GLM stores results in layers, not uns["rank_genes_groups"]
+
     statistic_matrix = np.array(adata.layers["z_score"])
     pvalue_matrix = np.array(adata.layers["pvalue"])
     pvalue_adj_matrix = np.array(adata.layers["pvalue_adj"])
-    logfc_matrix = np.array(adata.layers["logfoldchanges"])
-    effect_matrix = logfc_matrix.copy()  # effect_size equals logfc for NB-GLM
-    pts_matrix = np.array(adata.layers.get("pts", np.zeros_like(effect_matrix, dtype=np.float32)))
-    pts_rest_matrix = np.array(adata.layers.get("pts_rest", np.zeros_like(effect_matrix, dtype=np.float32)))
+    # X is the effect size. t_test stores a separate scanpy-style fold change;
+    # for nb_glm the fold change is the effect size.
+    effect_matrix = np.array(adata.X)
+    logfc_matrix = np.array(adata.layers["logfoldchanges"]) if "logfoldchanges" in adata.layers else effect_matrix
+    pts_matrix = np.array(adata.layers["pts"])
+    pts_rest_matrix = np.broadcast_to(adata.var["pts_rest"].to_numpy(dtype=np.float32), pts_matrix.shape)
     
     # Reconstruct order from statistics
     statistic_for_order = np.where(
@@ -372,7 +369,7 @@ def _load_existing_nb_glm_result(
         pts_rest=pts_rest_matrix,
         order=order_matrix,
         groupby=perturbation_column,
-        method="nb_glm",
+        method=method,
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
@@ -438,6 +435,56 @@ def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, n
     return out
 
 
+#: Arguments that change how a DE call runs but not what it computes; a
+#: checkpoint from a call differing only in these is still resumable. The
+#: memory and chunking knobs belong here because rerunning with a lower
+#: ``memory_limit_gb`` is the natural response to an OOM kill; a path that
+#: counts its progress in chunks puts the resolved chunk size in the
+#: fingerprint itself (see ``wilcoxon_test``).
+_OPERATIONAL_ARGS = frozenset({
+    "data", "perturbations", "verbose", "resume", "checkpoint_interval", "n_jobs",
+    "profiling", "force", "output_path", "output_dir", "data_name", "scanpy_format",
+    "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
+    "cell_chunk_size", "chunk_size", "irls_batch_size",
+})
+
+
+def _de_fingerprint(path: Path, call_args: dict, **extra) -> dict:
+    """:func:`run_fingerprint` of a DE call: the source file, every argument
+    that shapes the results (``call_args`` is the function's ``locals()`` at
+    entry), and ``extra`` (the resolved perturbations, gene count, ...)."""
+    params = {k: v for k, v in call_args.items() if k not in _OPERATIONAL_ARGS}
+    return run_fingerprint(path, params=params, **extra)
+
+
+# Disk a DE run needs beside its output: the resumable partial arrays plus
+# the final h5ad, which coexist until the run finishes. One function per
+# method, shared by the run's own low-disk warning and estimate_disk_usage.
+
+def _t_test_disk_bytes(n_groups: int, n_genes: int) -> float:
+    # partial: statistics/pvalues/pvalues_adj/order (8 B) + lfc/effect/pts (4 B)
+    # output: z/pvalue/pvalue_adj (8 B) + X/logfoldchanges/pts (4 B)
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 7 + estimate_bytes(n_groups, n_genes, itemsize=4) * 6
+
+
+def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
+    # partial: 10 f64 matrices + pts/iterations (4 B) + converged (1 B)
+    # output (upper bound): X, z, p, padj, intercept, se, 2 ln-scale, a raw
+    # LFC and 3 per-comparison dispersion layers (8 B) + pts (4 B) + 2 small
+    return (
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 22
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3
+        + estimate_bytes(n_groups, n_genes, itemsize=1) * 3
+    )
+
+
+def _wilcoxon_disk_bytes(n_groups: int, n_genes: int) -> float:
+    # partial: effect/u/pvalue/pvalue_adj/z/lfc (8 B) + pts (4 B); the output
+    # holds the same seven matrices. The streaming path writes only the
+    # output-sized file, so this bounds every path.
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+
+
 def _release_chunk_memory() -> None:
     """Force Python and glibc to return freed memory to the OS.
 
@@ -466,7 +513,7 @@ def _write_wilcoxon_result_h5ad(
     lfc_matrix: np.ndarray,
     u_matrix: np.ndarray,
     pts_matrix: np.ndarray,
-    pts_rest_matrix: np.ndarray,
+    pts_rest: np.ndarray,
     candidates: list[str],
     gene_symbols: pd.Index,
     perturbation_column: str,
@@ -476,65 +523,71 @@ def _write_wilcoxon_result_h5ad(
     batch_column: str | None = None,
     stratified_diagnostics: dict[str, object] | None = None,
 ) -> None:
-    """Write wilcoxon result arrays directly to h5ad via h5py.
+    """Write wilcoxon result arrays to h5ad.
 
-    Writes each array (which may be a memmap) as an HDF5 dataset one at a
-    time, avoiding the triple-allocation of memmap → np.array copy → AnnData
-    → ``.write()``.  h5py reads memmap pages on demand and writes HDF5 chunks
-    without requiring the full array in RAM simultaneously.
+    obs, var and uns go through anndata (so ``adata.uns`` and the plotting
+    readers see the metadata, as for t_test and nb_glm); the matrices, which
+    may be memmaps, are then written one dataset at a time via h5py, avoiding
+    the triple allocation of memmap → np.array copy → AnnData → ``.write()``.
+
+    ``pts_rest`` is the control arm's detection rate, one value per gene, so
+    it is stored as ``var["pts_rest"]`` rather than repeated for every
+    perturbation.
     """
-    obs_names = pd.Index(candidates, name="perturbation").astype(str)
-    var_names = gene_symbols.astype(str)
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    var = pd.DataFrame({"pts_rest": np.asarray(pts_rest, dtype=np.float32)}, index=gene_symbols.astype(str))
+    uns = _wilcoxon_uns(
+        control_label=control_label, perturbation_column=perturbation_column,
+        tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
+        stratified_diagnostics=stratified_diagnostics,
+    )
+    # The metadata lands before the matrices, so the file is written under a
+    # partial name: a run killed mid-write must not leave a file whose uns
+    # matches and passes for a finished result.
+    with _replace_on_success(output_path) as partial:
+        ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
+        with h5py.File(partial, "r+") as hf:
+            _create_array(hf, "X", data=effect_matrix)
+            layers_grp = hf.require_group("layers")
+            _create_array(layers_grp, "z_score", data=z_matrix)
+            _create_array(layers_grp, "pvalue", data=pvalue_matrix)
+            _create_array(layers_grp, "pvalue_adj", data=pvalue_adj_matrix)
+            _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
+            _create_array(layers_grp, "u_statistic", data=u_matrix)
+            _create_array(layers_grp, "pts", data=pts_matrix)
 
-    # Create a minimal AnnData structure via h5py
-    with h5py.File(output_path, "w") as hf:
-        # X = effect_size matrix
-        hf.create_dataset("X", data=effect_matrix)
 
-        # obs
-        obs_grp = hf.create_group("obs")
-        obs_grp.attrs["_index"] = "_index"
-        obs_grp.attrs["encoding-type"] = "dataframe"
-        obs_grp.attrs["encoding-version"] = "0.2.0"
-        obs_grp.create_dataset("_index", data=np.array(obs_names, dtype="S"))
-        obs_grp.attrs["column-order"] = [perturbation_column]
-        obs_grp.create_dataset(
-            perturbation_column, data=np.array(obs_names, dtype="S")
-        )
+def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
+    """``group.create_dataset`` tagged as an anndata dense array."""
+    ds = group.create_dataset(name, **kwargs)
+    ds.attrs["encoding-type"] = "array"
+    ds.attrs["encoding-version"] = "0.2.0"
+    return ds
 
-        # var
-        var_grp = hf.create_group("var")
-        var_grp.attrs["_index"] = "_index"
-        var_grp.attrs["encoding-type"] = "dataframe"
-        var_grp.attrs["encoding-version"] = "0.2.0"
-        var_grp.create_dataset("_index", data=np.array(var_names, dtype="S"))
-        var_grp.attrs["column-order"] = []
 
-        # layers
-        layers_grp = hf.create_group("layers")
-        layers_grp.create_dataset("z_score", data=z_matrix)
-        layers_grp.create_dataset("pvalue", data=pvalue_matrix)
-        layers_grp.create_dataset("pvalue_adj", data=pvalue_adj_matrix)
-        layers_grp.create_dataset("logfoldchanges", data=lfc_matrix)
-        layers_grp.create_dataset("u_statistic", data=u_matrix)
-        layers_grp.create_dataset("pts", data=pts_matrix)
-        layers_grp.create_dataset("pts_rest", data=pts_rest_matrix)
-
-        # uns metadata
-        uns_grp = hf.create_group("uns")
-        uns_grp.attrs["method"] = "wilcoxon"
-        uns_grp.attrs["control_label"] = control_label
-        uns_grp.attrs["perturbation_column"] = perturbation_column
-        uns_grp.attrs["tie_correct"] = tie_correct
-        uns_grp.attrs["pvalue_correction"] = corr_method
-        if batch_column is not None:
-            uns_grp.attrs["batch_column"] = batch_column
-            uns_grp.attrs["stratified"] = True
-        else:
-            uns_grp.attrs["stratified"] = False
-        if stratified_diagnostics:
-            for key, value in stratified_diagnostics.items():
-                uns_grp.attrs[key] = value
+def _wilcoxon_uns(
+    *,
+    control_label: str,
+    perturbation_column: str,
+    tie_correct: bool,
+    corr_method: str,
+    batch_column: str | None = None,
+    stratified_diagnostics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """``uns`` metadata shared by every Wilcoxon result path."""
+    uns: dict[str, object] = {
+        "method": "wilcoxon",
+        "control_label": control_label,
+        "perturbation_column": perturbation_column,
+        "tie_correct": bool(tie_correct),
+        "pvalue_correction": corr_method,
+        "stratified": batch_column is not None,
+    }
+    if batch_column is not None:
+        uns["batch_column"] = batch_column
+    uns.update(stratified_diagnostics or {})
+    return uns
 
 
 def _build_result_from_h5ad(
@@ -562,7 +615,7 @@ def _build_result_from_h5ad(
 
     n_groups = len(candidates)
     n_genes = len(gene_symbols)
-    result_bytes = n_groups * n_genes * (7 * 8 + 2 * 4)  # same as memmap estimate
+    result_bytes = n_groups * n_genes * (6 * 8 + 4)  # X + 5 f64 layers + pts
     # Use actual physical memory for the lazy-load decision, not the
     # (possibly tiny) memory_limit_gb used for streaming dispatch.
     physical_budget = _resolve_memory_limit_bytes(None)
@@ -614,7 +667,9 @@ def _build_result_from_h5ad(
         effect_arr = hf["X"][:]
         u_arr = hf["layers/u_statistic"][:]
         pts_arr = np.array(hf["layers/pts"][:], dtype=np.float32)
-        pts_rest_arr = np.array(hf["layers/pts_rest"][:], dtype=np.float32)
+        pts_rest_arr = np.broadcast_to(
+            np.asarray(hf["var/pts_rest"][:], dtype=np.float32), pts_arr.shape
+        )
 
     order_arr = np.argsort(-np.abs(z_arr), axis=1, kind="mergesort").astype(np.int64)
 
@@ -703,7 +758,7 @@ def _load_completed_de_result(
     Reads all necessary metadata (method, control_label, perturbation_column,
     etc.) from the result file itself so the original input data is not required.
     Dispatches to :func:`_build_result_from_h5ad` for wilcoxon results and
-    :func:`_load_existing_nb_glm_result` for nb_glm / t_test results.
+    :func:`_load_layered_de_result` for nb_glm / t_test results.
     """
 
     def _decode(v) -> str:
@@ -764,14 +819,14 @@ def _load_completed_de_result(
             corr_method=corr_method,
             memory_limit_gb=memory_limit_gb,
         )
-    # nb_glm and t_test share the same layer layout
-    return _load_existing_nb_glm_result(
+    return _load_layered_de_result(
         output_path=output_path,
         candidates=candidates,
         gene_symbols=gene_symbols.tolist(),
         perturbation_column=perturbation_column,
         control_label=control_label,
         corr_method=corr_method,
+        method=method,
     )
 
 
@@ -957,6 +1012,7 @@ def t_test(
     verbose: int | bool = True,
     resume: bool = False,
     checkpoint_interval: int | None = None,
+    corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
     force: bool = False,
@@ -1041,9 +1097,15 @@ def t_test(
     verbose
         If True, show a progress bar for perturbation processing. Requires tqdm.
     resume
-        If True, attempt to resume from a previous interrupted run using checkpoint.
+        If True, continue an interrupted run from its last checkpoint,
+        skipping the perturbations it had finished.
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of perturbations between checkpoint saves. Auto-determined if None.
+    corr_method
+        Method for p-value correction: ``"benjamini-hochberg"`` or ``"bonferroni"``.
     scanpy_format
         If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
         in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
@@ -1065,6 +1127,11 @@ def t_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
 
+        The h5ad file holds one row per perturbation: the effect size in
+        ``X`` and the layers ``z_score``, ``pvalue``, ``pvalue_adj``,
+        ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
+        arm, so it is the per-gene column ``var["pts_rest"]``.
+
     Notes
     -----
     ``logfoldchanges`` follows scanpy's formula,
@@ -1077,6 +1144,7 @@ def t_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
         perturbation_column=perturbation_column,
@@ -1088,6 +1156,8 @@ def t_test(
         min_pct_pert=min_pct_pert,
         fn_name="t_test",
     )
+    if corr_method not in {"benjamini-hochberg", "bonferroni"}:
+        raise ValueError("corr_method must be 'benjamini-hochberg' or 'bonferroni'")
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(
@@ -1195,332 +1265,284 @@ def t_test(
 
     # Determine worker count for parallelization
     n_groups = len(candidates)
-    max_available_workers = os.cpu_count() or 1
-    if n_jobs is None or n_jobs == 0:
-        worker_count = min(n_groups, max_available_workers)
-    else:
-        worker_count = min(n_groups, abs(n_jobs))
-    worker_count = max(worker_count, 1)
+    worker_count = max(1, min(n_groups, _resolve_n_jobs(n_jobs)))
 
     # Prepare on-disk buffers for results
     shape = (n_groups, n_genes)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
-    
-    # Handle resume logic
-    if resume:
-        candidates_to_run, completed_labels, failed_labels = _get_resumable_candidates(
-            checkpoint_path, output_path, candidates, retry_failed=True
-        )
-    else:
-        candidates_to_run = candidates
-        completed_labels = []
-        failed_labels = []
-    
+
     # Determine checkpoint interval
     eff_checkpoint_interval = _get_checkpoint_interval(n_groups, checkpoint_interval)
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
-    
+
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
 
-    adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=obs, var=pd.DataFrame(index=[]))
-    adata.uns["method"] = "t_test"
-    adata.uns["control_label"] = control_label
-    adata.uns["genes"] = gene_symbols.to_numpy()
-    adata.uns["pvalue_correction"] = "benjamini-hochberg"
-    adata.uns["de_filter"] = {
-        "min_cells_expressed": int(min_cells_expressed),
-        "min_pct_ctrl": float(min_pct_ctrl),
-        "min_pct_pert": float(min_pct_pert),
-        "min_mean_ctrl": float(min_mean_ctrl),
-        "min_mean_pert": float(min_mean_pert),
-    }
-    if int(verbose) >= 1:
-        print(f"[cx] t_test: Saving \u2192 {output_path}")
-    adata.write(output_path)
-
-    candidate_indices = {label: i for i, label in enumerate(candidates)}
+    # pts_rest describes the control arm, so it is one per-gene vector, not a
+    # per-comparison matrix.
+    pts_rest_vector = control_pts.astype(np.float32)
 
     _t_test_disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(*shape, itemsize=8) * 3 + estimate_bytes(*shape, itemsize=4) * 4,
-        tempfile.gettempdir(),
-        context="t_test intermediate arrays",
+        _t_test_disk_bytes(*shape),
+        output_path,
+        context="t_test",
     )
     _messages.print_disk_estimate(verbose, "t_test", _t_test_disk_estimate)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        stat_memmap = np.memmap(tmp_path / "statistics.dat", mode="w+", dtype=np.float64, shape=shape)
-        pval_memmap = np.memmap(tmp_path / "pvalues.dat", mode="w+", dtype=np.float64, shape=shape)
-        lfc_memmap = np.memmap(tmp_path / "logfoldchanges.dat", mode="w+", dtype=np.float32, shape=shape)
-        effect_memmap = np.memmap(tmp_path / "effect_size.dat", mode="w+", dtype=np.float32, shape=shape)
-        pts_memmap = np.memmap(tmp_path / "pts.dat", mode="w+", dtype=np.float32, shape=shape)
-        order_memmap = np.memmap(tmp_path / "order.dat", mode="w+", dtype=np.int64, shape=shape)
-        pts_rest_memmap = np.memmap(
-            tmp_path / "pts_rest.dat", mode="w+", dtype=np.float32, shape=shape
-        )
-        pts_rest_memmap[:] = control_pts.astype(np.float32)
+    # Per-perturbation results live beside the output until the run finishes,
+    # so an interrupted run resumes from its last checkpoint.
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        fingerprint=_de_fingerprint(path, call_args, method="t_test", candidates=candidates, n_genes=n_genes),
+        # NaN, not 0: a perturbation that fails is never written, and a
+        # p-value of 0 would report every gene as significant for it.
+        arrays={
+            "statistics": (shape, np.float64, np.nan),
+            "pvalues": (shape, np.float64, np.nan),
+            "pvalues_adj": (shape, np.float64, np.nan),
+            "logfoldchanges": (shape, np.float32, np.nan),
+            "effect_size": (shape, np.float32, np.nan),
+            "pts": (shape, np.float32, 0),
+            "order": (shape, np.int64, 0),
+        },
+        resume=resume,
+    )
+    # Earlier failures are retried, so only completions carry over.
+    completed_labels: list[str] = run.progress.get("completed", [])
+    candidates_to_run = [c for c in candidates if c not in set(completed_labels)]
+    if run.resumed:
+        _messages.vprint(verbose, "t_test", f"Resuming: {len(completed_labels)}/{n_groups} perturbations already done")
+    stat_memmap = run.arrays["statistics"]
+    pval_memmap = run.arrays["pvalues"]
+    lfc_memmap = run.arrays["logfoldchanges"]
+    effect_memmap = run.arrays["effect_size"]
+    pts_memmap = run.arrays["pts"]
+    order_memmap = run.arrays["order"]
 
-        with h5py.File(output_path, "r+") as handle:
-            uns_group = handle.require_group("uns")
-            if "rank_genes_groups" in uns_group:
-                del uns_group["rank_genes_groups"]
-            rgg = uns_group.create_group("rank_genes_groups")
-            full = rgg.create_group("full")
-            ds_scores = full.create_dataset("scores", shape=shape, dtype="float64")
-            ds_pvals = full.create_dataset("pvals", shape=shape, dtype="float64")
-            ds_pvals_adj = full.create_dataset("pvals_adj", shape=shape, dtype="float64")
-            ds_lfc = full.create_dataset("logfoldchanges", shape=shape, dtype="float32")
-            ds_auc = full.create_dataset("auc", shape=shape, dtype="float32")
-            ds_u = full.create_dataset("u_stat", shape=shape, dtype="float32")
-            ds_pts = full.create_dataset("pts", shape=shape, dtype="float32")
-            ds_pts_rest = full.create_dataset("pts_rest", shape=shape, dtype="float32")
-            ds_order = rgg.create_dataset("order", shape=shape, dtype="int64")
+    batch_size = worker_count
+    effect_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+    stat_buffer = np.zeros((batch_size, n_genes), dtype=np.float64)
+    pval_buffer = np.ones((batch_size, n_genes), dtype=np.float64)
+    lfc_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+    pts_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+    order_buffer = np.zeros((batch_size, n_genes), dtype=np.int64)
+    mean_buffer = np.zeros(n_genes, dtype=np.float64)
+    var_buffer = np.zeros(n_genes, dtype=np.float64)
+    se_buffer = np.zeros(n_genes, dtype=np.float64)
+    lfc_work_buffer = np.zeros(n_genes, dtype=np.float64)  # Work buffer for in-place LFC
+    n_tested_per_slot = np.zeros(batch_size, dtype=np.int32)
 
-            ds_auc[:] = 0.0
-            ds_u[:] = 0.0
-            ds_pts_rest[:] = pts_rest_memmap
+    def compute_perturbation(label: str, slot: int) -> None:
+        idx = group_index[label]
+        n_cells = counts[idx]
+        if n_cells == 0:
+            raise ValueError(f"Perturbation '{label}' contains no cells")
 
-            batch_size = worker_count
-            effect_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
-            stat_buffer = np.zeros((batch_size, n_genes), dtype=np.float64)
-            pval_buffer = np.ones((batch_size, n_genes), dtype=np.float64)
-            lfc_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
-            pts_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
-            order_buffer = np.zeros((batch_size, n_genes), dtype=np.int64)
-            mean_buffer = np.zeros(n_genes, dtype=np.float64)
-            var_buffer = np.zeros(n_genes, dtype=np.float64)
-            se_buffer = np.zeros(n_genes, dtype=np.float64)
-            lfc_work_buffer = np.zeros(n_genes, dtype=np.float64)  # Work buffer for in-place LFC
-            n_tested_per_slot = np.zeros(batch_size, dtype=np.int32)
+        np.divide(sums[idx], n_cells, out=mean_buffer)
+        np.copyto(var_buffer, sumsq[idx])
+        if n_cells > 1:
+            np.subtract(var_buffer, np.square(sums[idx]) / n_cells, out=var_buffer)
+            np.divide(var_buffer, n_cells - 1, out=var_buffer)
+        else:
+            var_buffer.fill(0)
+        np.clip(var_buffer, a_min=0, a_max=None, out=var_buffer)
 
-            def compute_perturbation(label: str, slot: int) -> None:
-                idx = group_index[label]
-                n_cells = counts[idx]
-                if n_cells == 0:
-                    raise ValueError(f"Perturbation '{label}' contains no cells")
+        np.subtract(mean_buffer, control_mean, out=effect_buffer[slot])
+        effect_f32 = effect_buffer[slot].astype(np.float32, copy=False)
 
-                np.divide(sums[idx], n_cells, out=mean_buffer)
-                np.copyto(var_buffer, sumsq[idx])
-                if n_cells > 1:
-                    np.subtract(var_buffer, np.square(sums[idx]) / n_cells, out=var_buffer)
-                    np.divide(var_buffer, n_cells - 1, out=var_buffer)
-                else:
-                    var_buffer.fill(0)
-                np.clip(var_buffer, a_min=0, a_max=None, out=var_buffer)
-
-                np.subtract(mean_buffer, control_mean, out=effect_buffer[slot])
-                effect_f32 = effect_buffer[slot].astype(np.float32, copy=False)
-
-                # Compute variance terms for SE and Welch-Satterthwaite df
-                var_term_pert = var_buffer / n_cells  # var_pert / n_pert
-                var_term_ctrl = control_var / control_n  # var_ctrl / n_ctrl
-                
-                # SE = sqrt(var_pert/n_pert + var_ctrl/n_ctrl)
-                np.add(var_term_pert, var_term_ctrl, out=se_buffer)
-                np.sqrt(se_buffer, out=se_buffer)
-
-                total_expr = expr_counts[idx] + expr_counts[control_idx]
-                valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
-                # Per-condition low-expression filter: drop genes that are
-                # jointly low in BOTH the perturbation and control groups.
-                low_both = _low_expr_in_both_mask(
-                    pert_expr_counts=expr_counts[idx],
-                    control_expr_counts=expr_counts[control_idx],
-                    pert_mean=mean_buffer,
-                    control_mean=control_mean,
-                    n_pert_cells=n_cells,
-                    n_control_cells=control_n,
-                    min_pct_ctrl=min_pct_ctrl,
-                    min_pct_pert=min_pct_pert,
-                    min_mean_ctrl=min_mean_ctrl,
-                    min_mean_pert=min_mean_pert,
-                )
-                valid &= ~low_both
-                n_tested_per_slot[slot] = int(valid.sum())
-
-                stat_buffer[slot].fill(np.nan)
-                pval_buffer[slot].fill(np.nan)
-                stat_buffer[slot][valid] = effect_f32[valid] / se_buffer[valid]
-                
-                # Welch-Satterthwaite degrees of freedom for Welch's t-test
-                # df = (var1/n1 + var2/n2)^2 / ((var1/n1)^2/(n1-1) + (var2/n2)^2/(n2-1))
-                numerator = (var_term_pert + var_term_ctrl) ** 2
-                denominator = np.zeros_like(numerator)
-                if n_cells > 1:
-                    denominator += (var_term_pert ** 2) / (n_cells - 1)
-                if control_n > 1:
-                    denominator += (var_term_ctrl ** 2) / (control_n - 1)
-                # Avoid division by zero; set df to a large value when denominator is 0
-                # Use np.divide with where to prevent NaN from 0/0
-                df_welch = np.divide(
-                    numerator, denominator,
-                    out=np.full_like(numerator, 1e6),
-                    where=denominator > 0
-                )
-                # Clip df to reasonable bounds (minimum 1, no upper limit needed)
-                df_welch = np.clip(df_welch, 1.0, None)
-                
-                # Use t-distribution for p-value calculation (matches scanpy's Welch's t-test)
-                pval_buffer[slot][valid] = 2 * t_dist.sf(np.abs(stat_buffer[slot][valid]), df_welch[valid])
-
-                np.divide(
-                    expr_counts[idx],
-                    n_cells,
-                    out=pts_buffer[slot],
-                    where=n_cells > 0,
-                    casting="unsafe",
-                )
-
-                order_buffer[slot] = np.argsort(-np.abs(stat_buffer[slot]))
-                # Scanpy-compatible log2 fold change: log2((expm1(mean_group) + eps) / (expm1(mean_rest) + eps))
-                # Use in-place operations to minimize temporary allocations
-                np.expm1(mean_buffer, out=lfc_work_buffer)
-                np.add(lfc_work_buffer, 1e-9, out=lfc_work_buffer)
-                np.divide(lfc_work_buffer, control_mean_expm1, out=lfc_work_buffer)
-                np.log2(lfc_work_buffer, out=lfc_work_buffer)
-                lfc_buffer[slot] = lfc_work_buffer.astype(np.float32)
-
-                # Untested genes carry NaN in every column derived from the
-                # comparison; reporting 0 would assert "no change" about a gene
-                # nobody tested.  pts / pts_rest describe the data and stay.
-                if not valid.all():
-                    invalid = ~valid
-                    effect_buffer[slot][invalid] = np.nan
-                    lfc_buffer[slot][invalid] = np.nan
-
-            # Track completed labels
-            newly_completed = list(completed_labels)
-            newly_failed = list(failed_labels)
-            completed_set = set(completed_labels)
-            n_processed = 0
+        # Compute variance terms for SE and Welch-Satterthwaite df
+        var_term_pert = var_buffer / n_cells  # var_pert / n_pert
+        var_term_ctrl = control_var / control_n  # var_ctrl / n_ctrl
             
-            # Helper to save checkpoint
-            def _save_t_test_checkpoint() -> None:
-                checkpoint_data = {
-                    "total": n_groups,
-                    "completed": newly_completed,
-                    "failed": newly_failed,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "method": "t_test",
-                    "control_label": control_label,
-                }
-                _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+        # SE = sqrt(var_pert/n_pert + var_ctrl/n_ctrl)
+        np.add(var_term_pert, var_term_ctrl, out=se_buffer)
+        np.sqrt(se_buffer, out=se_buffer)
 
-            if n_groups > 0:
-                n_tested_list: list[int] = []
-                with _create_progress_context(len(candidates_to_run), "t-test DE", verbose) as pbar:
-                    for batch_start in range(0, n_groups, batch_size):
-                        batch_labels = candidates[batch_start : batch_start + batch_size]
-                        # Filter to only labels that need processing
-                        batch_to_run = [l for l in batch_labels if l not in completed_set]
-                        
-                        for local_idx, label in enumerate(batch_labels):
-                            if label in completed_set:
-                                continue
-                            try:
-                                compute_perturbation(label, local_idx)
-                            except Exception as e:
-                                logger.error(f"Failed perturbation {label}: {e}")
-                                newly_failed.append(label)
-                                continue
-
-                        for local_idx, label in enumerate(batch_labels):
-                            if label in completed_set or label in newly_failed:
-                                continue
-                            global_idx = candidate_to_idx[label]
-                            effect_memmap[global_idx] = effect_buffer[local_idx]
-                            stat_memmap[global_idx] = stat_buffer[local_idx]
-                            pval_memmap[global_idx] = pval_buffer[local_idx]
-                            lfc_memmap[global_idx] = lfc_buffer[local_idx]
-                            pts_memmap[global_idx] = pts_buffer[local_idx]
-                            order_memmap[global_idx] = order_buffer[local_idx]
-
-                            ds_scores[global_idx] = stat_buffer[local_idx]
-                            ds_pvals[global_idx] = pval_buffer[local_idx]
-                            ds_lfc[global_idx] = lfc_buffer[local_idx]
-                            ds_pts[global_idx] = pts_buffer[local_idx]
-                            ds_order[global_idx] = order_buffer[local_idx]
-                            
-                            newly_completed.append(label)
-                            n_tested_list.append(int(n_tested_per_slot[local_idx]))
-                            _print_de_perturbation_verbose(verbose, label, int(n_tested_per_slot[local_idx]), n_genes)
-                            n_processed += 1
-                            pbar.update(1)
-                            logger.debug(f"Completed perturbation: {label}")
-                        
-                        # Save checkpoint after each batch
-                        if len(batch_to_run) > 0 and n_processed % eff_checkpoint_interval == 0:
-                            _save_t_test_checkpoint()
-                
-                # Final checkpoint
-                _save_t_test_checkpoint()
-                logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
-                _print_de_summary(verbose, "t-test DE", len(newly_completed), n_groups, n_tested_list, n_genes)
-
-            pvalue_adj_memmap = np.memmap(
-                tmp_path / "pvalues_adj.dat", mode="w+", dtype=np.float64, shape=shape
-            )
-            _adjust_pvalue_matrix(pval_memmap, method="benjamini-hochberg", out=pvalue_adj_memmap)
-            ds_pvals_adj[:] = pvalue_adj_memmap
-
-        # Convert memmap arrays to regular arrays before tempdir cleanup
-        stat_matrix = np.asarray(stat_memmap)
-        pval_matrix = np.asarray(pval_memmap)
-        pval_adj_matrix = np.asarray(pvalue_adj_memmap)
-        lfc_matrix = np.asarray(lfc_memmap)
-        effect_matrix = np.asarray(effect_memmap)
-        pts_matrix = np.asarray(pts_memmap)
-        pts_rest_matrix = np.asarray(pts_rest_memmap)
-        order_matrix = np.asarray(order_memmap)
-        
-        result = RankGenesGroupsResult(
-            genes=gene_symbols,
-            groups=candidates,
-            statistics=stat_matrix,
-            pvalues=pval_matrix,
-            pvalues_adj=pval_adj_matrix,
-            logfoldchanges=lfc_matrix,
-            effect_size=effect_matrix,
-            u_statistics=np.zeros(shape, dtype=np.float32),
-            pts=pts_matrix,
-            pts_rest=pts_rest_matrix,
-            order=order_matrix,
-            groupby=perturbation_column,
-            method="t_test",
-            control_label=control_label,
-            tie_correct=False,
-            pvalue_correction="benjamini-hochberg",
-            result=None,
+        total_expr = expr_counts[idx] + expr_counts[control_idx]
+        valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
+        # Per-condition low-expression filter: drop genes that are
+        # jointly low in BOTH the perturbation and control groups.
+        low_both = _low_expr_in_both_mask(
+            pert_expr_counts=expr_counts[idx],
+            control_expr_counts=expr_counts[control_idx],
+            pert_mean=mean_buffer,
+            control_mean=control_mean,
+            n_pert_cells=n_cells,
+            n_control_cells=control_n,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
         )
+        valid &= ~low_both
+        n_tested_per_slot[slot] = int(valid.sum())
+
+        stat_buffer[slot].fill(np.nan)
+        pval_buffer[slot].fill(np.nan)
+        stat_buffer[slot][valid] = effect_f32[valid] / se_buffer[valid]
+            
+        # Welch-Satterthwaite degrees of freedom for Welch's t-test
+        # df = (var1/n1 + var2/n2)^2 / ((var1/n1)^2/(n1-1) + (var2/n2)^2/(n2-1))
+        numerator = (var_term_pert + var_term_ctrl) ** 2
+        denominator = np.zeros_like(numerator)
+        if n_cells > 1:
+            denominator += (var_term_pert ** 2) / (n_cells - 1)
+        if control_n > 1:
+            denominator += (var_term_ctrl ** 2) / (control_n - 1)
+        # Avoid division by zero; set df to a large value when denominator is 0
+        # Use np.divide with where to prevent NaN from 0/0
+        df_welch = np.divide(
+            numerator, denominator,
+            out=np.full_like(numerator, 1e6),
+            where=denominator > 0
+        )
+        # Clip df to reasonable bounds (minimum 1, no upper limit needed)
+        df_welch = np.clip(df_welch, 1.0, None)
+            
+        # Use t-distribution for p-value calculation (matches scanpy's Welch's t-test)
+        pval_buffer[slot][valid] = 2 * t_dist.sf(np.abs(stat_buffer[slot][valid]), df_welch[valid])
+
+        np.divide(
+            expr_counts[idx],
+            n_cells,
+            out=pts_buffer[slot],
+            where=n_cells > 0,
+            casting="unsafe",
+        )
+
+        order_buffer[slot] = np.argsort(-np.abs(stat_buffer[slot]))
+        # Scanpy-compatible log2 fold change: log2((expm1(mean_group) + eps) / (expm1(mean_rest) + eps))
+        # Use in-place operations to minimize temporary allocations
+        np.expm1(mean_buffer, out=lfc_work_buffer)
+        np.add(lfc_work_buffer, 1e-9, out=lfc_work_buffer)
+        np.divide(lfc_work_buffer, control_mean_expm1, out=lfc_work_buffer)
+        np.log2(lfc_work_buffer, out=lfc_work_buffer)
+        lfc_buffer[slot] = lfc_work_buffer.astype(np.float32)
+
+        # Untested genes carry NaN in every column derived from the
+        # comparison; reporting 0 would assert "no change" about a gene
+        # nobody tested.  pts / pts_rest describe the data and stay.
+        if not valid.all():
+            invalid = ~valid
+            effect_buffer[slot][invalid] = np.nan
+            lfc_buffer[slot][invalid] = np.nan
+
+    # Track completed labels
+    newly_completed = list(completed_labels)
+    newly_failed: list[str] = []
+    completed_set = set(completed_labels)
+    n_processed = 0
+    n_at_last_save = 0
+        
+    # Helper to save checkpoint
+    def _save_t_test_checkpoint() -> None:
+        checkpoint_data = {
+            "total": n_groups,
+            "completed": newly_completed,
+            "failed": newly_failed,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        run.save(**checkpoint_data)
+
+    if n_groups > 0:
+        n_tested_list: list[int] = []
+        with _create_progress_context(len(candidates_to_run), "t-test DE", verbose) as pbar:
+            for batch_start in range(0, n_groups, batch_size):
+                batch_labels = candidates[batch_start : batch_start + batch_size]
+                for local_idx, label in enumerate(batch_labels):
+                    if label in completed_set:
+                        continue
+                    try:
+                        compute_perturbation(label, local_idx)
+                    except Exception as e:
+                        logger.error(f"Failed perturbation {label}: {e}")
+                        newly_failed.append(label)
+                        continue
+
+                for local_idx, label in enumerate(batch_labels):
+                    if label in completed_set or label in newly_failed:
+                        continue
+                    global_idx = candidate_to_idx[label]
+                    effect_memmap[global_idx] = effect_buffer[local_idx]
+                    stat_memmap[global_idx] = stat_buffer[local_idx]
+                    pval_memmap[global_idx] = pval_buffer[local_idx]
+                    lfc_memmap[global_idx] = lfc_buffer[local_idx]
+                    pts_memmap[global_idx] = pts_buffer[local_idx]
+                    order_memmap[global_idx] = order_buffer[local_idx]
+
+                    newly_completed.append(label)
+                    n_tested_list.append(int(n_tested_per_slot[local_idx]))
+                    _print_de_perturbation_verbose(verbose, label, int(n_tested_per_slot[local_idx]), n_genes)
+                    n_processed += 1
+                    pbar.update(1)
+                    logger.debug(f"Completed perturbation: {label}")
+                    
+                # A batch completes several perturbations, so save once the
+                # interval is crossed rather than on exact multiples.
+                if n_processed - n_at_last_save >= eff_checkpoint_interval:
+                    _save_t_test_checkpoint()
+                    n_at_last_save = n_processed
+            
+        # Final checkpoint
+        _save_t_test_checkpoint()
+        logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
+        _print_de_summary(verbose, "t-test DE", len(newly_completed), n_groups, n_tested_list, n_genes)
+
+    pvalue_adj_memmap = run.arrays["pvalues_adj"]
+    _adjust_pvalue_matrix(pval_memmap, method=corr_method, out=pvalue_adj_memmap)
+
+    # Copy out of the memmaps: run.discard() deletes their files, and a view
+    # would keep the deleted files mapped for as long as the result lives.
+    stat_matrix = np.array(stat_memmap)
+    pval_matrix = np.array(pval_memmap)
+    pval_adj_matrix = np.array(pvalue_adj_memmap)
+    lfc_matrix = np.array(lfc_memmap)
+    effect_matrix = np.array(effect_memmap)
+    pts_matrix = np.array(pts_memmap)
+    order_matrix = np.array(order_memmap)
+    del stat_memmap, pval_memmap, pvalue_adj_memmap, lfc_memmap, effect_memmap, pts_memmap, order_memmap
+        
+    result = RankGenesGroupsResult(
+        genes=gene_symbols,
+        groups=candidates,
+        statistics=stat_matrix,
+        pvalues=pval_matrix,
+        pvalues_adj=pval_adj_matrix,
+        logfoldchanges=lfc_matrix,
+        effect_size=effect_matrix,
+        u_statistics=np.zeros(shape, dtype=np.float32),
+        pts=pts_matrix,
+        pts_rest=np.broadcast_to(pts_rest_vector, shape),
+        order=order_matrix,
+        groupby=perturbation_column,
+        method="t_test",
+        control_label=control_label,
+        tie_correct=False,
+        pvalue_correction=corr_method,
+        result=None,
+    )
 
     # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
     # which fails with HDF5 header size limits for large group counts)
-    var = pd.DataFrame(index=gene_symbols)
+    var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=gene_symbols)
     adata = ad.AnnData(effect_matrix, obs=obs, var=var)
     adata.layers["z_score"] = stat_matrix  # t-statistic (converges to z for large n)
     adata.layers["pvalue"] = pval_matrix
     adata.layers["pvalue_adj"] = pval_adj_matrix
     adata.layers["logfoldchanges"] = lfc_matrix
     adata.layers["pts"] = pts_matrix
-    adata.layers["pts_rest"] = pts_rest_matrix
     adata.uns["method"] = "t_test"
     adata.uns["control_label"] = control_label
     adata.uns["perturbation_column"] = perturbation_column
-    adata.uns["pvalue_correction"] = "benjamini-hochberg"
-    adata.write(output_path)
-    
-    # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format:
-        _write_rank_genes_groups_hdf5(output_path, result)
-    
-    # Clean up checkpoint on successful completion
-    if checkpoint_path.exists():
-        try:
-            checkpoint_path.unlink()
-        except Exception:
-            pass
+    adata.uns["pvalue_correction"] = corr_method
+    _messages.print_saving(verbose, "t_test", output_path)
+    with _replace_on_success(output_path) as partial:
+        adata.write(partial)
+        if scanpy_format:
+            _write_rank_genes_groups_hdf5(partial, result)
 
+    run.discard()  # the output is complete; the checkpoint and partial arrays are not needed
     result.result = AnnData(output_path)
     return result
 
@@ -1790,15 +1812,15 @@ def nb_glm_test(
         When False (default), ``adata.uns["profiling"]`` is set to ``"NA"`` to
         avoid profiling overhead in production.
     resume
-        If True, attempt to resume from a previous interrupted run. Reads the
-        checkpoint file to determine which perturbations have already been
-        completed and skips them. If the checkpoint file is missing or corrupted,
-        falls back to scanning the output h5ad to detect completed perturbations.
+        If True, continue an interrupted run from its last checkpoint,
+        skipping the perturbations it had finished.
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of perturbations to process between checkpoint saves. If None,
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
-        <1000, 50 for larger). The checkpoint file `<output>_progress.json` is
-        written atomically to prevent corruption.
+        <1000, 50 for larger).
     memory_limit_gb
         Optional memory limit in GB. If provided, this is used together with
         available system memory to determine when to switch to streaming mode
@@ -1858,7 +1880,21 @@ def nb_glm_test(
         Differential expression results. Access results via dict-like interface:
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
+
+        The h5ad file holds one row per perturbation. ``X`` is the fold
+        change in ``lfc_base`` (shrunk under ``lfc_shrinkage_type="apeglm"``).
+        Layers: ``z_score``, ``pvalue``, ``pvalue_adj``, ``standard_error``,
+        ``intercept`` (ln scale), ``pts``, ``converged`` (bool) and
+        ``iterations`` (integer); ``logfoldchange_raw`` holds the MLE fold
+        change only when ``X`` is shrunk, and with a log2 base
+        ``logfoldchange_raw_ln`` / ``standard_error_ln`` keep the ln-scale
+        values :func:`shrink_lfc` needs. Per-gene quantities are ``var``
+        columns: ``pts_rest``, and, when a global dispersion is fitted,
+        ``dispersion`` and ``dispersion_trend``; a per-comparison dispersion
+        is stored as the layers ``dispersion``, ``dispersion_raw`` and
+        ``dispersion_trend`` instead.
     """
+    call_args = dict(locals())  # for the resume fingerprint, before any other local
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
@@ -2866,628 +2902,703 @@ def nb_glm_test(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
     
-    # Handle resume logic
-    if resume:
-        candidates_to_run, completed_labels, failed_labels = _get_resumable_candidates(
-            checkpoint_path, output_path, candidates, retry_failed=True
-        )
-        # If all candidates are completed, load and return the existing result
-        if len(candidates_to_run) == 0 and output_path.exists():
-            logger.info("All perturbations already completed. Loading existing result...")
-            return _load_existing_nb_glm_result(
-                output_path=output_path,
-                candidates=candidates,
-                gene_symbols=gene_symbols,
-                perturbation_column=perturbation_column,
-                control_label=control_label,
-                corr_method=corr_method,
-            )
-    else:
-        candidates_to_run = candidates
-        completed_labels = []
-        failed_labels = []
-    
     # Determine checkpoint interval
     eff_checkpoint_interval = _get_checkpoint_interval(len(candidates), checkpoint_interval)
     
     # Create index mappings
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
-    _nb_glm_disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 11
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3,
-        tempfile.gettempdir(),
-        context="nb_glm_test intermediate arrays",
-    )
-    _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
+    # Load control cells matrix once (all genes)
+    # For very large control groups, skip loading and use streaming path
+    control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
+    if memory_limit_gb is not None:
+        _ctrl_mem_limit = min(memory_limit_gb, _get_available_memory_mb() / 1000)
+    else:
+        _ctrl_mem_limit = _get_available_memory_mb() / 1000
+    # Streaming threshold: control dense + 3 work arrays > 30% available memory
+    _ctrl_streaming_threshold = max_dense_fraction * _ctrl_mem_limit
+    use_streaming_control = (control_matrix_gb * 4) > _ctrl_streaming_threshold
 
-        def _create_memmap(
-            name: str, dtype: np.dtype, *, fill: float | int | bool | None = np.nan
-        ) -> np.memmap:
-            mmap = np.memmap(
-                tmp_path / f"{name}.dat",
-                mode="w+",
-                dtype=dtype,
-                shape=(n_groups, n_genes),
-            )
-            if fill is None:
-                return mmap
-            if isinstance(fill, float) and np.isnan(fill):
-                mmap.fill(np.nan)
-            else:
-                mmap.fill(fill)
-            return mmap
-
-        effect_memmap = _create_memmap("effect", np.float64)
-        statistic_memmap = _create_memmap("statistic", np.float64)
-        pvalue_memmap = _create_memmap("pvalue", np.float64)
-        logfc_memmap = _create_memmap("logfoldchange", np.float64)
-        logfc_raw_memmap = _create_memmap("logfoldchange_raw", np.float64)
-        intercept_memmap = _create_memmap("intercept", np.float64)  # MLE intercept for shrink_lfc
-        se_memmap = _create_memmap("standard_error", np.float64)
-        pts_memmap = _create_memmap("pts", np.float32, fill=0.0)
-        pts_rest_memmap = _create_memmap("pts_rest", np.float32, fill=0.0)
-        dispersion_memmap = _create_memmap("dispersion", np.float64)
-        dispersion_raw_memmap = _create_memmap("dispersion_raw", np.float64)
-        dispersion_trend_memmap = _create_memmap("dispersion_trend", np.float64)
-        mean_memmap = _create_memmap("mean", np.float64, fill=0.0)
-        iter_memmap = _create_memmap("iterations", np.int32, fill=0)
-        convergence_memmap = _create_memmap("converged", np.bool_, fill=False)
-
-        # Load control cells matrix once (all genes)
-        # For very large control groups, skip loading and use streaming path
-        control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
-        if memory_limit_gb is not None:
-            _ctrl_mem_limit = min(memory_limit_gb, _get_available_memory_mb() / 1000)
-        else:
-            _ctrl_mem_limit = _get_available_memory_mb() / 1000
-        # Streaming threshold: control dense + 3 work arrays > 30% available memory
-        _ctrl_streaming_threshold = max_dense_fraction * _ctrl_mem_limit
-        use_streaming_control = (control_matrix_gb * 4) > _ctrl_streaming_threshold
-
-        if use_streaming_control:
-            logger.info(
-                f"Large control group: {control_n:,} cells × {n_genes:,} genes = "
-                f"{control_matrix_gb:.1f} GB dense. Using streaming control statistics."
-            )
-            control_matrix = None  # Not loaded — streaming will read from disk
-            # Compute control_expr_counts via streaming
-            control_expr_counts = np.zeros(n_genes, dtype=np.int64)
-            backed = read_backed(path)
-            try:
-                ctrl_indices = np.where(control_mask)[0]
-                _chunk = 4096
-                for _start in range(0, control_n, _chunk):
-                    _end = min(_start + _chunk, control_n)
-                    _idx = ctrl_indices[_start:_end]
-                    _blk = backed.X[_idx, :]
-                    if sp.issparse(_blk):
-                        control_expr_counts += np.asarray(_blk.getnnz(axis=0)).ravel()
-                    else:
-                        control_expr_counts += np.asarray((_blk > 0).sum(axis=0)).ravel()
-            finally:
-                backed.file.close()
-            drop_file_cache(path)  # Free page cache from streaming reads
-        else:
-            backed = read_backed(path)
-            try:
-                control_matrix = backed.X[control_mask, :]
-                if sp.issparse(control_matrix):
-                    control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
+    if use_streaming_control:
+        logger.info(
+            f"Large control group: {control_n:,} cells × {n_genes:,} genes = "
+            f"{control_matrix_gb:.1f} GB dense. Using streaming control statistics."
+        )
+        control_matrix = None  # Not loaded — streaming will read from disk
+        # Compute control_expr_counts via streaming
+        control_expr_counts = np.zeros(n_genes, dtype=np.int64)
+        backed = read_backed(path)
+        try:
+            ctrl_indices = np.where(control_mask)[0]
+            _chunk = 4096
+            for _start in range(0, control_n, _chunk):
+                _end = min(_start + _chunk, control_n)
+                _idx = ctrl_indices[_start:_end]
+                _blk = backed.X[_idx, :]
+                if sp.issparse(_blk):
+                    control_expr_counts += np.asarray(_blk.getnnz(axis=0)).ravel()
                 else:
-                    control_matrix = np.asarray(control_matrix, dtype=np.float64)
-            finally:
-                backed.file.close()
-            drop_file_cache(path)  # Free page cache from control matrix read
-            # Pre-compute control expression counts
+                    control_expr_counts += np.asarray((_blk > 0).sum(axis=0)).ravel()
+        finally:
+            backed.file.close()
+        drop_file_cache(path)  # Free page cache from streaming reads
+    else:
+        backed = read_backed(path)
+        try:
+            control_matrix = backed.X[control_mask, :]
             if sp.issparse(control_matrix):
-                control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
+                control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
             else:
-                control_expr_counts = np.sum(control_matrix > 0, axis=0)
+                control_matrix = np.asarray(control_matrix, dtype=np.float64)
+        finally:
+            backed.file.close()
+        drop_file_cache(path)  # Free page cache from control matrix read
+        # Pre-compute control expression counts
+        if sp.issparse(control_matrix):
+            control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
+        else:
+            control_expr_counts = np.sum(control_matrix > 0, axis=0)
         
-        # Compute pts_rest once (same for all perturbations)
-        pts_rest_shared = np.divide(
-            control_expr_counts,
-            control_n,
-            out=np.zeros(n_genes, dtype=np.float32),
-            where=control_n > 0,
-        )
+    # Compute pts_rest once (same for all perturbations)
+    pts_rest_shared = np.divide(
+        control_expr_counts,
+        control_n,
+        out=np.zeros(n_genes, dtype=np.float32),
+        where=control_n > 0,
+    )
 
-        # =====================================================================
-        # Parallel fitting of perturbation groups
-        # =====================================================================
-        # Determine number of parallel workers with memory-awareness
-        # For small n_groups, run sequentially to avoid joblib overhead
-        # (profiling shows joblib.sleep takes 24s for 2 perturbations)
-        cpu_count = os.cpu_count() or 1
-        if n_jobs is None or n_jobs == 0:
-            effective_n_jobs = cpu_count
-        elif n_jobs == -1:
-            effective_n_jobs = cpu_count
-        elif n_jobs < 0:
-            effective_n_jobs = max(1, cpu_count + n_jobs + 1)
-        else:
-            effective_n_jobs = min(n_jobs, cpu_count)
-        effective_n_jobs = max(1, effective_n_jobs)
+    # =====================================================================
+    # Parallel fitting of perturbation groups
+    # =====================================================================
+    # Determine number of parallel workers with memory-awareness
+    # For small n_groups, run sequentially to avoid joblib overhead
+    # (profiling shows joblib.sleep takes 24s for 2 perturbations)
+    effective_n_jobs = _resolve_n_jobs(n_jobs)
         
-        # Save original requested workers for auto-detection logic
-        # (before memory-based reduction)
-        requested_n_jobs = effective_n_jobs
+    # Save original requested workers for auto-detection logic
+    # (before memory-based reduction)
+    requested_n_jobs = effective_n_jobs
         
-        # Memory-aware worker limiting: Adaptive estimation based on dataset statistics
-        # Compute group size statistics without loading the full matrix
-        # Use numpy unique with counts since labels is a numpy array
-        unique_labels, label_counts = np.unique(labels, return_counts=True)
-        group_sizes = dict(zip(unique_labels, label_counts))
-        pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
-        max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
-        avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
+    # Memory-aware worker limiting: Adaptive estimation based on dataset statistics
+    # Compute group size statistics without loading the full matrix
+    # Use numpy unique with counts since labels is a numpy array
+    unique_labels, label_counts = np.unique(labels, return_counts=True)
+    group_sizes = dict(zip(unique_labels, label_counts))
+    pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
+    max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
+    avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
         
-        # Use p95 group size for realistic estimate (avoids over-conservative from outliers)
-        if len(pert_group_sizes) >= 10:
-            p95_group_size = int(np.percentile(pert_group_sizes, 95))
-            use_group_size = p95_group_size
-        else:
-            use_group_size = max_group_size
+    # Use p95 group size for realistic estimate (avoids over-conservative from outliers)
+    if len(pert_group_sizes) >= 10:
+        p95_group_size = int(np.percentile(pert_group_sizes, 95))
+        use_group_size = p95_group_size
+    else:
+        use_group_size = max_group_size
         
-        # Decide early if we can use control cache (needed for memory estimation)
-        can_use_cache_early = (
-            use_control_cache and 
-            len(covariates) == 0 and
-            size_factor_scope == "global"
-        )
+    # Decide early if we can use control cache (needed for memory estimation)
+    can_use_cache_early = (
+        use_control_cache and 
+        len(covariates) == 0 and
+        size_factor_scope == "global"
+    )
         
-        # =====================================================================
-        # AUTO-DETECTION: Enable freeze_control for large datasets
-        # =====================================================================
-        # When freeze_control=None (default), auto-enable if:
-        # 1. Control matrix serialization would severely limit workers (<4)
-        # 2. Required settings are met (dispersion_scope='global', shrink_dispersion=True)
-        #
-        # This provides optimal parallelization without user intervention.
+    # =====================================================================
+    # AUTO-DETECTION: Enable freeze_control for large datasets
+    # =====================================================================
+    # When freeze_control=None (default), auto-enable if:
+    # 1. Control matrix serialization would severely limit workers (<4)
+    # 2. Required settings are met (dispersion_scope='global', shrink_dispersion=True)
+    #
+    # This provides optimal parallelization without user intervention.
         
-        if freeze_control is None:
-            # Check if settings are compatible with frozen control
-            settings_compatible = (
-                can_use_cache_early and
-                dispersion_scope == "global" and
-                shrink_dispersion
-            )
-            
-            if settings_compatible:
-                # Estimate per-worker memory in standard mode (matching actual formula below)
-                control_matrix_mb_est = control_n * n_genes * 8 / 1e6
-                control_matrix_gb_est = control_matrix_mb_est / 1000
-                labels_mb_est = n_cells_total * 50 / 1e6  # ~50 bytes per string
-                size_factors_mb_est = n_cells_total * 8 / 1e6
-                work_arrays_mb_est = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
-                serialized_args_mb_est = (control_matrix_mb_est + labels_mb_est + size_factors_mb_est) * 2.5
-                per_worker_standard_mb = serialized_args_mb_est + work_arrays_mb_est + 2000
-                
-                # Get available memory
-                if memory_limit_gb is not None:
-                    available_mb = memory_limit_gb * 1000
-                else:
-                    try:
-                        available_mb = _detected_available_bytes() / 1e6
-                    except ImportError:
-                        available_mb = 8000.0
-                
-                # ================================================================
-                # AUTO-ENABLE CONDITION 1: Large control matrix (>10 GB)
-                # For datasets like Feng (110K control × 36K genes = 32 GB),
-                # freeze_control significantly reduces per-worker memory.
-                # ================================================================
-                if control_matrix_gb_est > 10.0:
-                    freeze_control = True
-                    logger.info(
-                        f"Auto-enabling freeze_control: large control matrix "
-                        f"({control_n:,} cells × {n_genes:,} genes = {control_matrix_gb_est:.1f} GB > 10 GB threshold)"
-                    )
-                else:
-                    # ================================================================
-                    # AUTO-ENABLE CONDITION 2: Worker count limitation (<4 workers)
-                    # Original logic: enable if parallelization would be severely limited
-                    # ================================================================
-                    base_memory_mb_est = control_matrix_mb_est + 1000
-                    usable_mb = available_mb * 0.8
-                    remaining_mb = max(usable_mb - base_memory_mb_est, per_worker_standard_mb)
-                    max_workers_standard = max(1, int(remaining_mb / per_worker_standard_mb))
-                    
-                    if max_workers_standard < 4 and requested_n_jobs >= 4:
-                        freeze_control = True
-                        logger.info(
-                            f"Auto-enabling freeze_control: standard mode would limit to {max_workers_standard} workers "
-                            f"(control: {control_n:,} cells × {n_genes:,} genes = {control_matrix_mb_est:.0f} MB, "
-                            f"per_worker: {per_worker_standard_mb:.0f} MB). "
-                            f"Frozen control enables ~{requested_n_jobs} workers."
-                        )
-                    else:
-                        freeze_control = False
-            else:
-                freeze_control = False
-        
-        # Check if frozen control mode is valid (after auto-detection)
-        can_use_frozen_control = (
-            freeze_control and 
-            can_use_cache_early and 
-            dispersion_scope == "global" and 
+    if freeze_control is None:
+        # Check if settings are compatible with frozen control
+        settings_compatible = (
+            can_use_cache_early and
+            dispersion_scope == "global" and
             shrink_dispersion
         )
-        
-        # When frozen control is enabled but streaming was not, retroactively
-        # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
-        # streaming avoids that by processing chunks.  The loaded control
-        # matrix is freed because frozen stats replace it.
-        if can_use_frozen_control and not use_streaming_control and control_matrix is not None:
-            use_streaming_control = True
-            del control_matrix
-            control_matrix = None
-            gc.collect()
-            logger.info(
-                "Switching to streaming control statistics for frozen control mode "
-                f"(avoids {control_matrix_gb * 4:.1f} GB dense IRLS peak)."
-            )
-        
-        # Memory estimation for joblib parallel execution
-        # IMPORTANT: joblib's loky backend serializes (pickles) all function arguments
-        # for each worker process. This means control_matrix is copied to each worker,
-        # not shared via copy-on-write as it would be with fork().
-        #
-        # What each worker receives via pickle:
-        # 1. control_cache.control_matrix: (control_n × n_genes) × 8 bytes
-        #    OR with freeze_control=True: frozen stats only (~1MB total)
-        # 2. labels array: n_cells_total strings (pickled as object array)
-        # 3. size_factors: n_cells_total × 8 bytes
-        # 4. Other small arrays (control_offset, etc.)
-        #
-        # What each worker allocates during execution:
-        # 1. group_matrix (loaded from disk, small: ~200 cells × n_genes)
-        # 2. Intermediate arrays for SE recomputation, mu, etc.
-        # 3. When dispersion_scope='per_comparison': full Y and mu matrices
-        #
-        # Pickle overhead is typically 1.5-2× the raw array size due to protocol
-        # serialization and Python object overhead.
-        
-        if can_use_frozen_control:
-            # FROZEN CONTROL MODE: Optimized memory estimation
-            # 
-            # What each worker receives:
-            # 1. control_cache with frozen stats (~1MB): W_sum, Wz_sum, etc.
-            # 2. perturbation_boundaries dict: ~100KB for 10K perturbations
-            # 3. size_factors: still full array (~16MB for 2M cells) - could optimize later
-            # 4. labels: still needed for fallback, but could use boundaries only
-            #
-            # What each worker allocates:
-            # 1. group_matrix from disk: (group_size × n_genes) × 8 bytes
-            # 2. Work arrays: mu, W, z for perturbation cells only
-            # 3. Result arrays: ~n_genes × 8 bytes × 10 arrays
             
-            # Frozen stats: 6 arrays of shape (n_genes,)
-            frozen_stats_mb = n_genes * 8 * 6 / 1e6  # W_sum, Wz_sum, mu_sum, etc.
-            
-            # Cache metadata (beta_intercept, dispersion, pts_rest, etc.)
-            cache_metadata_mb = n_genes * 8 * 5 / 1e6
-            
-            # Perturbation boundaries: ~50 bytes per perturbation
-            boundaries_mb = n_groups * 50 / 1e6
-            
-            # Labels and size_factors (still passed but could be optimized)
-            labels_mb = n_cells_total * 50 / 1e6
-            size_factors_mb = n_cells_total * 8 / 1e6
-            
-            # Serialized args with reduced pickle overhead (simpler objects)
-            control_matrix_mb_for_pickle = frozen_stats_mb + cache_metadata_mb + boundaries_mb
-            serialized_args_mb = (control_matrix_mb_for_pickle + labels_mb + size_factors_mb) * 2.0
-            
-            # Work arrays: only perturbation cells (much smaller!)
-            # mu_pert, W_pert, z_pert, Y_pert_valid for fitting
-            work_arrays_mb = use_group_size * n_genes * 8 * 5 / 1e6
-            
-            # Result arrays per worker
-            result_arrays_mb = n_genes * 8 * 12 / 1e6  # 12 result fields
-            
-            # Reduced Python overhead for frozen control (simpler computation)
-            python_overhead_mb = 500  # 500 MB instead of 2 GB
-            
-            per_worker_mb = serialized_args_mb + work_arrays_mb + result_arrays_mb + python_overhead_mb
-            
-            logger.debug(
-                f"Frozen control memory estimate: serialized={serialized_args_mb:.1f}MB, "
-                f"work_arrays={work_arrays_mb:.1f}MB, per_worker={per_worker_mb:.1f}MB"
-            )
-        else:
-            control_matrix_mb_for_pickle = control_n * n_genes * 8 / 1e6  # float64
-            
-            # Context-aware work arrays based on dispersion mode
-            if can_use_cache_early and dispersion_scope == "global":
-                # Global dispersion: skip MoM/trend, but still need SE recomputation arrays
-                work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
+        if settings_compatible:
+            # Estimate per-worker memory in standard mode (matching actual formula below)
+            control_matrix_mb_est = control_n * n_genes * 8 / 1e6
+            control_matrix_gb_est = control_matrix_mb_est / 1000
+            labels_mb_est = n_cells_total * 50 / 1e6  # ~50 bytes per string
+            size_factors_mb_est = n_cells_total * 8 / 1e6
+            work_arrays_mb_est = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
+            serialized_args_mb_est = (control_matrix_mb_est + labels_mb_est + size_factors_mb_est) * 2.5
+            per_worker_standard_mb = serialized_args_mb_est + work_arrays_mb_est + 2000
+                
+            # Get available memory
+            if memory_limit_gb is not None:
+                available_mb = memory_limit_gb * 1000
             else:
-                # Per-comparison: need full Y and mu matrices for MAP dispersion
-                work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 6 / 1e6
-            
-            # Standard mode: full labels and size_factors arrays
-            labels_mb = n_cells_total * 50 / 1e6  # ~50 bytes per string (pickled)
-            size_factors_mb = n_cells_total * 8 / 1e6
-            
-            # Pickle overhead is 2-3× for complex objects due to Python object structure
-            serialized_args_mb = (control_matrix_mb_for_pickle + labels_mb + size_factors_mb) * 2.5
-            
-            # Per-worker total: serialized args + work arrays + Python/process overhead
-            per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
-        
-        # For base memory and logging
-        control_matrix_mb = control_n * n_genes * 8 / 1e6
-        
-        # Base memory: parent process + one copy of control matrix + misc arrays
-        base_memory_mb = control_matrix_mb + 1000  # Parent process overhead
-        
-        # Calculate available memory
-        if memory_limit_gb is not None:
-            available_mb = memory_limit_gb * 1000
-        else:
-            try:
-                available_mb = _detected_available_bytes() / 1e6
-            except ImportError:
-                available_mb = 8000.0  # 8 GB default
-        
-        # Reserve 20% headroom for safety
-        usable_mb = available_mb * 0.8
-        remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
-        max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
-        
-        # Dataset-size-aware caps
-        full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
-        if full_matrix_gb < 1.0:
-            # Tiny dataset: cap workers to reduce parallelization overhead
-            max_workers_by_size = max(4, n_groups // 2)
-        else:
-            max_workers_by_size = n_groups
-        
-        # Apply all constraints
-        # Use candidates_to_run (not n_groups) for worker limit since that's what we're actually running
-        n_to_run = len(candidates_to_run)
-        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
-        
-        if memory_limited_workers < effective_n_jobs:
-            # Apply memory limiting
-            # Determine limiting factor for logging
-            if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
-                limit_reason = "perturbation_count"
-            elif memory_limited_workers == max_workers_by_memory:
-                limit_reason = "memory"
-            elif memory_limited_workers == max_workers_by_size:
-                limit_reason = "small_dataset"
+                try:
+                    available_mb = _detected_available_bytes() / 1e6
+                except ImportError:
+                    available_mb = 8000.0
+                
+            # ================================================================
+            # AUTO-ENABLE CONDITION 1: Large control matrix (>10 GB)
+            # For datasets like Feng (110K control × 36K genes = 32 GB),
+            # freeze_control significantly reduces per-worker memory.
+            # ================================================================
+            if control_matrix_gb_est > 10.0:
+                freeze_control = True
+                logger.info(
+                    f"Auto-enabling freeze_control: large control matrix "
+                    f"({control_n:,} cells × {n_genes:,} genes = {control_matrix_gb_est:.1f} GB > 10 GB threshold)"
+                )
             else:
-                limit_reason = "perturbation_count"
-            logger.info(
-                f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
-                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
-                f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
-            )
-            effective_n_jobs = memory_limited_workers
-        effective_n_jobs = max(1, effective_n_jobs)
+                # ================================================================
+                # AUTO-ENABLE CONDITION 2: Worker count limitation (<4 workers)
+                # Original logic: enable if parallelization would be severely limited
+                # ================================================================
+                base_memory_mb_est = control_matrix_mb_est + 1000
+                usable_mb = available_mb * 0.8
+                remaining_mb = max(usable_mb - base_memory_mb_est, per_worker_standard_mb)
+                max_workers_standard = max(1, int(remaining_mb / per_worker_standard_mb))
+                    
+                if max_workers_standard < 4 and requested_n_jobs >= 4:
+                    freeze_control = True
+                    logger.info(
+                        f"Auto-enabling freeze_control: standard mode would limit to {max_workers_standard} workers "
+                        f"(control: {control_n:,} cells × {n_genes:,} genes = {control_matrix_mb_est:.0f} MB, "
+                        f"per_worker: {per_worker_standard_mb:.0f} MB). "
+                        f"Frozen control enables ~{requested_n_jobs} workers."
+                    )
+                else:
+                    freeze_control = False
+        else:
+            freeze_control = False
         
-        # For small number of perturbations to run, run sequentially to avoid overhead
-        use_parallel = n_to_run >= 4 and effective_n_jobs > 1
+    # Check if frozen control mode is valid (after auto-detection)
+    can_use_frozen_control = (
+        freeze_control and 
+        can_use_cache_early and 
+        dispersion_scope == "global" and 
+        shrink_dispersion
+    )
         
-        # Decide whether to use control cache optimization
-        # Control cache is used when: no covariates, use_control_cache=True, global SF
-        # Per-comparison size factors require fresh computation per comparison
-        can_use_cache = (
-            use_control_cache and 
-            len(covariates) == 0 and
-            size_factor_scope == "global"
+    # When frozen control is enabled but streaming was not, retroactively
+    # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
+    # streaming avoids that by processing chunks.  The loaded control
+    # matrix is freed because frozen stats replace it.
+    if can_use_frozen_control and not use_streaming_control and control_matrix is not None:
+        use_streaming_control = True
+        del control_matrix
+        control_matrix = None
+        gc.collect()
+        logger.info(
+            "Switching to streaming control statistics for frozen control mode "
+            f"(avoids {control_matrix_gb * 4:.1f} GB dense IRLS peak)."
+        )
+
+    shape = (n_groups, n_genes)
+    _nb_glm_disk_estimate = warn_if_disk_space_low(
+        _nb_glm_disk_bytes(*shape),
+        output_path,
+        context="nb_glm_test",
+    )
+    _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
+    # Per-perturbation results live beside the output until the run finishes,
+    # so an interrupted run resumes from its last checkpoint.
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        # freeze_control is resolved from free memory above; a resume must
+        # fit the remaining rows with the same model as the saved ones.
+        fingerprint=_de_fingerprint(
+            path, call_args, method="nb_glm", candidates=candidates, n_genes=n_genes,
+            frozen_control=bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control)),
+            streaming_control=bool(use_streaming_control),
+        ),
+        arrays={
+            "statistic": (shape, np.float64, np.nan),
+            "pvalue": (shape, np.float64, np.nan),
+            "pvalue_adj": (shape, np.float64, np.nan),
+            "logfoldchange": (shape, np.float64, np.nan),
+            "logfoldchange_raw": (shape, np.float64, np.nan),
+            "intercept": (shape, np.float64, np.nan),  # MLE intercept for shrink_lfc
+            "standard_error": (shape, np.float64, np.nan),
+            "dispersion": (shape, np.float64, np.nan),
+            "dispersion_raw": (shape, np.float64, np.nan),
+            "dispersion_trend": (shape, np.float64, np.nan),
+            "pts": (shape, np.float32, 0),
+            "iterations": (shape, np.int32, 0),
+            "converged": (shape, np.bool_, False),
+        },
+        resume=resume,
+    )
+    # Earlier failures are retried, so only completions carry over.
+    completed_labels: list[str] = run.progress.get("completed", [])
+    candidates_to_run = [c for c in candidates if c not in set(completed_labels)]
+    if run.resumed:
+        _messages.vprint(verbose, "nb_glm_test", f"Resuming: {len(completed_labels)}/{n_groups} perturbations already done")
+    statistic_memmap = run.arrays["statistic"]
+    pvalue_memmap = run.arrays["pvalue"]
+    logfc_memmap = run.arrays["logfoldchange"]
+    logfc_raw_memmap = run.arrays["logfoldchange_raw"]
+    intercept_memmap = run.arrays["intercept"]
+    se_memmap = run.arrays["standard_error"]
+    pts_memmap = run.arrays["pts"]
+    dispersion_memmap = run.arrays["dispersion"]
+    dispersion_raw_memmap = run.arrays["dispersion_raw"]
+    dispersion_trend_memmap = run.arrays["dispersion_trend"]
+    iter_memmap = run.arrays["iterations"]
+    convergence_memmap = run.arrays["converged"]
+        
+    # Memory estimation for joblib parallel execution
+    # IMPORTANT: joblib's loky backend serializes (pickles) all function arguments
+    # for each worker process. This means control_matrix is copied to each worker,
+    # not shared via copy-on-write as it would be with fork().
+    #
+    # What each worker receives via pickle:
+    # 1. control_cache.control_matrix: (control_n × n_genes) × 8 bytes
+    #    OR with freeze_control=True: frozen stats only (~1MB total)
+    # 2. labels array: n_cells_total strings (pickled as object array)
+    # 3. size_factors: n_cells_total × 8 bytes
+    # 4. Other small arrays (control_offset, etc.)
+    #
+    # What each worker allocates during execution:
+    # 1. group_matrix (loaded from disk, small: ~200 cells × n_genes)
+    # 2. Intermediate arrays for SE recomputation, mu, etc.
+    # 3. When dispersion_scope='per_comparison': full Y and mu matrices
+    #
+    # Pickle overhead is typically 1.5-2× the raw array size due to protocol
+    # serialization and Python object overhead.
+        
+    if can_use_frozen_control:
+        # FROZEN CONTROL MODE: Optimized memory estimation
+        # 
+        # What each worker receives:
+        # 1. control_cache with frozen stats (~1MB): W_sum, Wz_sum, etc.
+        # 2. perturbation_boundaries dict: ~100KB for 10K perturbations
+        # 3. size_factors: still full array (~16MB for 2M cells) - could optimize later
+        # 4. labels: still needed for fallback, but could use boundaries only
+        #
+        # What each worker allocates:
+        # 1. group_matrix from disk: (group_size × n_genes) × 8 bytes
+        # 2. Work arrays: mu, W, z for perturbation cells only
+        # 3. Result arrays: ~n_genes × 8 bytes × 10 arrays
+            
+        # Frozen stats: 6 arrays of shape (n_genes,)
+        frozen_stats_mb = n_genes * 8 * 6 / 1e6  # W_sum, Wz_sum, mu_sum, etc.
+            
+        # Cache metadata (beta_intercept, dispersion, pts_rest, etc.)
+        cache_metadata_mb = n_genes * 8 * 5 / 1e6
+            
+        # Perturbation boundaries: ~50 bytes per perturbation
+        boundaries_mb = n_groups * 50 / 1e6
+            
+        # Labels and size_factors (still passed but could be optimized)
+        labels_mb = n_cells_total * 50 / 1e6
+        size_factors_mb = n_cells_total * 8 / 1e6
+            
+        # Serialized args with reduced pickle overhead (simpler objects)
+        control_matrix_mb_for_pickle = frozen_stats_mb + cache_metadata_mb + boundaries_mb
+        serialized_args_mb = (control_matrix_mb_for_pickle + labels_mb + size_factors_mb) * 2.0
+            
+        # Work arrays: only perturbation cells (much smaller!)
+        # mu_pert, W_pert, z_pert, Y_pert_valid for fitting
+        work_arrays_mb = use_group_size * n_genes * 8 * 5 / 1e6
+            
+        # Result arrays per worker
+        result_arrays_mb = n_genes * 8 * 12 / 1e6  # 12 result fields
+            
+        # Reduced Python overhead for frozen control (simpler computation)
+        python_overhead_mb = 500  # 500 MB instead of 2 GB
+            
+        per_worker_mb = serialized_args_mb + work_arrays_mb + result_arrays_mb + python_overhead_mb
+            
+        logger.debug(
+            f"Frozen control memory estimate: serialized={serialized_args_mb:.1f}MB, "
+            f"work_arrays={work_arrays_mb:.1f}MB, per_worker={per_worker_mb:.1f}MB"
+        )
+    else:
+        control_matrix_mb_for_pickle = control_n * n_genes * 8 / 1e6  # float64
+            
+        # Context-aware work arrays based on dispersion mode
+        if can_use_cache_early and dispersion_scope == "global":
+            # Global dispersion: skip MoM/trend, but still need SE recomputation arrays
+            work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
+        else:
+            # Per-comparison: need full Y and mu matrices for MAP dispersion
+            work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 6 / 1e6
+            
+        # Standard mode: full labels and size_factors arrays
+        labels_mb = n_cells_total * 50 / 1e6  # ~50 bytes per string (pickled)
+        size_factors_mb = n_cells_total * 8 / 1e6
+            
+        # Pickle overhead is 2-3× for complex objects due to Python object structure
+        serialized_args_mb = (control_matrix_mb_for_pickle + labels_mb + size_factors_mb) * 2.5
+            
+        # Per-worker total: serialized args + work arrays + Python/process overhead
+        per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
+        
+    # For base memory and logging
+    control_matrix_mb = control_n * n_genes * 8 / 1e6
+        
+    # Base memory: parent process + one copy of control matrix + misc arrays
+    base_memory_mb = control_matrix_mb + 1000  # Parent process overhead
+        
+    # Calculate available memory
+    if memory_limit_gb is not None:
+        available_mb = memory_limit_gb * 1000
+    else:
+        try:
+            available_mb = _detected_available_bytes() / 1e6
+        except ImportError:
+            available_mb = 8000.0  # 8 GB default
+        
+    # Reserve 20% headroom for safety
+    usable_mb = available_mb * 0.8
+    remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
+    max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
+        
+    # Dataset-size-aware caps
+    full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
+    if full_matrix_gb < 1.0:
+        # Tiny dataset: cap workers to reduce parallelization overhead
+        max_workers_by_size = max(4, n_groups // 2)
+    else:
+        max_workers_by_size = n_groups
+        
+    # Apply all constraints
+    # Use candidates_to_run (not n_groups) for worker limit since that's what we're actually running
+    n_to_run = len(candidates_to_run)
+    memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
+        
+    if memory_limited_workers < effective_n_jobs:
+        # Apply memory limiting
+        # Determine limiting factor for logging
+        if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
+            limit_reason = "perturbation_count"
+        elif memory_limited_workers == max_workers_by_memory:
+            limit_reason = "memory"
+        elif memory_limited_workers == max_workers_by_size:
+            limit_reason = "small_dataset"
+        else:
+            limit_reason = "perturbation_count"
+        logger.info(
+            f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
+            f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
+            f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
+        )
+        effective_n_jobs = memory_limited_workers
+    effective_n_jobs = max(1, effective_n_jobs)
+        
+    # For small number of perturbations to run, run sequentially to avoid overhead
+    use_parallel = n_to_run >= 4 and effective_n_jobs > 1
+        
+    # Decide whether to use control cache optimization
+    # Control cache is used when: no covariates, use_control_cache=True, global SF
+    # Per-comparison size factors require fresh computation per comparison
+    can_use_cache = (
+        use_control_cache and 
+        len(covariates) == 0 and
+        size_factor_scope == "global"
+    )
+        
+    # =====================================================================
+    # Early memory check: determine if we need streaming mode
+    # =====================================================================
+    # For very large datasets (e.g., Replogle-GW-k562: 2M cells × 8K genes),
+    # loading the full matrix would exceed memory. Check this ONCE before
+    # any full matrix loads (full_X for per-comparison SF, all_cell_matrix
+    # for global dispersion).
+    estimated_matrix_gb = n_cells_total * n_genes * 8 / 1e9  # float64
+    if memory_limit_gb is not None:
+        effective_memory_limit_gb = min(available_mb / 1000, memory_limit_gb)
+    else:
+        effective_memory_limit_gb = available_mb / 1000
+    memory_budget_gb = max_dense_fraction * effective_memory_limit_gb
+    use_streaming_mode = estimated_matrix_gb > memory_budget_gb
+        
+    if use_streaming_mode:
+        logger.info(
+            f"Large dataset detected: {n_cells_total:,} cells × {n_genes:,} genes = "
+            f"{estimated_matrix_gb:.1f} GB > {memory_budget_gb:.1f} GB budget. "
+            f"Using streaming mode for memory efficiency."
         )
         
-        # =====================================================================
-        # Early memory check: determine if we need streaming mode
-        # =====================================================================
-        # For very large datasets (e.g., Replogle-GW-k562: 2M cells × 8K genes),
-        # loading the full matrix would exceed memory. Check this ONCE before
-        # any full matrix loads (full_X for per-comparison SF, all_cell_matrix
-        # for global dispersion).
-        estimated_matrix_gb = n_cells_total * n_genes * 8 / 1e9  # float64
-        if memory_limit_gb is not None:
-            effective_memory_limit_gb = min(available_mb / 1000, memory_limit_gb)
-        else:
-            effective_memory_limit_gb = available_mb / 1000
-        memory_budget_gb = max_dense_fraction * effective_memory_limit_gb
-        use_streaming_mode = estimated_matrix_gb > memory_budget_gb
-        
+    # For per-comparison size factors, we need the full count matrix
+    # Skip if streaming mode - worker will fall back to global SF
+    if size_factor_scope == "per_comparison":
         if use_streaming_mode:
-            logger.info(
-                f"Large dataset detected: {n_cells_total:,} cells × {n_genes:,} genes = "
-                f"{estimated_matrix_gb:.1f} GB > {memory_budget_gb:.1f} GB budget. "
-                f"Using streaming mode for memory efficiency."
+            logger.warning(
+                f"Dataset too large ({estimated_matrix_gb:.1f} GB) for per-comparison "
+                f"size factors (requires loading full matrix). "
+                f"Falling back to global size factors for memory efficiency."
             )
+            full_X = None  # Worker will use global SF
+        else:
+            logger.info("Using per-comparison size factors for PyDESeq2 compatibility...")
+            backed = read_backed(path)
+            try:
+                full_X = backed.X[:]
+                if sp.issparse(full_X):
+                    full_X = sp.csr_matrix(full_X, dtype=np.float64)
+                else:
+                    full_X = np.asarray(full_X, dtype=np.float64)
+            finally:
+                backed.file.close()
+    else:
+        full_X = None
         
-        # For per-comparison size factors, we need the full count matrix
-        # Skip if streaming mode - worker will fall back to global SF
-        if size_factor_scope == "per_comparison":
-            if use_streaming_mode:
-                logger.warning(
-                    f"Dataset too large ({estimated_matrix_gb:.1f} GB) for per-comparison "
-                    f"size factors (requires loading full matrix). "
-                    f"Falling back to global size factors for memory efficiency."
+    # Precompute control statistics once if using cache
+    control_cache = None
+    if can_use_cache:
+        # Validate freeze_control requirements (for explicit freeze_control=True)
+        if freeze_control:
+            if dispersion_scope != "global":
+                raise ValueError(
+                    "freeze_control=True requires dispersion_scope='global'. "
+                    "Per-comparison dispersion needs raw control matrix."
                 )
-                full_X = None  # Worker will use global SF
+            if not shrink_dispersion:
+                raise ValueError(
+                    "freeze_control=True requires shrink_dispersion=True. "
+                    "Global dispersion must be computed for frozen control mode."
+                )
+            # Note: Auto-detected freeze_control already logged in auto-detection block
+            
+        logger.info("Precomputing control cell statistics for cache optimization...")
+        control_offset_arr = offset[control_mask]
+        if use_streaming_control:
+            # Streaming path: read control cells from disk in chunks
+            # Forces freeze_control=True (raw matrix never materialised)
+            if not freeze_control:
+                logger.info(
+                    "Forcing freeze_control=True for streaming control statistics "
+                    "(raw control matrix too large to fit in memory)."
+                )
+                freeze_control = True
+            control_cache = precompute_control_statistics_streaming(
+                path=path,
+                control_mask=control_mask,
+                control_offset=control_offset_arr,
+                max_iter=max_iter,
+                tol=tol,
+                min_mu=min_mu,
+                global_size_factors=size_factors,
+                freeze_control=True,
+            )
+            drop_file_cache(path)  # Free page cache from streaming IRLS
+        else:
+            control_cache = precompute_control_statistics(
+                control_matrix=control_matrix,
+                control_offset=control_offset_arr,
+                max_iter=max_iter,
+                tol=tol,
+                min_mu=min_mu,
+                dispersion_method="moments",  # Fast initial estimate
+                global_size_factors=size_factors,  # Store global SF in cache
+                freeze_control=freeze_control,  # Enable frozen control mode
+            )
+            # If frozen control, the cache holds sufficient statistics —
+            # the raw control_matrix is no longer needed.
+            if freeze_control and control_matrix is not None:
+                del control_matrix
+                control_matrix = None
+                gc.collect()
+            
+        # Precompute global dispersion if dispersion_scope='global'
+        if dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
+            logger.info("Precomputing global dispersion trend (dispersion_scope='global')...")
+                
+            if use_streaming_mode:
+                # Use path-based streaming for large datasets
+                # Reads chunks from disk, never loads full matrix
+                control_cache = precompute_global_dispersion_from_path(
+                    path=path,
+                    control_cache=control_cache,
+                    all_cell_offset=offset,
+                    fit_type="parametric",
+                )
+                drop_file_cache(path)  # Free page cache from streaming reads
             else:
-                logger.info("Using per-comparison size factors for PyDESeq2 compatibility...")
+                # Load all cells for global dispersion estimation
                 backed = read_backed(path)
                 try:
-                    full_X = backed.X[:]
-                    if sp.issparse(full_X):
-                        full_X = sp.csr_matrix(full_X, dtype=np.float64)
+                    all_cell_matrix = backed.X[:]
+                    if sp.issparse(all_cell_matrix):
+                        all_cell_matrix = sp.csr_matrix(all_cell_matrix, dtype=np.float64)
                     else:
-                        full_X = np.asarray(full_X, dtype=np.float64)
+                        all_cell_matrix = np.asarray(all_cell_matrix, dtype=np.float64)
                 finally:
                     backed.file.close()
-        else:
-            full_X = None
-        
-        # Precompute control statistics once if using cache
-        control_cache = None
-        if can_use_cache:
-            # Validate freeze_control requirements (for explicit freeze_control=True)
-            if freeze_control:
-                if dispersion_scope != "global":
-                    raise ValueError(
-                        "freeze_control=True requires dispersion_scope='global'. "
-                        "Per-comparison dispersion needs raw control matrix."
-                    )
-                if not shrink_dispersion:
-                    raise ValueError(
-                        "freeze_control=True requires shrink_dispersion=True. "
-                        "Global dispersion must be computed for frozen control mode."
-                    )
-                # Note: Auto-detected freeze_control already logged in auto-detection block
-            
-            logger.info("Precomputing control cell statistics for cache optimization...")
-            control_offset_arr = offset[control_mask]
-            if use_streaming_control:
-                # Streaming path: read control cells from disk in chunks
-                # Forces freeze_control=True (raw matrix never materialised)
-                if not freeze_control:
-                    logger.info(
-                        "Forcing freeze_control=True for streaming control statistics "
-                        "(raw control matrix too large to fit in memory)."
-                    )
-                    freeze_control = True
-                control_cache = precompute_control_statistics_streaming(
-                    path=path,
-                    control_mask=control_mask,
-                    control_offset=control_offset_arr,
-                    max_iter=max_iter,
-                    tol=tol,
-                    min_mu=min_mu,
-                    global_size_factors=size_factors,
-                    freeze_control=True,
-                )
-                drop_file_cache(path)  # Free page cache from streaming IRLS
-            else:
-                control_cache = precompute_control_statistics(
-                    control_matrix=control_matrix,
-                    control_offset=control_offset_arr,
-                    max_iter=max_iter,
-                    tol=tol,
-                    min_mu=min_mu,
-                    dispersion_method="moments",  # Fast initial estimate
-                    global_size_factors=size_factors,  # Store global SF in cache
-                    freeze_control=freeze_control,  # Enable frozen control mode
-                )
-                # If frozen control, the cache holds sufficient statistics —
-                # the raw control_matrix is no longer needed.
-                if freeze_control and control_matrix is not None:
-                    del control_matrix
-                    control_matrix = None
-                    gc.collect()
-            
-            # Precompute global dispersion if dispersion_scope='global'
-            if dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
-                logger.info("Precomputing global dispersion trend (dispersion_scope='global')...")
-                
-                if use_streaming_mode:
-                    # Use path-based streaming for large datasets
-                    # Reads chunks from disk, never loads full matrix
-                    control_cache = precompute_global_dispersion_from_path(
-                        path=path,
-                        control_cache=control_cache,
-                        all_cell_offset=offset,
-                        fit_type="parametric",
-                    )
-                    drop_file_cache(path)  # Free page cache from streaming reads
-                else:
-                    # Load all cells for global dispersion estimation
-                    backed = read_backed(path)
-                    try:
-                        all_cell_matrix = backed.X[:]
-                        if sp.issparse(all_cell_matrix):
-                            all_cell_matrix = sp.csr_matrix(all_cell_matrix, dtype=np.float64)
-                        else:
-                            all_cell_matrix = np.asarray(all_cell_matrix, dtype=np.float64)
-                    finally:
-                        backed.file.close()
                     
-                    # Compute global dispersion using all cells
-                    # Use fast_mode=True for speed (MoM + trend shrinkage instead of MAP)
-                    # Memory-adaptive: switches to streaming if matrix too large
-                    control_cache = precompute_global_dispersion(
-                        control_cache=control_cache,
-                        all_cell_matrix=all_cell_matrix,
-                        all_cell_offset=offset,
-                        n_grid=25,
-                        fit_type="parametric",
-                        fast_mode=True,  # ~50× faster than full MAP
-                        max_dense_fraction=max_dense_fraction,
-                        memory_limit_gb=memory_limit_gb,
-                    )
-                    del all_cell_matrix  # Free memory
-                    gc.collect()  # Force garbage collection before spawning workers
-                    drop_file_cache(path)  # Free page cache from full matrix read
+                # Compute global dispersion using all cells
+                # Use fast_mode=True for speed (MoM + trend shrinkage instead of MAP)
+                # Memory-adaptive: switches to streaming if matrix too large
+                control_cache = precompute_global_dispersion(
+                    control_cache=control_cache,
+                    all_cell_matrix=all_cell_matrix,
+                    all_cell_offset=offset,
+                    n_grid=25,
+                    fit_type="parametric",
+                    fast_mode=True,  # ~50× faster than full MAP
+                    max_dense_fraction=max_dense_fraction,
+                    memory_limit_gb=memory_limit_gb,
+                )
+                del all_cell_matrix  # Free memory
+                gc.collect()  # Force garbage collection before spawning workers
+                drop_file_cache(path)  # Free page cache from full matrix read
                 
-                logger.info(f"Global dispersion precomputed: prior_var={control_cache.global_disp_prior_var:.4f}")
+            logger.info(f"Global dispersion precomputed: prior_var={control_cache.global_disp_prior_var:.4f}")
         
-        # Log progress info
-        if resume and completed_labels:
-            logger.info(f"Fitting {n_to_run}/{n_groups} remaining perturbations with {effective_n_jobs} workers...")
+    # Log progress info
+    if resume and completed_labels:
+        logger.info(f"Fitting {n_to_run}/{n_groups} remaining perturbations with {effective_n_jobs} workers...")
+    else:
+        logger.info(f"Fitting {n_groups} perturbations with {effective_n_jobs} workers...")
+        
+    # Track completed labels during this run
+    newly_completed = list(completed_labels)  # Start with already completed
+    newly_failed: list[str] = []
+    n_processed = 0
+        
+    # Helper function to write result to memmap
+    def _write_result_to_memmap(res: dict, label: str) -> None:
+        idx = candidate_to_idx[label]
+        statistic_memmap[idx, :] = res["statistic"]
+        pvalue_memmap[idx, :] = res["pvalue"]
+        logfc_memmap[idx, :] = res["logfc"]
+        logfc_raw_memmap[idx, :] = res["logfc_raw"]
+        intercept_memmap[idx, :] = res["intercept"]  # MLE intercept for shrink_lfc
+        se_memmap[idx, :] = res["se"]
+        pts_memmap[idx, :] = res["pts"]
+        dispersion_memmap[idx, :] = res["dispersion"]
+        dispersion_raw_memmap[idx, :] = res["dispersion_raw"]
+        dispersion_trend_memmap[idx, :] = res["dispersion_trend"]
+        iter_memmap[idx, :] = res["iterations"]
+        convergence_memmap[idx, :] = res["converged"]
+        
+    # Helper to save checkpoint
+    def _save_checkpoint() -> None:
+        checkpoint_data = {
+            "total": n_groups,
+            "completed": newly_completed,
+            "failed": newly_failed,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        run.save(**checkpoint_data)
+        
+    # Run fitting with progress tracking
+    n_tested_list: list[int] = []
+    with _create_progress_context(n_to_run, "NB-GLM DE", verbose) as pbar:
+        if use_parallel:
+            # Use joblib.Parallel with loky backend for true process-based parallelism
+            # This avoids GIL contention that limits ThreadPoolExecutor performance
+            if can_use_cache:
+                results = Parallel(
+                    n_jobs=effective_n_jobs,
+                    backend="loky",
+                    prefer="processes",
+                    return_as="generator",  # Stream results for progress updates
+                )(
+                    delayed(_fit_perturbation_worker_cached)(
+                        group_idx=candidate_to_idx[label],
+                        label=label,
+                        path=path,
+                        labels=labels,
+                        control_cache=control_cache,
+                        size_factors=size_factors,
+                        n_genes=n_genes,
+                        min_cells_expressed=min_cells_expressed,
+                        min_pct_ctrl=min_pct_ctrl,
+                        min_pct_pert=min_pct_pert,
+                        min_mean_ctrl=min_mean_ctrl,
+                        min_mean_pert=min_mean_pert,
+                        min_cells_ctrl=min_cells_ctrl,
+                        min_cells_pert=min_cells_pert,
+                        min_total_count=min_total_count,
+                        max_iter=max_iter,
+                        tol=tol,
+                        min_mu=min_mu,
+                        dispersion_method=dispersion_method,
+                        shrink_dispersion=shrink_dispersion,
+                        use_map_dispersion=use_map_dispersion,
+                        lfc_shrinkage_type=lfc_shrinkage_type,
+                        se_method=se_method,
+                        perturbation_boundaries=perturbation_boundaries,
+                    )
+                    for label in candidates_to_run
+                )
+            else:
+                results = Parallel(
+                    n_jobs=effective_n_jobs,
+                    backend="loky",
+                    prefer="processes",
+                    return_as="generator",
+                )(
+                    delayed(_fit_perturbation_worker)(
+                        group_idx=candidate_to_idx[label],
+                        label=label,
+                        path=path,
+                        labels=labels,
+                        control_mask=control_mask,
+                        control_matrix=control_matrix,
+                        control_expr_counts=control_expr_counts,
+                        control_n=control_n,
+                        obs_df=obs_df,
+                        covariates=covariates,
+                        size_factors=size_factors,
+                        offset=offset,
+                        n_genes=n_genes,
+                        min_cells_expressed=min_cells_expressed,
+                        min_pct_ctrl=min_pct_ctrl,
+                        min_pct_pert=min_pct_pert,
+                        min_mean_ctrl=min_mean_ctrl,
+                        min_mean_pert=min_mean_pert,
+                        min_cells_ctrl=min_cells_ctrl,
+                        min_cells_pert=min_cells_pert,
+                        min_total_count=min_total_count,
+                        max_iter=max_iter,
+                        tol=tol,
+                        poisson_init_iter=poisson_init_iter,
+                        dispersion_method=dispersion_method,
+                        global_dispersion=global_dispersion,
+                        shrink_dispersion=shrink_dispersion,
+                        use_map_dispersion=use_map_dispersion,
+                        lfc_shrinkage_type=lfc_shrinkage_type,
+                        pts_rest_shared=pts_rest_shared,
+                        full_X=full_X,
+                        per_comparison_sf=(size_factor_scope == "per_comparison"),
+                        se_method=se_method,
+                        perturbation_boundaries=perturbation_boundaries,
+                    )
+                    for label in candidates_to_run
+                )
+                
+            # Process results as they stream in
+            for idx, res in enumerate(results):
+                label = candidates_to_run[idx]
+                try:
+                    _write_result_to_memmap(res, label)
+                    newly_completed.append(label)
+                    n_tested_list.append(res.get("n_tested", 0))
+                    _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
+                    logger.debug(f"Completed perturbation: {label}")
+                except Exception as e:
+                    logger.error(f"Failed perturbation {label}: {e}")
+                    newly_failed.append(label)
+                    
+                n_processed += 1
+                pbar.update(1)
+                    
+                # Save checkpoint periodically
+                if n_processed % eff_checkpoint_interval == 0:
+                    _save_checkpoint()
         else:
-            logger.info(f"Fitting {n_groups} perturbations with {effective_n_jobs} workers...")
-        
-        # Track completed labels during this run
-        newly_completed = list(completed_labels)  # Start with already completed
-        newly_failed = list(failed_labels)
-        n_processed = 0
-        
-        # Helper function to write result to memmap
-        def _write_result_to_memmap(res: dict, label: str) -> None:
-            idx = candidate_to_idx[label]
-            effect_memmap[idx, :] = res["effect"]
-            statistic_memmap[idx, :] = res["statistic"]
-            pvalue_memmap[idx, :] = res["pvalue"]
-            logfc_memmap[idx, :] = res["logfc"]
-            logfc_raw_memmap[idx, :] = res["logfc_raw"]
-            intercept_memmap[idx, :] = res["intercept"]  # MLE intercept for shrink_lfc
-            se_memmap[idx, :] = res["se"]
-            pts_memmap[idx, :] = res["pts"]
-            pts_rest_memmap[idx, :] = res["pts_rest"]
-            dispersion_memmap[idx, :] = res["dispersion"]
-            dispersion_raw_memmap[idx, :] = res["dispersion_raw"]
-            dispersion_trend_memmap[idx, :] = res["dispersion_trend"]
-            mean_memmap[idx, :] = res["mean"]
-            iter_memmap[idx, :] = res["iterations"]
-            convergence_memmap[idx, :] = res["converged"]
-        
-        # Helper to save checkpoint
-        def _save_checkpoint() -> None:
-            checkpoint_data = {
-                "total": n_groups,
-                "completed": newly_completed,
-                "failed": newly_failed,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "method": "nb_glm",
-                "control_label": control_label,
-            }
-            _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
-        
-        # Run fitting with progress tracking
-        n_tested_list: list[int] = []
-        with _create_progress_context(n_to_run, "NB-GLM DE", verbose) as pbar:
-            if use_parallel:
-                # Use joblib.Parallel with loky backend for true process-based parallelism
-                # This avoids GIL contention that limits ThreadPoolExecutor performance
-                if can_use_cache:
-                    results = Parallel(
-                        n_jobs=effective_n_jobs,
-                        backend="loky",
-                        prefer="processes",
-                        return_as="generator",  # Stream results for progress updates
-                    )(
-                        delayed(_fit_perturbation_worker_cached)(
-                            group_idx=candidate_to_idx[label],
+            # Run sequentially
+            for label in candidates_to_run:
+                group_idx = candidate_to_idx[label]
+                try:
+                    if can_use_cache:
+                        res = _fit_perturbation_worker_cached(
+                            group_idx=group_idx,
                             label=label,
                             path=path,
                             labels=labels,
@@ -3512,17 +3623,9 @@ def nb_glm_test(
                             se_method=se_method,
                             perturbation_boundaries=perturbation_boundaries,
                         )
-                        for label in candidates_to_run
-                    )
-                else:
-                    results = Parallel(
-                        n_jobs=effective_n_jobs,
-                        backend="loky",
-                        prefer="processes",
-                        return_as="generator",
-                    )(
-                        delayed(_fit_perturbation_worker)(
-                            group_idx=candidate_to_idx[label],
+                    else:
+                        res = _fit_perturbation_worker(
+                            group_idx=group_idx,
                             label=label,
                             path=path,
                             labels=labels,
@@ -3545,6 +3648,7 @@ def nb_glm_test(
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
+                            min_mu=min_mu,
                             poisson_init_iter=poisson_init_iter,
                             dispersion_method=dispersion_method,
                             global_dispersion=global_dispersion,
@@ -3557,182 +3661,110 @@ def nb_glm_test(
                             se_method=se_method,
                             perturbation_boundaries=perturbation_boundaries,
                         )
-                        for label in candidates_to_run
-                    )
-                
-                # Process results as they stream in
-                for idx, res in enumerate(results):
-                    label = candidates_to_run[idx]
-                    try:
-                        _write_result_to_memmap(res, label)
-                        newly_completed.append(label)
-                        n_tested_list.append(res.get("n_tested", 0))
-                        _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
-                        logger.debug(f"Completed perturbation: {label}")
-                    except Exception as e:
-                        logger.error(f"Failed perturbation {label}: {e}")
-                        newly_failed.append(label)
+                    _write_result_to_memmap(res, label)
+                    newly_completed.append(label)
+                    n_tested_list.append(res.get("n_tested", 0))
+                    _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
+                    logger.debug(f"Completed perturbation: {label}")
+                except Exception as e:
+                    logger.error(f"Failed perturbation {label}: {e}")
+                    newly_failed.append(label)
                     
-                    n_processed += 1
-                    pbar.update(1)
+                n_processed += 1
+                pbar.update(1)
                     
-                    # Save checkpoint periodically
-                    if n_processed % eff_checkpoint_interval == 0:
-                        _save_checkpoint()
-            else:
-                # Run sequentially
-                for label in candidates_to_run:
-                    group_idx = candidate_to_idx[label]
-                    try:
-                        if can_use_cache:
-                            res = _fit_perturbation_worker_cached(
-                                group_idx=group_idx,
-                                label=label,
-                                path=path,
-                                labels=labels,
-                                control_cache=control_cache,
-                                size_factors=size_factors,
-                                n_genes=n_genes,
-                                min_cells_expressed=min_cells_expressed,
-                                min_pct_ctrl=min_pct_ctrl,
-                                min_pct_pert=min_pct_pert,
-                                min_mean_ctrl=min_mean_ctrl,
-                                min_mean_pert=min_mean_pert,
-                                min_cells_ctrl=min_cells_ctrl,
-                                min_cells_pert=min_cells_pert,
-                                min_total_count=min_total_count,
-                                max_iter=max_iter,
-                                tol=tol,
-                                min_mu=min_mu,
-                                dispersion_method=dispersion_method,
-                                shrink_dispersion=shrink_dispersion,
-                                use_map_dispersion=use_map_dispersion,
-                                lfc_shrinkage_type=lfc_shrinkage_type,
-                                se_method=se_method,
-                                perturbation_boundaries=perturbation_boundaries,
-                            )
-                        else:
-                            res = _fit_perturbation_worker(
-                                group_idx=group_idx,
-                                label=label,
-                                path=path,
-                                labels=labels,
-                                control_mask=control_mask,
-                                control_matrix=control_matrix,
-                                control_expr_counts=control_expr_counts,
-                                control_n=control_n,
-                                obs_df=obs_df,
-                                covariates=covariates,
-                                size_factors=size_factors,
-                                offset=offset,
-                                n_genes=n_genes,
-                                min_cells_expressed=min_cells_expressed,
-                                min_pct_ctrl=min_pct_ctrl,
-                                min_pct_pert=min_pct_pert,
-                                min_mean_ctrl=min_mean_ctrl,
-                                min_mean_pert=min_mean_pert,
-                                min_cells_ctrl=min_cells_ctrl,
-                                min_cells_pert=min_cells_pert,
-                                min_total_count=min_total_count,
-                                max_iter=max_iter,
-                                tol=tol,
-                                min_mu=min_mu,
-                                poisson_init_iter=poisson_init_iter,
-                                dispersion_method=dispersion_method,
-                                global_dispersion=global_dispersion,
-                                shrink_dispersion=shrink_dispersion,
-                                use_map_dispersion=use_map_dispersion,
-                                lfc_shrinkage_type=lfc_shrinkage_type,
-                                pts_rest_shared=pts_rest_shared,
-                                full_X=full_X,
-                                per_comparison_sf=(size_factor_scope == "per_comparison"),
-                                se_method=se_method,
-                                perturbation_boundaries=perturbation_boundaries,
-                            )
-                        _write_result_to_memmap(res, label)
-                        newly_completed.append(label)
-                        n_tested_list.append(res.get("n_tested", 0))
-                        _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
-                        logger.debug(f"Completed perturbation: {label}")
-                    except Exception as e:
-                        logger.error(f"Failed perturbation {label}: {e}")
-                        newly_failed.append(label)
-                    
-                    n_processed += 1
-                    pbar.update(1)
-                    
-                    # Save checkpoint periodically
-                    if n_processed % eff_checkpoint_interval == 0:
-                        _save_checkpoint()
+                # Save checkpoint periodically
+                if n_processed % eff_checkpoint_interval == 0:
+                    _save_checkpoint()
         
-        # Final checkpoint save
-        _save_checkpoint()
-        logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
-        _print_de_summary(verbose, "NB-GLM DE", len(newly_completed), n_groups, n_tested_list, n_genes)
-        if newly_failed:
-            logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
+    # Final checkpoint save
+    _save_checkpoint()
+    logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
+    _print_de_summary(verbose, "NB-GLM DE", len(newly_completed), n_groups, n_tested_list, n_genes)
+    if newly_failed:
+        logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
 
-        pvalue_adj_memmap = np.memmap(
-            tmp_path / "pvalue_adj.dat", mode="w+", dtype=np.float64, shape=(n_groups, n_genes)
-        )
-        _adjust_pvalue_matrix(pvalue_memmap, corr_method, out=pvalue_adj_memmap)
+    pvalue_adj_memmap = run.arrays["pvalue_adj"]
+    _adjust_pvalue_matrix(pvalue_memmap, corr_method, out=pvalue_adj_memmap)
 
-        gene_symbols = pd.Index(gene_symbols).astype(str)
-        statistic_for_order = np.where(
-            np.isfinite(statistic_memmap), np.abs(statistic_memmap), -np.inf
-        )
-        order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+    statistic_for_order = np.where(
+        np.isfinite(statistic_memmap), np.abs(statistic_memmap), -np.inf
+    )
+    order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
 
-        effect_matrix = np.array(effect_memmap)
-        statistic_matrix = np.array(statistic_memmap)
-        pvalue_matrix = np.array(pvalue_memmap)
-        pvalue_adj_matrix = np.array(pvalue_adj_memmap)
-        logfc_matrix = np.array(logfc_memmap)
-        logfc_raw_matrix = np.array(logfc_raw_memmap)
-        intercept_matrix = np.array(intercept_memmap)  # MLE intercept for shrink_lfc
-        se_matrix = np.array(se_memmap)
+    # The effect size is the LFC: every fit path sets ``effect`` to a copy
+    # of ``logfc`` (shrunk or not), so the LFC is stored once, as X.
+    logfc_matrix = np.array(logfc_memmap)
+    # The MLE LFC differs from X only when apeGLM shrank it.
+    shrunk = lfc_shrinkage_type == "apeglm"
+    logfc_raw_matrix = np.array(logfc_raw_memmap) if shrunk else None
+    statistic_matrix = np.array(statistic_memmap)
+    pvalue_matrix = np.array(pvalue_memmap)
+    pvalue_adj_matrix = np.array(pvalue_adj_memmap)
+    intercept_matrix = np.array(intercept_memmap)  # MLE intercept for shrink_lfc
+    se_matrix = np.array(se_memmap)
+    pts_matrix = np.array(pts_memmap, dtype=np.float32)
+    iter_matrix = np.array(iter_memmap)
+    convergence_matrix = np.array(convergence_memmap)
+    # A precomputed global dispersion is one value per gene, copied into
+    # every perturbation's row; store it once in var. Otherwise dispersion
+    # was estimated per comparison and stays a matrix.
+    global_dispersion_fit = control_cache is not None and control_cache.global_dispersion is not None
+    if not global_dispersion_fit:
         dispersion_matrix = np.array(dispersion_memmap)
         dispersion_raw_matrix = np.array(dispersion_raw_memmap)
         dispersion_trend_matrix = np.array(dispersion_trend_memmap)
-        mean_matrix = np.array(mean_memmap)
-        iter_matrix = np.array(iter_memmap)
-        convergence_matrix = np.array(convergence_memmap)
-        pts_matrix = np.array(pts_memmap, dtype=np.float32)
-        pts_rest_matrix = np.array(pts_rest_memmap, dtype=np.float32)
+    # pts_rest describes the control arm: the same vector for every row.
+    pts_rest_vector = (
+        control_cache.pts_rest if control_cache is not None else pts_rest_shared
+    ).astype(np.float32)
 
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    var = pd.DataFrame(index=gene_symbols)
+    var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=gene_symbols)
+    if global_dispersion_fit:
+        var["dispersion"] = control_cache.global_dispersion
+        var["dispersion_trend"] = (
+            control_cache.global_dispersion_trend
+            if control_cache.global_dispersion_trend is not None
+            else control_cache.global_dispersion
+        )
 
-    # Store ln-scale raw values BEFORE log2 conversion (for shrink_lfc post-hoc)
-    logfc_raw_ln_matrix = logfc_raw_matrix.copy()
-    se_ln_matrix = se_matrix.copy()
-
-    # Convert from natural log to log2 if requested (PyDESeq2/edgeR convention)
+    # Convert from natural log to log2 if requested (PyDESeq2/edgeR convention).
+    # shrink_lfc needs the ln-scale MLE values; with a log2 base they are kept
+    # as separate *_ln layers, with an ln base the main layers already are.
+    ln_layers = {}
     if lfc_base == "log2":
         ln2 = np.log(2)
-        effect_matrix = effect_matrix / ln2
+        ln_layers["logfoldchange_raw_ln"] = logfc_raw_matrix if shrunk else logfc_matrix
+        ln_layers["standard_error_ln"] = se_matrix
         logfc_matrix = logfc_matrix / ln2
-        logfc_raw_matrix = logfc_raw_matrix / ln2
+        if shrunk:
+            logfc_raw_matrix = logfc_raw_matrix / ln2
         se_matrix = se_matrix / ln2
 
-    adata = ad.AnnData(effect_matrix, obs=obs, var=var)
+    adata = ad.AnnData(logfc_matrix, obs=obs, var=var)
     adata.layers["z_score"] = statistic_matrix
     adata.layers["pvalue"] = pvalue_matrix
     adata.layers["pvalue_adj"] = pvalue_adj_matrix
-    adata.layers["logfoldchanges"] = logfc_matrix
-    adata.layers["logfoldchange_raw"] = logfc_raw_matrix
-    adata.layers["logfoldchange_raw_ln"] = logfc_raw_ln_matrix  # Always ln-scale for shrink_lfc
+    if shrunk:
+        adata.layers["logfoldchange_raw"] = logfc_raw_matrix
     adata.layers["intercept"] = intercept_matrix  # MLE intercept (ln-scale) for shrink_lfc
     adata.layers["standard_error"] = se_matrix
-    adata.layers["standard_error_ln"] = se_ln_matrix  # Always ln-scale for shrink_lfc
-    adata.layers["dispersion"] = dispersion_matrix
-    adata.layers["dispersion_raw"] = dispersion_raw_matrix
-    adata.layers["dispersion_trend"] = dispersion_trend_matrix
-    adata.layers["converged"] = convergence_matrix.astype(np.float32)
-    adata.layers["iterations"] = iter_matrix.astype(np.float32)
+    for name, matrix in ln_layers.items():
+        adata.layers[name] = matrix
+    if not global_dispersion_fit:
+        adata.layers["dispersion"] = dispersion_matrix
+        adata.layers["dispersion_raw"] = dispersion_raw_matrix
+        adata.layers["dispersion_trend"] = dispersion_trend_matrix
+    adata.layers["converged"] = convergence_matrix
+    # Iteration counts are small integers; the narrowest integer type that
+    # holds the largest one stores them exactly.
+    adata.layers["iterations"] = iter_matrix.astype(
+        np.min_scalar_type(int(iter_matrix.max(initial=0)))
+    )
     adata.layers["pts"] = pts_matrix
-    adata.layers["pts_rest"] = pts_rest_matrix
     adata.uns["lfc_base"] = lfc_base  # Store for downstream tools
     adata.uns["method"] = "nb_glm"
     adata.uns["fit_method"] = "independent"
@@ -3768,18 +3800,6 @@ def nb_glm_test(
     else:
         adata.uns["profiling"] = "NA"
 
-    # output_path already resolved earlier for checkpoint
-    if int(verbose) >= 1:
-        print(f"[cx] nb_glm_test: Saving \u2192 {output_path}")
-    adata.write(output_path)
-    
-    # Clean up checkpoint file on successful completion
-    if checkpoint_path.exists():
-        try:
-            checkpoint_path.unlink()
-        except Exception:
-            pass  # Ignore cleanup errors
-
     result = RankGenesGroupsResult(
         genes=gene_symbols,
         groups=candidates,
@@ -3787,26 +3807,75 @@ def nb_glm_test(
         pvalues=pvalue_matrix,
         pvalues_adj=pvalue_adj_matrix,
         logfoldchanges=logfc_matrix,
-        effect_size=effect_matrix,
-        u_statistics=np.zeros_like(effect_matrix),
+        effect_size=logfc_matrix,
+        u_statistics=np.zeros_like(logfc_matrix),
         pts=pts_matrix,
-        pts_rest=pts_rest_matrix,
+        pts_rest=np.broadcast_to(pts_rest_vector, pts_matrix.shape),
         order=order_matrix,
         groupby=perturbation_column,
         method="nb_glm",
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
-        result=AnnData(output_path),
+        result=None,
     )
-    
-    # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format:
-        _write_rank_genes_groups_hdf5(output_path, result)
-        # Reload to pick up the new uns structure
-        result.result = AnnData(output_path)
-    
+    _messages.print_saving(verbose, "nb_glm_test", output_path)
+    with _replace_on_success(output_path) as partial:
+        adata.write(partial)
+        if scanpy_format:
+            _write_rank_genes_groups_hdf5(partial, result)
+
+    # Unmap the partial arrays before deleting them (Windows cannot delete a
+    # mapped file).
+    del (
+        statistic_memmap, pvalue_memmap, pvalue_adj_memmap, logfc_memmap, logfc_raw_memmap,
+        intercept_memmap, se_memmap, pts_memmap, dispersion_memmap, dispersion_raw_memmap,
+        dispersion_trend_memmap, iter_memmap, convergence_memmap, _write_result_to_memmap,
+    )
+    run.discard()  # the output is complete; the checkpoint and partial arrays are not needed
+    result.result = AnnData(output_path)
     return result
+
+
+def _create_streaming_scaffold(
+    path: Path,
+    *,
+    obs: pd.DataFrame,
+    var: pd.DataFrame,
+    n_groups: int,
+    n_genes: int,
+    group_batch_size: int,
+    control_label: str,
+    perturbation_column: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
+    """Write the streaming Wilcoxon result file's obs/var/uns and its empty,
+    batch-chunked X and layers, ready to be filled one group batch at a time.
+
+    X is created directly as a chunked dataset, so no ``n_groups x n_genes``
+    placeholder is ever materialised.
+    """
+    uns = _wilcoxon_uns(
+        control_label=control_label, perturbation_column=perturbation_column,
+        tie_correct=tie_correct, corr_method=corr_method,
+    )
+    ad.AnnData(obs=obs, var=var, uns=uns).write(path)
+    with h5py.File(path, "r+") as hf:
+        _create_array(hf, "X", shape=(n_groups, n_genes), dtype="float64",
+                      chunks=(min(group_batch_size, n_groups), n_genes))
+
+        layer_dtypes = {
+            "z_score": "float64", "pvalue": "float64", "pvalue_adj": "float64",
+            "logfoldchanges": "float64", "u_statistic": "float64",
+            "pts": "float32",
+        }
+        layers_group = hf.require_group("layers")
+        for name, dtype in layer_dtypes.items():
+            _create_array(
+                layers_group, name, shape=(n_groups, n_genes), dtype=dtype,
+                chunks=(min(group_batch_size, n_groups), n_genes),
+            )
 
 
 def _wilcoxon_test_streaming(
@@ -3831,6 +3900,7 @@ def _wilcoxon_test_streaming(
     scanpy_format: bool,
     verbose: int | bool,
     resume: bool,
+    fingerprint: dict,
     group_batch_size: int,
     memory_limit_gb: float | None = None,
 ) -> "RankGenesGroupsResult":
@@ -3840,6 +3910,11 @@ def _wilcoxon_test_streaming(
     in batches and writes results incrementally to the output h5ad via h5py.
     This keeps peak memory bounded by ``group_batch_size * n_genes`` rather than
     ``n_groups * n_genes``.
+
+    The h5ad is built inside a :class:`ResumableRun` directory and moved to
+    ``output_path`` only once every batch is written, so a file at
+    ``output_path`` is always complete and an interrupted run resumes at its
+    first unfinished batch.
     """
     n_groups = len(candidates)
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
@@ -3850,65 +3925,40 @@ def _wilcoxon_test_streaming(
     # Pre-create h5ad scaffold with obs/var/uns and empty layer datasets
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    var = pd.DataFrame(index=gene_symbols)
-    # Write a minimal AnnData to establish the h5ad structure
-    scaffold = ad.AnnData(
-        np.zeros((n_groups, n_genes), dtype=np.float32),  # placeholder X, will be overwritten
-        obs=obs, var=var,
-    )
+    # pts_rest (the control arm's detection rate) is per gene; the first
+    # group batch fills it.
+    var = pd.DataFrame({"pts_rest": np.zeros(n_genes, dtype=np.float32)}, index=gene_symbols)
     _wilcoxon_disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 6
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
+        _wilcoxon_disk_bytes(n_groups, n_genes),
         output_path,
-        context="wilcoxon_test (streaming) output",
+        context="wilcoxon_test",
     )
     _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
-    scaffold.write(output_path)
-    del scaffold
-    gc.collect()
-
-    # Now re-open with h5py and create layer datasets for streaming writes
-    with h5py.File(output_path, "r+") as hf:
-        # Overwrite X with chunked dataset for streaming writes
-        if "X" in hf:
-            del hf["X"]
-        hf.create_dataset("X", shape=(n_groups, n_genes), dtype="float64",
-                          chunks=(min(group_batch_size, n_groups), n_genes))
-
-        layer_names = ["z_score", "pvalue", "pvalue_adj", "logfoldchanges",
-                       "u_statistic", "pts", "pts_rest"]
-        layer_dtypes = {
-            "z_score": "float64", "pvalue": "float64", "pvalue_adj": "float64",
-            "logfoldchanges": "float64", "u_statistic": "float64",
-            "pts": "float32", "pts_rest": "float32",
-        }
-        layers_group = hf.require_group("layers")
-        for name in layer_names:
-            if name in layers_group:
-                del layers_group[name]
-            layers_group.create_dataset(
-                name, shape=(n_groups, n_genes), dtype=layer_dtypes[name],
-                chunks=(min(group_batch_size, n_groups), n_genes),
-            )
-
-        # Write uns metadata
-        uns = hf.require_group("uns")
-        for key in ["method", "control_label", "perturbation_column", "tie_correct", "pvalue_correction"]:
-            if key in uns:
-                del uns[key]
-        uns.create_dataset("method", data="wilcoxon")
-        uns.create_dataset("control_label", data=control_label)
-        uns.create_dataset("perturbation_column", data=perturbation_column)
-        uns.create_dataset("tie_correct", data=tie_correct)
-        uns.create_dataset("pvalue_correction", data=corr_method)
-
-    # Resume logic: track which group batches are already done
-    last_completed_batch = -1
-    if resume and checkpoint_path.exists():
-        checkpoint = _read_checkpoint(checkpoint_path)
-        if checkpoint is not None:
-            last_completed_batch = checkpoint.get("last_group_batch", -1)
-            logger.info(f"Resuming from group batch {last_completed_batch + 1}")
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        fingerprint={**fingerprint, "path": "streaming", "group_batch_size": int(group_batch_size)},
+        arrays={},
+        resume=resume,
+        requires=("result.h5ad",),
+    )
+    work_path = run.directory / "result.h5ad"
+    resumed = run.resumed
+    if resumed:
+        try:
+            h5py.File(work_path, "r+").close()
+        except OSError:  # a kill mid-write left it unreadable; start over
+            resumed = False
+    last_completed_batch = run.progress.get("last_group_batch", -1) if resumed else -1
+    if resumed:
+        _messages.vprint(verbose, "wilcoxon_test", f"Resuming at group batch {last_completed_batch + 1}/{n_batches}")
+    else:
+        _create_streaming_scaffold(
+            work_path, obs=obs, var=var, n_groups=n_groups, n_genes=n_genes,
+            group_batch_size=group_batch_size, control_label=control_label,
+            perturbation_column=perturbation_column, tie_correct=tie_correct,
+            corr_method=corr_method,
+        )
 
     eff_checkpoint_interval = _get_checkpoint_interval(n_batches, checkpoint_interval)
 
@@ -3935,15 +3985,12 @@ def _wilcoxon_test_streaming(
                 )
 
     def _save_streaming_checkpoint(batch_idx: int) -> None:
-        checkpoint_data = {
-            "total_group_batches": n_batches,
-            "last_group_batch": batch_idx,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "method": "wilcoxon",
-            "mode": "streaming",
-            "control_label": control_label,
-        }
-        _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+        # Each batch's h5py handle is closed (flushed) before this runs.
+        run.save(
+            total_group_batches=n_batches,
+            last_group_batch=batch_idx,
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
 
     with _create_progress_context(n_batches, "Wilcoxon DE (group batches)", verbose) as pbar:
         for batch_idx in range(n_batches):
@@ -3963,7 +4010,8 @@ def _wilcoxon_test_streaming(
             batch_p = np.full((bs, n_genes), np.nan, dtype=np.float64)
             batch_lfc = np.zeros((bs, n_genes), dtype=np.float64)
             batch_pts = np.zeros((bs, n_genes), dtype=np.float32)
-            batch_pts_rest = np.zeros((bs, n_genes), dtype=np.float32)
+            # The control arm is the same for every batch.
+            pts_rest_vector = np.zeros(n_genes, dtype=np.float32) if batch_idx == 0 else None
 
             # Stream gene chunks from backed file
             backed = read_backed(path)
@@ -4000,11 +4048,13 @@ def _wilcoxon_test_streaming(
                         else np.zeros(n_chunk_genes, dtype=np.float64)
                     )
                     control_mean_expm1 = np.expm1(control_mean) + 1e-9
-                    control_pts_chunk = np.divide(
-                        control_expr, control_n,
-                        out=np.zeros_like(control_expr, dtype=float),
-                        where=control_n > 0,
-                    )
+                    if pts_rest_vector is not None:
+                        np.divide(
+                            control_expr, control_n,
+                            out=pts_rest_vector[slc],
+                            where=control_n > 0,
+                            casting="unsafe",
+                        )
 
                     # Pre-compute perturbation summary stats from sparse
                     pert_expr_counts = []
@@ -4142,7 +4192,6 @@ def _wilcoxon_test_streaming(
                         gene_pos = np.arange(slc.start, slc.stop)
                         batch_lfc[idx, gene_pos] = lfc
                         batch_pts[idx, gene_pos] = pts
-                        batch_pts_rest[idx, gene_pos] = control_pts_chunk
 
                         # Applied per row after the block write: the kernel
                         # leaves its defaults in the columns it skips, and a
@@ -4163,7 +4212,7 @@ def _wilcoxon_test_streaming(
 
             # Write batch results to h5ad
             sl = slice(batch_start, batch_end)
-            with h5py.File(output_path, "r+") as hf:
+            with h5py.File(work_path, "r+") as hf:
                 hf["X"][sl, :] = batch_effect
                 hf["layers/z_score"][sl, :] = batch_z
                 hf["layers/pvalue"][sl, :] = batch_p
@@ -4171,10 +4220,11 @@ def _wilcoxon_test_streaming(
                 hf["layers/logfoldchanges"][sl, :] = batch_lfc
                 hf["layers/u_statistic"][sl, :] = batch_u
                 hf["layers/pts"][sl, :] = batch_pts
-                hf["layers/pts_rest"][sl, :] = batch_pts_rest
+                if pts_rest_vector is not None:
+                    hf["var/pts_rest"][:] = pts_rest_vector
 
             del batch_effect, batch_u, batch_z, batch_p, batch_lfc
-            del batch_pts, batch_pts_rest, batch_pvalue_adj
+            del batch_pts, batch_pvalue_adj
             gc.collect()
             _release_chunk_memory()  # return freed batch-array pages to OS before next batch
 
@@ -4186,6 +4236,8 @@ def _wilcoxon_test_streaming(
     logger.info(f"Completed all {n_batches} group batches")
     if int(verbose) >= 1:
         print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
+    os.replace(work_path, output_path)
+    run.discard()
 
     # Build RankGenesGroupsResult by reading back from h5ad.
     # Uses _build_result_from_h5ad which skips loading for very large results
@@ -4203,13 +4255,6 @@ def _wilcoxon_test_streaming(
 
     if scanpy_format and result.statistics.size > 0:
         _write_rank_genes_groups_hdf5(output_path, result)
-
-    # Clean up checkpoint on success
-    if checkpoint_path.exists():
-        try:
-            checkpoint_path.unlink()
-        except Exception:
-            pass
 
     return result
 
@@ -4237,6 +4282,7 @@ def _wilcoxon_test_stratified(
     scanpy_format: bool,
     verbose: int | bool,
     resume: bool,
+    fingerprint: dict,
     memory_limit_gb: float | None,
 ) -> RankGenesGroupsResult:
     """Batch-stratified (van Elteren) Wilcoxon rank-sum test.
@@ -4251,461 +4297,451 @@ def _wilcoxon_test_stratified(
     """
     n_groups = len(candidates)
 
-    # Resume logic: read checkpoint to get last completed gene chunk
-    last_completed_chunk = -1
-    if resume and checkpoint_path.exists():
-        checkpoint = _read_checkpoint(checkpoint_path)
-        if checkpoint is not None:
-            last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
-            logger.info(f"Resuming from gene chunk {last_completed_chunk + 1}")
-
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
 
     _wilcoxon_disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
-        tempfile.gettempdir(),
-        context="wilcoxon_test (stratified) intermediate arrays",
+        _wilcoxon_disk_bytes(n_groups, n_genes),
+        output_path,
+        context="wilcoxon_test",
     )
     _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
+    shape = (n_groups, n_genes)
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        fingerprint={**fingerprint, "path": "stratified"},
+        arrays={
+            "effect": (shape, np.float64, 0),
+            "u_stat": (shape, np.float64, 0),
+            "pvalue": (shape, np.float64, 1.0),
+            "pvalue_adj": (shape, np.float64, 0),
+            "z_score": (shape, np.float64, 0),
+            "logfoldchange": (shape, np.float64, 0),
+            "pts": (shape, np.float32, 0),
+            "pts_rest": ((n_genes,), np.float32, 0),  # per gene, filled chunk by chunk
+        },
+        resume=resume,
+    )
+    last_completed_chunk = run.progress.get("last_gene_chunk", -1)
+    if run.resumed:
+        _messages.vprint(verbose, "wilcoxon_test", f"Resuming at gene chunk {last_completed_chunk + 1}/{n_gene_chunks}")
+    effect_matrix = run.arrays["effect"]
+    u_matrix = run.arrays["u_stat"]
+    pvalue_matrix = run.arrays["pvalue"]
+    z_matrix = run.arrays["z_score"]
+    lfc_matrix = run.arrays["logfoldchange"]
+    pts_matrix = run.arrays["pts"]
+    pts_rest_vector = run.arrays["pts_rest"]
 
-        def _create_memmap(name: str, dtype: np.dtype, *, fill: float | int = 0):
-            p = tmpdir_path / f"{name}.dat"
-            mmap = np.memmap(p, dtype=dtype, mode="w+", shape=(n_groups, n_genes))
-            if fill != 0:
-                mmap[:] = fill
-            else:
-                mmap.fill(0)
-            return mmap
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_mask = labels == control_label
+        control_n = int(control_mask.sum())
 
-        effect_matrix = _create_memmap("effect", np.float64)
-        u_matrix = _create_memmap("u_stat", np.float64)
-        pvalue_matrix = _create_memmap("pvalue", np.float64, fill=1.0)
-        z_matrix = _create_memmap("z_score", np.float64)
-        lfc_matrix = _create_memmap("logfoldchange", np.float64)
-        pts_matrix = _create_memmap("pts", np.float32)
-        pts_rest_matrix = _create_memmap("pts_rest", np.float32)
-
-        backed = read_backed(path)
-        try:
-            labels = backed.obs[perturbation_column].astype(str).to_numpy()
-            control_mask = labels == control_label
-            control_n = int(control_mask.sum())
-
-            # ----- Batch codes (0..n_batches-1; NaN/unknown -> -1) -----
-            batch_values = np.asarray(backed.obs[batch_column].to_numpy())
-            batch_codes, _batch_uniques = pd.factorize(batch_values, sort=True)
-            batch_codes = batch_codes.astype(np.int64)
-            n_batches = len(_batch_uniques)
-            n_excluded = int((batch_codes < 0).sum())
-            if n_excluded > 0:
-                _messages.warn(
-                    "wilcoxon_test",
-                    f"{n_excluded} cells have a missing '{batch_column}' value and are "
-                    "excluded from the batch-stratified test.",
-                    stacklevel=2,
-                )
-            if n_batches < 1:
-                raise ValueError(
-                    f"Batch column '{batch_column}' contains no usable batches."
-                )
-
-            # ----- Control cells ordered by batch (contiguous per-batch ranges) -----
-            control_idx = np.where(control_mask)[0]
-            control_batch = batch_codes[control_idx]
-            _ckeep = control_batch >= 0
-            control_idx = control_idx[_ckeep]
-            control_batch = control_batch[_ckeep]
-            _corder = np.argsort(control_batch, kind="stable")
-            control_idx_sorted = control_idx[_corder]
-            control_batch_sorted = control_batch[_corder]
-            _b_arange = np.arange(n_batches)
-            ctrl_batch_start = np.searchsorted(control_batch_sorted, _b_arange, side="left")
-            ctrl_batch_end = np.searchsorted(control_batch_sorted, _b_arange, side="right")
-            control_batch_counts = np.bincount(control_batch, minlength=n_batches)
-            batches_with_control = control_batch_counts > 0
-
-            # ----- Perturbation cells grouped into (pert, batch) segments -----
-            pert_idx = _group_row_indices(labels, candidates)
-            seg_offsets = [0]
-            seg_batch: list[int] = []
-            pert_ptr = [0]
-            all_pert_flat_idx_list = []
-            pert_total_batch_counts = np.zeros(n_groups, dtype=np.int64)
-            pert_shared_batch_counts = np.zeros(n_groups, dtype=np.int64)
-            pert_cells_without_control_batch = np.zeros(n_groups, dtype=np.int64)
-            running = 0
-            for p_i, label in enumerate(candidates):
-                p_cells = pert_idx[label]
-                p_b = batch_codes[p_cells]
-                _pkeep = p_b >= 0
-                p_cells = p_cells[_pkeep]
-                p_b = p_b[_pkeep]
-                if p_b.size:
-                    p_batch_counts = np.bincount(p_b, minlength=n_batches)
-                    p_batches = p_batch_counts > 0
-                    shared_batches = p_batches & batches_with_control
-                    pert_total_batch_counts[p_i] = int(p_batches.sum())
-                    pert_shared_batch_counts[p_i] = int(shared_batches.sum())
-                    pert_cells_without_control_batch[p_i] = int(
-                        p_batch_counts[~batches_with_control].sum()
-                    )
-                _porder = np.argsort(p_b, kind="stable")
-                p_cells = p_cells[_porder]
-                p_b = p_b[_porder]
-                all_pert_flat_idx_list.append(p_cells)
-                if p_b.size:
-                    change = np.where(np.diff(p_b) != 0)[0] + 1
-                    starts = np.concatenate(([0], change))
-                    ends = np.concatenate((change, [p_b.size]))
-                    for st, en in zip(starts, ends):
-                        running += int(en - st)
-                        seg_batch.append(int(p_b[st]))
-                        seg_offsets.append(running)
-                pert_ptr.append(len(seg_batch))
-
-            all_pert_flat_idx = (
-                np.concatenate(all_pert_flat_idx_list)
-                if all_pert_flat_idx_list
-                else np.empty(0, dtype=np.int64)
+        # ----- Batch codes (0..n_batches-1; NaN/unknown -> -1) -----
+        batch_values = np.asarray(backed.obs[batch_column].to_numpy())
+        batch_codes, _batch_uniques = pd.factorize(batch_values, sort=True)
+        batch_codes = batch_codes.astype(np.int64)
+        n_batches = len(_batch_uniques)
+        n_excluded = int((batch_codes < 0).sum())
+        if n_excluded > 0:
+            _messages.warn(
+                "wilcoxon_test",
+                f"{n_excluded} cells have a missing '{batch_column}' value and are "
+                "excluded from the batch-stratified test.",
+                stacklevel=2,
             )
-            seg_offsets = np.asarray(seg_offsets, dtype=np.int64)
-            seg_batch_arr = np.asarray(seg_batch, dtype=np.int64)
-            pert_ptr = np.asarray(pert_ptr, dtype=np.int64)
-            untestable_pert_mask = pert_shared_batch_counts == 0
-            n_untestable_perts = int(untestable_pert_mask.sum())
-            if n_untestable_perts:
-                example_idx = np.where(untestable_pert_mask)[0][:5]
-                examples = [str(candidates[i]) for i in example_idx]
-                _messages.warn(
-                    "wilcoxon_test",
-                    f"{n_untestable_perts} perturbation(s) have no batches "
-                    "containing both perturbation and control cells; stratified "
-                    "rank statistics for these perturbations will be "
-                    f"set to NaN. Examples: {examples}",
-                    stacklevel=2,
+        if n_batches < 1:
+            raise ValueError(
+                f"Batch column '{batch_column}' contains no usable batches."
+            )
+
+        # ----- Control cells ordered by batch (contiguous per-batch ranges) -----
+        control_idx = np.where(control_mask)[0]
+        control_batch = batch_codes[control_idx]
+        _ckeep = control_batch >= 0
+        control_idx = control_idx[_ckeep]
+        control_batch = control_batch[_ckeep]
+        _corder = np.argsort(control_batch, kind="stable")
+        control_idx_sorted = control_idx[_corder]
+        control_batch_sorted = control_batch[_corder]
+        _b_arange = np.arange(n_batches)
+        ctrl_batch_start = np.searchsorted(control_batch_sorted, _b_arange, side="left")
+        ctrl_batch_end = np.searchsorted(control_batch_sorted, _b_arange, side="right")
+        control_batch_counts = np.bincount(control_batch, minlength=n_batches)
+        batches_with_control = control_batch_counts > 0
+
+        # ----- Perturbation cells grouped into (pert, batch) segments -----
+        pert_idx = _group_row_indices(labels, candidates)
+        seg_offsets = [0]
+        seg_batch: list[int] = []
+        pert_ptr = [0]
+        all_pert_flat_idx_list = []
+        pert_total_batch_counts = np.zeros(n_groups, dtype=np.int64)
+        pert_shared_batch_counts = np.zeros(n_groups, dtype=np.int64)
+        pert_cells_without_control_batch = np.zeros(n_groups, dtype=np.int64)
+        running = 0
+        for p_i, label in enumerate(candidates):
+            p_cells = pert_idx[label]
+            p_b = batch_codes[p_cells]
+            _pkeep = p_b >= 0
+            p_cells = p_cells[_pkeep]
+            p_b = p_b[_pkeep]
+            if p_b.size:
+                p_batch_counts = np.bincount(p_b, minlength=n_batches)
+                p_batches = p_batch_counts > 0
+                shared_batches = p_batches & batches_with_control
+                pert_total_batch_counts[p_i] = int(p_batches.sum())
+                pert_shared_batch_counts[p_i] = int(shared_batches.sum())
+                pert_cells_without_control_batch[p_i] = int(
+                    p_batch_counts[~batches_with_control].sum()
                 )
+            _porder = np.argsort(p_b, kind="stable")
+            p_cells = p_cells[_porder]
+            p_b = p_b[_porder]
+            all_pert_flat_idx_list.append(p_cells)
+            if p_b.size:
+                change = np.where(np.diff(p_b) != 0)[0] + 1
+                starts = np.concatenate(([0], change))
+                ends = np.concatenate((change, [p_b.size]))
+                for st, en in zip(starts, ends):
+                    running += int(en - st)
+                    seg_batch.append(int(p_b[st]))
+                    seg_offsets.append(running)
+            pert_ptr.append(len(seg_batch))
 
-            # Pooled control cell count per candidate (for LFC/pts, batch-agnostic)
-            control_idx_all = np.where(control_mask)[0]
+        all_pert_flat_idx = (
+            np.concatenate(all_pert_flat_idx_list)
+            if all_pert_flat_idx_list
+            else np.empty(0, dtype=np.int64)
+        )
+        seg_offsets = np.asarray(seg_offsets, dtype=np.int64)
+        seg_batch_arr = np.asarray(seg_batch, dtype=np.int64)
+        pert_ptr = np.asarray(pert_ptr, dtype=np.int64)
+        untestable_pert_mask = pert_shared_batch_counts == 0
+        n_untestable_perts = int(untestable_pert_mask.sum())
+        if n_untestable_perts:
+            example_idx = np.where(untestable_pert_mask)[0][:5]
+            examples = [str(candidates[i]) for i in example_idx]
+            _messages.warn(
+                "wilcoxon_test",
+                f"{n_untestable_perts} perturbation(s) have no batches "
+                "containing both perturbation and control cells; stratified "
+                "rank statistics for these perturbations will be "
+                f"set to NaN. Examples: {examples}",
+                stacklevel=2,
+            )
 
-            dtype_checked = False
+        # Pooled control cell count per candidate (for LFC/pts, batch-agnostic)
+        control_idx_all = np.where(control_mask)[0]
 
-            def _check_not_count_like(chunk: sp.spmatrix) -> None:
-                if np.issubdtype(chunk.dtype, np.integer):
+        dtype_checked = False
+
+        def _check_not_count_like(chunk: sp.spmatrix) -> None:
+            if np.issubdtype(chunk.dtype, np.integer):
+                raise ValueError(
+                    "Detected integer count data in wilcoxon_test. "
+                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                )
+            if np.issubdtype(chunk.dtype, np.floating):
+                non_zero = chunk.data[chunk.data > 0]
+                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                if is_count_like:
                     raise ValueError(
-                        "Detected integer count data in wilcoxon_test. "
+                        "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
                         "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                     )
-                if np.issubdtype(chunk.dtype, np.floating):
-                    non_zero = chunk.data[chunk.data > 0]
-                    is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                    if is_count_like:
+
+        # Resume at the first unfinished chunk; iter_matrix_chunks seeks
+        # there rather than reading and discarding the completed ones.
+        current_chunk = last_completed_chunk + 1
+        n_chunks_processed = 0
+
+        def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
+            run.save(
+                total_gene_chunks=n_gene_chunks,
+                last_gene_chunk=chunk_idx,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+        with _create_progress_context(
+            n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose,
+            initial=current_chunk,
+        ) as pbar:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                start_chunk=current_chunk, warn_slow_axis=False,
+            ):
+                if not dtype_checked:
+                    if not sp.issparse(block):
                         raise ValueError(
-                            "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
-                            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
                         )
+                    _check_not_count_like(block)
+                    dtype_checked = True
 
-            # Resume would start at the first unfinished chunk, and
-            # iter_matrix_chunks seeks there rather than reading and
-            # discarding the completed ones. Today this is always 0: resuming
-            # from a checkpoint is refused at the entry point (see the
-            # NotImplementedError in wilcoxon_test) because the partial result
-            # arrays live in a TemporaryDirectory that a killed run takes with
-            # it, so a checkpoint records progress whose data is gone.
-            current_chunk = last_completed_chunk + 1
-            n_chunks_processed = 0
-            _track_gene_counts = int(verbose) >= 1
-            if _track_gene_counts:
-                _valid_gene_counts = np.zeros(n_groups, dtype=np.int32)
+                csr_block = sp.csr_matrix(block)
+                n_chunk_genes = csr_block.shape[1]
 
-            def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
-                checkpoint_data = {
-                    "total_gene_chunks": n_gene_chunks,
-                    "last_gene_chunk": chunk_idx,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "method": "wilcoxon",
-                    "control_label": control_label,
-                    "batch_column": batch_column,
-                }
-                _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+                # ----- Pooled control stats (LFC / pts) -----
+                control_values = csr_block[control_mask, :]
+                control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
+                control_mean = (
+                    np.asarray(control_values.mean(axis=0)).ravel()
+                    if control_values.nnz
+                    else np.zeros(n_chunk_genes, dtype=np.float64)
+                )
+                control_mean_expm1 = np.expm1(control_mean) + 1e-9
+                control_pts = np.divide(
+                    control_expr,
+                    control_n,
+                    out=np.zeros_like(control_expr, dtype=float),
+                    where=control_n > 0,
+                )
 
-            with _create_progress_context(
-                n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose,
-                initial=current_chunk,
-            ) as pbar:
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
-                    start_chunk=current_chunk, warn_slow_axis=False,
-                ):
-                    if not dtype_checked:
-                        if not sp.issparse(block):
-                            raise ValueError(
-                                "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                            )
-                        _check_not_count_like(block)
-                        dtype_checked = True
-
-                    csr_block = sp.csr_matrix(block)
-                    n_chunk_genes = csr_block.shape[1]
-
-                    # ----- Pooled control stats (LFC / pts) -----
-                    control_values = csr_block[control_mask, :]
-                    control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
-                    control_mean = (
-                        np.asarray(control_values.mean(axis=0)).ravel()
-                        if control_values.nnz
+                # ----- Pooled perturbation stats -----
+                pert_expr_counts = []
+                pert_means = []
+                pert_n_cells = []
+                for label in candidates:
+                    group_values = csr_block[pert_idx[label], :]
+                    pert_n_cells.append(group_values.shape[0])
+                    pert_expr_counts.append(np.asarray(group_values.getnnz(axis=0)).ravel())
+                    group_mean = (
+                        np.asarray(group_values.mean(axis=0)).ravel()
+                        if group_values.nnz
                         else np.zeros(n_chunk_genes, dtype=np.float64)
                     )
-                    control_mean_expm1 = np.expm1(control_mean) + 1e-9
-                    control_pts = np.divide(
-                        control_expr,
-                        control_n,
-                        out=np.zeros_like(control_expr, dtype=float),
-                        where=control_n > 0,
+                    pert_means.append(group_mean)
+
+                # ----- Per-condition low-expression filter (pooled) -----
+                valid_masks = []
+                for idx, label in enumerate(candidates):
+                    group_expr = pert_expr_counts[idx]
+                    group_mean = pert_means[idx]
+                    total_expr = control_expr + group_expr
+                    valid = total_expr >= min_cells_expressed
+                    low_both = _low_expr_in_both_mask(
+                        pert_expr_counts=group_expr,
+                        control_expr_counts=control_expr,
+                        pert_mean=group_mean,
+                        control_mean=control_mean,
+                        n_pert_cells=pert_n_cells[idx],
+                        n_control_cells=control_n,
+                        min_pct_ctrl=min_pct_ctrl,
+                        min_pct_pert=min_pct_pert,
+                        min_mean_ctrl=min_mean_ctrl,
+                        min_mean_pert=min_mean_pert,
+                    )
+                    valid_masks.append(valid & ~low_both)
+
+                rank_valid_masks = [
+                    np.zeros_like(valid, dtype=bool)
+                    if untestable_pert_mask[idx]
+                    else valid
+                    for idx, valid in enumerate(valid_masks)
+                ]
+
+
+                any_valid = np.zeros(n_chunk_genes, dtype=bool)
+                for valid in rank_valid_masks:
+                    any_valid |= valid
+                valid_gene_indices = np.where(any_valid)[0]
+                n_valid_genes = len(valid_gene_indices)
+
+                chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
+                chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
+
+                if n_valid_genes > 0:
+                    all_valid_dense = csr_block[:, valid_gene_indices].toarray()
+                    control_dense = all_valid_dense[control_idx_sorted, :]
+
+                    # Pre-sort control non-zeros per (batch, gene).
+                    ctrl_flats = []
+                    ctrl_starts = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                    ctrl_nnz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                    ctrl_nz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
+                    ctrl_tie = np.zeros((n_batches, n_valid_genes), dtype=np.float64)
+                    base = 0
+                    for b in range(n_batches):
+                        rows = control_dense[ctrl_batch_start[b]:ctrl_batch_end[b], :]
+                        if rows.shape[0] == 0:
+                            # No control cells in this batch: leave zeros.
+                            continue
+                        flat_b, off_b, nnz_b, nz_b = _presort_control_nonzeros(rows)
+                        tie_b = _compute_ctrl_tie_sums(flat_b, off_b, nnz_b)
+                        ctrl_starts[b] = off_b[:-1] + base
+                        ctrl_nnz[b] = nnz_b
+                        ctrl_nz[b] = nz_b
+                        ctrl_tie[b] = tie_b
+                        ctrl_flats.append(flat_b)
+                        base += flat_b.shape[0]
+                    ctrl_flat = (
+                        np.concatenate(ctrl_flats)
+                        if ctrl_flats
+                        else np.empty(0, dtype=np.float64)
                     )
 
-                    # ----- Pooled perturbation stats -----
-                    pert_expr_counts = []
-                    pert_means = []
-                    pert_n_cells = []
-                    for label in candidates:
-                        group_values = csr_block[pert_idx[label], :]
-                        pert_n_cells.append(group_values.shape[0])
-                        pert_expr_counts.append(np.asarray(group_values.getnnz(axis=0)).ravel())
-                        group_mean = (
-                            np.asarray(group_values.mean(axis=0)).ravel()
-                            if group_values.nnz
-                            else np.zeros(n_chunk_genes, dtype=np.float64)
-                        )
-                        pert_means.append(group_mean)
-
-                    # ----- Per-condition low-expression filter (pooled) -----
-                    valid_masks = []
-                    for idx, label in enumerate(candidates):
-                        group_expr = pert_expr_counts[idx]
-                        group_mean = pert_means[idx]
-                        total_expr = control_expr + group_expr
-                        valid = total_expr >= min_cells_expressed
-                        low_both = _low_expr_in_both_mask(
-                            pert_expr_counts=group_expr,
-                            control_expr_counts=control_expr,
-                            pert_mean=group_mean,
-                            control_mean=control_mean,
-                            n_pert_cells=pert_n_cells[idx],
-                            n_control_cells=control_n,
-                            min_pct_ctrl=min_pct_ctrl,
-                            min_pct_pert=min_pct_pert,
-                            min_mean_ctrl=min_mean_ctrl,
-                            min_mean_pert=min_mean_pert,
-                        )
-                        valid_masks.append(valid & ~low_both)
-
-                    rank_valid_masks = [
-                        np.zeros_like(valid, dtype=bool)
-                        if untestable_pert_mask[idx]
-                        else valid
-                        for idx, valid in enumerate(valid_masks)
-                    ]
-
-                    if _track_gene_counts:
-                        for _vi in range(len(rank_valid_masks)):
-                            _valid_gene_counts[_vi] += int(rank_valid_masks[_vi].sum())
-
-                    any_valid = np.zeros(n_chunk_genes, dtype=bool)
-                    for valid in rank_valid_masks:
-                        any_valid |= valid
-                    valid_gene_indices = np.where(any_valid)[0]
-                    n_valid_genes = len(valid_gene_indices)
-
-                    chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
-                    chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
-                    chunk_pts_rest = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
-
-                    if n_valid_genes > 0:
-                        all_valid_dense = csr_block[:, valid_gene_indices].toarray()
-                        control_dense = all_valid_dense[control_idx_sorted, :]
-
-                        # Pre-sort control non-zeros per (batch, gene).
-                        ctrl_flats = []
-                        ctrl_starts = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
-                        ctrl_nnz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
-                        ctrl_nz = np.zeros((n_batches, n_valid_genes), dtype=np.int64)
-                        ctrl_tie = np.zeros((n_batches, n_valid_genes), dtype=np.float64)
-                        base = 0
-                        for b in range(n_batches):
-                            rows = control_dense[ctrl_batch_start[b]:ctrl_batch_end[b], :]
-                            if rows.shape[0] == 0:
-                                # No control cells in this batch: leave zeros.
-                                continue
-                            flat_b, off_b, nnz_b, nz_b = _presort_control_nonzeros(rows)
-                            tie_b = _compute_ctrl_tie_sums(flat_b, off_b, nnz_b)
-                            ctrl_starts[b] = off_b[:-1] + base
-                            ctrl_nnz[b] = nnz_b
-                            ctrl_nz[b] = nz_b
-                            ctrl_tie[b] = tie_b
-                            ctrl_flats.append(flat_b)
-                            base += flat_b.shape[0]
-                        ctrl_flat = (
-                            np.concatenate(ctrl_flats)
-                            if ctrl_flats
-                            else np.empty(0, dtype=np.float64)
-                        )
-
-                        all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
-                        valid_masks_2d = np.array(
-                            [vm[valid_gene_indices] for vm in rank_valid_masks]
-                        )
-
-                        valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-
-                        _wilcoxon_stratified_batch_perts_numba(
-                            ctrl_flat,
-                            ctrl_starts,
-                            ctrl_nnz,
-                            ctrl_nz,
-                            ctrl_tie,
-                            all_pert_stacked,
-                            seg_offsets,
-                            seg_batch_arr,
-                            pert_ptr,
-                            valid_masks_2d,
-                            tie_correct,
-                            valid_u,
-                            valid_z,
-                            valid_p,
-                            valid_effect,
-                        )
-
-                        chunk_u[:, valid_gene_indices] = valid_u
-                        chunk_z[:, valid_gene_indices] = valid_z
-                        chunk_p[:, valid_gene_indices] = valid_p
-                        chunk_effect[:, valid_gene_indices] = valid_effect
-
-                    # ----- LFC / pts (pooled, batch-agnostic) -----
-                    all_expr = np.array(pert_expr_counts)
-                    all_means = np.array(pert_means)
-                    all_n = np.array(pert_n_cells, dtype=np.float64)
-
-                    n_col = all_n[:, np.newaxis]
-                    # pts describes the data, not the comparison, so it is
-                    # reported for untested genes too -- the only way to see an
-                    # untested 0%-vs-95% knockdown.
-                    chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
-                    chunk_pts_rest[:] = control_pts[np.newaxis, :]
-
-                    raw_lfc = np.log2(
-                        (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                    all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
+                    valid_masks_2d = np.array(
+                        [vm[valid_gene_indices] for vm in rank_valid_masks]
                     )
 
-                    # Untested genes carry NaN in every column derived from the
-                    # comparison.  Two masks, because only the rank test is
-                    # stratified: the test columns follow rank_valid_masks,
-                    # which also zeroes perturbations sharing no batch with the
-                    # control, while the pooled logfoldchanges follows the
-                    # pooled filter alone.
-                    valid_arr = np.array(valid_masks)
-                    rank_valid_arr = np.array(rank_valid_masks)
-                    invalid_arr = ~rank_valid_arr
-                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
-                    if invalid_arr.any():
-                        chunk_u[invalid_arr] = np.nan
-                        chunk_z[invalid_arr] = np.nan
-                        chunk_p[invalid_arr] = np.nan
-                        chunk_effect[invalid_arr] = np.nan
+                    valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
 
-                    u_matrix[:, slc] = chunk_u
-                    pvalue_matrix[:, slc] = chunk_p
-                    effect_matrix[:, slc] = chunk_effect
-                    z_matrix[:, slc] = chunk_z
-                    lfc_matrix[:, slc] = chunk_lfc
-                    pts_matrix[:, slc] = chunk_pts
-                    pts_rest_matrix[:, slc] = chunk_pts_rest
-
-                    del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
-                    del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
-                    del pert_n_cells, valid_masks, rank_valid_masks
-                    del valid_arr, rank_valid_arr, invalid_arr
-                    if n_valid_genes > 0:
-                        del all_valid_dense, control_dense, ctrl_flats, ctrl_flat
-                        del ctrl_starts, ctrl_nnz, ctrl_nz, ctrl_tie
-                        del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
-                        del valid_masks_2d
-                    _release_chunk_memory()
-
-                    n_chunks_processed += 1
-                    pbar.update(1)
-                    if n_chunks_processed % eff_checkpoint_interval == 0:
-                        _save_wilcoxon_checkpoint(current_chunk)
-                    current_chunk += 1
-
-                _save_wilcoxon_checkpoint(current_chunk - 1)
-                logger.info(f"Completed {n_chunks_processed} gene chunks (stratified)")
-                if _track_gene_counts:
-                    if int(verbose) >= 2:
-                        for _gi, _label in enumerate(candidates):
-                            _print_de_perturbation_verbose(
-                                verbose, _label, int(_valid_gene_counts[_gi]), n_genes
-                            )
-                    _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
-                    _pct = 100.0 * _mean / n_genes if n_genes else 0
-                    print(
-                        f"[cx] Wilcoxon DE (batch-stratified by '{batch_column}', "
-                        f"{n_batches} batches): {n_groups} perturbations complete, "
-                        f"mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)"
+                    _wilcoxon_stratified_batch_perts_numba(
+                        ctrl_flat,
+                        ctrl_starts,
+                        ctrl_nnz,
+                        ctrl_nz,
+                        ctrl_tie,
+                        all_pert_stacked,
+                        seg_offsets,
+                        seg_batch_arr,
+                        pert_ptr,
+                        valid_masks_2d,
+                        tie_correct,
+                        valid_u,
+                        valid_z,
+                        valid_p,
+                        valid_effect,
                     )
-        finally:
-            backed.file.close()
 
-        gene_symbols = pd.Index(gene_symbols).astype(str)
-        pvalue_adj_matrix = _create_memmap("pvalue_adj", np.float64)
-        _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
+                    chunk_u[:, valid_gene_indices] = valid_u
+                    chunk_z[:, valid_gene_indices] = valid_z
+                    chunk_p[:, valid_gene_indices] = valid_p
+                    chunk_effect[:, valid_gene_indices] = valid_effect
 
-        if int(verbose) >= 1:
-            print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
-        stratified_diagnostics = {
-            "stratified_n_batches": int(n_batches),
-            "stratified_n_control_batches": int(batches_with_control.sum()),
-            "stratified_n_untestable_perturbations": int(n_untestable_perts),
-            "stratified_min_shared_batches_per_perturbation": (
-                int(pert_shared_batch_counts.min()) if n_groups else 0
-            ),
-            "stratified_median_shared_batches_per_perturbation": (
-                float(np.median(pert_shared_batch_counts)) if n_groups else 0.0
-            ),
-            "stratified_perturbation_cells_without_control_batch": int(
-                pert_cells_without_control_batch.sum()
-            ),
-        }
-        _write_wilcoxon_result_h5ad(
-            output_path,
-            effect_matrix=effect_matrix,
-            z_matrix=z_matrix,
-            pvalue_matrix=pvalue_matrix,
-            pvalue_adj_matrix=pvalue_adj_matrix,
-            lfc_matrix=lfc_matrix,
-            u_matrix=u_matrix,
-            pts_matrix=pts_matrix,
-            pts_rest_matrix=pts_rest_matrix,
-            candidates=candidates,
-            gene_symbols=gene_symbols,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            tie_correct=tie_correct,
-            corr_method=corr_method,
-            batch_column=batch_column,
-            stratified_diagnostics=stratified_diagnostics,
-        )
+                # ----- LFC / pts (pooled, batch-agnostic) -----
+                all_expr = np.array(pert_expr_counts)
+                all_means = np.array(pert_means)
+                all_n = np.array(pert_n_cells, dtype=np.float64)
+
+                n_col = all_n[:, np.newaxis]
+                # pts describes the data, not the comparison, so it is
+                # reported for untested genes too -- the only way to see an
+                # untested 0%-vs-95% knockdown.
+                chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
+                pts_rest_vector[slc] = control_pts
+
+                raw_lfc = np.log2(
+                    (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                )
+
+                # Untested genes carry NaN in every column derived from the
+                # comparison.  Two masks, because only the rank test is
+                # stratified: the test columns follow rank_valid_masks,
+                # which also zeroes perturbations sharing no batch with the
+                # control, while the pooled logfoldchanges follows the
+                # pooled filter alone.
+                valid_arr = np.array(valid_masks)
+                rank_valid_arr = np.array(rank_valid_masks)
+                invalid_arr = ~rank_valid_arr
+                chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                if invalid_arr.any():
+                    chunk_u[invalid_arr] = np.nan
+                    chunk_z[invalid_arr] = np.nan
+                    chunk_p[invalid_arr] = np.nan
+                    chunk_effect[invalid_arr] = np.nan
+
+                u_matrix[:, slc] = chunk_u
+                pvalue_matrix[:, slc] = chunk_p
+                effect_matrix[:, slc] = chunk_effect
+                z_matrix[:, slc] = chunk_z
+                lfc_matrix[:, slc] = chunk_lfc
+                pts_matrix[:, slc] = chunk_pts
+
+                del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
+                del chunk_pts, pert_expr_counts, pert_means
+                del pert_n_cells, valid_masks, rank_valid_masks
+                del valid_arr, rank_valid_arr, invalid_arr
+                if n_valid_genes > 0:
+                    del all_valid_dense, control_dense, ctrl_flats, ctrl_flat
+                    del ctrl_starts, ctrl_nnz, ctrl_nz, ctrl_tie
+                    del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
+                    del valid_masks_2d
+                _release_chunk_memory()
+
+                n_chunks_processed += 1
+                pbar.update(1)
+                if n_chunks_processed % eff_checkpoint_interval == 0:
+                    _save_wilcoxon_checkpoint(current_chunk)
+                current_chunk += 1
+
+            _save_wilcoxon_checkpoint(current_chunk - 1)
+            logger.info(f"Completed {n_chunks_processed} gene chunks (stratified)")
+            if int(verbose) >= 1:
+                # Untested pairs are NaN in every test column; counting
+                # them at the end (not per chunk) stays right across a
+                # resume.
+                _valid_gene_counts = np.count_nonzero(~np.isnan(u_matrix), axis=1)
+                if int(verbose) >= 2:
+                    for _gi, _label in enumerate(candidates):
+                        _print_de_perturbation_verbose(
+                            verbose, _label, int(_valid_gene_counts[_gi]), n_genes
+                        )
+                _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
+                _pct = 100.0 * _mean / n_genes if n_genes else 0
+                print(
+                    f"[cx] Wilcoxon DE (batch-stratified by '{batch_column}', "
+                    f"{n_batches} batches): {n_groups} perturbations complete, "
+                    f"mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)"
+                )
+    finally:
+        backed.file.close()
+
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+    pvalue_adj_matrix = run.arrays["pvalue_adj"]
+    _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
+
+    if int(verbose) >= 1:
+        print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
+    stratified_diagnostics = {
+        "stratified_n_batches": int(n_batches),
+        "stratified_n_control_batches": int(batches_with_control.sum()),
+        "stratified_n_untestable_perturbations": int(n_untestable_perts),
+        "stratified_min_shared_batches_per_perturbation": (
+            int(pert_shared_batch_counts.min()) if n_groups else 0
+        ),
+        "stratified_median_shared_batches_per_perturbation": (
+            float(np.median(pert_shared_batch_counts)) if n_groups else 0.0
+        ),
+        "stratified_perturbation_cells_without_control_batch": int(
+            pert_cells_without_control_batch.sum()
+        ),
+    }
+    _write_wilcoxon_result_h5ad(
+        output_path,
+        effect_matrix=effect_matrix,
+        z_matrix=z_matrix,
+        pvalue_matrix=pvalue_matrix,
+        pvalue_adj_matrix=pvalue_adj_matrix,
+        lfc_matrix=lfc_matrix,
+        u_matrix=u_matrix,
+        pts_matrix=pts_matrix,
+        pts_rest=pts_rest_vector,
+        candidates=candidates,
+        gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        tie_correct=tie_correct,
+        corr_method=corr_method,
+        batch_column=batch_column,
+        stratified_diagnostics=stratified_diagnostics,
+    )
+    # Release the memmaps (and their pages) before reading the result back.
+    del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
+    del lfc_matrix, pts_matrix, pts_rest_vector
+    run.discard()
 
     _release_chunk_memory()
     result = _build_result_from_h5ad(
@@ -4721,12 +4757,6 @@ def _wilcoxon_test_stratified(
 
     if scanpy_format and result.statistics.size > 0:
         _write_rank_genes_groups_hdf5(output_path, result)
-
-    if checkpoint_path.exists():
-        try:
-            checkpoint_path.unlink()
-        except Exception:
-            pass
 
     return result
 
@@ -4841,14 +4871,16 @@ def wilcoxon_test(
     verbose
         If True, show a progress bar for gene chunk processing. Requires tqdm.
     resume
-        If True and a completed output already exists, load that output as usual.
-        Resuming an interrupted Wilcoxon run from a progress checkpoint is
-        currently disabled because partial chunk arrays are stored in temporary
-        files during execution.
+        If True, continue an interrupted run from its last checkpoint, at the
+        first unfinished gene chunk (or perturbation batch, on the streaming
+        path). The resolved ``chunk_size`` is part of the call's identity, so
+        pass the same value (or leave both on auto with the same memory).
+        Only a checkpoint from a call with the same input and
+        result-affecting parameters is used; partial results live in a hidden
+        ``.<output name>.resume`` directory until the output is written.
     checkpoint_interval
         Number of gene chunks between checkpoint saves. If None, auto-determined
-        based on dataset size. The checkpoint file `<output>.progress.json` is
-        written atomically to prevent corruption.
+        based on dataset size.
     scanpy_format
         If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
         in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
@@ -4894,6 +4926,12 @@ def wilcoxon_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
 
+        The h5ad file holds one row per perturbation: the effect size in
+        ``X`` and the layers ``z_score``, ``pvalue``, ``pvalue_adj``,
+        ``logfoldchanges``, ``u_statistic`` and ``pts``. ``pts_rest``
+        describes the control arm, so it is the per-gene column
+        ``var["pts_rest"]``.
+
     Notes
     -----
     The rank test itself runs in a numba ``prange`` kernel over perturbations
@@ -4910,6 +4948,7 @@ def wilcoxon_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
         perturbation_column=perturbation_column,
@@ -4994,14 +5033,12 @@ def wilcoxon_test(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
 
-    if resume and checkpoint_path.exists():
-        raise NotImplementedError(
-            "Resuming interrupted wilcoxon_test runs from a progress checkpoint "
-            "is currently disabled because partial Wilcoxon result arrays are "
-            "stored in temporary files during execution. Delete the progress "
-            "file and rerun, or rerun with force=True after removing the "
-            "incomplete output."
-        )
+    # The resolved chunk_size is part of the identity: checkpoints count
+    # gene chunks.
+    fingerprint = _de_fingerprint(
+        path, call_args, method="wilcoxon", candidates=candidates, n_genes=n_genes,
+        chunk_size=chunk_size,
+    )
 
     # =========================================================================
     # Dispatch. Every path streams gene chunks (axis=1), which on a CSR source
@@ -5009,14 +5046,10 @@ def wilcoxon_test(
     # that per format_mismatch_policy (temporary CSC copy beside the output
     # by default) before any X access.
     # =========================================================================
-    # No resumable= here: the guard above refuses to resume a Wilcoxon run at
-    # all, so the advice that warning gives -- convert once, because the copy
-    # is rebuilt on every restart -- would be about restarts that cannot
-    # happen. Pass it again if and when Wilcoxon resume lands.
     with stream_on_fast_axis(
         path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
         scratch_dir=output_path.parent, chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb, verbose=verbose,
+        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
     ) as stream_path:
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined. Dedicated standard (memmap) path; the
@@ -5045,6 +5078,7 @@ def wilcoxon_test(
                 scanpy_format=scanpy_format,
                 verbose=verbose,
                 resume=resume,
+                fingerprint=fingerprint,
                 memory_limit_gb=memory_limit_gb,
             )
 
@@ -5085,6 +5119,7 @@ def wilcoxon_test(
                 scanpy_format=scanpy_format,
                 verbose=verbose,
                 resume=resume,
+                fingerprint=fingerprint,
                 group_batch_size=group_batch_size,
                 memory_limit_gb=memory_limit_gb,
             )
@@ -5111,6 +5146,7 @@ def wilcoxon_test(
             scanpy_format=scanpy_format,
             verbose=verbose,
             resume=resume,
+            fingerprint=fingerprint,
             memory_limit_gb=memory_limit_gb,
         )
 
@@ -5137,374 +5173,361 @@ def _wilcoxon_test_standard(
     scanpy_format: bool,
     verbose: int | bool,
     resume: bool,
+    fingerprint: dict,
     memory_limit_gb: float | None,
 ) -> RankGenesGroupsResult:
     """Standard single-pass pooled Wilcoxon test with memmapped result arrays.
 
-    Every group's per-chunk results go into seven ``(n_groups, n_genes)``
-    memmaps under ``tempfile.gettempdir()`` and the h5ad is written from them
-    at the end. Used whenever the group-batch streaming path is not needed.
+    Every group's per-chunk results go into ``(n_groups, n_genes)`` memmaps
+    beside the output (a :class:`ResumableRun`, so an interrupted run resumes
+    at its first unfinished gene chunk) and the h5ad is written from them at
+    the end. Used whenever the group-batch streaming path is not needed.
     """
     n_groups = len(candidates)
 
-    # For wilcoxon, we track gene chunk progress (not perturbation progress)
-    # Resume logic: read checkpoint to get last completed gene chunk
-    last_completed_chunk = -1
-    if resume and checkpoint_path.exists():
-        checkpoint = _read_checkpoint(checkpoint_path)
-        if checkpoint is not None:
-            last_completed_chunk = checkpoint.get("last_gene_chunk", -1)
-            logger.info(f"Resuming from gene chunk {last_completed_chunk + 1}")
-    
     # Determine checkpoint interval (number of gene chunks between saves)
     n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
     eff_checkpoint_interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
 
     _wilcoxon_disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2,
-        tempfile.gettempdir(),
-        context="wilcoxon_test intermediate arrays",
+        _wilcoxon_disk_bytes(n_groups, n_genes),
+        output_path,
+        context="wilcoxon_test",
     )
     _messages.print_disk_estimate(verbose, "wilcoxon_test", _wilcoxon_disk_estimate)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
+    shape = (n_groups, n_genes)
+    run = ResumableRun(
+        output_path,
+        checkpoint_path,
+        fingerprint={**fingerprint, "path": "standard"},
+        arrays={
+            "effect": (shape, np.float64, 0),
+            "u_stat": (shape, np.float64, 0),
+            "pvalue": (shape, np.float64, 1.0),
+            "pvalue_adj": (shape, np.float64, 0),
+            "z_score": (shape, np.float64, 0),
+            "logfoldchange": (shape, np.float64, 0),
+            "pts": (shape, np.float32, 0),
+            # Per-gene, filled chunk by chunk.
+            "pts_rest": ((n_genes,), np.float32, 0),
+        },
+        resume=resume,
+    )
+    last_completed_chunk = run.progress.get("last_gene_chunk", -1)
+    if run.resumed:
+        _messages.vprint(verbose, "wilcoxon_test", f"Resuming at gene chunk {last_completed_chunk + 1}/{n_gene_chunks}")
+    effect_matrix = run.arrays["effect"]
+    u_matrix = run.arrays["u_stat"]
+    pvalue_matrix = run.arrays["pvalue"]
+    z_matrix = run.arrays["z_score"]
+    lfc_matrix = run.arrays["logfoldchange"]
+    pts_matrix = run.arrays["pts"]
+    pts_rest_vector = run.arrays["pts_rest"]
 
-        def _create_memmap(name: str, dtype: np.dtype, *, fill: float | int = 0):
-            path = tmpdir_path / f"{name}.dat"
-            mmap = np.memmap(path, dtype=dtype, mode="w+", shape=(n_groups, n_genes))
-            if fill != 0:
-                mmap[:] = fill
-            else:
-                mmap.fill(0)
-            return mmap
+    backed = read_backed(path)
+    try:
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_mask = labels == control_label
+        control_n = int(control_mask.sum())
+        # Precompute integer row indices (faster than boolean indexing
+        # on the dense block: O(n_pert) vs O(n_cells) per group)
+        control_idx = np.where(control_mask)[0]
+        pert_idx = _group_row_indices(labels, candidates)
 
-        effect_matrix = _create_memmap("effect", np.float64)
-        u_matrix = _create_memmap("u_stat", np.float64)
-        pvalue_matrix = _create_memmap("pvalue", np.float64, fill=1.0)
-        z_matrix = _create_memmap("z_score", np.float64)
-        lfc_matrix = _create_memmap("logfoldchange", np.float64)
-        pts_matrix = _create_memmap("pts", np.float32)
-        pts_rest_matrix = _create_memmap("pts_rest", np.float32)
+        # Pre-build flat perturbation indices and row offsets once
+        # (avoids rebuilding inside the per-chunk stacking loop).
+        all_pert_flat_idx = np.concatenate([pert_idx[label] for label in candidates])
+        total_pert_cells = len(all_pert_flat_idx)
+        pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
+        for idx, label in enumerate(candidates):
+            pert_row_offsets[idx + 1] = pert_row_offsets[idx] + len(pert_idx[label])
 
-        backed = read_backed(path)
-        try:
-            labels = backed.obs[perturbation_column].astype(str).to_numpy()
-            control_mask = labels == control_label
-            control_n = int(control_mask.sum())
-            # Precompute integer row indices (faster than boolean indexing
-            # on the dense block: O(n_pert) vs O(n_cells) per group)
-            control_idx = np.where(control_mask)[0]
-            pert_idx = _group_row_indices(labels, candidates)
+        dtype_checked = False
 
-            # Pre-build flat perturbation indices and row offsets once
-            # (avoids rebuilding inside the per-chunk stacking loop).
-            all_pert_flat_idx = np.concatenate([pert_idx[label] for label in candidates])
-            total_pert_cells = len(all_pert_flat_idx)
-            pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
-            for idx, label in enumerate(candidates):
-                pert_row_offsets[idx + 1] = pert_row_offsets[idx] + len(pert_idx[label])
-
-            dtype_checked = False
-
-            def _check_not_count_like(chunk: sp.spmatrix) -> None:
-                """Raise ValueError if the chunk looks like raw counts."""
-                if np.issubdtype(chunk.dtype, np.integer):
+        def _check_not_count_like(chunk: sp.spmatrix) -> None:
+            """Raise ValueError if the chunk looks like raw counts."""
+            if np.issubdtype(chunk.dtype, np.integer):
+                raise ValueError(
+                    "Detected integer count data in wilcoxon_test. "
+                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                )
+            if np.issubdtype(chunk.dtype, np.floating):
+                non_zero = chunk.data[chunk.data > 0]
+                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                if is_count_like:
                     raise ValueError(
-                        "Detected integer count data in wilcoxon_test. "
+                        "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
                         "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                     )
-                if np.issubdtype(chunk.dtype, np.floating):
-                    non_zero = chunk.data[chunk.data > 0]
-                    is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                    if is_count_like:
+
+        # Resume at the first unfinished chunk; iter_matrix_chunks seeks
+        # there rather than reading and discarding the completed ones.
+        current_chunk = last_completed_chunk + 1
+        n_chunks_processed = 0
+
+        def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
+            run.save(
+                total_gene_chunks=n_gene_chunks,
+                last_gene_chunk=chunk_idx,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+        with _create_progress_context(
+            n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose,
+            initial=current_chunk,
+        ) as pbar:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                start_chunk=current_chunk, warn_slow_axis=False,
+            ):
+                if not dtype_checked:
+                    if not sp.issparse(block):
                         raise ValueError(
-                            "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
-                            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
                         )
+                    _check_not_count_like(block)
+                    dtype_checked = True
 
-            # Track progress
-            # Resume would start at the first unfinished chunk, and
-            # iter_matrix_chunks seeks there rather than reading and
-            # discarding the completed ones. Today this is always 0: resuming
-            # from a checkpoint is refused at the entry point (see the
-            # NotImplementedError in wilcoxon_test) because the partial result
-            # arrays live in a TemporaryDirectory that a killed run takes with
-            # it, so a checkpoint records progress whose data is gone.
-            current_chunk = last_completed_chunk + 1
-            n_chunks_processed = 0
-            _track_gene_counts = int(verbose) >= 1
-            if _track_gene_counts:
-                _valid_gene_counts = np.zeros(n_groups, dtype=np.int32)
-            
-            # Helper to save checkpoint
-            def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
-                checkpoint_data = {
-                    "total_gene_chunks": n_gene_chunks,
-                    "last_gene_chunk": chunk_idx,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "method": "wilcoxon",
-                    "control_label": control_label,
-                }
-                _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+                csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
+                n_chunk_genes = csr_block.shape[1]
 
-            with _create_progress_context(
-                n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose,
-                initial=current_chunk,
-            ) as pbar:
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
-                    start_chunk=current_chunk, warn_slow_axis=False,
-                ):
-                    if not dtype_checked:
-                        if not sp.issparse(block):
-                            raise ValueError(
-                                "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                            )
-                        _check_not_count_like(block)
-                        dtype_checked = True
+                # ===== OPTIMIZED BATCH PROCESSING =====
+                # 1. Extract control and perturbation data once
+                control_values = csr_block[control_mask, :]
+                control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
+                control_mean = (
+                    np.asarray(control_values.mean(axis=0)).ravel()
+                    if control_values.nnz
+                    else np.zeros(n_chunk_genes, dtype=np.float64)
+                )
+                control_mean_expm1 = np.expm1(control_mean) + 1e-9
+                control_pts = np.divide(
+                    control_expr,
+                    control_n,
+                    out=np.zeros_like(control_expr, dtype=float),
+                    where=control_n > 0,
+                )
+                chunk_gene_indices = np.arange(slc.start, slc.stop)
 
-                    csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
-                    n_chunk_genes = csr_block.shape[1]
-
-                    # ===== OPTIMIZED BATCH PROCESSING =====
-                    # 1. Extract control and perturbation data once
-                    control_values = csr_block[control_mask, :]
-                    control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
-                    control_mean = (
-                        np.asarray(control_values.mean(axis=0)).ravel()
-                        if control_values.nnz
+                # 2. Pre-compute perturbation expression counts
+                pert_expr_counts = []
+                pert_means = []
+                pert_n_cells = []
+                for label in candidates:
+                    group_values = csr_block[pert_idx[label], :]
+                    n_pert_cells = group_values.shape[0]
+                    pert_n_cells.append(n_pert_cells)
+                    group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
+                    pert_expr_counts.append(group_expr)
+                    group_mean = (
+                        np.asarray(group_values.mean(axis=0)).ravel()
+                        if group_values.nnz
                         else np.zeros(n_chunk_genes, dtype=np.float64)
                     )
-                    control_mean_expm1 = np.expm1(control_mean) + 1e-9
-                    control_pts = np.divide(
-                        control_expr,
-                        control_n,
-                        out=np.zeros_like(control_expr, dtype=float),
-                        where=control_n > 0,
+                    pert_means.append(group_mean)
+
+                # 3. Determine valid genes per perturbation using the
+                # shared per-condition low-expression filter (drop genes
+                # that are jointly low in BOTH groups by both pct and mean).
+                valid_masks = []
+                for idx, label in enumerate(candidates):
+                    group_expr = pert_expr_counts[idx]
+                    group_mean = pert_means[idx]
+                    total_expr = control_expr + group_expr
+                    valid = total_expr >= min_cells_expressed
+                    low_both = _low_expr_in_both_mask(
+                        pert_expr_counts=group_expr,
+                        control_expr_counts=control_expr,
+                        pert_mean=group_mean,
+                        control_mean=control_mean,
+                        n_pert_cells=pert_n_cells[idx],
+                        n_control_cells=control_n,
+                        min_pct_ctrl=min_pct_ctrl,
+                        min_pct_pert=min_pct_pert,
+                        min_mean_ctrl=min_mean_ctrl,
+                        min_mean_pert=min_mean_pert,
                     )
-                    chunk_gene_indices = np.arange(slc.start, slc.stop)
+                    valid_masks.append(valid & ~low_both)
 
-                    # 2. Pre-compute perturbation expression counts
-                    pert_expr_counts = []
-                    pert_means = []
-                    pert_n_cells = []
-                    for label in candidates:
-                        group_values = csr_block[pert_idx[label], :]
-                        n_pert_cells = group_values.shape[0]
-                        pert_n_cells.append(n_pert_cells)
-                        group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
-                        pert_expr_counts.append(group_expr)
-                        group_mean = (
-                            np.asarray(group_values.mean(axis=0)).ravel()
-                            if group_values.nnz
-                            else np.zeros(n_chunk_genes, dtype=np.float64)
-                        )
-                        pert_means.append(group_mean)
+                # Accumulate per-perturbation valid gene counts for verbose output
 
-                    # 3. Determine valid genes per perturbation using the
-                    # shared per-condition low-expression filter (drop genes
-                    # that are jointly low in BOTH groups by both pct and mean).
-                    valid_masks = []
-                    for idx, label in enumerate(candidates):
-                        group_expr = pert_expr_counts[idx]
-                        group_mean = pert_means[idx]
-                        total_expr = control_expr + group_expr
-                        valid = total_expr >= min_cells_expressed
-                        low_both = _low_expr_in_both_mask(
-                            pert_expr_counts=group_expr,
-                            control_expr_counts=control_expr,
-                            pert_mean=group_mean,
-                            control_mean=control_mean,
-                            n_pert_cells=pert_n_cells[idx],
-                            n_control_cells=control_n,
-                            min_pct_ctrl=min_pct_ctrl,
-                            min_pct_pert=min_pct_pert,
-                            min_mean_ctrl=min_mean_ctrl,
-                            min_mean_pert=min_mean_pert,
-                        )
-                        valid_masks.append(valid & ~low_both)
+                # 4. Find union of all valid genes (to minimize dense conversion)
+                any_valid = np.zeros(n_chunk_genes, dtype=bool)
+                for valid in valid_masks:
+                    any_valid |= valid
+                valid_gene_indices = np.where(any_valid)[0]
+                n_valid_genes = len(valid_gene_indices)
 
-                    # Accumulate per-perturbation valid gene counts for verbose output
-                    if _track_gene_counts:
-                        for _vi in range(len(valid_masks)):
-                            _valid_gene_counts[_vi] += int(valid_masks[_vi].sum())
+                # 5. Initialize output arrays for this chunk
+                chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
+                chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
+                chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
 
-                    # 4. Find union of all valid genes (to minimize dense conversion)
-                    any_valid = np.zeros(n_chunk_genes, dtype=bool)
-                    for valid in valid_masks:
-                        any_valid |= valid
-                    valid_gene_indices = np.where(any_valid)[0]
-                    n_valid_genes = len(valid_gene_indices)
+                if n_valid_genes > 0:
+                    # 6. Convert valid-gene block to dense ONCE for all cells,
+                    # then use integer indexing per group (O(n_pert) vs
+                    # O(n_cells) for boolean masks on large arrays).
+                    # Keep native dtype (float32 for typical h5ad) to halve
+                    # working-set memory, consistent with Scanpy's wilcoxon.
+                    # ctrl_sorted_flat is always float64 inside _presort_control_nonzeros.
+                    all_valid_dense = csr_block[:, valid_gene_indices].toarray()
+                    control_dense = all_valid_dense[control_idx, :]
 
-                    # 5. Initialize output arrays for this chunk
-                    chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
-                    chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
-                    chunk_pts_rest = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
-
-                    if n_valid_genes > 0:
-                        # 6. Convert valid-gene block to dense ONCE for all cells,
-                        # then use integer indexing per group (O(n_pert) vs
-                        # O(n_cells) for boolean masks on large arrays).
-                        # Keep native dtype (float32 for typical h5ad) to halve
-                        # working-set memory, consistent with Scanpy's wilcoxon.
-                        # ctrl_sorted_flat is always float64 inside _presort_control_nonzeros.
-                        all_valid_dense = csr_block[:, valid_gene_indices].toarray()
-                        control_dense = all_valid_dense[control_idx, :]
-
-                        # Pre-sort control non-zeros once per chunk (~14x
-                        # speedup: avoids redundant sort across all groups)
-                        ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
-                            _presort_control_nonzeros(control_dense)
-                        ctrl_tie_sums = _compute_ctrl_tie_sums(
-                            ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz
-                        )
-                        
-                        # 7. Pre-allocate output arrays for valid genes
-                        valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
-                        valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-
-                        # 8. Stack all pert dense matrices and call batched kernel.
-                        # Single prange(n_perts) replaces n_perts serial kernel
-                        # launches, eliminating the ~25ms prange thread-pool startup
-                        # overhead per call (~50x speedup on kernel time).
-                        # Vectorised: single fancy-index replaces n_groups-iteration loop.
-                        all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
-                        valid_masks_2d = np.array([vm[valid_gene_indices] for vm in valid_masks])
-
-                        _wilcoxon_batch_perts_presorted_numba(
-                            control_dense,
-                            ctrl_sorted_flat,
-                            ctrl_offsets,
-                            ctrl_n_nz,
-                            ctrl_n_z,
-                            ctrl_tie_sums,
-                            all_pert_stacked,
-                            pert_row_offsets,
-                            valid_masks_2d,
-                            tie_correct,
-                            _ZERO_PARTITION_THRESHOLD,
-                            valid_u,
-                            valid_z,
-                            valid_p,
-                            valid_effect,
-                        )
-                        
-                        # 9. Map results back to full chunk gene indices
-                        # Vectorised: single 2-D fancy-index write per array
-                        # replaces n_groups Python-loop iterations.
-                        chunk_u[:, valid_gene_indices] = valid_u
-                        chunk_z[:, valid_gene_indices] = valid_z
-                        chunk_p[:, valid_gene_indices] = valid_p
-                        chunk_effect[:, valid_gene_indices] = valid_effect
-
-                    # 10. Compute LFC and pts — batch vectorised
-                    # (replaces n_groups Python-loop iterations)
-                    all_expr = np.array(pert_expr_counts)         # (n_groups, n_chunk_genes)
-                    all_means = np.array(pert_means)              # (n_groups, n_chunk_genes)
-                    all_n = np.array(pert_n_cells, dtype=np.float64)  # (n_groups,)
-                    valid_arr = np.array(valid_masks)             # (n_groups, n_chunk_genes)
-
-                    n_col = all_n[:, np.newaxis]                  # (n_groups, 1)
-                    # pts describes the data, not the comparison, so it is
-                    # reported for untested genes too -- the only way to see an
-                    # untested 0%-vs-95% knockdown.
-                    chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
-                    chunk_pts_rest[:] = control_pts[np.newaxis, :]
-
-                    raw_lfc = np.log2(
-                        (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                    # Pre-sort control non-zeros once per chunk (~14x
+                    # speedup: avoids redundant sort across all groups)
+                    ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
+                        _presort_control_nonzeros(control_dense)
+                    ctrl_tie_sums = _compute_ctrl_tie_sums(
+                        ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz
                     )
+                        
+                    # 7. Pre-allocate output arrays for valid genes
+                    valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
+                    valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
 
-                    # Untested genes carry NaN in every column derived from the
-                    # comparison.  Masked after the block write: the kernel
-                    # leaves its defaults in the columns it skips, and a gene
-                    # excluded here may be tested for another perturbation.
-                    invalid_arr = ~valid_arr
-                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
-                    if invalid_arr.any():
-                        chunk_u[invalid_arr] = np.nan
-                        chunk_z[invalid_arr] = np.nan
-                        chunk_p[invalid_arr] = np.nan
-                        chunk_effect[invalid_arr] = np.nan
+                    # 8. Stack all pert dense matrices and call batched kernel.
+                    # Single prange(n_perts) replaces n_perts serial kernel
+                    # launches, eliminating the ~25ms prange thread-pool startup
+                    # overhead per call (~50x speedup on kernel time).
+                    # Vectorised: single fancy-index replaces n_groups-iteration loop.
+                    all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
+                    valid_masks_2d = np.array([vm[valid_gene_indices] for vm in valid_masks])
 
-                    # 13. Write results to memmap — vectorized 2-D slice
-                    # (7 calls instead of 7 × n_groups; better cache locality)
-                    u_matrix[:, slc] = chunk_u
-                    pvalue_matrix[:, slc] = chunk_p
-                    effect_matrix[:, slc] = chunk_effect
-                    z_matrix[:, slc] = chunk_z
-                    lfc_matrix[:, slc] = chunk_lfc
-                    pts_matrix[:, slc] = chunk_pts
-                    pts_rest_matrix[:, slc] = chunk_pts_rest
+                    _wilcoxon_batch_perts_presorted_numba(
+                        control_dense,
+                        ctrl_sorted_flat,
+                        ctrl_offsets,
+                        ctrl_n_nz,
+                        ctrl_n_z,
+                        ctrl_tie_sums,
+                        all_pert_stacked,
+                        pert_row_offsets,
+                        valid_masks_2d,
+                        tie_correct,
+                        _ZERO_PARTITION_THRESHOLD,
+                        valid_u,
+                        valid_z,
+                        valid_p,
+                        valid_effect,
+                    )
+                        
+                    # 9. Map results back to full chunk gene indices
+                    # Vectorised: single 2-D fancy-index write per array
+                    # replaces n_groups Python-loop iterations.
+                    chunk_u[:, valid_gene_indices] = valid_u
+                    chunk_z[:, valid_gene_indices] = valid_z
+                    chunk_p[:, valid_gene_indices] = valid_p
+                    chunk_effect[:, valid_gene_indices] = valid_effect
+
+                # 10. Compute LFC and pts — batch vectorised
+                # (replaces n_groups Python-loop iterations)
+                all_expr = np.array(pert_expr_counts)         # (n_groups, n_chunk_genes)
+                all_means = np.array(pert_means)              # (n_groups, n_chunk_genes)
+                all_n = np.array(pert_n_cells, dtype=np.float64)  # (n_groups,)
+                valid_arr = np.array(valid_masks)             # (n_groups, n_chunk_genes)
+
+                n_col = all_n[:, np.newaxis]                  # (n_groups, 1)
+                # pts describes the data, not the comparison, so it is
+                # reported for untested genes too -- the only way to see an
+                # untested 0%-vs-95% knockdown.
+                chunk_pts[:] = np.where(n_col > 0, all_expr / n_col, 0.0).astype(np.float32)
+                pts_rest_vector[slc] = control_pts
+
+                raw_lfc = np.log2(
+                    (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                )
+
+                # Untested genes carry NaN in every column derived from the
+                # comparison.  Masked after the block write: the kernel
+                # leaves its defaults in the columns it skips, and a gene
+                # excluded here may be tested for another perturbation.
+                invalid_arr = ~valid_arr
+                chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                if invalid_arr.any():
+                    chunk_u[invalid_arr] = np.nan
+                    chunk_z[invalid_arr] = np.nan
+                    chunk_p[invalid_arr] = np.nan
+                    chunk_effect[invalid_arr] = np.nan
+
+                # 13. Write results to memmap — vectorized 2-D slice
+                # (7 calls instead of 7 × n_groups; better cache locality)
+                u_matrix[:, slc] = chunk_u
+                pvalue_matrix[:, slc] = chunk_p
+                effect_matrix[:, slc] = chunk_effect
+                z_matrix[:, slc] = chunk_z
+                lfc_matrix[:, slc] = chunk_lfc
+                pts_matrix[:, slc] = chunk_pts
                     
-                    # Release transient chunk arrays and return freed pages to OS
-                    # (prevents glibc arena fragmentation across many gene chunks)
-                    del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
-                    del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
-                    del pert_n_cells, valid_masks, valid_arr, invalid_arr
-                    if n_valid_genes > 0:
-                        del all_valid_dense, control_dense
-                        del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z, ctrl_tie_sums
-                        del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
-                        del valid_masks_2d
-                    _release_chunk_memory()
+                # Release transient chunk arrays and return freed pages to OS
+                # (prevents glibc arena fragmentation across many gene chunks)
+                del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
+                del chunk_pts, pert_expr_counts, pert_means
+                del pert_n_cells, valid_masks, valid_arr, invalid_arr
+                if n_valid_genes > 0:
+                    del all_valid_dense, control_dense
+                    del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z, ctrl_tie_sums
+                    del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
+                    del valid_masks_2d
+                _release_chunk_memory()
 
-                    # Update progress and checkpoint
-                    n_chunks_processed += 1
-                    pbar.update(1)
-                    if n_chunks_processed % eff_checkpoint_interval == 0:
-                        _save_wilcoxon_checkpoint(current_chunk)
-                    current_chunk += 1
+                # Update progress and checkpoint
+                n_chunks_processed += 1
+                pbar.update(1)
+                if n_chunks_processed % eff_checkpoint_interval == 0:
+                    _save_wilcoxon_checkpoint(current_chunk)
+                current_chunk += 1
                 
-                # Final checkpoint
-                _save_wilcoxon_checkpoint(current_chunk - 1)
-                logger.info(f"Completed {n_chunks_processed} gene chunks")
-                if _track_gene_counts:
-                    if int(verbose) >= 2:
-                        for _gi, _label in enumerate(candidates):
-                            _print_de_perturbation_verbose(verbose, _label, int(_valid_gene_counts[_gi]), n_genes)
-                    _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
-                    _pct = 100.0 * _mean / n_genes if n_genes else 0
-                    print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
-        finally:
-            backed.file.close()
+            # Final checkpoint
+            _save_wilcoxon_checkpoint(current_chunk - 1)
+            logger.info(f"Completed {n_chunks_processed} gene chunks")
+            if int(verbose) >= 1:
+                # Untested pairs are NaN in every test column; counting them
+                # at the end (not per chunk) stays right across a resume.
+                _valid_gene_counts = np.count_nonzero(~np.isnan(u_matrix), axis=1)
+                if int(verbose) >= 2:
+                    for _gi, _label in enumerate(candidates):
+                        _print_de_perturbation_verbose(verbose, _label, int(_valid_gene_counts[_gi]), n_genes)
+                _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
+                _pct = 100.0 * _mean / n_genes if n_genes else 0
+                print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
+    finally:
+        backed.file.close()
 
-        gene_symbols = pd.Index(gene_symbols).astype(str)
-        pvalue_adj_matrix = _create_memmap("pvalue_adj", np.float64)
-        _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+    pvalue_adj_matrix = run.arrays["pvalue_adj"]
+    _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
 
-        # Write h5ad directly from memmaps via h5py (avoids triple allocation:
-        # memmap + np.array copy + AnnData that previously caused OOM)
-        if int(verbose) >= 1:
-            print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
-        _write_wilcoxon_result_h5ad(
-            output_path,
-            effect_matrix=effect_matrix,
-            z_matrix=z_matrix,
-            pvalue_matrix=pvalue_matrix,
-            pvalue_adj_matrix=pvalue_adj_matrix,
-            lfc_matrix=lfc_matrix,
-            u_matrix=u_matrix,
-            pts_matrix=pts_matrix,
-            pts_rest_matrix=pts_rest_matrix,
-            candidates=candidates,
-            gene_symbols=gene_symbols,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            tie_correct=tie_correct,
-            corr_method=corr_method,
-        )
-        # Memmaps will be released when TemporaryDirectory exits below
+    # Write h5ad directly from memmaps via h5py (avoids triple allocation:
+    # memmap + np.array copy + AnnData that previously caused OOM)
+    if int(verbose) >= 1:
+        print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
+    _write_wilcoxon_result_h5ad(
+        output_path,
+        effect_matrix=effect_matrix,
+        z_matrix=z_matrix,
+        pvalue_matrix=pvalue_matrix,
+        pvalue_adj_matrix=pvalue_adj_matrix,
+        lfc_matrix=lfc_matrix,
+        u_matrix=u_matrix,
+        pts_matrix=pts_matrix,
+        pts_rest=pts_rest_vector,
+        candidates=candidates,
+        gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        tie_correct=tie_correct,
+        corr_method=corr_method,
+    )
+    # Release the memmaps (and their pages) before reading the result back.
+    del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
+    del lfc_matrix, pts_matrix, pts_rest_vector
+    run.discard()
 
-    # tmpdir is now cleaned up — all memmaps released.
-    # Read back from h5ad for the result object.
     _release_chunk_memory()
     result = _build_result_from_h5ad(
         output_path,
@@ -5520,13 +5543,6 @@ def _wilcoxon_test_standard(
     # Optionally write Scanpy-compatible rank_genes_groups structure
     if scanpy_format and result.statistics.size > 0:
         _write_rank_genes_groups_hdf5(output_path, result)
-
-    # Clean up checkpoint on successful completion
-    if checkpoint_path.exists():
-        try:
-            checkpoint_path.unlink()
-        except Exception:
-            pass
 
     return result
 
@@ -5680,41 +5696,38 @@ def shrink_lfc(
         profiler.reset_peak()  # Reset peak memory after h5ad load
         profiler.start("shrinkage")
     
-    # Validate that this is an NB-GLM result with required layers
-    if "logfoldchange_raw" not in adata.layers:
+    # Validate that this is an NB-GLM result
+    if adata.uns.get("method") != "nb_glm" or "standard_error" not in adata.layers:
         raise ValueError(
-            f"Input file '{path}' does not have 'logfoldchange_raw' layer. "
-            "This function requires NB-GLM results from nb_glm_test. "
-            "Ensure the NB-GLM was run with a version that stores raw LFCs."
+            f"Input file '{path}' is not an nb_glm_test result "
+            "(expected uns['method'] == 'nb_glm' and a 'standard_error' layer)."
         )
-    if "standard_error" not in adata.layers:
-        raise ValueError(
-            f"Input file '{path}' does not have 'standard_error' layer. "
-            "This function requires NB-GLM results with standard errors."
-        )
-    if "dispersion" not in adata.layers:
-        raise ValueError(
-            f"Input file '{path}' does not have 'dispersion' layer. "
-            "This function requires NB-GLM results with dispersion estimates."
-        )
-    
+
     # Get required metadata
     control_label = adata.uns.get("control_label", "control")
     perturbation_column = adata.uns.get("perturbation_column", "perturbation")
-    
-    # Get raw LFC, SE, and dispersion in ln-scale (required for apeGLM optimization)
-    # Use ln-scale layers if available (v0.5.0+), otherwise fall back with conversion
+
+    # MLE LFC in the file's base: X, unless X was already shrunk, in which
+    # case nb_glm_test / shrink_lfc kept the MLE as logfoldchange_raw.
     lfc_base = adata.uns.get("lfc_base", "log2")
-    if "logfoldchange_raw_ln" in adata.layers:
-        raw_lfc = adata.layers["logfoldchange_raw_ln"]  # Already ln-scale
-        se = adata.layers["standard_error_ln"]
+    mle_lfc = adata.layers["logfoldchange_raw"] if "logfoldchange_raw" in adata.layers else adata.X
+    # ln-scale MLE LFC and SE (apeGLM works on the ln scale). With a log2
+    # base they are stored as *_ln layers; with an ln base the main layers
+    # already hold them.
+    if lfc_base == "ln":
+        raw_lfc = mle_lfc
+        se = adata.layers.get("standard_error_ln", adata.layers["standard_error"])
     else:
-        raise ValueError(
-            f"Input file '{path}' lacks ln-scale layers "
-            "('logfoldchange_raw_ln', 'standard_error_ln'). "
-            "Re-run nb_glm_test with the current version of crispyx."
-        )
-    dispersion = adata.layers["dispersion"]
+        raw_lfc = adata.layers["logfoldchange_raw_ln"]
+        se = adata.layers["standard_error_ln"]
+    raw_lfc = np.asarray(raw_lfc)
+    se = np.asarray(se)
+    # A global dispersion is stored once per gene in var; a per-comparison
+    # one is a layer.
+    if "dispersion" in adata.var:
+        dispersion = np.broadcast_to(adata.var["dispersion"].to_numpy(dtype=np.float64), raw_lfc.shape)
+    else:
+        dispersion = adata.layers["dispersion"]
     
     # Get fitted intercept from NB-GLM (ln-scale, critical for accurate shrinkage)
     if "intercept" not in adata.layers:
@@ -5962,10 +5975,13 @@ def shrink_lfc(
         shrunk_lfc = shrunk_lfc / ln2
         shrunk_se = shrunk_se / ln2
     
-    # Update layers
-    adata.layers["logfoldchanges"] = shrunk_lfc
+    # X becomes the shrunk LFC (the effect size); keep the MLE LFC and, with
+    # an ln base, the MLE SE, which the posterior values below replace.
+    adata.layers["logfoldchange_raw"] = np.array(mle_lfc)
+    if lfc_base == "ln":
+        adata.layers["standard_error_ln"] = se
     adata.layers["standard_error"] = shrunk_se  # Posterior SE
-    adata.X = shrunk_lfc  # Update effect_size matrix
+    adata.X = shrunk_lfc
     
     # Update metadata
     adata.uns["lfc_shrinkage_type"] = "apeglm"
@@ -6023,7 +6039,7 @@ def shrink_lfc(
     pvalue_matrix = adata.layers.get("pvalue", np.ones_like(shrunk_lfc))
     pvalue_adj_matrix = adata.layers.get("pvalue_adj", np.ones_like(shrunk_lfc))
     pts_matrix = adata.layers.get("pts", np.zeros((n_groups, n_genes), dtype=np.float32))
-    pts_rest_matrix = adata.layers.get("pts_rest", np.zeros((n_groups, n_genes), dtype=np.float32))
+    pts_rest_matrix = np.broadcast_to(adata.var["pts_rest"].to_numpy(dtype=np.float32), (n_groups, n_genes))
     
     # Create order matrix
     statistic_for_order = np.where(
@@ -6088,11 +6104,7 @@ def _estimate_shape_for_t_test(
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    # statistics/pvalues/order (f64) + logfoldchanges/effect_size/pts/pts_rest (f32)
-    return {
-        "tempdir": estimate_bytes(n_groups, n_genes, itemsize=8) * 3
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 4,
-    }
+    return {"output": _t_test_disk_bytes(n_groups, n_genes)}
 
 
 def _estimate_shape_for_nb_glm_test(
@@ -6112,13 +6124,7 @@ def _estimate_shape_for_nb_glm_test(
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    # 11 f64 arrays (effect, statistic, pvalue, logfoldchange, logfoldchange_raw,
-    # intercept, standard_error, dispersion, dispersion_raw, dispersion_trend, mean)
-    # + 3 4-byte arrays (pts, pts_rest, iterations)
-    return {
-        "tempdir": estimate_bytes(n_groups, n_genes, itemsize=8) * 11
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3,
-    }
+    return {"output": _nb_glm_disk_bytes(n_groups, n_genes)}
 
 
 def _estimate_shape_for_wilcoxon_test(
@@ -6149,21 +6155,7 @@ def _estimate_shape_for_wilcoxon_test(
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    # effect/u_stat/pvalue/z_score/logfoldchange (f64) + pts/pts_rest (f32);
-    # shared by the standard and batch-stratified memmap paths.
-    tempdir_bytes = (
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 5
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
-    )
-    estimate = {"tempdir": tempdir_bytes}
-    if batch_column is None:
-        # Without a batch column, large group counts may instead take the
-        # group-batch streaming path, which writes 6 f64 + 2 f32 layers
-        # directly to the output file instead of a tempdir. Report both.
-        estimate["output"] = (
-            estimate_bytes(n_groups, n_genes, itemsize=8) * 6
-            + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
-        )
+    estimate = {"output": _wilcoxon_disk_bytes(n_groups, n_genes)}
     # A CSR source may first be converted to a temporary CSC copy beside the
     # output; scratch_copy_bytes makes that call the same way the run does.
     scratch = scratch_copy_bytes(
@@ -6178,7 +6170,8 @@ def _estimate_shape_for_shrink_lfc(path: Path, **_ignored) -> dict[str, float]:
     backed = read_backed(path)
     try:
         n_obs, n_vars = backed.n_obs, backed.n_vars
-        n_layers = len(backed.layers) + 1
+        # AnnData 0.13 exposes X as layers[None]; count it once, via the + 1.
+        n_layers = sum(key is not None for key in backed.layers.keys()) + 1
     finally:
         backed.file.close()
     return {"output": estimate_bytes(n_obs, n_vars, n_layers, overhead=1.10)}
