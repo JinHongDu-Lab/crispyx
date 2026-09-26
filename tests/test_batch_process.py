@@ -725,8 +725,10 @@ def test_multi_channel_output_populates_layers_and_x(tmp_path):
         output_path=tmp_path / "multi_channel.h5ad", force=True,
     )
     backed = result.backed
-    # The first channel is X; it is not duplicated as a layer.
-    assert set(backed.layers.keys()) == {"se", "mean_diff_weight_sum", "se_weight_sum"}
+    # The first channel is X; it is not duplicated as a layer. AnnData 0.13
+    # exposes X itself as layers[None], so only named layers are compared.
+    layer_keys = {key for key in backed.layers.keys() if key is not None}
+    assert layer_keys == {"se", "mean_diff_weight_sum", "se_weight_sum"}
     assert backed.uns["channels"].tolist() == ["mean_diff", "se"]
     assert np.all(np.asarray(backed.layers["se"][:]) >= 0)
     result.close()

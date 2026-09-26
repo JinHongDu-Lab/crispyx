@@ -90,10 +90,29 @@ def _record_runs(monkeypatch) -> list[ResumableRun]:
     return runs
 
 
+def _dataset_keys(f: h5py.File, key: str) -> list[str]:
+    """``key`` itself, or every dataset under it when it is a group.
+
+    With pandas 3, AnnData writes string columns as ``nullable-string-array``
+    groups (``values`` + ``mask``) rather than a single dataset.
+    """
+    if isinstance(f[key], h5py.Dataset):
+        return [key]
+    found: list[str] = []
+
+    def collect(name: str, obj) -> None:
+        if isinstance(obj, h5py.Dataset):
+            found.append(f"{key}/{name}")
+
+    f[key].visititems(collect)
+    return found
+
+
 def _assert_same_result(expected: Path, actual: Path) -> None:
     """Every stored value of the two DE results is bit-identical."""
     with h5py.File(expected, "r") as a, h5py.File(actual, "r") as b:
-        keys = ["X"] + [f"layers/{k}" for k in a["layers"]] + [f"var/{k}" for k in a["var"]]
+        tops = ["X"] + [f"layers/{k}" for k in a["layers"]] + [f"var/{k}" for k in a["var"]]
+        keys = [key for top in tops for key in _dataset_keys(a, top)]
         assert sorted(a["layers"]) == sorted(b["layers"])
         for key in keys:
             x, y = a[key][()], b[key][()]

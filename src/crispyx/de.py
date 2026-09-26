@@ -6170,7 +6170,8 @@ def _estimate_shape_for_shrink_lfc(path: Path, **_ignored) -> dict[str, float]:
     backed = read_backed(path)
     try:
         n_obs, n_vars = backed.n_obs, backed.n_vars
-        n_layers = len(backed.layers) + 1
+        # AnnData 0.13 exposes X as layers[None]; count it once, via the + 1.
+        n_layers = sum(key is not None for key in backed.layers.keys()) + 1
     finally:
         backed.file.close()
     return {"output": estimate_bytes(n_obs, n_vars, n_layers, overhead=1.10)}
