@@ -327,8 +327,8 @@ class TestStratifiedCacheSafety:
         assert strat.result_path.name == "data_cx_wilcoxon_stratified.h5ad"
         assert not np.allclose(pooled.statistics, strat.statistics, equal_nan=True)
         with h5py.File(strat.result_path, "r") as hf:
-            assert hf["uns"].attrs["batch_column"] == "batch"
-            assert bool(hf["uns"].attrs["stratified"]) is True
+            assert hf["uns/batch_column"][()].decode() == "batch"
+            assert bool(hf["uns/stratified"][()]) is True
 
     def test_explicit_output_path_metadata_mismatch_reruns(self, tmp_path):
         rng = np.random.default_rng(4)
@@ -363,8 +363,8 @@ class TestStratifiedCacheSafety:
         assert strat.result_path == pooled.result_path == out
         assert not np.allclose(pooled.statistics, strat.statistics, equal_nan=True)
         with h5py.File(out, "r") as hf:
-            assert hf["uns"].attrs["batch_column"] == "batch"
-            assert bool(hf["uns"].attrs["stratified"]) is True
+            assert hf["uns/batch_column"][()].decode() == "batch"
+            assert bool(hf["uns/stratified"][()]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -395,42 +395,37 @@ class TestUntestableBatchLayouts:
         assert np.isnan(result.u_statistics[0]).all()
         assert np.isfinite(result.logfoldchanges[0]).any()
         with h5py.File(result.result_path, "r") as hf:
-            assert hf["uns"].attrs["stratified_n_untestable_perturbations"] == 1
+            assert hf["uns/stratified_n_untestable_perturbations"][()] == 1
 
 
 # ---------------------------------------------------------------------------
 # 6. Interrupted checkpoint resume guard
 # ---------------------------------------------------------------------------
 
-class TestWilcoxonResumeGuard:
-    def test_interrupted_wilcoxon_checkpoint_is_rejected(self, tmp_path):
+class TestWilcoxonResume:
+    def test_checkpoint_from_another_call_is_not_trusted(self, tmp_path):
+        """A checkpoint without this call's fingerprint (another run's, or a
+        hand-edited one) is discarded, not resumed from."""
         rng = np.random.default_rng(6)
         counts = rng.poisson(5, (80, 6))
         labels = ["control"] * 40 + ["pert_0"] * 40
         batch = [0, 1] * 40
         path, _ = _make_h5ad(tmp_path, counts, labels, batch)
+        kwargs = dict(
+            perturbation_column="perturbation", control_label="control", batch_column="batch",
+            **_NO_FILTER,
+        )
+        reference = wilcoxon_test(path, output_path=tmp_path / "reference.h5ad", **kwargs)
+
         out = tmp_path / "interrupted_stratified.h5ad"
         out.with_suffix(".progress.json").write_text('{"last_gene_chunk": 0}')
+        result = wilcoxon_test(path, output_path=out, resume=True, **kwargs)
+        np.testing.assert_array_equal(result.statistics, reference.statistics)
+        assert not out.with_suffix(".progress.json").exists()
 
-        with pytest.raises(NotImplementedError, match="Resuming interrupted wilcoxon_test"):
-            wilcoxon_test(
-                path,
-                perturbation_column="perturbation",
-                control_label="control",
-                batch_column="batch",
-                output_path=out,
-                resume=True,
-                **_NO_FILTER,
-            )
-
-    def test_resume_does_not_claim_a_conversion_is_rebuilt_each_restart(self, tmp_path):
-        """The convert-once advice is for runs that can resume; this one cannot.
-
-        stream_on_fast_axis warns a resumable caller that its temporary CSC
-        copy is rebuilt on every restart. wilcoxon_test refuses to resume from
-        a checkpoint at all, so passing resume= through to that warning would
-        advertise restarts that cannot happen.
-        """
+    def test_resume_warns_that_a_conversion_is_rebuilt_each_restart(self, tmp_path):
+        """A resumable run on a converted copy rebuilds that copy on every
+        restart, so stream_on_fast_axis advises converting once."""
         rng = np.random.default_rng(7)
         counts = rng.poisson(5, (80, 6))
         labels = ["control"] * 40 + ["pert_0"] * 40
@@ -444,12 +439,12 @@ class TestWilcoxonResumeGuard:
                 perturbation_column="perturbation",
                 control_label="control",
                 batch_column="batch",
-                output_path=tmp_path / "no_resume_warning.h5ad",
+                output_path=tmp_path / "resume_warning.h5ad",
                 resume=True,
                 format_mismatch_policy="convert",
                 **_NO_FILTER,
             )
-        assert not [w for w in caught if "rebuilt from scratch" in str(w.message)]
+        assert [w for w in caught if "rebuilt from scratch" in str(w.message)]
 
 
 if __name__ == "__main__":

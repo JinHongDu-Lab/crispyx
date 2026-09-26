@@ -189,8 +189,9 @@ class BatchReducer:
         )
 
     Each channel is combined across batches independently (with its own
-    weight) and written to ``result.layers[name]``; the first channel
-    (``"mean_diff"`` above) is also copied into ``result.X``. Leave
+    weight). The first channel (``"mean_diff"`` above) is written to
+    ``result.X`` and every later one to ``result.layers[name]``; each
+    channel's weights go to ``result.layers[f"{name}_weight_sum"]``. Leave
     ``channels`` as ``None`` (the default) for the single-value form above.
 
     Notes
@@ -513,10 +514,11 @@ def batch_process(
     AnnData
         On-disk result with groups in observations, genes in variables, the
         corrected statistic in ``X``, and accumulated weights in
-        ``layers['weight_sum']``. With ``reducer.channels`` set, every
-        channel's combined values are additionally written to
-        ``layers[name]`` (weights to ``layers[f"{name}_weight_sum"]``); the
-        first channel's values are the ones copied into ``X``.
+        ``layers['weight_sum']``. With ``reducer.channels`` set, the first
+        channel's combined values are ``X`` and every later channel's are
+        ``layers[name]``; each channel's weights are
+        ``layers[f"{name}_weight_sum"]``. ``uns['channels']`` lists the
+        channels in order.
 
     Notes
     -----
@@ -831,7 +833,7 @@ def batch_process(
                     stacklevel=2,
                 )
 
-        n_layer_arrays = 1 + 2 * len(channels) if channels else 2
+        n_layer_arrays = 2 * len(channels) if channels else 2
         _output_disk_estimate = warn_if_disk_space_low(
             estimate_bytes(max(n_groups, 1), n_genes, overhead=1.10) * n_layer_arrays,
             resolved_output,
@@ -903,8 +905,10 @@ def batch_process(
                 _create_dense(f, "X", np.nan)
                 layers_grp = f.require_group("layers")
                 if channels:
-                    for name in channels:
+                    # The first channel lives in X only.
+                    for name in channels[1:]:
                         _create_dense(layers_grp, name, np.nan)
+                    for name in channels:
                         _create_dense(layers_grp, f"{name}_weight_sum", 0.0)
                 else:
                     _create_dense(layers_grp, "weight_sum", 0.0)
@@ -1082,14 +1086,11 @@ def batch_process(
                             positive = weights > 0
                             np.divide(values, weights, out=values, where=positive)
                             values[~positive] = np.nan
-                            if name is None:
+                            if name == scan_layer:  # None, or the first channel
                                 out_X[:, gene_start:gene_end] = values
                             else:
                                 out_layers[name][:, gene_start:gene_end] = values
-                                if name == scan_layer:
-                                    out_X[:, gene_start:gene_end] = values
-                                if name != scan_layer:
-                                    out_layers[f"{name}_weight_sum"][:, gene_start:gene_end] = weights
+                                out_layers[f"{name}_weight_sum"][:, gene_start:gene_end] = weights
                         out_layers[scan_weight_key][:, gene_start:gene_end] = denominators[scan_layer]
                         del numerators, denominators
 
@@ -1212,7 +1213,7 @@ def _estimate_shape_for_batch_process(
         backed.file.close()
     n_groups = max(len(groups), 1)
     channels = reducer.channels if isinstance(reducer, BatchReducer) else None
-    n_layer_arrays = 1 + 2 * len(channels) if channels else 2
+    n_layer_arrays = 2 * len(channels) if channels else 2
     if chunk_size is None:
         chunk_size = _auto_gene_chunk_size(
             n_obs, n_genes,

@@ -30,6 +30,7 @@ from .batch import BatchReducer, BatchStatistic, batch_process
 from .data import (
     AnnData,
     OverlapResult,
+    compress_h5ad,
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
@@ -153,6 +154,7 @@ __all__ = [
     "downsample_counts",
     "convert_to_csc",
     "convert_to_csr",
+    "compress_h5ad",
     "load_obs",
     "load_var",
     "write_obs",

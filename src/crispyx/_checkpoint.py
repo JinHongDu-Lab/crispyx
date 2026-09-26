@@ -11,6 +11,7 @@ import binascii
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,13 +61,13 @@ def _write_checkpoint_atomic(
 
 def _read_checkpoint(
     checkpoint_path: Path,
-    required_keys: tuple[str, ...] = ("completed", "total"),
+    required_keys: tuple[str, ...],
 ) -> dict | None:
     """Read checkpoint file, returning None if missing or corrupted.
 
     ``required_keys`` distinguishes a valid checkpoint from a corrupted or
-    schema-mismatched one; it defaults to the per-candidate DE schema
-    (``t_test``/``wilcoxon_test``/``nb_glm_test``). ``batch_process`` uses
+    schema-mismatched one. The DE functions (through :class:`ResumableRun`)
+    require ``("fingerprint",)``; ``batch_process`` uses
     its own gene-chunk schema and passes ``required_keys=("last_gene_chunk",
     "total_gene_chunks", "batches_used")``. Presence is all that is checked:
     a checkpoint written before 0.1.4 carries ``batches_used`` as a
@@ -134,60 +135,6 @@ def _unpack_bool_matrix(payload: object, shape: tuple[int, int]) -> np.ndarray |
     return flat[:count].astype(bool).reshape(shape)
 
 
-def _scan_h5ad_completed(
-    h5ad_path: Path,
-    all_candidates: list[str],
-    result_dataset: str = "uns/rank_genes_groups/full/scores",
-) -> list[str]:
-    """Scan h5ad file to detect completed perturbations by non-zero/non-NaN rows.
-    
-    This is a fallback when checkpoint file is missing or corrupted.
-    
-    Parameters
-    ----------
-    h5ad_path
-        Path to the output h5ad file.
-    all_candidates
-        List of all perturbation labels (in order).
-    result_dataset
-        HDF5 dataset path to check for results. Should have shape (n_groups, n_genes).
-        
-    Returns
-    -------
-    list[str]
-        List of perturbation labels that have been completed.
-    """
-    completed = []
-    if not h5ad_path.exists():
-        return completed
-    
-    try:
-        with h5py.File(h5ad_path, "r") as f:
-            # Try to access the result dataset
-            if result_dataset in f:
-                ds = f[result_dataset]
-                n_groups = ds.shape[0]
-                for idx in range(min(n_groups, len(all_candidates))):
-                    row = ds[idx, :]
-                    # Check if row has any non-NaN, non-zero values
-                    if np.any(np.isfinite(row) & (row != 0)):
-                        completed.append(all_candidates[idx])
-            else:
-                # Try alternative: check layers in X matrix
-                if "X" in f:
-                    X = f["X"]
-                    if hasattr(X, "shape") and len(X.shape) == 2:
-                        n_groups = X.shape[0]
-                        for idx in range(min(n_groups, len(all_candidates))):
-                            row = X[idx, :]
-                            if np.any(np.isfinite(row) & (row != 0)):
-                                completed.append(all_candidates[idx])
-    except Exception as e:
-        logger.warning(f"Failed to scan h5ad for completed perturbations: {e}")
-    
-    return completed
-
-
 def _find_last_completed_gene_chunk(
     h5ad_path: Path,
     n_gene_chunks: int,
@@ -210,8 +157,7 @@ def _find_last_completed_gene_chunk(
 
     Known limitation: a group with zero cells for every gene in a chunk has
     a legitimately-zero weight there and looks indistinguishable from
-    "not yet written" -- the same convention DE's ``_scan_h5ad_completed``
-    already uses.
+    "not yet written".
     """
     if not h5ad_path.exists():
         return -1
@@ -234,68 +180,6 @@ def _find_last_completed_gene_chunk(
     except Exception as e:
         logger.warning(f"Failed to scan h5ad for completed gene chunks: {e}")
         return -1
-
-
-def _get_resumable_candidates(
-    checkpoint_path: Path,
-    h5ad_path: Path,
-    all_candidates: list[str],
-    retry_failed: bool = True,
-) -> tuple[list[str], list[str], list[str]]:
-    """Get candidates to process, accounting for previous progress.
-
-    Parameters
-    ----------
-    checkpoint_path
-        Path to the progress JSON file.
-    h5ad_path
-        Path to the output h5ad file.
-    all_candidates
-        List of all perturbation labels to process.
-    retry_failed
-        If True, previously failed perturbations will be retried.
-
-    Returns
-    -------
-    tuple[list[str], list[str], list[str]]
-        (candidates_to_run, completed, failed)
-        - candidates_to_run: perturbations that need to be processed
-        - completed: perturbations already completed
-        - failed: perturbations that failed (for logging)
-    """
-    checkpoint = _read_checkpoint(checkpoint_path)
-
-    if checkpoint is not None:
-        completed = checkpoint.get("completed", [])
-        failed = checkpoint.get("failed", [])
-        logger.info(f"Resuming: {len(completed)}/{len(all_candidates)} already completed")
-        if failed:
-            logger.info(f"  {len(failed)} previously failed perturbations")
-    else:
-        # Checkpoint missing or corrupted - try scanning h5ad
-        if h5ad_path.exists():
-            logger.warning(
-                f"Checkpoint file missing or corrupted at {checkpoint_path}. "
-                f"Scanning h5ad file to detect completed perturbations..."
-            )
-            completed = _scan_h5ad_completed(h5ad_path, all_candidates)
-            failed = []
-            if completed:
-                logger.info(f"Detected {len(completed)} completed perturbations from h5ad scan")
-        else:
-            completed = []
-            failed = []
-    
-    # Determine which candidates to run
-    completed_set = set(completed)
-    failed_set = set(failed) if not retry_failed else set()
-    
-    candidates_to_run = [
-        c for c in all_candidates 
-        if c not in completed_set and c not in failed_set
-    ]
-    
-    return candidates_to_run, completed, failed
 
 
 def _get_checkpoint_interval(n_perturbations: int, checkpoint_interval: int | None) -> int:
@@ -322,6 +206,115 @@ def _get_checkpoint_interval(n_perturbations: int, checkpoint_interval: int | No
         return 10
     else:
         return 50
+
+
+def run_fingerprint(source_path: Path, **items) -> dict:
+    """Identity of a call, for deciding whether a checkpoint belongs to it.
+
+    Covers the source file (path, size, modification time) and every item
+    passed -- the parameters that shape the results -- normalised through
+    JSON so a fingerprint read back from a checkpoint compares equal.
+    """
+    stat = Path(source_path).stat()
+    fingerprint = {
+        "source": str(source_path),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        **items,
+    }
+    return json.loads(json.dumps(fingerprint, default=_jsonable, sort_keys=True))
+
+
+def _jsonable(value):
+    """JSON form of the non-JSON types a DE call's parameters can hold."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    if isinstance(value, Path):
+        return str(value)
+    return repr(value)
+
+
+class ResumableRun:
+    """Result arrays and a progress checkpoint that outlive an interruption.
+
+    The arrays are memmaps in a hidden ``.{output name}.partial`` directory
+    beside the output (a temporary directory would vanish with the process,
+    taking the finished work with it). The checkpoint JSON records the call's
+    :func:`run_fingerprint` plus caller-defined progress, and :meth:`save`
+    flushes the arrays before writing it, so everything a checkpoint lists
+    as done is on disk.
+
+    A caller that writes its partial output itself (rather than into
+    arrays) keeps it in :attr:`directory` too and names it in ``requires``.
+
+    A run resumes only when ``resume`` is set, the checkpoint's fingerprint
+    matches this call, and every array exists with the expected shape and
+    dtype (plus every file named in ``requires``). Otherwise the stale
+    checkpoint and directory are discarded and the run starts fresh, so a
+    checkpoint can never be paired with another run's data.
+    """
+
+    def __init__(
+        self,
+        output_path: Path,
+        checkpoint_path: Path,
+        *,
+        fingerprint: dict,
+        arrays: dict[str, tuple[tuple[int, ...], "np.typing.DTypeLike", float | int | bool]],
+        resume: bool,
+        requires: tuple[str, ...] = (),
+    ) -> None:
+        self.checkpoint_path = checkpoint_path
+        self.fingerprint = fingerprint
+        self.directory = output_path.with_name(f".{output_path.name}.partial")
+        checkpoint = _read_checkpoint(checkpoint_path, required_keys=("fingerprint",)) if resume else None
+        self.resumed = (
+            checkpoint is not None
+            and checkpoint["fingerprint"] == fingerprint
+            and all((self.directory / name).exists() for name in requires)
+            and all(
+                (self.directory / f"{name}.dat").exists()
+                and (self.directory / f"{name}.dat").stat().st_size
+                == int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize
+                for name, (shape, dtype, _fill) in arrays.items()
+            )
+        )
+        self.progress = {k: v for k, v in checkpoint.items() if k != "fingerprint"} if self.resumed else {}
+        self.arrays: dict[str, np.memmap] = {}
+        if not self.resumed:
+            self.discard()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for name, (shape, dtype, fill) in arrays.items():
+            path = self.directory / f"{name}.dat"
+            if self.resumed:
+                self.arrays[name] = np.memmap(path, mode="r+", dtype=dtype, shape=shape)
+            else:
+                array = np.memmap(path, mode="w+", dtype=dtype, shape=shape)
+                if fill != 0:
+                    array.fill(fill)
+                self.arrays[name] = array
+
+    def save(self, **progress) -> None:
+        """Flush the arrays, then record ``progress`` in the checkpoint."""
+        for array in self.arrays.values():
+            array.flush()
+        _write_checkpoint_atomic(self.checkpoint_path, {"fingerprint": self.fingerprint, **progress})
+
+    def discard(self) -> None:
+        """Remove the checkpoint and the arrays (after success, or when stale).
+
+        Drops this object's references to the arrays; once the caller drops
+        its own, the mapped pages are released.
+        """
+        self.arrays = {}
+        self.checkpoint_path.unlink(missing_ok=True)
+        # ignore_errors: on Windows a file still mapped by a live result view
+        # cannot be deleted; the next run on this output removes it.
+        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class _DummyProgress:

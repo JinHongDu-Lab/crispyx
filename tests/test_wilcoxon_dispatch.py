@@ -597,7 +597,7 @@ class TestWriteResultH5ad:
             lfc_matrix=rng.standard_normal((n_groups, n_genes)),
             u_matrix=rng.random((n_groups, n_genes)) * 1000,
             pts_matrix=rng.random((n_groups, n_genes)).astype(np.float32),
-            pts_rest_matrix=rng.random((n_groups, n_genes)).astype(np.float32),
+            pts_rest=rng.random(n_genes).astype(np.float32),
         )
 
     def test_roundtrip_values(self, tmp_path):
@@ -621,7 +621,10 @@ class TestWriteResultH5ad:
             np.testing.assert_allclose(hf["layers/logfoldchanges"][:], arrs["lfc_matrix"])
             np.testing.assert_allclose(hf["layers/u_statistic"][:], arrs["u_matrix"])
             np.testing.assert_allclose(hf["layers/pts"][:], arrs["pts_matrix"], atol=1e-7)
-            np.testing.assert_allclose(hf["layers/pts_rest"][:], arrs["pts_rest_matrix"], atol=1e-7)
+            assert "pts_rest" not in hf["layers"]
+            np.testing.assert_array_equal(hf["var/pts_rest"][:], arrs["pts_rest"])
+        # pts_rest is a proper var column for anndata readers
+        np.testing.assert_array_equal(ad.read_h5ad(out).var["pts_rest"].to_numpy(), arrs["pts_rest"])
 
     def test_obs_var_metadata(self, tmp_path):
         """obs/var indices are encoded correctly."""
@@ -636,14 +639,13 @@ class TestWriteResultH5ad:
             perturbation_column="perturbation", control_label="control",
             tie_correct=False, corr_method="bonferroni", **arrs,
         )
-        with h5py.File(out, "r") as hf:
-            obs_idx = [x.decode() for x in hf["obs/_index"][:]]
-            var_idx = [x.decode() for x in hf["var/_index"][:]]
-            assert obs_idx == candidates
-            assert var_idx == list(genes.astype(str))
-            assert hf["uns"].attrs["method"] == "wilcoxon"
-            assert hf["uns"].attrs["tie_correct"] == False
-            assert hf["uns"].attrs["pvalue_correction"] == "bonferroni"
+        result = ad.read_h5ad(out)
+        assert result.obs_names.tolist() == candidates
+        assert result.var_names.tolist() == list(genes.astype(str))
+        assert result.uns["method"] == "wilcoxon"
+        assert result.uns["tie_correct"] == False
+        assert result.uns["pvalue_correction"] == "bonferroni"
+        assert result.uns["stratified"] == False
 
 
 class TestBuildResultFromH5ad:
@@ -675,6 +677,7 @@ class TestBuildResultFromH5ad:
         np.testing.assert_allclose(result.effect_size, arrs["effect_matrix"])
         np.testing.assert_allclose(result.pvalues, arrs["pvalue_matrix"])
         np.testing.assert_allclose(result.logfoldchanges, arrs["lfc_matrix"])
+        np.testing.assert_array_equal(result.pts_rest, np.broadcast_to(arrs["pts_rest"], result.pts.shape))
 
     def test_order_is_z_argsort(self, tmp_path):
         result, arrs = self._write_and_build(tmp_path)
