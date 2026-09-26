@@ -61,16 +61,29 @@ unaffected.
   row for every perturbation its checkpoint marked as done (``t_test`` the
   same with zeros), and ``wilcoxon_test`` refused to resume at all. The
   partial arrays now live beside the output in a hidden
-  ``.<output name>.partial`` directory, removed on success, and the
+  ``.<output name>.resume`` directory, removed on success, and the
   checkpoint records a fingerprint of the call (input file, perturbations and
   result-affecting parameters). A run resumes only from its own checkpoint --
   anything else is discarded and the run starts over -- and a resumed run's
-  output is bit-identical to an uninterrupted one. Streaming ``wilcoxon_test``
-  builds its file inside that directory too, so a file at the output path is
-  always complete: an interrupted streaming run used to leave a half-filled
-  output that the next call loaded as a finished result. Disk estimates for
+  output is bit-identical to an uninterrupted one. Memory and chunking
+  settings (``memory_limit_gb``, ``max_dense_fraction``, ``cell_chunk_size``,
+  ``chunk_size``, ``irls_batch_size``) are not part of the fingerprint, so a
+  run killed for memory resumes with a lower limit; a different chunk size
+  sums cells in a different order, so the rows fitted after such a resume
+  can differ in the last bits. Every ``wilcoxon_test`` path writes its
+  file under a partial name and renames it into place, so a file at the
+  output path is always complete: an interrupted run used to leave a
+  half-filled output that the next call loaded as a finished result. Disk estimates for
   the DE functions are now reported under ``"output"`` instead of
   ``"tempdir"``.
+* **``t_test`` reports ``NaN`` for a perturbation it could not test** (e.g.
+  one named in ``perturbations`` with no cells), as ``nb_glm_test`` does. It
+  used to report ``pvalue = 0`` for every gene of it. ``t_test`` also
+  rejects an unknown ``corr_method`` before reading the data, not after a
+  full pass over it.
+* **``n_jobs`` follows joblib in ``t_test`` and ``nb_glm_test``**, capped at
+  the CPUs the process may use (affinity mask and cgroup quota): ``None``
+  and ``-1`` use them all, ``-2`` all but one, and ``0`` is an error.
 * **``cx.tl.rank_genes_groups(method="t-test")`` returns ``t_test``'s own
   result**, like the other methods. It used to rebuild the result, storing
   the mean difference as ``logfoldchanges``, zeroing ``pts`` and

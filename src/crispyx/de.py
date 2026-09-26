@@ -51,6 +51,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    _replace_on_success,
 )
 from .glm import (
     NBGLMFitter,
@@ -94,7 +95,7 @@ from ._checkpoint import (
 from . import _messages
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
-from ._memory import _detected_available_bytes, _should_use_streaming
+from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -435,11 +436,16 @@ def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, n
 
 
 #: Arguments that change how a DE call runs but not what it computes; a
-#: checkpoint from a call differing only in these is still resumable.
+#: checkpoint from a call differing only in these is still resumable. The
+#: memory and chunking knobs belong here because rerunning with a lower
+#: ``memory_limit_gb`` is the natural response to an OOM kill; a path that
+#: counts its progress in chunks puts the resolved chunk size in the
+#: fingerprint itself (see ``wilcoxon_test``).
 _OPERATIONAL_ARGS = frozenset({
     "data", "perturbations", "verbose", "resume", "checkpoint_interval", "n_jobs",
     "profiling", "force", "output_path", "output_dir", "data_name", "scanpy_format",
-    "format_mismatch_policy",
+    "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
+    "cell_chunk_size", "chunk_size", "irls_batch_size",
 })
 
 
@@ -536,16 +542,20 @@ def _write_wilcoxon_result_h5ad(
         tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
         stratified_diagnostics=stratified_diagnostics,
     )
-    ad.AnnData(obs=obs, var=var, uns=uns).write(output_path)
-    with h5py.File(output_path, "r+") as hf:
-        _create_array(hf, "X", data=effect_matrix)
-        layers_grp = hf.require_group("layers")
-        _create_array(layers_grp, "z_score", data=z_matrix)
-        _create_array(layers_grp, "pvalue", data=pvalue_matrix)
-        _create_array(layers_grp, "pvalue_adj", data=pvalue_adj_matrix)
-        _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
-        _create_array(layers_grp, "u_statistic", data=u_matrix)
-        _create_array(layers_grp, "pts", data=pts_matrix)
+    # The metadata lands before the matrices, so the file is written under a
+    # partial name: a run killed mid-write must not leave a file whose uns
+    # matches and passes for a finished result.
+    with _replace_on_success(output_path) as partial:
+        ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
+        with h5py.File(partial, "r+") as hf:
+            _create_array(hf, "X", data=effect_matrix)
+            layers_grp = hf.require_group("layers")
+            _create_array(layers_grp, "z_score", data=z_matrix)
+            _create_array(layers_grp, "pvalue", data=pvalue_matrix)
+            _create_array(layers_grp, "pvalue_adj", data=pvalue_adj_matrix)
+            _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
+            _create_array(layers_grp, "u_statistic", data=u_matrix)
+            _create_array(layers_grp, "pts", data=pts_matrix)
 
 
 def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
@@ -1090,7 +1100,7 @@ def t_test(
         If True, continue an interrupted run from its last checkpoint,
         skipping the perturbations it had finished.
         Partial results are kept beside the output, in a hidden
-        ``.<output name>.partial`` directory, together with the checkpoint
+        ``.<output name>.resume`` directory, together with the checkpoint
         ``<output>.progress.json``; both are removed once the output is
         written. A run resumes only from a checkpoint written by a call with
         the same input file, perturbations and result-affecting parameters;
@@ -1150,6 +1160,8 @@ def t_test(
         min_pct_pert=min_pct_pert,
         fn_name="t_test",
     )
+    if corr_method not in {"benjamini-hochberg", "bonferroni"}:
+        raise ValueError("corr_method must be 'benjamini-hochberg' or 'bonferroni'")
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(
@@ -1257,20 +1269,12 @@ def t_test(
 
     # Determine worker count for parallelization
     n_groups = len(candidates)
-    max_available_workers = os.cpu_count() or 1
-    if n_jobs is None or n_jobs == 0:
-        worker_count = min(n_groups, max_available_workers)
-    else:
-        worker_count = min(n_groups, abs(n_jobs))
-    worker_count = max(worker_count, 1)
+    worker_count = max(1, min(n_groups, _resolve_n_jobs(n_jobs)))
 
     # Prepare on-disk buffers for results
     shape = (n_groups, n_genes)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
-    
-    if corr_method not in {"benjamini-hochberg", "bonferroni"}:
-        raise ValueError("corr_method must be 'benjamini-hochberg' or 'bonferroni'")
 
     # Determine checkpoint interval
     eff_checkpoint_interval = _get_checkpoint_interval(n_groups, checkpoint_interval)
@@ -1295,12 +1299,14 @@ def t_test(
         output_path,
         checkpoint_path,
         fingerprint=_de_fingerprint(path, call_args, method="t_test", candidates=candidates, n_genes=n_genes),
+        # NaN, not 0: a perturbation that fails is never written, and a
+        # p-value of 0 would report every gene as significant for it.
         arrays={
-            "statistics": (shape, np.float64, 0),
-            "pvalues": (shape, np.float64, 0),
-            "pvalues_adj": (shape, np.float64, 0),
-            "logfoldchanges": (shape, np.float32, 0),
-            "effect_size": (shape, np.float32, 0),
+            "statistics": (shape, np.float64, np.nan),
+            "pvalues": (shape, np.float64, np.nan),
+            "pvalues_adj": (shape, np.float64, np.nan),
+            "logfoldchanges": (shape, np.float32, np.nan),
+            "effect_size": (shape, np.float32, np.nan),
             "pts": (shape, np.float32, 0),
             "order": (shape, np.int64, 0),
         },
@@ -1490,14 +1496,16 @@ def t_test(
     pvalue_adj_memmap = run.arrays["pvalues_adj"]
     _adjust_pvalue_matrix(pval_memmap, method=corr_method, out=pvalue_adj_memmap)
 
-    # Convert memmap arrays to regular arrays before tempdir cleanup
-    stat_matrix = np.asarray(stat_memmap)
-    pval_matrix = np.asarray(pval_memmap)
-    pval_adj_matrix = np.asarray(pvalue_adj_memmap)
-    lfc_matrix = np.asarray(lfc_memmap)
-    effect_matrix = np.asarray(effect_memmap)
-    pts_matrix = np.asarray(pts_memmap)
-    order_matrix = np.asarray(order_memmap)
+    # Copy out of the memmaps: run.discard() deletes their files, and a view
+    # would keep the deleted files mapped for as long as the result lives.
+    stat_matrix = np.array(stat_memmap)
+    pval_matrix = np.array(pval_memmap)
+    pval_adj_matrix = np.array(pvalue_adj_memmap)
+    lfc_matrix = np.array(lfc_memmap)
+    effect_matrix = np.array(effect_memmap)
+    pts_matrix = np.array(pts_memmap)
+    order_matrix = np.array(order_memmap)
+    del stat_memmap, pval_memmap, pvalue_adj_memmap, lfc_memmap, effect_memmap, pts_memmap, order_memmap
         
     result = RankGenesGroupsResult(
         genes=gene_symbols,
@@ -1812,7 +1820,7 @@ def nb_glm_test(
         If True, continue an interrupted run from its last checkpoint,
         skipping the perturbations it had finished.
         Partial results are kept beside the output, in a hidden
-        ``.<output name>.partial`` directory, together with the checkpoint
+        ``.<output name>.resume`` directory, together with the checkpoint
         ``<output>.progress.json``; both are removed once the output is
         written. A run resumes only from a checkpoint written by a call with
         the same input file, perturbations and result-affecting parameters;
@@ -3022,16 +3030,7 @@ def nb_glm_test(
     # Determine number of parallel workers with memory-awareness
     # For small n_groups, run sequentially to avoid joblib overhead
     # (profiling shows joblib.sleep takes 24s for 2 perturbations)
-    cpu_count = os.cpu_count() or 1
-    if n_jobs is None or n_jobs == 0:
-        effective_n_jobs = cpu_count
-    elif n_jobs == -1:
-        effective_n_jobs = cpu_count
-    elif n_jobs < 0:
-        effective_n_jobs = max(1, cpu_count + n_jobs + 1)
-    else:
-        effective_n_jobs = min(n_jobs, cpu_count)
-    effective_n_jobs = max(1, effective_n_jobs)
+    effective_n_jobs = _resolve_n_jobs(n_jobs)
         
     # Save original requested workers for auto-detection logic
     # (before memory-based reduction)
@@ -4873,7 +4872,7 @@ def wilcoxon_test(
         path). The resolved ``chunk_size`` is part of the call's identity, so
         pass the same value (or leave both on auto with the same memory).
         Partial results are kept beside the output, in a hidden
-        ``.<output name>.partial`` directory, together with the checkpoint
+        ``.<output name>.resume`` directory, together with the checkpoint
         ``<output>.progress.json``; both are removed once the output is
         written. A run resumes only from a checkpoint written by a call with
         the same input file, perturbations and result-affecting parameters;

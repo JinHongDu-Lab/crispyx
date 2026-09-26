@@ -367,11 +367,11 @@ def test_decoder_falls_back_for_unwritten_chunks(tmp_path):
             compression="gzip", shuffle=True, fillvalue=np.nan,
         )
         ds[:300] = np.arange(300 * 50, dtype=np.float64).reshape(300, 50)  # chunks 3.. never written
-    with h5py.File(path, "r") as f, _h5codec.ChunkDecoder(4) as decoder:
+    with h5py.File(path, "r") as f:
         ds = f["d"]
-        assert decoder.supports(ds)
+        assert _h5codec.supports_parallel_read(ds)
         for start, stop in ((0, 250), (250, 450), (990, 1000), (0, 1000)):
-            assert np.array_equal(decoder.read(ds, start, stop), ds[start:stop], equal_nan=True)
+            assert np.array_equal(_h5codec.read_rows(ds, start, stop), ds[start:stop], equal_nan=True)
 
 
 def test_uncompressed_files_keep_the_plain_slicing_path(tmp_path):
@@ -381,6 +381,43 @@ def test_uncompressed_files_keep_the_plain_slicing_path(tmp_path):
     _single_cell(n_obs=500).write(path)
     backed = read_backed(path)
     try:
-        assert _decoded_block_reader(backed.X, "csr", 0, backed.n_obs, backed.n_vars) == (None, None)
+        assert _decoded_block_reader(backed.X, "csr", 0, backed.n_obs, backed.n_vars) is None
     finally:
         backed.file.close()
+
+
+def test_named_datatypes_are_copied(tmp_path):
+    src, dst = tmp_path / "typed.h5", tmp_path / "typed.gz.h5"
+    with h5py.File(src, "w") as f:
+        f["committed"] = np.dtype([("a", "<i4"), ("b", "<f8")])
+        f["committed"].attrs["note"] = "named type"
+        f.create_dataset("values", data=np.arange(5000, dtype=np.float64))
+    compress_h5ad(src, dst)  # verify=True compares the named type too
+    with h5py.File(dst, "r") as f:
+        assert isinstance(f["committed"], h5py.Datatype)
+        assert f["committed"].dtype == np.dtype([("a", "<i4"), ("b", "<f8")])
+        assert f["committed"].attrs["note"] == "named type"
+
+
+def test_leftover_de_resume_directory_does_not_block_compression(tmp_path):
+    # An interrupted DE run keeps its arrays in ".<name>.resume"; the
+    # converters' own partial file must not collide with it.
+    src, dst = tmp_path / "sc.h5ad", tmp_path / "res.h5ad"
+    _single_cell(n_obs=100).write(src)
+    resume_dir = tmp_path / ".res.h5ad.resume"
+    resume_dir.mkdir()
+    (resume_dir / "pvalue.dat").write_bytes(b"\0" * 8)
+    compress_h5ad(src, dst)
+    assert dst.exists() and (resume_dir / "pvalue.dat").exists()
+
+
+def test_streaming_reads_share_one_decode_pool(tmp_path):
+    path = tmp_path / "d.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("d", data=np.arange(20000.0).reshape(400, 50), chunks=(10, 50),
+                         compression="gzip", shuffle=True)
+    with h5py.File(path, "r") as f:
+        _h5codec.read_rows(f["d"], 0, 400)
+        pool = _h5codec._decode_pool
+        assert np.array_equal(_h5codec.read_rows(f["d"], 5, 395), f["d"][5:395])
+        assert _h5codec._decode_pool is pool

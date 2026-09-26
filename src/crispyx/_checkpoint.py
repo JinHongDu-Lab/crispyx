@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import h5py
 import numpy as np
+import pandas as pd
 
 if TYPE_CHECKING:
     from tqdm import tqdm
@@ -226,11 +228,24 @@ def run_fingerprint(source_path: Path, **items) -> dict:
 
 
 def _jsonable(value):
-    """JSON form of the non-JSON types a DE call's parameters can hold."""
+    """JSON form of the non-JSON types a DE call's parameters can hold.
+
+    Arrays and pandas objects (e.g. ``size_factors``) become a digest of
+    their contents: a ``repr`` is truncated and rounded, so two different
+    vectors could share one, and ``tolist()`` of a per-cell vector is tens of
+    megabytes rewritten into the checkpoint on every save.
+    """
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, (pd.Series, pd.DataFrame, pd.Index)):
+        hashes = pd.util.hash_pandas_object(value, index=not isinstance(value, pd.Index))
+        columns = [str(c) for c in value.columns] if isinstance(value, pd.DataFrame) else None
+        return {"type": type(value).__name__, "shape": list(value.shape), "columns": columns,
+                "sha256": _sha256(hashes.to_numpy())}
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        if value.dtype == object:
+            return value.tolist()
+        return {"dtype": value.dtype.str, "shape": list(value.shape), "sha256": _sha256(value)}
     if isinstance(value, (set, frozenset)):
         return sorted(value)
     if isinstance(value, Path):
@@ -238,10 +253,14 @@ def _jsonable(value):
     return repr(value)
 
 
+def _sha256(array: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
 class ResumableRun:
     """Result arrays and a progress checkpoint that outlive an interruption.
 
-    The arrays are memmaps in a hidden ``.{output name}.partial`` directory
+    The arrays are memmaps in a hidden ``.{output name}.resume`` directory
     beside the output (a temporary directory would vanish with the process,
     taking the finished work with it). The checkpoint JSON records the call's
     :func:`run_fingerprint` plus caller-defined progress, and :meth:`save`
@@ -270,7 +289,7 @@ class ResumableRun:
     ) -> None:
         self.checkpoint_path = checkpoint_path
         self.fingerprint = fingerprint
-        self.directory = output_path.with_name(f".{output_path.name}.partial")
+        self.directory = output_path.with_name(f".{output_path.name}.resume")
         checkpoint = _read_checkpoint(checkpoint_path, required_keys=("fingerprint",)) if resume else None
         self.resumed = (
             checkpoint is not None

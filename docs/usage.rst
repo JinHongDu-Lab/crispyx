@@ -246,7 +246,7 @@ RAM for **disk**: the per-``(perturbation, batch)`` accumulator described
 above, the partial result arrays of ``cx.tl.t_test`` /
 ``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test``, and whole-file CSR↔CSC
 conversions. The DE functions keep their partial results beside the output
-(in a hidden ``.<output name>.partial`` directory, removed on success) rather
+(in a hidden ``.<output name>.resume`` directory, removed on success) rather
 than in ``$TMPDIR``, so an interrupted run can continue with ``resume=True``;
 their ``"output"`` estimate covers those arrays plus the final file.
 ``cx.tl.batch_process`` writes results directly into its output file as each

@@ -20,7 +20,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _cgroup_available_bytes, _detected_available_bytes
+from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context
 from ._disk import (
     assess_bytes,
@@ -1346,27 +1346,23 @@ def iter_matrix_chunks(
         _warn_slow_axis(fmt, axis)
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
-    decoder, read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
-    try:
-        for start in range(start_chunk * chunk_size, length, chunk_size):
-            end = min(start + chunk_size, length)
-            if read_block is not None:
-                block = read_block(start, end)
-            elif axis == 0:
-                block = matrix[start:end]
-            else:
-                block = matrix[:, start:end]
-            if convert_to_dense:
-                block = _to_dense(block)
-            yield slice(start, end), block
-    finally:
-        if decoder is not None:
-            decoder.close()
+    read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
+    for start in range(start_chunk * chunk_size, length, chunk_size):
+        end = min(start + chunk_size, length)
+        if read_block is not None:
+            block = read_block(start, end)
+        elif axis == 0:
+            block = matrix[start:end]
+        else:
+            block = matrix[:, start:end]
+        if convert_to_dense:
+            block = _to_dense(block)
+        yield slice(start, end), block
 
 
 def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars: int):
-    """``(decoder, read_block)`` for a deflate-compressed backed matrix
-    streamed along its fast axis, else ``(None, None)``.
+    """``read_block`` for a deflate-compressed backed matrix streamed along
+    its fast axis, else ``None``.
 
     ``read_block(start, end)`` returns exactly what ``matrix[start:end]``
     (rows) or ``matrix[:, start:end]`` (columns) would, but inflates the
@@ -1374,36 +1370,34 @@ def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars
     Uncompressed files and every other access pattern keep the plain slicing
     path.
     """
-    from ._h5codec import ChunkDecoder
+    from ._h5codec import read_rows, supports_parallel_read
 
     if isinstance(matrix, h5py.Dataset):
-        if axis != 0 or matrix.ndim != 2 or not ChunkDecoder.supports(matrix):
-            return None, None
-        decoder = ChunkDecoder()
-        return decoder, lambda start, end: decoder.read(matrix, start, end)
+        if axis != 0 or matrix.ndim != 2 or not supports_parallel_read(matrix):
+            return None
+        return lambda start, end: read_rows(matrix, start, end)
 
     fast = (fmt == "csr" and axis == 0) or (fmt == "csc" and axis == 1)
     group = getattr(matrix, "group", None)
     if not fast or not isinstance(group, h5py.Group):
-        return None, None
+        return None
     data_ds, indices_ds = group["data"], group["indices"]
-    if not (ChunkDecoder.supports(data_ds) and ChunkDecoder.supports(indices_ds)):
-        return None, None
+    if not (supports_parallel_read(data_ds) and supports_parallel_read(indices_ds)):
+        return None
     indptr = group["indptr"][:]
     # Build blocks with the same class anndata's own slicing returns.
     probe = matrix[0:1] if axis == 0 else matrix[:, 0:1]
     cls = type(probe)
-    decoder = ChunkDecoder()
 
     def read_block(start: int, end: int):
         lo, hi = int(indptr[start]), int(indptr[end])
         shape = (end - start, n_vars) if axis == 0 else (n_obs, end - start)
         return cls(
-            (decoder.read(data_ds, lo, hi), decoder.read(indices_ds, lo, hi), indptr[start : end + 1] - lo),
+            (read_rows(data_ds, lo, hi), read_rows(indices_ds, lo, hi), indptr[start : end + 1] - lo),
             shape=shape,
         )
 
-    return decoder, read_block
+    return read_block
 
 
 def _to_dense(matrix: np.ndarray) -> np.ndarray:
@@ -3175,7 +3169,7 @@ def compress_h5ad(
         raise FileNotFoundError(f"compress_h5ad: {src} does not exist")
     if dst.exists() and not overwrite:
         raise FileExistsError(f"compress_h5ad: {dst} exists; pass overwrite=True to replace it")
-    n_threads = _h5codec.resolve_n_threads(n_jobs)
+    n_threads = _resolve_n_jobs(n_jobs)
     src_bytes = src.stat().st_size
 
     # Worst case the output is as large as the source, and both coexist.

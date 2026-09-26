@@ -104,8 +104,8 @@ def _assert_same_result(expected: Path, actual: Path) -> None:
                 assert np.ascontiguousarray(x).tobytes() == np.ascontiguousarray(y).tobytes(), key
 
 
-def _partial_dir(out: Path) -> Path:
-    return out.with_name(f".{out.name}.partial")
+def _resume_dir(out: Path) -> Path:
+    return out.with_name(f".{out.name}.resume")
 
 
 CASES = ["t_test", "nb_glm", "wilcoxon", "wilcoxon_stratified", "wilcoxon_streaming"]
@@ -128,14 +128,14 @@ def test_interrupted_run_resumes_to_the_uninterrupted_result(screen, tmp_path, m
     # Nothing at the output path until the run is complete, so a later call
     # cannot mistake the partial result for a finished one.
     assert not out.exists()
-    assert checkpoint.exists() and _partial_dir(out).is_dir()
+    assert checkpoint.exists() and _resume_dir(out).is_dir()
 
     runs = _record_runs(monkeypatch)
     result = _run(method, screen, out, resume=True)
     assert runs[-1].resumed, "the run started over instead of resuming"
     _assert_same_result(reference, out)
     assert result.result_path == out
-    assert not checkpoint.exists() and not _partial_dir(out).exists()
+    assert not checkpoint.exists() and not _resume_dir(out).exists()
 
 
 def test_nb_glm_resumes_after_all_fits_when_the_final_write_failed(screen, tmp_path, monkeypatch):
@@ -182,4 +182,87 @@ def test_resume_false_discards_a_stale_checkpoint(screen, tmp_path, monkeypatch)
     runs = _record_runs(monkeypatch)
     _run("wilcoxon", screen, out)  # resume=False
     assert not runs[-1].resumed
-    assert not out.with_suffix(".progress.json").exists() and not _partial_dir(out).exists()
+    assert not out.with_suffix(".progress.json").exists() and not _resume_dir(out).exists()
+
+
+def test_memory_and_chunking_changes_still_resume(screen, tmp_path, monkeypatch):
+    # Rerunning with a lower memory limit is the natural response to an OOM
+    # kill; it must not throw the finished work away.
+    reference = tmp_path / "reference.h5ad"
+    _run("t_test", screen, reference)
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run("t_test", screen, out)
+    runs = _record_runs(monkeypatch)
+    _run("t_test", screen, out, resume=True, memory_limit_gb=1.0, cell_chunk_size=64)
+    assert runs[-1].resumed
+    # A different cell chunk sums in a different order, so rows fitted after
+    # the resume may differ from the reference in the last bit.
+    with h5py.File(reference, "r") as a, h5py.File(out, "r") as b:
+        for key in ["X"] + [f"layers/{k}" for k in a["layers"]]:
+            np.testing.assert_allclose(a[key][()], b[key][()], rtol=1e-5, atol=1e-5, err_msg=key)
+
+
+@pytest.mark.parametrize("case", ["wilcoxon", "wilcoxon_stratified"])
+def test_wilcoxon_killed_while_writing_leaves_no_output(screen, tmp_path, monkeypatch, case):
+    reference = tmp_path / "reference.h5ad"
+    _run(case, screen, reference)
+    out = tmp_path / "result.h5ad"
+    real_create = de._create_array
+
+    def create(group, name, **kwargs):
+        if name == "pvalue_adj":
+            raise Interrupted
+        return real_create(group, name, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(de, "_create_array", create)
+        with pytest.raises(Interrupted):
+            _run(case, screen, out)
+    # A file with matching uns but missing layers would be loaded as done.
+    assert not out.exists()
+    assert not list(tmp_path.glob(f".{out.name}.partial"))
+
+    runs = _record_runs(monkeypatch)
+    _run(case, screen, out, resume=True)
+    assert runs[-1].resumed
+    _assert_same_result(reference, out)
+
+
+def test_t_test_failed_perturbation_is_nan_not_significant(screen, tmp_path):
+    out = tmp_path / "result.h5ad"
+    result = _run("t_test", screen, out, perturbations=["P0", "absent"])
+    row = result.groups.index("absent")
+    assert np.isnan(result.pvalues[row]).all() and np.isnan(result.pvalues_adj[row]).all()
+    assert np.isfinite(result.pvalues[1 - row]).any()
+
+
+def test_t_test_result_does_not_map_the_deleted_partial_files(screen, tmp_path):
+    result = _run("t_test", screen, tmp_path / "result.h5ad")
+    for array in (result.statistics, result.pvalues, result.pvalues_adj, result.logfoldchanges,
+                  result.effect_size, result.pts, result.order):
+        assert type(array) is np.ndarray and array.base is None
+
+
+def test_t_test_rejects_a_bad_corr_method_before_reading(screen, tmp_path, monkeypatch):
+    def read_backed(*args, **kwargs):
+        raise AssertionError("read the data before validating corr_method")
+
+    monkeypatch.setattr(de, "read_backed", read_backed)
+    with pytest.raises(ValueError, match="corr_method"):
+        _run("t_test", screen, tmp_path / "result.h5ad", corr_method="bh")
+
+
+def test_fingerprint_tells_array_arguments_apart(screen):
+    from crispyx._checkpoint import run_fingerprint
+
+    sf = pd.Series(np.linspace(0.5, 2.0, 1000))
+    nudged = sf.copy()
+    nudged.iloc[500] += 1e-9  # hidden by a truncated, rounded repr
+    fp = lambda v: run_fingerprint(screen / "norm.h5ad", size_factors=v)
+    assert fp(sf) == fp(sf.copy())
+    assert fp(sf) != fp(nudged)
+    assert fp(sf.to_numpy()) != fp(nudged.to_numpy())
+    assert len(str(fp(np.ones(2_000_000)))) < 1000  # a digest, not the vector

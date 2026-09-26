@@ -8,7 +8,7 @@ releases the GIL) and hands the finished bytes to
 ``Dataset.id.write_direct_chunk``. Any HDF5 reader decodes the result with
 its built-in filters: h5py, anndata/scanpy, R (rhdf5, zellkonverter),
 ``h5ls``. No plugin is involved. The reverse direction,
-:class:`ChunkDecoder`, inflates deflate-compressed chunks on threads for
+:func:`read_rows`, inflates deflate-compressed chunks on threads for
 crispyx's streaming reads.
 
 The tree walk knows nothing about AnnData: it copies every group, dataset,
@@ -21,12 +21,14 @@ codec bug cannot hide behind a self-consistent round trip.
 from __future__ import annotations
 
 import os
+import threading
 import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator
 
 import h5py
+import joblib
 import numpy as np
 
 #: Target size of one HDF5 chunk. 1 MiB matches h5py's default chunk cache,
@@ -48,23 +50,6 @@ _SLAB_BYTES = 16 * 2**20
 _SOURCE_RDCC_BYTES = 64 * 2**20
 
 _FIXED_WIDTH_NUMERIC_KINDS = frozenset("biufc")
-
-
-def _available_cpus() -> int:
-    """CPUs this process may run on (the affinity mask SLURM/cgroups set on
-    Linux; every core elsewhere)."""
-    try:
-        return len(os.sched_getaffinity(0))
-    except AttributeError:
-        return os.cpu_count() or 1
-
-
-def resolve_n_threads(n_jobs: int) -> int:
-    """joblib-style ``n_jobs`` → thread count (``-1`` = every available CPU)."""
-    if n_jobs == 0:
-        raise ValueError("n_jobs must be a positive integer or negative (joblib convention), not 0")
-    cpu = _available_cpus()
-    return min(n_jobs, cpu) if n_jobs > 0 else max(1, cpu + 1 + n_jobs)
 
 
 def _is_parallel_encodable(ds: h5py.Dataset) -> bool:
@@ -253,11 +238,13 @@ def _copy_group(src, dst, *, level, pool, window, on_bytes) -> None:
         if isinstance(obj, h5py.Group):
             child = dst.create_group(name, track_order=_tracks_order(obj))
             _copy_group(obj, child, level=level, pool=pool, window=window, on_bytes=on_bytes)
-        elif _wants_filter(obj):
+        elif isinstance(obj, h5py.Dataset) and _wants_filter(obj):
             _copy_filtered(obj, dst, name, level=level, pool=pool, window=window, on_bytes=on_bytes)
         else:
+            # Unfiltered datasets and committed (named) datatypes.
             src.copy(obj, dst, name=name)
-            on_bytes(obj.id.get_storage_size())
+            if isinstance(obj, h5py.Dataset):
+                on_bytes(obj.id.get_storage_size())
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +310,13 @@ def verify_tree(src: h5py.Group, dst: h5py.Group, on_bytes: Callable[[int], None
         if isinstance(s_obj, h5py.Group):
             verify_tree(s_obj, d_obj, on_bytes)
             continue
+        if isinstance(s_obj, h5py.Datatype) != isinstance(d_obj, h5py.Datatype):
+            raise ValueError(f"{path}: datatype/dataset kind differs")
+        if isinstance(s_obj, h5py.Datatype):
+            _check_attrs(s_obj, d_obj, path)
+            if s_obj.id != d_obj.id:
+                raise ValueError(f"{path}: named datatype differs")
+            continue
         _check_attrs(s_obj, d_obj, path)
         if s_obj.shape != d_obj.shape or s_obj.maxshape != d_obj.maxshape:
             raise ValueError(f"{path}: shape differs")
@@ -359,8 +353,32 @@ def file_tracks_order(f: h5py.File) -> bool:
 
 #: Decode threads for streaming reads. One thread inflates ~300-400 MB/s and
 #: throughput scales with threads, so use every available CPU (up to 32):
-#: the caller is blocked on the read anyway.
-DECODE_THREADS = min(32, _available_cpus())
+#: the caller is blocked on the read anyway. The threads form one pool shared
+#: by every reader in the process, so nested or concurrent streams never
+#: start more than this many.
+DECODE_THREADS = min(32, joblib.cpu_count())
+
+_decode_pool: ThreadPoolExecutor | None = None
+_decode_pool_lock = threading.Lock()
+
+
+def _shared_decode_pool() -> ThreadPoolExecutor:
+    global _decode_pool
+    with _decode_pool_lock:
+        if _decode_pool is None:
+            _decode_pool = ThreadPoolExecutor(DECODE_THREADS, thread_name_prefix="crispyx-inflate")
+        return _decode_pool
+
+
+def _forget_decode_pool() -> None:
+    # A forked child inherits the pool object but none of its threads.
+    global _decode_pool, _decode_pool_lock
+    _decode_pool = None
+    _decode_pool_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_decode_pool)
 
 
 def deflate_shuffle(ds: h5py.Dataset) -> bool | None:
@@ -377,73 +395,59 @@ def deflate_shuffle(ds: h5py.Dataset) -> bool | None:
     return None
 
 
-class ChunkDecoder:
-    """Read row ranges of deflate-compressed datasets, inflating on threads.
+def supports_parallel_read(ds: h5py.Dataset) -> bool:
+    """Whether :func:`read_rows` can decode row ranges of *ds*: a deflate
+    pipeline whose chunks span every axis but the first."""
+    return (
+        isinstance(ds, h5py.Dataset)
+        and ds.ndim >= 1
+        and deflate_shuffle(ds) is not None
+        and tuple(ds.chunks[1:]) == tuple(ds.shape[1:])
+    )
+
+
+def read_rows(ds: h5py.Dataset, start: int, stop: int) -> np.ndarray:
+    """``ds[start:stop]``, inflating the chunks on the shared decode pool.
 
     h5py inflates every chunk on the calling thread, so streaming a
     compressed file is CPU-bound at a few hundred MB/s. This reads the
-    compressed chunks with ``read_direct_chunk`` and inflates them on a
-    thread pool. The result is identical to ``ds[start:stop]``, which it
-    falls back to for anything it does not handle (a chunk HDF5 left
-    unfiltered or never allocated).
+    compressed chunks with ``read_direct_chunk`` and inflates them on
+    threads. For a dataset :func:`supports_parallel_read` accepts, the result
+    is identical to ``ds[start:stop]``, which it falls back to for anything
+    it does not handle (a chunk HDF5 left unfiltered or never allocated).
     """
+    stop = min(stop, ds.shape[0])
+    if stop <= start:
+        return ds[start:stop]
+    pool = _shared_decode_pool()
+    # Chunks in flight: enough to keep every thread busy, few enough that a
+    # read never holds a second full copy of the block it returns.
+    window = 2 * DECODE_THREADS
+    shuffle = deflate_shuffle(ds)
+    rows = ds.chunks[0]
+    tail = (0,) * (ds.ndim - 1)
+    out = np.empty((stop - start,) + ds.shape[1:], dtype=ds.dtype)
+    pending: deque = deque()
 
-    def __init__(self, n_threads: int = DECODE_THREADS) -> None:
-        self._pool = ThreadPoolExecutor(n_threads)
-        # Chunks in flight: enough to keep every thread busy, few enough that
-        # a read never holds a second full copy of the block it returns.
-        self._window = 2 * n_threads
+    def place_one() -> None:
+        first, future = pending.popleft()
+        chunk = future.result()
+        lo, hi = max(first, start), min(first + rows, stop)
+        out[lo - start : hi - start] = chunk[lo - first : hi - first]
 
-    def close(self) -> None:
-        self._pool.shutdown(wait=True)
-
-    def __enter__(self) -> "ChunkDecoder":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    @staticmethod
-    def supports(ds: h5py.Dataset) -> bool:
-        """Whether row ranges of *ds* can be decoded here: a deflate pipeline
-        whose chunks span every axis but the first."""
-        return (
-            isinstance(ds, h5py.Dataset)
-            and ds.ndim >= 1
-            and deflate_shuffle(ds) is not None
-            and tuple(ds.chunks[1:]) == tuple(ds.shape[1:])
-        )
-
-    def read(self, ds: h5py.Dataset, start: int, stop: int) -> np.ndarray:
-        """``ds[start:stop]`` for a dataset :meth:`supports` accepts."""
-        stop = min(stop, ds.shape[0])
-        if stop <= start:
+    for first in range(start - start % rows, stop, rows):
+        try:
+            mask, blob = ds.id.read_direct_chunk((first,) + tail)
+        except (KeyError, ValueError, RuntimeError):  # chunk never written
+            mask, blob = 1, None
+        if mask:  # a filter was skipped or the chunk is missing: let HDF5 read it
+            for _first, future in pending:
+                future.cancel()
             return ds[start:stop]
-        shuffle = deflate_shuffle(ds)
-        rows = ds.chunks[0]
-        tail = (0,) * (ds.ndim - 1)
-        out = np.empty((stop - start,) + ds.shape[1:], dtype=ds.dtype)
-        pending: deque = deque()
-
-        def place_one() -> None:
-            first, future = pending.popleft()
-            chunk = future.result()
-            lo, hi = max(first, start), min(first + rows, stop)
-            out[lo - start : hi - start] = chunk[lo - first : hi - first]
-
-        for first in range(start - start % rows, stop, rows):
-            try:
-                mask, blob = ds.id.read_direct_chunk((first,) + tail)
-            except (KeyError, ValueError, RuntimeError):  # chunk never written
-                mask, blob = 1, None
-            if mask:  # a filter was skipped or the chunk is missing: let HDF5 read it
-                for _first, future in pending:
-                    future.cancel()
-                return ds[start:stop]
-            pending.append((first, self._pool.submit(decode_chunk, blob, ds.dtype, ds.chunks, shuffle=shuffle)))
-            if len(pending) >= self._window:
-                place_one()
-        while pending:
+        pending.append((first, pool.submit(decode_chunk, blob, ds.dtype, ds.chunks, shuffle=shuffle)))
+        if len(pending) >= window:
             place_one()
-        return out
+    while pending:
+        place_one()
+    return out
 
