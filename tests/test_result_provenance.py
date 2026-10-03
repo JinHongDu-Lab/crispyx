@@ -1,7 +1,7 @@
 """A finished output is reused only when it was computed from the same inputs.
 
-Every reusable output carries ``uns["crispyx"]`` (writer version, install
-type, layout schema and the call's fingerprint); a later call reuses it only
+Every reusable output carries ``uns["crispyx"]`` (writer version, layout
+schema and the call's fingerprint); a later call reuses it only
 when the fingerprint and schema match. Regression tests for results returned
 stale after the input was relabelled in place, an argument changed, or the
 file was written by a crispyx with another layout.
@@ -135,13 +135,37 @@ def test_stamp_records_writer_and_inputs(tmp_path):
     assert stamp["version"] == cx.__version__
     assert stamp["kind"] == "de_result"
     assert stamp["schema"] == SCHEMAS["de_result"]
-    assert isinstance(stamp["editable"], (bool, np.bool_))
     fingerprint = json.loads(stamp["fingerprint"])
-    assert fingerprint["source"] == str(path)
+    assert fingerprint["source"] == str(path.resolve())
     assert fingerprint["params"]["min_pct_both"] == 0.0
     # How the run was carried out is not part of what it computed.
     assert "chunk_size" not in fingerprint["params"]
     assert "verbose" not in fingerprint["params"]
+
+
+def test_any_spelling_of_the_input_path_reuses_the_result(tmp_path, monkeypatch, capsys):
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    monkeypatch.chdir(tmp_path)
+    _run("wilcoxon", Path("data.h5ad"), output)
+    capsys.readouterr()
+    _run("wilcoxon", path.resolve(), output)
+    assert "Loading existing result" in capsys.readouterr().out
+
+
+def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys):
+    from crispyx.de import _checkpoint_fingerprint
+
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("t_test", path, output)
+    capsys.readouterr()
+    _run("t_test", path, output, scanpy_format=True)
+    assert "argument 'scanpy_format' differs" in capsys.readouterr().out
+
+    stamped = json.loads(read_stamp(output)["fingerprint"])
+    unformatted = {**stamped, "params": {**stamped["params"], "scanpy_format": False}}
+    assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
 
 
 def _delete_uns_key(path: Path, key: str) -> None:
@@ -187,6 +211,30 @@ def test_one_group_result_round_trips(de_setup, scanpy_format):
     reloaded = _run(method, path, output, perturbations=["A"], scanpy_format=scanpy_format)
     assert reloaded.groups == ["A"]
     np.testing.assert_array_equal(reloaded.pvalues, first.pvalues)
+
+
+def test_pseudobulk_reuse_reads_no_matrix(tmp_path, monkeypatch, capsys):
+    """A matching result is found before any pass over the input matrix."""
+    import crispyx.pseudobulk as pb
+
+    counts = _write_counts(tmp_path / "counts.h5ad", _labels(), log_normalise=False)
+    logs = _write_counts(tmp_path / "logs.h5ad", _labels(), log_normalise=True)
+    aggregate = dict(groupby=["perturbation", "batch"], method="sum", min_cells=1,
+                     output_path=tmp_path / "pb.h5ad")
+    effects = dict(perturbation_column="perturbation", batch_column="batch",
+                   control_label="ctrl", min_cells=1, output_path=tmp_path / "effects.h5ad")
+    cx.aggregate_pseudobulk(counts, **aggregate).close()
+    cx.compute_pseudobulk_effects(logs, **effects).close()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("streamed the input instead of reusing the result")
+
+    monkeypatch.setattr(pb, "read_backed", unexpected)
+    monkeypatch.setattr(pb, "aggregate_pseudobulk", unexpected)
+    capsys.readouterr()
+    cx.aggregate_pseudobulk(counts, **aggregate).close()
+    cx.compute_pseudobulk_effects(logs, **effects).close()
+    assert capsys.readouterr().out.count("Loading existing result") == 2
 
 
 def test_aggregate_pseudobulk_tracks_its_inputs(tmp_path, capsys):
@@ -276,6 +324,14 @@ def test_batch_process_reuses_a_finished_result_across_chunk_widths(tmp_path, ca
     capsys.readouterr()
     cx.batch_process(path, reducer(), chunk_size=5, **kwargs).close()
     assert "Loading existing result" in capsys.readouterr().out
+
+    # A rejected finished output is recomputed, not "resumed" with every
+    # chunk already done.
+    _delete_uns_key(output, "crispyx")
+    with pytest.warns(UserWarning, match="restarting from scratch"):
+        cx.batch_process(path, reducer(), chunk_size=4, resume=True, **kwargs).close()
+    assert "it has no crispyx provenance" in capsys.readouterr().out
+    assert read_stamp(output)["kind"] == "batch"
 
     _rewrite_labels(path, np.random.default_rng(4).permutation(_labels()))
     with pytest.warns(UserWarning, match="cannot be reused"):

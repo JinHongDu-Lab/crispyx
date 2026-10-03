@@ -1,29 +1,26 @@
 """Provenance stamped into crispyx outputs, and the check that reuses them.
 
 Every output a later call may reuse instead of recomputing carries
-``uns["crispyx"]``: the crispyx ``version`` that wrote it, whether that was an
-``editable`` (development) install, the output ``kind`` and its layout
-``schema``, and the ``fingerprint`` of the call that produced it (a
-:func:`crispyx._checkpoint.run_fingerprint`, stored as JSON). An existing
-output is reused only when its kind, schema and fingerprint all match the
-call being made, so an edited input, a changed argument or a file written
-by a crispyx with another layout is recomputed rather than returned stale.
-
-The version and install type are recorded, not compared: a new release with
-the same layout reuses an old result, while ``editable`` makes results from
-a development checkout visible after the fact.
+``uns["crispyx"]``: the crispyx ``version`` that wrote it, the output ``kind``
+and its layout ``schema``, and the ``fingerprint`` of the call that produced
+it (a :func:`crispyx._checkpoint.run_fingerprint`, stored as JSON). An
+existing output is reused only when its kind, schema and fingerprint all
+match the call being made, so an edited input, a changed argument or a file
+written by a crispyx with another layout is recomputed rather than returned
+stale. The version is recorded, not compared: a new release with the same
+layout reuses an old result.
 """
 
 from __future__ import annotations
 
-import functools
 import json
 import tempfile
-from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 import anndata as ad
 import h5py
+
+from ._checkpoint import run_fingerprint
 
 KEY = "crispyx"
 
@@ -43,15 +40,13 @@ SCHEMAS = {
 _SOURCE_KEYS = ("source", "source_size", "source_mtime_ns")
 
 
-@functools.cache
-def _is_editable_install() -> bool:
-    try:
-        text = distribution("crispyx").read_text("direct_url.json")
-    except PackageNotFoundError:
-        return False
-    if not text:
-        return False
-    return bool(json.loads(text).get("dir_info", {}).get("editable", False))
+def call_fingerprint(path: Path, call_args: dict, operational: frozenset, **extra) -> dict:
+    """:func:`run_fingerprint` of a call: the source file, every argument in
+    ``call_args`` (the function's ``locals()`` at entry) not listed as
+    ``operational`` -- those decide how a call runs, not what it writes --
+    and ``extra``."""
+    params = {k: v for k, v in call_args.items() if k not in operational}
+    return run_fingerprint(path, params=params, **extra)
 
 
 def stamp(kind: str, fingerprint: dict) -> dict:
@@ -61,7 +56,6 @@ def stamp(kind: str, fingerprint: dict) -> dict:
 
     return {
         "version": __version__,
-        "editable": _is_editable_install(),
         "kind": kind,
         "schema": SCHEMAS[kind],
         "fingerprint": json.dumps(fingerprint, sort_keys=True),
@@ -133,9 +127,24 @@ def reuse_mismatch(path: Path, kind: str, fingerprint: dict) -> str | None:
     return _describe_difference(previous, fingerprint)
 
 
+def reusable(path: Path, kind: str, fingerprint: dict, verbose: int | bool) -> bool:
+    """Whether the existing output at ``path`` was made by this call. Prints
+    the reuse notice, or why an existing output is recomputed."""
+    if not path.exists():
+        return False
+    reason = reuse_mismatch(path, kind, fingerprint)
+    if int(verbose) >= 1:
+        if reason is None:
+            print(f"[cx] Loading existing result: {path}")
+            print("[cx] Pass force=True to rerun the analysis.")
+        else:
+            print(f"[cx] Existing result at {path} is not reused: {reason}; rerunning.")
+    return reason is None
+
+
 def _describe_difference(previous: dict, current: dict) -> str:
     if previous.get("source") != current.get("source"):
-        return f"it was computed from {previous.get('source')}"
+        return "it was computed from another input file"
     if any(previous.get(key) != current.get(key) for key in _SOURCE_KEYS):
         return "the input file has changed since"
     old_params = previous.get("params", {})

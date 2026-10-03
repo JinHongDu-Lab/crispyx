@@ -22,7 +22,7 @@ import scipy.sparse as sp
 from . import _messages
 from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context, run_fingerprint
-from ._provenance import reuse_mismatch, stamp, write_stamp
+from ._provenance import KEY as _PROVENANCE_KEY, reuse_mismatch, stamp, write_stamp
 from ._disk import (
     assess_bytes,
     estimate_bytes,
@@ -4371,7 +4371,7 @@ def sort_by_perturbation(
     if len(sort_indices) < 100000:
         sorting_metadata["sort_order"] = sort_indices.tolist()
     uns["sorting_metadata"] = sorting_metadata
-    uns["crispyx"] = stamp("sorted", fingerprint)
+    uns[_PROVENANCE_KEY] = stamp("sorted", fingerprint)
     
     # Create output file
     output_path.parent.mkdir(parents=True, exist_ok=True)

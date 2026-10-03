@@ -14,8 +14,8 @@ import pandas as pd
 import scipy.sparse as sparse
 
 from . import _messages
-from ._checkpoint import _create_progress_context, run_fingerprint
-from ._provenance import reuse_mismatch, stamp
+from ._checkpoint import _create_progress_context
+from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import _group_seed, resolve_group_reference_aliases
 from .data import (
@@ -717,29 +717,6 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
-def _pseudobulk_fingerprint(path: Path, call_args: dict) -> dict:
-    """:func:`run_fingerprint` of a pseudo-bulk call: the source file and
-    every argument that shapes the output (``call_args`` is the function's
-    ``locals()`` at entry)."""
-    params = {k: v for k, v in call_args.items() if k not in _OPERATIONAL_ARGS}
-    return run_fingerprint(path, params=params)
-
-
-def _reusable(path: Path, kind: str, fingerprint: dict, verbose: int | bool, name: str) -> bool:
-    """Whether the existing output at ``path`` was made by this call; says
-    why not when it exists but was not."""
-    if not path.exists():
-        return False
-    reason = reuse_mismatch(path, kind, fingerprint)
-    if reason is not None:
-        _messages.vprint(verbose, name, f"Existing result at {path} is not reused: {reason}; rerunning.")
-        return False
-    if int(verbose) >= 1:
-        print(f"[cx] Loading existing result: {path}")
-        print("[cx] Pass force=True to rerun the analysis.")
-    return True
-
-
 def aggregate_pseudobulk(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -842,6 +819,9 @@ def aggregate_pseudobulk(
         output_path=output_path,
         output_dir=output_dir,
     )
+    fingerprint = call_fingerprint(path, call_args, _OPERATIONAL_ARGS)
+    if not force and reusable(resolved_output, "pseudobulk", fingerprint, verbose):
+        return AnnData(resolved_output)
     backed = read_backed(path)
     try:
         missing_columns = [column for column in columns if column not in backed.obs.columns]
@@ -961,9 +941,6 @@ def aggregate_pseudobulk(
             "n_input_cells": int(backed.n_obs),
             "n_profiles": int(len(keys)),
         }
-        fingerprint = _pseudobulk_fingerprint(path, call_args)
-        if not force and _reusable(resolved_output, "pseudobulk", fingerprint, verbose, "pb.aggregate"):
-            return AnnData(resolved_output)
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
         _accumulator_disk_estimate = warn_if_disk_space_low(
@@ -1024,7 +1001,7 @@ def aggregate_pseudobulk(
             var.index = pd.Index(gene_symbols, name=backed.var_names.name)
             result = ad.AnnData(np.asarray(profiles[: len(keys)]), obs=obs, var=var)
             result.uns["crispyx_pseudobulk"] = metadata
-            result.uns["crispyx"] = stamp("pseudobulk", fingerprint)
+            result.uns[_PROVENANCE_KEY] = stamp("pseudobulk", fingerprint)
             with _replace_on_success(resolved_output) as partial:
                 result.write(partial)
             profiles._mmap.close()  # type: ignore[attr-defined]
@@ -1106,10 +1083,13 @@ def compute_pseudobulk_effects(
         output_path=output_path,
         output_dir=output_dir,
     )
-    input_is_bulk = _has_pseudobulk_marker(source_path)
     # Identified by the caller's input, so a cell-level input's intermediate
-    # pseudo-bulk file is an implementation detail of this call.
-    fingerprint = _pseudobulk_fingerprint(source_path, call_args)
+    # pseudo-bulk file is an implementation detail of this call; checked
+    # before that aggregation streams the matrix.
+    fingerprint = call_fingerprint(source_path, call_args, _OPERATIONAL_ARGS)
+    if not force and reusable(resolved_output, "pseudobulk_effects", fingerprint, verbose):
+        return AnnData(resolved_output)
+    input_is_bulk = _has_pseudobulk_marker(source_path)
 
     def _run_from_bulk(bulk_path: Path) -> AnnData:
         bulk = read_backed(bulk_path)
@@ -1217,10 +1197,6 @@ def compute_pseudobulk_effects(
                 "method": str(marker.get("method", method)),
                 "n_missing_control_batches": int(len(missing_batches)),
             }
-            if not force and _reusable(
-                resolved_output, "pseudobulk_effects", fingerprint, verbose, "pb.effects",
-            ):
-                return AnnData(resolved_output)
 
             if aggregate_batches:
                 output_labels = list(dict.fromkeys(target_labels.tolist()))
@@ -1298,7 +1274,7 @@ def compute_pseudobulk_effects(
                 result.layers["target_profile"] = np.asarray(target_mm[:n_output])
                 result.layers["reference_profile"] = np.asarray(reference_mm[:n_output])
                 result.uns["crispyx_pseudobulk_effects"] = effect_metadata
-                result.uns["crispyx"] = stamp("pseudobulk_effects", fingerprint)
+                result.uns[_PROVENANCE_KEY] = stamp("pseudobulk_effects", fingerprint)
                 with _replace_on_success(resolved_output) as partial:
                     result.write(partial)
                 effect_mm._mmap.close()  # type: ignore[attr-defined]

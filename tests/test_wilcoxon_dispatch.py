@@ -611,7 +611,7 @@ class TestWriteResultH5ad:
         _write_wilcoxon_result_h5ad(
             out, candidates=candidates, gene_symbols=genes,
             perturbation_column="perturbation", control_label="control",
-            tie_correct=True, corr_method="benjamini-hochberg", provenance={}, **arrs,
+            tie_correct=True, corr_method="benjamini-hochberg", **arrs,
         )
         with h5py.File(out, "r") as hf:
             np.testing.assert_allclose(hf["X"][:], arrs["effect_matrix"])
@@ -637,7 +637,7 @@ class TestWriteResultH5ad:
         _write_wilcoxon_result_h5ad(
             out, candidates=candidates, gene_symbols=genes,
             perturbation_column="perturbation", control_label="control",
-            tie_correct=False, corr_method="bonferroni", provenance={}, **arrs,
+            tie_correct=False, corr_method="bonferroni", **arrs,
         )
         result = ad.read_h5ad(out)
         assert result.obs_names.tolist() == candidates
@@ -661,7 +661,7 @@ class TestBuildResultFromH5ad:
         _write_wilcoxon_result_h5ad(
             out, candidates=candidates, gene_symbols=genes,
             perturbation_column="perturbation", control_label="ctrl",
-            tie_correct=True, corr_method="benjamini-hochberg", provenance={}, **arrs,
+            tie_correct=True, corr_method="benjamini-hochberg", **arrs,
         )
         result = _build_result_from_h5ad(
             out, candidates=candidates, gene_symbols=genes,

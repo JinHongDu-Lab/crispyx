@@ -6,35 +6,17 @@ Version 0.1.7
 
 *Released 2026-10-03.*
 
-* **Fixed: a finished result could be returned stale.** With an existing
-  output file, ``wilcoxon_test``, ``t_test`` and ``nb_glm_test`` compared only
-  a few metadata fields before loading it instead of recomputing, so
-  relabelling the cells of the input in place (a permutation null, say), or
-  changing a filter or ``perturbations``, silently returned the old
-  p-values. ``aggregate_pseudobulk`` and ``compute_pseudobulk_effects``
-  ignored some arguments the same way (``perturbations``, ``min_cells`` of
-  the inner aggregation). Every reusable output now records the call that
-  made it in ``uns["crispyx"]`` -- the input file's path, size and
-  modification time and every result-shaping argument -- and is reused only
-  when that matches; otherwise the notice says why it is recomputed.
-  Arguments that only change how a run is carried out (``chunk_size``,
-  ``memory_limit_gb``, ``n_jobs``, ...) do not invalidate a result.
-* **Fixed: stale sorted and standardised copies.** ``nb_glm_test`` used an
-  existing ``<input>_sorted.h5ad`` whenever one existed, and
-  ``sort_by_perturbation`` and ``standardize_dataset`` reused theirs on a
-  name match, so a regenerated input was analysed through an old copy of its
-  cells. These copies now carry the same provenance, and are written under a
-  partial name so a killed run cannot leave one that passes for complete.
-* **Every output records who wrote it.** ``uns["crispyx"]`` also holds the
-  crispyx ``version``, whether it was an ``editable`` (development) install,
-  and a per-output layout ``schema``. A file written with another layout --
-  including any file from 0.1.6 or earlier, which has no stamp -- is
-  recomputed on the next call rather than read under the wrong layout (the
-  ``KeyError: 'pts_rest'`` a 0.1.6 checkout raised on 0.1.5 files).
-  Existing outputs are therefore recomputed once after upgrading.
-* ``batch_process`` now reuses a finished result regardless of the gene
-  ``chunk_size`` it was computed with; a partial output still resumes only on
-  the width it was started with.
+* **Fixed: stale results.** The DE functions, ``batch_process``, the
+  pseudo-bulk functions, ``sort_by_perturbation`` and ``standardize_dataset``
+  could return an existing output after its input or a result-shaping
+  argument (e.g. ``perturbations``) had changed. Each output now records
+  the input file, every result-shaping argument, the crispyx version and its
+  layout in ``uns["crispyx"]``, and is reused only when these match; the
+  notice says why one is recomputed. Execution-only arguments
+  (``chunk_size``, ``memory_limit_gb``, ``n_jobs``, ...) do not invalidate a
+  result.
+* Outputs from 0.1.6 or earlier carry no such record and are recomputed once
+  after upgrading.
 
 Version 0.1.6
 -------------
