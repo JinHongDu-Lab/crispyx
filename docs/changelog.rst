@@ -4,7 +4,7 @@ Changelog
 Version 0.1.7
 -------------
 
-*Unreleased.*
+*Released 2026-10-03.*
 
 * **Fixed: a finished result could be returned stale.** With an existing
   output file, ``wilcoxon_test``, ``t_test`` and ``nb_glm_test`` compared only
