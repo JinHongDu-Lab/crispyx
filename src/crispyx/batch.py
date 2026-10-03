@@ -25,7 +25,9 @@ from ._checkpoint import (
     _read_checkpoint,
     _unpack_bool_matrix,
     _write_checkpoint_atomic,
+    run_fingerprint,
 )
+from ._provenance import reuse_mismatch, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _resolve_memory_limit_bytes
@@ -742,6 +744,18 @@ def batch_process(
             "source_path": str(path.resolve()),
             "source_mtime_ns": int(path.stat().st_mtime_ns),
         }
+        # What a finished output must have been computed from to be reused.
+        # Unlike expected_metadata, which a resume also checks, it leaves out
+        # the gene chunk width: that decides where a partial run stopped, not
+        # what a finished one holds.
+        fingerprint = run_fingerprint(
+            path,
+            params={
+                **{k: v for k, v in expected_metadata.items()
+                   if k not in ("chunk_size", "source_path", "source_mtime_ns")},
+                "gene_name_column": gene_name_column,
+            },
+        )
         # The output file is created -- with all of this metadata and a NaN
         # fill -- before the first gene chunk runs, so metadata alone cannot
         # tell a finished result from one whose run was killed. Only the
@@ -749,16 +763,20 @@ def batch_process(
         if resolved_output.exists() and not force:
             existing = ad.read_h5ad(resolved_output, backed="r")
             try:
-                matches = _run_is_complete(existing) and _metadata_matches(
-                    existing, expected_metadata
-                )
+                complete = _run_is_complete(existing)
             finally:
                 existing.file.close()
-            if matches:
-                if int(verbose) >= 1:
-                    print(f"[cx] Loading existing result: {resolved_output}")
-                    print("[cx] Pass force=True to rerun the analysis.")
-                return AnnData(resolved_output)
+            if complete:
+                reason = reuse_mismatch(resolved_output, "batch", fingerprint)
+                if reason is None:
+                    if int(verbose) >= 1:
+                        print(f"[cx] Loading existing result: {resolved_output}")
+                        print("[cx] Pass force=True to rerun the analysis.")
+                    return AnnData(resolved_output)
+                _messages.vprint(
+                    verbose, "tl.batch_process",
+                    f"Existing result at {resolved_output} is not reused: {reason}.",
+                )
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
         if int(verbose) >= 1:
@@ -878,6 +896,7 @@ def batch_process(
                 sp.csr_matrix((n_groups, n_genes), dtype=np.float64), obs=obs, var=var,
             )
             placeholder.uns.update(expected_metadata)
+            placeholder.uns["crispyx"] = stamp("batch", fingerprint)
             placeholder.uns["stratified"] = True
             placeholder.uns["stratified_n_batches"] = int(n_batches)
             placeholder.uns["cell_chunk_size"] = int(cell_chunk_size)

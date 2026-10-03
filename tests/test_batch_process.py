@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import warnings
 from dataclasses import replace
@@ -1468,13 +1469,17 @@ def test_restart_from_scratch_does_not_inherit_the_stale_batches_used_grid(tmp_p
     assert truth.tolist() == [1, 1, 1]  # each group is in one batch only
 
     # An earlier run under a different chunk_size, whose checkpoint claims
-    # every group used every batch.
+    # every group used every batch. The source is then touched: a finished
+    # output is reused across chunk widths, so only a changed source sends
+    # this call down the resume path to the mismatch it is testing.
     output_path = tmp_path / "stale_grid.h5ad"
     first = cx.batch_process(
         path, _moment_reducer(), output_path=output_path,
         chunk_size=2, force=True, **common,
     )
     first.close()
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     output_path.with_suffix(".progress.json").write_text(json.dumps({
         "total_gene_chunks": 4,
         "last_gene_chunk": 1,

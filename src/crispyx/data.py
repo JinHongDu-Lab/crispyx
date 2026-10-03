@@ -21,7 +21,8 @@ import scipy.sparse as sp
 
 from . import _messages
 from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
-from ._checkpoint import _create_progress_context
+from ._checkpoint import _create_progress_context, run_fingerprint
+from ._provenance import reuse_mismatch, stamp, write_stamp
 from ._disk import (
     assess_bytes,
     estimate_bytes,
@@ -3915,11 +3916,23 @@ def standardize_dataset(
     cache_dir.mkdir(parents=True, exist_ok=True)
     
     standardized_path = cache_dir / f"standardized_{dataset_path.stem}.h5ad"
-    
-    # Check if cached version exists
+
+    # The cache is keyed by file name alone, so it is reused only when it
+    # was made from this exact source with these arguments.
+    fingerprint = run_fingerprint(
+        dataset_path,
+        params={
+            "perturbation_column": perturbation_column,
+            "control_label": control_label,
+            "gene_name_column": gene_name_column,
+        },
+    )
     if standardized_path.exists() and not force:
-        logger.info(f"Using cached standardized dataset: {standardized_path}")
-        return standardized_path
+        reason = reuse_mismatch(standardized_path, "standardized", fingerprint)
+        if reason is None:
+            logger.info(f"Using cached standardized dataset: {standardized_path}")
+            return standardized_path
+        logger.info(f"Not reusing cached standardized dataset {standardized_path}: {reason}")
     
     logger.info(f"Standardizing dataset: {dataset_path.name}")
     logger.info(f"  - Perturbation column: '{perturbation_column}' → 'perturbation'")
@@ -3985,20 +3998,22 @@ def standardize_dataset(
     
     # Copy h5ad file at filesystem level (streaming - no memory load)
     logger.info(f"  - Copying dataset (streaming, no X matrix load)...")
-    shutil.copy2(dataset_path, standardized_path)
-    
-    # Modify obs/var/uns in-place using h5py
-    logger.info(f"  - Updating metadata in copied file...")
-    with h5py.File(standardized_path, 'r+') as f:
-        # Update obs - need to rewrite the obs group
-        # Read current obs structure and update
-        _update_h5ad_dataframe(f, 'obs', obs_df)
-        
-        # Update var - need to rewrite the var group
-        _update_h5ad_dataframe(f, 'var', var_df)
-        
-        # Update uns - handle the standardization_metadata key
-        _update_h5ad_uns(f, 'uns', uns_dict)
+    with _replace_on_success(standardized_path) as partial:
+        shutil.copy2(dataset_path, partial)
+
+        # Modify obs/var/uns in-place using h5py
+        logger.info(f"  - Updating metadata in copied file...")
+        with h5py.File(partial, 'r+') as f:
+            # Update obs - need to rewrite the obs group
+            # Read current obs structure and update
+            _update_h5ad_dataframe(f, 'obs', obs_df)
+
+            # Update var - need to rewrite the var group
+            _update_h5ad_dataframe(f, 'var', var_df)
+
+            # Update uns - handle the standardization_metadata key
+            _update_h5ad_uns(f, 'uns', uns_dict)
+        write_stamp(partial, stamp("standardized", fingerprint))
     
     logger.info(f"Saved standardized dataset: {standardized_path}")
     
@@ -4272,18 +4287,18 @@ def sort_by_perturbation(
     else:
         output_path = Path(output_path)
     
-    # Check if already sorted
+    # Reuse an existing sorted copy only when it was made from this exact
+    # source: a copy of an older version of the input would silently feed
+    # its cells to every analysis that sorts first.
+    fingerprint = run_fingerprint(
+        path, params={"perturbation_column": perturbation_column, "control_label": control_label},
+    )
     if output_path.exists() and not force:
-        # Verify it's properly sorted
-        try:
-            backed = read_backed(output_path)
-            has_metadata = "sorting_metadata" in backed.uns
-            backed.file.close()
-            if has_metadata:
-                logger.info(f"Using existing sorted file: {output_path}")
-                return output_path
-        except Exception:
-            pass  # File exists but invalid, recreate
+        reason = reuse_mismatch(output_path, "sorted", fingerprint)
+        if reason is None:
+            logger.info(f"Using existing sorted file: {output_path}")
+            return output_path
+        logger.info(f"Not reusing sorted file {output_path}: {reason}")
     
     logger.info(f"Sorting dataset by perturbation: {path}")
     
@@ -4356,6 +4371,7 @@ def sort_by_perturbation(
     if len(sort_indices) < 100000:
         sorting_metadata["sort_order"] = sort_indices.tolist()
     uns["sorting_metadata"] = sorting_metadata
+    uns["crispyx"] = stamp("sorted", fingerprint)
     
     # Create output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4370,35 +4386,20 @@ def sort_by_perturbation(
     storage_format = get_matrix_storage_format(path)
     is_dense = storage_format == "dense"
     
-    try:
-        if is_dense:
-            # For dense storage: write directly as dense
-            _write_sorted_dense(
-                source_path=path,
-                output_path=output_path,
-                sort_indices=sort_indices,
-                obs_sorted=obs_sorted,
-                var=var,
-                uns=uns,
-                chunk_size=chunk_size,
-            )
-        else:
-            # For sparse storage: stream as CSR
-            _write_sorted_sparse(
-                source_path=path,
-                output_path=output_path,
-                sort_indices=sort_indices,
-                obs_sorted=obs_sorted,
-                var=var,
-                uns=uns,
-                chunk_size=chunk_size,
-            )
-    except Exception:
-        # Remove partial output to avoid corrupt file on next run
-        if output_path.exists():
-            logger.warning(f"  Removing partial sorted file: {output_path}")
-            output_path.unlink()
-        raise
+    # Written under a partial name: the provenance lands before the matrix,
+    # so a run killed midway must not leave a file that passes for a
+    # finished copy.
+    with _replace_on_success(output_path) as partial:
+        writer = _write_sorted_dense if is_dense else _write_sorted_sparse
+        writer(
+            source_path=path,
+            output_path=partial,
+            sort_indices=sort_indices,
+            obs_sorted=obs_sorted,
+            var=var,
+            uns=uns,
+            chunk_size=chunk_size,
+        )
     
     logger.info(f"Saved sorted dataset: {output_path}")
     logger.info(f"  Perturbation groups: {len(label_order)} (control + {len(unique_labels)} perturbations)")

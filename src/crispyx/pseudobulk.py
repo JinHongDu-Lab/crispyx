@@ -14,7 +14,8 @@ import pandas as pd
 import scipy.sparse as sparse
 
 from . import _messages
-from ._checkpoint import _create_progress_context
+from ._checkpoint import _create_progress_context, run_fingerprint
+from ._provenance import reuse_mismatch, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import _group_seed, resolve_group_reference_aliases
 from .data import (
@@ -27,6 +28,7 @@ from .data import (
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    _replace_on_success,
 )
 
 
@@ -705,12 +707,37 @@ def _validate_expression_block(block, *, context: str) -> bool:
     return bool(np.all(np.abs(values - np.rint(values)) <= 1e-8))
 
 
-def _metadata_value_equal(actual, expected) -> bool:
-    if isinstance(expected, list):
-        return [str(value) for value in np.asarray(actual).tolist()] == expected
-    if isinstance(expected, bool):
-        return bool(actual) is expected
-    return actual == expected
+#: Arguments that decide where and how a pseudo-bulk call runs but not what
+#: it writes; a finished output from a call differing only in these is
+#: reused. ``data`` is identified by the fingerprint's source path, size and
+#: mtime instead.
+_OPERATIONAL_ARGS = frozenset({
+    "data", "chunk_size", "memory_limit_gb", "bulk_output_path", "data_name",
+    "output_path", "output_dir", "verbose", "force",
+})
+
+
+def _pseudobulk_fingerprint(path: Path, call_args: dict) -> dict:
+    """:func:`run_fingerprint` of a pseudo-bulk call: the source file and
+    every argument that shapes the output (``call_args`` is the function's
+    ``locals()`` at entry)."""
+    params = {k: v for k, v in call_args.items() if k not in _OPERATIONAL_ARGS}
+    return run_fingerprint(path, params=params)
+
+
+def _reusable(path: Path, kind: str, fingerprint: dict, verbose: int | bool, name: str) -> bool:
+    """Whether the existing output at ``path`` was made by this call; says
+    why not when it exists but was not."""
+    if not path.exists():
+        return False
+    reason = reuse_mismatch(path, kind, fingerprint)
+    if reason is not None:
+        _messages.vprint(verbose, name, f"Existing result at {path} is not reused: {reason}; rerunning.")
+        return False
+    if int(verbose) >= 1:
+        print(f"[cx] Loading existing result: {path}")
+        print("[cx] Pass force=True to rerun the analysis.")
+    return True
 
 
 def aggregate_pseudobulk(
@@ -784,14 +811,19 @@ def aggregate_pseudobulk(
         Level 1 reports input interpretation and save summaries.
     force
         Recompute an existing output instead of reloading a matching result.
+        A result matches when it was computed from the same input file (path,
+        size, modification time) with the same result-shaping arguments, as
+        recorded in its ``uns["crispyx"]``.
 
     Returns
     -------
     AnnData
         On-disk result with absolute profiles in ``X``; grouping columns,
-        ``n_cells``, and ``n_cells_aggregated`` in ``obs``; and a versioned
-        ``uns['crispyx_pseudobulk']`` provenance marker.
+        ``n_cells``, and ``n_cells_aggregated`` in ``obs``; a
+        ``uns['crispyx_pseudobulk']`` description of the aggregation; and the
+        ``uns['crispyx']`` provenance stamp.
     """
+    call_args = dict(locals())  # for the result fingerprint, before any other local
     if method not in ("mean_log1p", "sum"):
         raise ValueError("method must be 'mean_log1p' or 'sum'")
     if min_cells < 1:
@@ -917,7 +949,6 @@ def aggregate_pseudobulk(
             print("[cx] pb.aggregate: detected count data; applying log1p before averaging")
 
         metadata = {
-            "schema_version": 1,
             "is_pseudobulk": True,
             "groupby": columns,
             "method": method,
@@ -929,23 +960,10 @@ def aggregate_pseudobulk(
             "random_state": int(random_state),
             "n_input_cells": int(backed.n_obs),
             "n_profiles": int(len(keys)),
-            "source_path": str(path.resolve()),
-            "source_mtime_ns": int(path.stat().st_mtime_ns),
         }
-        if resolved_output.exists() and not force:
-            existing = ad.read_h5ad(resolved_output, backed="r")
-            try:
-                existing_meta = existing.uns.get("crispyx_pseudobulk", {})
-                if all(
-                    _metadata_value_equal(existing_meta.get(key), value)
-                    for key, value in metadata.items()
-                ):
-                    if int(verbose) >= 1:
-                        print(f"[cx] Loading existing result: {resolved_output}")
-                        print("[cx] Pass force=True to rerun the analysis.")
-                    return AnnData(resolved_output)
-            finally:
-                existing.file.close()
+        fingerprint = _pseudobulk_fingerprint(path, call_args)
+        if not force and _reusable(resolved_output, "pseudobulk", fingerprint, verbose, "pb.aggregate"):
+            return AnnData(resolved_output)
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
         _accumulator_disk_estimate = warn_if_disk_space_low(
@@ -1006,7 +1024,9 @@ def aggregate_pseudobulk(
             var.index = pd.Index(gene_symbols, name=backed.var_names.name)
             result = ad.AnnData(np.asarray(profiles[: len(keys)]), obs=obs, var=var)
             result.uns["crispyx_pseudobulk"] = metadata
-            result.write(resolved_output)
+            result.uns["crispyx"] = stamp("pseudobulk", fingerprint)
+            with _replace_on_success(resolved_output) as partial:
+                result.write(partial)
             profiles._mmap.close()  # type: ignore[attr-defined]
     finally:
         backed.file.close()
@@ -1061,6 +1081,7 @@ def compute_pseudobulk_effects(
     per perturbation and batch. Set ``aggregate_batches=True`` to combine
     within-batch effects using harmonic target/control cell-count weights.
     """
+    call_args = dict(locals())  # for the result fingerprint, before any other local
     if groupby is not None and perturbation_column is not None:
         raise TypeError(
             "compute_pseudobulk_effects() received both 'perturbation_column' "
@@ -1086,6 +1107,9 @@ def compute_pseudobulk_effects(
         output_dir=output_dir,
     )
     input_is_bulk = _has_pseudobulk_marker(source_path)
+    # Identified by the caller's input, so a cell-level input's intermediate
+    # pseudo-bulk file is an implementation detail of this call.
+    fingerprint = _pseudobulk_fingerprint(source_path, call_args)
 
     def _run_from_bulk(bulk_path: Path) -> AnnData:
         bulk = read_backed(bulk_path)
@@ -1184,10 +1208,7 @@ def compute_pseudobulk_effects(
             )
 
             effect_metadata = {
-                "schema_version": 1,
                 "source_is_pseudobulk": bool(input_is_bulk),
-                "source_path": str(source_path.resolve()),
-                "source_mtime_ns": int(source_path.stat().st_mtime_ns),
                 "perturbation_column": str(perturbation_column),
                 "batch_column": str(local_batch_column),
                 "reference": str(resolved_control),
@@ -1196,20 +1217,10 @@ def compute_pseudobulk_effects(
                 "method": str(marker.get("method", method)),
                 "n_missing_control_batches": int(len(missing_batches)),
             }
-            if resolved_output.exists() and not force:
-                existing = ad.read_h5ad(resolved_output, backed="r")
-                try:
-                    existing_meta = existing.uns.get("crispyx_pseudobulk_effects", {})
-                    if all(
-                        _metadata_value_equal(existing_meta.get(key), value)
-                        for key, value in effect_metadata.items()
-                    ):
-                        if int(verbose) >= 1:
-                            print(f"[cx] Loading existing result: {resolved_output}")
-                            print("[cx] Pass force=True to rerun the analysis.")
-                        return AnnData(resolved_output)
-                finally:
-                    existing.file.close()
+            if not force and _reusable(
+                resolved_output, "pseudobulk_effects", fingerprint, verbose, "pb.effects",
+            ):
+                return AnnData(resolved_output)
 
             if aggregate_batches:
                 output_labels = list(dict.fromkeys(target_labels.tolist()))
@@ -1287,7 +1298,9 @@ def compute_pseudobulk_effects(
                 result.layers["target_profile"] = np.asarray(target_mm[:n_output])
                 result.layers["reference_profile"] = np.asarray(reference_mm[:n_output])
                 result.uns["crispyx_pseudobulk_effects"] = effect_metadata
-                result.write(resolved_output)
+                result.uns["crispyx"] = stamp("pseudobulk_effects", fingerprint)
+                with _replace_on_success(resolved_output) as partial:
+                    result.write(partial)
                 effect_mm._mmap.close()  # type: ignore[attr-defined]
                 target_mm._mmap.close()  # type: ignore[attr-defined]
                 reference_mm._mmap.close()  # type: ignore[attr-defined]
