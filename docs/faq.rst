@@ -285,18 +285,32 @@ HPC / SLURM tips
 My DE result is loaded instantly on the second call — is that expected?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Yes.  Since v0.0.3 all three DE functions auto-reload an existing result file
-instead of rerunning the analysis.  When ``verbose=True`` a notice is printed:
+Yes, when nothing that shapes the result has changed.  The DE functions,
+``batch_process`` and the pseudo-bulk functions reuse an existing output file
+instead of recomputing it.  When ``verbose=True`` a notice is printed:
 
 .. code-block:: text
 
-   [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
-   [crispyx] Pass force=True to rerun the analysis.
+   [cx] Loading existing result: data/crispyx_wilcoxon.h5ad
+   [cx] Pass force=True to rerun the analysis.
 
-If you changed a parameter (e.g. ``min_pct_ctrl``, ``min_pct_pert``, a covariate list, or
-``dispersion_scope``) and want the result to reflect the new settings, pass
-``force=True`` to the DE function.  The existing output file will be
-overwritten.
+Since v0.1.7 every output records what it was computed from in
+``uns["crispyx"]``: the input file (path, size and modification time), every
+argument that shapes the result, the crispyx version that wrote it, and the
+file layout.  The file is reused only when all of these match the call, so
+relabelling the cells of the input in place, changing ``min_pct_ctrl`` or
+``perturbations``, or upgrading to a crispyx that stores results differently
+recomputes it, and the notice says why:
+
+.. code-block:: text
+
+   [cx] Existing result at data/crispyx_wilcoxon.h5ad is not reused: the input file has changed since; rerunning.
+
+Arguments that only change how a run is carried out (``chunk_size``,
+``memory_limit_gb``, ``n_jobs``, ``verbose``, ...) do not invalidate a
+result.  Pass ``force=True`` to recompute regardless, for example after
+changing a ``batch_process`` reducer without changing its
+``statistic_name``.
 
 Can I pickle / serialise a ``RankGenesGroupsResult``?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

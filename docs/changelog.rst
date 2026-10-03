@@ -1,6 +1,23 @@
 Changelog
 =========
 
+Version 0.1.7
+-------------
+
+*Released 2026-10-03.*
+
+* **Fixed: stale results.** The DE functions, ``batch_process``, the
+  pseudo-bulk functions, ``sort_by_perturbation`` and ``standardize_dataset``
+  could return an existing output after its input or a result-shaping
+  argument (e.g. ``perturbations``) had changed. Each output now records
+  the input file, every result-shaping argument, the crispyx version and its
+  layout in ``uns["crispyx"]``, and is reused only when these match; the
+  notice says why one is recomputed. Execution-only arguments
+  (``chunk_size``, ``memory_limit_gb``, ``n_jobs``, ...) do not invalidate a
+  result.
+* Outputs from 0.1.6 or earlier carry no such record and are recomputed once
+  after upgrading.
+
 Version 0.1.6
 -------------
 

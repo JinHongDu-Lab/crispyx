@@ -102,8 +102,9 @@ treated as already transformed. ``method="sum"`` is stricter and accepts only
 finite, non-negative integer counts, typically supplied with
 ``layer="counts"``. Set ``bootstrap_size=N`` to sample exactly ``N`` cells once
 with replacement from every retained group. The output records grouping and
-cell-count columns in ``obs`` and full aggregation provenance under
-``uns['crispyx_pseudobulk']``.
+cell-count columns in ``obs``, a description of the aggregation under
+``uns['crispyx_pseudobulk']``, and the input and arguments it was computed
+from under ``uns['crispyx']``.
 
 ``perturbations`` restricts which profiles are returned. A profile is kept when
 any of its grouping values matches, so the argument selects on whichever column
@@ -840,11 +841,10 @@ You can also use ``cx.tl.shrink_lfc()`` for API consistency with other tools:
 Auto-reload and re-run control
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-All three DE functions (``wilcoxon_test``, ``t_test``, ``nb_glm_test``) write
-their results to an ``.h5ad`` file and remember the output path.  On a
-subsequent call with the same parameters, if the output file already exists
-the function **loads and returns the saved result instead of rerunning the
-analysis** — making notebook and script reruns instant:
+The DE functions, ``batch_process`` and the pseudo-bulk functions write their
+results to an ``.h5ad`` file. A later call that would compute the same result
+**loads and returns the saved file instead of rerunning the analysis**, making
+notebook and script reruns instant:
 
 .. code-block:: python
 
@@ -861,27 +861,15 @@ analysis** — making notebook and script reruns instant:
        perturbation_column="perturbation",
        verbose=True,
    )
-   # [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
-   # [crispyx] Pass force=True to rerun the analysis.
+   # [cx] Loading existing result: data/crispyx_wilcoxon.h5ad
+   # [cx] Pass force=True to rerun the analysis.
 
-To rerun unconditionally (e.g. after changing ``min_pct_ctrl``,
-``memory_limit_gb``, or any other parameter), pass ``force=True``:
-
-.. code-block:: python
-
-   result = cx.wilcoxon_test(
-       "data.h5ad",
-       perturbation_column="perturbation",
-       min_pct_ctrl=0.05,
-       min_pct_pert=0.05,
-       force=True,   # overwrite the existing file
-   )
-
-.. note::
-
-   The auto-reload check is based purely on file existence, not on a
-   comparison of the parameters used to produce it.  Always pass ``force=True``
-   when you intentionally run with different settings.
+Each output records in ``uns['crispyx']`` the input file (path, size and
+modification time) and every argument that shapes the result. The file is
+reused only when these match the call; otherwise it is recomputed and the
+notice says why. Arguments that only change how a run is carried out
+(``chunk_size``, ``memory_limit_gb``, ``n_jobs``, ``verbose``, ...) do not
+invalidate it. Pass ``force=True`` to recompute regardless.
 
 Resume and checkpointing
 ~~~~~~~~~~~~~~~~~~~~~~~~

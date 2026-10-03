@@ -212,11 +212,13 @@ def _get_checkpoint_interval(n_perturbations: int, checkpoint_interval: int | No
 def run_fingerprint(source_path: Path, **items) -> dict:
     """Identity of a call, for deciding whether a checkpoint belongs to it.
 
-    Covers the source file (path, size, modification time) and every item
-    passed -- the parameters that shape the results -- normalised through
-    JSON so a fingerprint read back from a checkpoint compares equal.
+    Covers the source file (resolved path, so any spelling of it matches;
+    size; modification time) and every item passed -- the parameters that
+    shape the results -- normalised through JSON so a fingerprint read back
+    from a checkpoint compares equal.
     """
-    stat = Path(source_path).stat()
+    source_path = Path(source_path).resolve()
+    stat = source_path.stat()
     fingerprint = {
         "source": str(source_path),
         "source_size": stat.st_size,

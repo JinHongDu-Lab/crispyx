@@ -87,12 +87,12 @@ from ._kernels import (
 )
 from ._checkpoint import (
     ResumableRun,
-    run_fingerprint,
     _get_checkpoint_interval,
     _create_progress_context,
     _DummyProgress,
 )
 from . import _messages
+from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
@@ -435,26 +435,32 @@ def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, n
     return out
 
 
-#: Arguments that change how a DE call runs but not what it computes; a
-#: checkpoint from a call differing only in these is still resumable. The
-#: memory and chunking knobs belong here because rerunning with a lower
-#: ``memory_limit_gb`` is the natural response to an OOM kill; a path that
-#: counts its progress in chunks puts the resolved chunk size in the
-#: fingerprint itself (see ``wilcoxon_test``).
+#: Arguments that change how a DE call runs but not what it writes; a
+#: finished result or a checkpoint from a call differing only in these is
+#: still reused. The memory and chunking knobs belong here because rerunning
+#: with a lower ``memory_limit_gb`` is the natural response to an OOM kill.
+#: ``data`` is identified by the fingerprint's source path, size and mtime.
 _OPERATIONAL_ARGS = frozenset({
-    "data", "perturbations", "verbose", "resume", "checkpoint_interval", "n_jobs",
-    "profiling", "force", "output_path", "output_dir", "data_name", "scanpy_format",
+    "data", "verbose", "resume", "checkpoint_interval", "n_jobs",
+    "profiling", "force", "output_path", "output_dir", "data_name",
     "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
     "cell_chunk_size", "chunk_size", "irls_batch_size",
 })
 
 
-def _de_fingerprint(path: Path, call_args: dict, **extra) -> dict:
-    """:func:`run_fingerprint` of a DE call: the source file, every argument
-    that shapes the results (``call_args`` is the function's ``locals()`` at
-    entry), and ``extra`` (the resolved perturbations, gene count, ...)."""
-    params = {k: v for k, v in call_args.items() if k not in _OPERATIONAL_ARGS}
-    return run_fingerprint(path, params=params, **extra)
+def _de_fingerprint(path: Path, call_args: dict, method: str) -> dict:
+    """Identity of a DE call, stamped into its result: see
+    :func:`~crispyx._provenance.call_fingerprint`."""
+    return call_fingerprint(path, call_args, _OPERATIONAL_ARGS, method=method)
+
+
+def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
+    """A checkpoint's identity: the result ``fingerprint`` without
+    ``scanpy_format``, which only changes the final write, plus ``extra``,
+    what the saved progress also depends on (e.g. the gene chunk width it
+    is counted in)."""
+    params = {k: v for k, v in fingerprint["params"].items() if k != "scanpy_format"}
+    return {**fingerprint, "params": params, **extra}
 
 
 # Disk a DE run needs beside its output: the resumable partial arrays plus
@@ -539,12 +545,11 @@ def _write_wilcoxon_result_h5ad(
     var = pd.DataFrame({"pts_rest": np.asarray(pts_rest, dtype=np.float32)}, index=gene_symbols.astype(str))
     uns = _wilcoxon_uns(
         control_label=control_label, perturbation_column=perturbation_column,
-        tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
-        stratified_diagnostics=stratified_diagnostics,
+        tie_correct=tie_correct, corr_method=corr_method,
+        batch_column=batch_column, stratified_diagnostics=stratified_diagnostics,
     )
-    # The metadata lands before the matrices, so the file is written under a
-    # partial name: a run killed mid-write must not leave a file whose uns
-    # matches and passes for a finished result.
+    # Written under a partial name, so a run killed mid-write leaves no
+    # truncated file at ``output_path``.
     with _replace_on_success(output_path) as partial:
         ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
         with h5py.File(partial, "r+") as hf:
@@ -556,6 +561,17 @@ def _write_wilcoxon_result_h5ad(
             _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
             _create_array(layers_grp, "u_statistic", data=u_matrix)
             _create_array(layers_grp, "pts", data=pts_matrix)
+
+
+def _finish_wilcoxon_result(
+    output_path: Path, result: "RankGenesGroupsResult", *, scanpy_format: bool, fingerprint: dict,
+) -> None:
+    """Add the optional Scanpy ``rank_genes_groups`` structure to a written
+    Wilcoxon result, then its provenance. The stamp goes last, so a run
+    killed before it leaves a file that is recomputed, not reused."""
+    if scanpy_format and result.statistics.size > 0:
+        _write_rank_genes_groups_hdf5(output_path, result)
+    write_stamp(output_path, stamp("de_result", fingerprint))
 
 
 def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
@@ -863,96 +879,18 @@ def _resolve_de_aliases(
     return perturbation_column, control_label, min_pct_ctrl, min_pct_pert
 
 
-def _decode_h5_scalar(value):
-    """Decode small HDF5 scalar/attribute values for metadata comparison."""
-    if isinstance(value, (bytes, np.bytes_)):
-        return value.decode()
-    if hasattr(value, "item"):
-        value = value.item()
-    if isinstance(value, (bytes, np.bytes_)):
-        return value.decode()
-    return value
-
-
-def _read_result_uns_metadata(output_path: Path) -> dict[str, object]:
-    """Read scalar ``uns`` metadata from an existing h5ad result."""
-    metadata: dict[str, object] = {}
-    try:
-        with h5py.File(output_path, "r") as hf:
-            if "uns" not in hf:
-                return metadata
-            uns = hf["uns"]
-            for key, value in uns.attrs.items():
-                metadata[str(key)] = _decode_h5_scalar(value)
-            for key, obj in uns.items():
-                if isinstance(obj, h5py.Dataset) and obj.shape == ():
-                    metadata[str(key)] = _decode_h5_scalar(obj[()])
-    except OSError:
-        return metadata
-    return metadata
-
-
-def _metadata_bool(value: object | None) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.lower() in {"true", "1", "yes"}
-    return bool(value)
-
-
-def _metadata_matches(
-    actual: dict[str, object],
-    expected: Mapping[str, object | None],
-) -> tuple[bool, str | None]:
-    """Return whether cached result metadata matches the requested analysis."""
-    for key, expected_value in expected.items():
-        actual_value = actual.get(key)
-        if isinstance(expected_value, bool):
-            if _metadata_bool(actual_value) != expected_value:
-                return False, key
-            continue
-        if expected_value is None:
-            if actual_value not in (None, "", b""):
-                return False, key
-            continue
-        if str(actual_value) != str(expected_value):
-            return False, key
-    return True, None
-
-
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
     force: bool,
     verbose: int | bool,
-    method_name: str,
     memory_limit_gb: float | None,
-    expected_metadata: Mapping[str, object | None] | None = None,
+    fingerprint: dict,
 ) -> "RankGenesGroupsResult | None":
-    """Return the loaded result if it already exists and ``force=False``, else ``None``."""
-    if not (output_path.exists() and not force):
+    """Return the existing result at ``output_path`` when ``force=False``
+    and it was computed by a call with this ``fingerprint``, else ``None``."""
+    if force or not reusable(output_path, "de_result", fingerprint, verbose):
         return None
-    if expected_metadata is not None:
-        metadata = _read_result_uns_metadata(output_path)
-        matches, mismatch_key = _metadata_matches(metadata, expected_metadata)
-        if not matches:
-            logger.info(
-                "Existing %s result at %s does not match requested metadata (%s); rerunning.",
-                method_name, output_path, mismatch_key,
-            )
-            if verbose:
-                print(
-                    f"[cx] Existing result does not match requested {method_name} "
-                    f"metadata ({mismatch_key}); rerunning."
-                )
-            return None
-    logger.info(
-        "Found existing %s result at %s. Loading instead of rerunning.",
-        method_name, output_path,
-    )
-    if verbose:
-        print(f"[cx] Loading existing result: {output_path}")
-        print("[cx] Pass force=True to rerun the analysis.")
     return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
 
 
@@ -1117,8 +1055,10 @@ def t_test(
         (e.g., ``memory_limit_gb=128``).
     force
         If True, rerun the analysis even when the output h5ad file already
-        exists. If False (default), load and return the existing result
-        instead of rerunning.
+        exists. If False (default), an existing result is loaded instead of
+        rerun when it was computed from the same input file (path, size,
+        modification time) with the same result-shaping arguments, as
+        recorded in its ``uns["crispyx"]``; otherwise it is recomputed.
     
     Returns
     -------
@@ -1165,9 +1105,11 @@ def t_test(
         output_path=output_path,
     )
 
+    fingerprint = _de_fingerprint(path, call_args, method="t_test")
     if (r := _try_load_existing_de_result(
         output_path, force=force, verbose=verbose,
-        method_name="t_test", memory_limit_gb=memory_limit_gb,
+        memory_limit_gb=memory_limit_gb,
+        fingerprint=fingerprint,
     )):
         return r
 
@@ -1294,7 +1236,7 @@ def t_test(
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        fingerprint=_de_fingerprint(path, call_args, method="t_test", candidates=candidates, n_genes=n_genes),
+        fingerprint=_checkpoint_fingerprint(fingerprint),
         # NaN, not 0: a perturbation that fails is never written, and a
         # p-value of 0 would report every gene as significant for it.
         arrays={
@@ -1536,6 +1478,7 @@ def t_test(
     adata.uns["control_label"] = control_label
     adata.uns["perturbation_column"] = perturbation_column
     adata.uns["pvalue_correction"] = corr_method
+    adata.uns[_PROVENANCE_KEY] = stamp("de_result", fingerprint)
     _messages.print_saving(verbose, "t_test", output_path)
     with _replace_on_success(output_path) as partial:
         adata.write(partial)
@@ -1871,8 +1814,10 @@ def nb_glm_test(
         μ_control = exp(β₀ + offset) is independent of the perturbation effect.
     force
         If True, rerun the analysis even when the output h5ad file already
-        exists. If False (default), load and return the existing result
-        instead of rerunning.
+        exists. If False (default), an existing result is loaded instead of
+        rerun when it was computed from the same input file (path, size,
+        modification time) with the same result-shaping arguments, as
+        recorded in its ``uns["crispyx"]``; otherwise it is recomputed.
     
     Returns
     -------
@@ -1932,9 +1877,13 @@ def nb_glm_test(
         path, suffix="nb_glm", output_dir=output_dir, data_name=data_name,
         output_path=output_path,
     )
+    # Identified by the caller's file: a sorted copy made below is an
+    # implementation detail of this run.
+    fingerprint = _de_fingerprint(path, call_args, method="nb_glm")
     if (r := _try_load_existing_de_result(
         _candidate_output_path, force=force, verbose=verbose,
-        method_name="nb_glm", memory_limit_gb=memory_limit_gb,
+        memory_limit_gb=memory_limit_gb,
+        fingerprint=fingerprint,
     )):
         return r
 
@@ -1953,21 +1902,14 @@ def nb_glm_test(
         )
 
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
-        sorted_path = path.parent / f"{path.stem}_sorted.h5ad"
-        if not sorted_path.exists():
-            logger.info(
-                f"Large dataset detected with scattered cells. "
-                f"Sorting by perturbation for efficient I/O..."
-            )
-            path = sort_by_perturbation(
-                path,
-                perturbation_column=perturbation_column,
-                control_label=control_label,
-                output_path=sorted_path,
-            )
-        else:
-            logger.info(f"Using existing sorted dataset: {sorted_path}")
-            path = sorted_path
+        # sort_by_perturbation reuses an existing sorted copy only when it
+        # was made from this exact source.
+        path = sort_by_perturbation(
+            path,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            output_path=path.parent / f"{path.stem}_sorted.h5ad",
+        )
 
     backed = read_backed(path)
     try:
@@ -3108,8 +3050,8 @@ def nb_glm_test(
         checkpoint_path,
         # freeze_control is resolved from free memory above; a resume must
         # fit the remaining rows with the same model as the saved ones.
-        fingerprint=_de_fingerprint(
-            path, call_args, method="nb_glm", candidates=candidates, n_genes=n_genes,
+        fingerprint=_checkpoint_fingerprint(
+            fingerprint,
             frozen_control=bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control)),
             streaming_control=bool(use_streaming_control),
         ),
@@ -3776,6 +3718,7 @@ def nb_glm_test(
     adata.uns["size_factor_method"] = size_factor_method
     adata.uns["size_factor_scope"] = size_factor_scope
     adata.uns["dispersion_scope"] = dispersion_scope
+    adata.uns[_PROVENANCE_KEY] = stamp("de_result", fingerprint)
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
         "min_pct_ctrl": float(min_pct_ctrl),
@@ -3937,7 +3880,10 @@ def _wilcoxon_test_streaming(
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        fingerprint={**fingerprint, "path": "streaming", "group_batch_size": int(group_batch_size)},
+        fingerprint=_checkpoint_fingerprint(
+            fingerprint, path="streaming", chunk_size=int(chunk_size),
+            group_batch_size=int(group_batch_size),
+        ),
         arrays={},
         resume=resume,
         requires=("result.h5ad",),
@@ -4253,9 +4199,7 @@ def _wilcoxon_test_streaming(
         memory_limit_gb=memory_limit_gb,
     )
 
-    if scanpy_format and result.statistics.size > 0:
-        _write_rank_genes_groups_hdf5(output_path, result)
-
+    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -4310,7 +4254,7 @@ def _wilcoxon_test_stratified(
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        fingerprint={**fingerprint, "path": "stratified"},
+        fingerprint=_checkpoint_fingerprint(fingerprint, path="stratified", chunk_size=int(chunk_size)),
         arrays={
             "effect": (shape, np.float64, 0),
             "u_stat": (shape, np.float64, 0),
@@ -4755,9 +4699,7 @@ def _wilcoxon_test_stratified(
         memory_limit_gb=memory_limit_gb,
     )
 
-    if scanpy_format and result.statistics.size > 0:
-        _write_rank_genes_groups_hdf5(output_path, result)
-
+    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -4893,8 +4835,10 @@ def wilcoxon_test(
         (e.g., ``memory_limit_gb=128``).
     force
         If True, rerun the analysis even when the output h5ad file already
-        exists. If False (default), load and return the existing result
-        instead of rerunning.
+        exists. If False (default), an existing result is loaded instead of
+        rerun when it was computed from the same input file (path, size,
+        modification time) with the same result-shaping arguments, as
+        recorded in its ``uns["crispyx"]``; otherwise it is recomputed.
     format_mismatch_policy
         How to handle a source stored as CSR. The test streams the matrix by
         gene (column) chunks, which on CSR re-reads the *whole* matrix once per
@@ -5013,32 +4957,17 @@ def wilcoxon_test(
 
     n_groups = len(candidates)
 
-    expected_metadata = {
-        "method": "wilcoxon",
-        "perturbation_column": perturbation_column,
-        "control_label": control_label,
-        "tie_correct": bool(tie_correct),
-        "pvalue_correction": corr_method,
-        "batch_column": batch_column,
-        "stratified": batch_column is not None,
-    }
+    fingerprint = _de_fingerprint(path, call_args, method="wilcoxon")
     if (r := _try_load_existing_de_result(
         output_path, force=force, verbose=verbose,
-        method_name="wilcoxon", memory_limit_gb=memory_limit_gb,
-        expected_metadata=expected_metadata,
+        memory_limit_gb=memory_limit_gb,
+        fingerprint=fingerprint,
     )):
         return r
     
     # Determine output path and checkpoint path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
-
-    # The resolved chunk_size is part of the identity: checkpoints count
-    # gene chunks.
-    fingerprint = _de_fingerprint(
-        path, call_args, method="wilcoxon", candidates=candidates, n_genes=n_genes,
-        chunk_size=chunk_size,
-    )
 
     # =========================================================================
     # Dispatch. Every path streams gene chunks (axis=1), which on a CSR source
@@ -5199,7 +5128,7 @@ def _wilcoxon_test_standard(
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        fingerprint={**fingerprint, "path": "standard"},
+        fingerprint=_checkpoint_fingerprint(fingerprint, path="standard", chunk_size=int(chunk_size)),
         arrays={
             "effect": (shape, np.float64, 0),
             "u_stat": (shape, np.float64, 0),
@@ -5540,10 +5469,7 @@ def _wilcoxon_test_standard(
         memory_limit_gb=memory_limit_gb,
     )
 
-    # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format and result.statistics.size > 0:
-        _write_rank_genes_groups_hdf5(output_path, result)
-
+    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -5984,6 +5910,10 @@ def shrink_lfc(
     adata.X = shrunk_lfc
     
     # Update metadata
+    # The provenance copied from the NB-GLM input describes that unshrunk
+    # result; left in place it would let nb_glm_test return this file as its
+    # own.
+    adata.uns.pop(_PROVENANCE_KEY, None)
     adata.uns["lfc_shrinkage_type"] = "apeglm"
     adata.uns["apeglm_prior_scale"] = global_prior_scale
     adata.uns["shrinkage_method"] = method

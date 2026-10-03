@@ -25,7 +25,9 @@ from ._checkpoint import (
     _read_checkpoint,
     _unpack_bool_matrix,
     _write_checkpoint_atomic,
+    run_fingerprint,
 )
+from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import resolve_group_reference_aliases
 from ._memory import _resolve_memory_limit_bytes
@@ -346,25 +348,6 @@ _COMPLETE_KEY = "crispyx_run_complete"
 def _run_is_complete(adata: ad.AnnData) -> bool:
     """Whether ``adata`` carries the marker written after the final gene chunk."""
     return bool(np.asarray(adata.uns.get(_COMPLETE_KEY, False)).item())
-
-
-def _metadata_matches(adata: ad.AnnData, expected: dict[str, Any]) -> bool:
-    for key, expected_value in expected.items():
-        actual = adata.uns.get(key)
-        if isinstance(expected_value, list):
-            if actual is None:
-                return False
-            actual_list = np.asarray(actual).tolist()
-            if not isinstance(actual_list, list):
-                return False
-            if [str(x) for x in actual_list] != expected_value:
-                return False
-        elif expected_value is None:
-            if actual not in (None, "", b""):
-                return False
-        elif str(actual) != str(expected_value):
-            return False
-    return True
 
 
 def batch_process(
@@ -737,11 +720,17 @@ def batch_process(
             "batch_ids": batch_ids,
             "channels": list(channels) if channels else None,
             "chunk_size": int(chunk_size),
-            # Identify the input itself, so that regenerating the source in place
-            # invalidates the cache instead of silently returning stale values.
-            "source_path": str(path.resolve()),
-            "source_mtime_ns": int(path.stat().st_mtime_ns),
         }
+        # What an output must have been computed from to be reused. It leaves
+        # out the gene chunk width: that decides where a partial run stopped
+        # (a resume also checks it), not what a finished one holds.
+        fingerprint = run_fingerprint(
+            path,
+            params={
+                **{k: v for k, v in expected_metadata.items() if k != "chunk_size"},
+                "gene_name_column": gene_name_column,
+            },
+        )
         # The output file is created -- with all of this metadata and a NaN
         # fill -- before the first gene chunk runs, so metadata alone cannot
         # tell a finished result from one whose run was killed. Only the
@@ -749,15 +738,10 @@ def batch_process(
         if resolved_output.exists() and not force:
             existing = ad.read_h5ad(resolved_output, backed="r")
             try:
-                matches = _run_is_complete(existing) and _metadata_matches(
-                    existing, expected_metadata
-                )
+                complete = _run_is_complete(existing)
             finally:
                 existing.file.close()
-            if matches:
-                if int(verbose) >= 1:
-                    print(f"[cx] Loading existing result: {resolved_output}")
-                    print("[cx] Pass force=True to rerun the analysis.")
+            if complete and reusable(resolved_output, "batch", fingerprint, verbose):
                 return AnnData(resolved_output)
 
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
@@ -811,8 +795,11 @@ def batch_process(
         if resume and last_completed_chunk >= 0 and resolved_output.exists():
             existing = ad.read_h5ad(resolved_output, backed="r")
             try:
+                # A finished output rejected above fails this too, so it is
+                # recomputed rather than "resumed" with nothing left to do.
                 reuse_existing_output = (
-                    _metadata_matches(existing, expected_metadata)
+                    reuse_mismatch(resolved_output, "batch", fingerprint) is None
+                    and existing.uns.get("chunk_size") == chunk_size
                     and existing.shape == (n_groups, n_genes)
                 )
             finally:
@@ -878,6 +865,7 @@ def batch_process(
                 sp.csr_matrix((n_groups, n_genes), dtype=np.float64), obs=obs, var=var,
             )
             placeholder.uns.update(expected_metadata)
+            placeholder.uns[_PROVENANCE_KEY] = stamp("batch", fingerprint)
             placeholder.uns["stratified"] = True
             placeholder.uns["stratified_n_batches"] = int(n_batches)
             placeholder.uns["cell_chunk_size"] = int(cell_chunk_size)
