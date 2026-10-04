@@ -61,21 +61,6 @@ def test_low_expr_mask(expr_p, expr_c, mean_p, mean_c, n_cells, thresholds, expe
     assert mask.tolist() == expected
 
 
-def test_low_expr_mask_min_pct_both_deprecation_warning():
-    """Passing min_pct_both emits DeprecationWarning and overrides ctrl/pert."""
-    with pytest.warns(DeprecationWarning, match="min_pct_both is deprecated"):
-        mask = _low_expr_in_both_mask(
-            pert_expr_counts=np.array([1]),
-            control_expr_counts=np.array([1]),
-            pert_mean=np.array([0.0]),
-            control_mean=np.array([0.0]),
-            n_pert_cells=10,
-            n_control_cells=10,
-            min_pct_both=0.5,
-        )
-    assert mask.tolist() == [True]
-
-
 # ---------------------------------------------------------------------------
 # End-to-end on tiny datasets
 # ---------------------------------------------------------------------------

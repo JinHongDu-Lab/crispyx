@@ -878,7 +878,7 @@ class _ToolsNamespace:
 
         if normalised == "wilcoxon":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
                 "checkpoint_interval",
                 "batch_column",
@@ -911,7 +911,7 @@ class _ToolsNamespace:
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
-                "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl",
                 "min_mean_pert",
                 "min_total_count",
@@ -938,7 +938,7 @@ class _ToolsNamespace:
 
         if normalised == "t_test":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
                 "n_jobs",
                 "checkpoint_interval",

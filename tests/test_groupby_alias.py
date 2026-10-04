@@ -17,7 +17,6 @@ import scipy.sparse as sp
 
 import crispyx as cx
 from crispyx._grouping import resolve_group_reference_aliases
-from crispyx.de import _resolve_de_aliases
 
 _COLUMN_CONFLICT = "perturbation_column.*groupby|groupby.*perturbation_column"
 _LABEL_CONFLICT = "control_label.*reference|reference.*control_label"
@@ -52,14 +51,6 @@ def test_resolver_rejects_conflicts(kwargs, match):
     args = dict(perturbation_column=None, groupby=None, control_label=None, reference=None)
     with pytest.raises(TypeError, match=match):
         resolve_group_reference_aliases(**{**args, **kwargs}, fn_name="f")
-
-
-def test_min_pct_both_sets_both_thresholds():
-    resolved = _resolve_de_aliases(
-        perturbation_column="p", groupby=None, control_label=None, reference=None,
-        min_pct_both=0.2, min_pct_ctrl=0.01, min_pct_pert=0.002, fn_name="f",
-    )
-    assert resolved == ("p", None, 0.2, 0.2)
 
 
 @pytest.fixture(scope="module")

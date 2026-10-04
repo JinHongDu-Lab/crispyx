@@ -4,6 +4,10 @@ Changelog
 Unreleased
 ----------
 
+* **Removed: ``min_pct_both``** from ``t_test``, ``wilcoxon_test`` and
+  ``nb_glm_test``. It was deprecated in favour of ``min_pct_ctrl`` and
+  ``min_pct_pert``, but the DE functions accepted it without a warning.
+  Pass ``min_pct_ctrl`` and ``min_pct_pert`` instead.
 * **Fixed: ``shrink_lfc(method="full")`` ignored ``memory_limit_gb``.** The
   parameter was documented to cap the parallel workers but was never read.
   The worker count is now capped so the workers fit in the budget (or in the

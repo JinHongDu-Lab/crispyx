@@ -850,35 +850,6 @@ def _load_completed_de_result(
 # Shared helpers for public DE functions
 # ---------------------------------------------------------------------------
 
-def _resolve_de_aliases(
-    *,
-    perturbation_column: str | None,
-    groupby: str | None,
-    control_label: str | None,
-    reference: str | None,
-    min_pct_both: float | None,
-    min_pct_ctrl: float,
-    min_pct_pert: float,
-    fn_name: str,
-) -> tuple[str, str | None, float, float]:
-    """Resolve groupby/reference aliases and handle min_pct_both.
-
-    Returns ``(perturbation_column, control_label, min_pct_ctrl, min_pct_pert)``.
-    """
-    perturbation_column, control_label = resolve_group_reference_aliases(
-        perturbation_column=perturbation_column,
-        groupby=groupby,
-        control_label=control_label,
-        reference=reference,
-        fn_name=fn_name,
-    )
-    # min_pct_both silent alias
-    if min_pct_both is not None:
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
-    return perturbation_column, control_label, min_pct_ctrl, min_pct_pert
-
-
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
@@ -939,7 +910,6 @@ def t_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     cell_chunk_size: int | None = None,
@@ -1002,9 +972,6 @@ def t_test(
         Minimum fraction of expressing cells for the *perturbed* side.
         Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
         biologically valid). Set to ``0.0`` to disable the pct check on pert.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean expression (log1p units) for the *control* side.
         Default ``0.05``. Excluded genes are written as NaN in
@@ -1086,14 +1053,11 @@ def t_test(
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="t_test",
     )
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
@@ -1527,7 +1491,6 @@ def nb_glm_test(
     min_pct_pert: float = 0.002,
     min_cells_ctrl: int = 1,
     min_cells_pert: int = 1,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     min_total_count: float = 1.0,
@@ -1681,9 +1644,6 @@ def nb_glm_test(
         Minimum fraction of expressing cells for the *perturbed* side.
         Default ``0.002``. Combined with ``min_mean_pert`` this forms a dual
         condition that is more robust to doublet / ambient-RNA artefacts.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean (size-factor-normalised) expression for the *control* side.
         Default ``0.05``. Excluded genes appear as NaN in ``pvalue`` /
@@ -1840,14 +1800,11 @@ def nb_glm_test(
         ``dispersion_trend`` instead.
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="nb_glm_test",
     )
 
@@ -4716,7 +4673,6 @@ def wilcoxon_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     chunk_size: int | None = None,
@@ -4783,9 +4739,6 @@ def wilcoxon_test(
         Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
         biologically valid). Combined with ``min_mean_pert`` this forms a dual
         condition more robust than pct alone.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean log1p expression for the *control* side. Default ``0.05``.
         Excluded genes are written as NaN in ``score`` / ``pvalue`` /
@@ -4894,14 +4847,11 @@ def wilcoxon_test(
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="wilcoxon_test",
     )
     validate_format_mismatch_policy(format_mismatch_policy)
