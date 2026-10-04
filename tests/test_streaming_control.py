@@ -394,16 +394,10 @@ def test_streaming_vs_dense_frozen_e2e(tmp_path):
         max_dense_fraction=0.0,
     )
 
-    dense_g1 = result_dense["g1"]
-    stream_g1 = result_stream["g1"]
-
-    # Since both use freeze_control=True with the same algorithm,
-    # they should match very closely
-    valid = np.isfinite(dense_g1.effect_size) & np.isfinite(stream_g1.effect_size)
-    np.testing.assert_allclose(
-        stream_g1.effect_size[valid],
-        dense_g1.effect_size[valid],
-        rtol=0.05,
-        atol=0.05,
-        err_msg="Dense vs streaming effect sizes differ too much",
-    )
+    # Same frozen-control algorithm, so the results agree to rounding.
+    for field in ("effect_size", "statistic", "pvalue", "pvalue_adj"):
+        np.testing.assert_allclose(
+            getattr(result_stream["g1"], field), getattr(result_dense["g1"], field),
+            rtol=1e-10, atol=1e-12, err_msg=field,
+        )
+    assert np.isfinite(result_dense["g1"].effect_size).all()
