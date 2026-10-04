@@ -6,19 +6,18 @@ import pytest
 import numpy as np
 import warnings
 from pathlib import Path
-import tempfile
-import shutil
 
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 # Test datasets with different storage formats
 TEST_DATASETS = {
     "csr_small": {
-        "path": Path("data/Adamson_subset.h5ad"),
+        "path": DATA_DIR / "Adamson_subset.h5ad",
         "perturbation_column": "perturbation",
         "expected_format": "csr",
     },
     "csc_medium": {
-        "path": Path("data/Tian-crispra.h5ad"),
+        "path": DATA_DIR / "Tian-crispra.h5ad",
         "perturbation_column": "perturbation",
         "expected_format": "csc",
     },
@@ -32,21 +31,13 @@ QC_PARAMS = {
 }
 
 
-@pytest.fixture
-def tmp_output_dir():
-    """Create a temporary directory for test outputs."""
-    tmp_dir = tempfile.mkdtemp(prefix="crispyx_qc_test_")
-    yield Path(tmp_dir)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 def test_get_matrix_storage_format():
     """Test storage format detection function."""
     from crispyx.data import get_matrix_storage_format
     
     for name, config in TEST_DATASETS.items():
         if not config["path"].exists():
-            pytest.skip(f"Dataset {config['path']} not found")
+            pytest.skip(f"data/{config['path'].name} not found")
         
         detected_format = get_matrix_storage_format(config["path"])
         assert detected_format == config["expected_format"], (
@@ -54,14 +45,14 @@ def test_get_matrix_storage_format():
         )
 
 
-def test_qc_in_memory_basic(tmp_output_dir):
+def test_qc_in_memory_basic(tmp_path):
     """Test that in-memory QC runs without errors on small dataset."""
     from crispyx.qc import _qc_in_memory
     from crispyx.data import read_backed, resolve_control_label
     
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Get control label
     backed = read_backed(dataset["path"])
@@ -69,7 +60,7 @@ def test_qc_in_memory_basic(tmp_output_dir):
     control_label = resolve_control_label(labels, None, verbose=False)
     backed.file.close()
     
-    output_path = tmp_output_dir / "in_memory.h5ad"
+    output_path = tmp_path / "in_memory.h5ad"
     result = _qc_in_memory(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
@@ -90,14 +81,14 @@ def test_qc_in_memory_basic(tmp_output_dir):
     assert adata.n_vars == result.gene_mask.sum()
 
 
-def test_qc_column_oriented_basic(tmp_output_dir):
+def test_qc_column_oriented_basic(tmp_path):
     """Test that column-oriented QC runs without errors on CSC dataset."""
     from crispyx.qc import _qc_column_oriented
     from crispyx.data import read_backed, resolve_control_label
     
     dataset = TEST_DATASETS["csc_medium"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Get control label
     backed = read_backed(dataset["path"])
@@ -105,7 +96,7 @@ def test_qc_column_oriented_basic(tmp_output_dir):
     control_label = resolve_control_label(labels, None, verbose=False)
     backed.file.close()
     
-    output_path = tmp_output_dir / "column_oriented.h5ad"
+    output_path = tmp_path / "column_oriented.h5ad"
     result = _qc_column_oriented(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
@@ -121,14 +112,14 @@ def test_qc_column_oriented_basic(tmp_output_dir):
     assert output_path.exists(), "Output file not created"
 
 
-def test_qc_row_oriented_basic(tmp_output_dir):
+def test_qc_row_oriented_basic(tmp_path):
     """Test that row-oriented QC runs without errors on CSR dataset."""
     from crispyx.qc import _qc_row_oriented
     from crispyx.data import read_backed, resolve_control_label
     
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Get control label
     backed = read_backed(dataset["path"])
@@ -136,7 +127,7 @@ def test_qc_row_oriented_basic(tmp_output_dir):
     control_label = resolve_control_label(labels, None, verbose=False)
     backed.file.close()
     
-    output_path = tmp_output_dir / "row_oriented.h5ad"
+    output_path = tmp_path / "row_oriented.h5ad"
     result = _qc_row_oriented(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
@@ -154,14 +145,14 @@ def test_qc_row_oriented_basic(tmp_output_dir):
     assert output_path.exists(), "Output file not created"
 
 
-def test_qc_strategy_parity_csr(tmp_output_dir):
+def test_qc_strategy_parity_csr(tmp_path):
     """Verify all QC strategies produce identical results on CSR dataset."""
     from crispyx.qc import _qc_in_memory, _qc_column_oriented, _qc_row_oriented
     from crispyx.data import read_backed, resolve_control_label
     
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Get control label
     backed = read_backed(dataset["path"])
@@ -179,20 +170,20 @@ def test_qc_strategy_parity_csr(tmp_output_dir):
     # Run all three strategies
     result_memory = _qc_in_memory(
         dataset["path"],
-        output_path=tmp_output_dir / "memory.h5ad",
+        output_path=tmp_path / "memory.h5ad",
         **common_kwargs,
     )
     
     result_column = _qc_column_oriented(
         dataset["path"],
-        output_path=tmp_output_dir / "column.h5ad",
+        output_path=tmp_path / "column.h5ad",
         chunk_size=1024,
         **common_kwargs,
     )
     
     result_row = _qc_row_oriented(
         dataset["path"],
-        output_path=tmp_output_dir / "row.h5ad",
+        output_path=tmp_path / "row.h5ad",
         chunk_size=1024,
         cache_mode="memmap",
         delta_threshold=0.3,
@@ -222,14 +213,14 @@ def test_qc_strategy_parity_csr(tmp_output_dir):
     print(f"✓ CSR parity: cells={result_memory.cell_mask.sum()}, genes={result_memory.gene_mask.sum()}")
 
 
-def test_qc_strategy_parity_csc(tmp_output_dir):
+def test_qc_strategy_parity_csc(tmp_path):
     """Verify all QC strategies produce identical results on CSC dataset."""
     from crispyx.qc import _qc_in_memory, _qc_column_oriented, _qc_row_oriented
     from crispyx.data import read_backed, resolve_control_label
     
     dataset = TEST_DATASETS["csc_medium"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Get control label
     backed = read_backed(dataset["path"])
@@ -247,20 +238,20 @@ def test_qc_strategy_parity_csc(tmp_output_dir):
     # Run all three strategies
     result_memory = _qc_in_memory(
         dataset["path"],
-        output_path=tmp_output_dir / "memory.h5ad",
+        output_path=tmp_path / "memory.h5ad",
         **common_kwargs,
     )
     
     result_column = _qc_column_oriented(
         dataset["path"],
-        output_path=tmp_output_dir / "column.h5ad",
+        output_path=tmp_path / "column.h5ad",
         chunk_size=1024,
         **common_kwargs,
     )
     
     result_row = _qc_row_oriented(
         dataset["path"],
-        output_path=tmp_output_dir / "row.h5ad",
+        output_path=tmp_path / "row.h5ad",
         chunk_size=1024,
         cache_mode="memmap",
         delta_threshold=0.3,
@@ -290,19 +281,19 @@ def test_qc_strategy_parity_csc(tmp_output_dir):
     print(f"✓ CSC parity: cells={result_memory.cell_mask.sum()}, genes={result_memory.gene_mask.sum()}")
 
 
-def test_quality_control_summary_dispatch(tmp_output_dir):
+def test_quality_control_summary_dispatch(tmp_path):
     """Test that quality_control_summary correctly dispatches based on data size."""
     from crispyx.qc import quality_control_summary
     
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     # Test with force_streaming=False (should use in-memory for small data)
     result1 = quality_control_summary(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
-        output_dir=tmp_output_dir,
+        output_dir=tmp_path,
         data_name="test1",
         force_streaming=False,
         **QC_PARAMS,
@@ -312,7 +303,7 @@ def test_quality_control_summary_dispatch(tmp_output_dir):
     result2 = quality_control_summary(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
-        output_dir=tmp_output_dir,
+        output_dir=tmp_path,
         data_name="test2",
         force_streaming=True,
         **QC_PARAMS,
@@ -331,7 +322,7 @@ def test_quality_control_summary_dispatch(tmp_output_dir):
     print(f"✓ Dispatch parity verified")
 
 
-def test_qc_against_scanpy(tmp_output_dir):
+def test_qc_against_scanpy(tmp_path):
     """Compare crispyx QC results against Scanpy QC as ground truth."""
     import anndata as ad
     import scanpy as sc
@@ -339,7 +330,7 @@ def test_qc_against_scanpy(tmp_output_dir):
     
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
     
     from crispyx.qc import quality_control_summary
     from crispyx.data import resolve_control_label, read_backed
@@ -354,7 +345,7 @@ def test_qc_against_scanpy(tmp_output_dir):
     crispyx_result = quality_control_summary(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
-        output_dir=tmp_output_dir,
+        output_dir=tmp_path,
         data_name="crispyx",
         **QC_PARAMS,
     )
@@ -444,7 +435,7 @@ def _make_synthetic_h5ad(dir_path, fmt, seed=0):
     return path
 
 
-def test_masks_only_csc_matches_csr(tmp_output_dir):
+def test_masks_only_csc_matches_csr(tmp_path):
     """Masks-only QC (output_dir=None) must give identical results for CSC and CSR.
 
     Regression test for the CSC row-slicing performance fix: the masks-only
@@ -454,8 +445,8 @@ def test_masks_only_csc_matches_csr(tmp_output_dir):
     from crispyx.data import get_matrix_storage_format
     from crispyx.qc import quality_control_summary
 
-    csr_p = _make_synthetic_h5ad(tmp_output_dir, "csr")
-    csc_p = _make_synthetic_h5ad(tmp_output_dir, "csc")
+    csr_p = _make_synthetic_h5ad(tmp_path, "csr")
+    csc_p = _make_synthetic_h5ad(tmp_path, "csc")
     assert get_matrix_storage_format(csr_p) == "csr"
     assert get_matrix_storage_format(csc_p) == "csc"
 
@@ -472,14 +463,14 @@ def test_masks_only_csc_matches_csr(tmp_output_dir):
     assert r_csr.perturbation_keep == r_csc.perturbation_keep
 
 
-def test_iter_matrix_chunks_slow_axis_warns_once(tmp_output_dir, caplog):
+def test_iter_matrix_chunks_slow_axis_warns_once(tmp_path, caplog):
     """Streaming a backed CSC matrix by rows should warn exactly once."""
     import logging
 
     import crispyx.data as cxd
     from crispyx.data import iter_matrix_chunks, read_backed
 
-    csc_p = _make_synthetic_h5ad(tmp_output_dir, "csc")
+    csc_p = _make_synthetic_h5ad(tmp_path, "csc")
     cxd._SLOW_AXIS_WARNED.clear()
 
     backed = read_backed(csc_p)
@@ -496,7 +487,7 @@ def test_iter_matrix_chunks_slow_axis_warns_once(tmp_output_dir, caplog):
     assert len(slow_warnings) == 1, f"expected exactly one slow-axis warning, got {len(slow_warnings)}"
 
 
-def test_verbose_prefix_matches_current_function_and_namespace_names(tmp_output_dir, capsys):
+def test_verbose_prefix_matches_current_function_and_namespace_names(tmp_path, capsys):
     """Regression test: quality_control_summary's print prefix must track its
     own name (and cx.pp.qc_summary's), not a name it was renamed from.
 
@@ -509,12 +500,12 @@ def test_verbose_prefix_matches_current_function_and_namespace_names(tmp_output_
 
     dataset = TEST_DATASETS["csr_small"]
     if not dataset["path"].exists():
-        pytest.skip(f"Dataset {dataset['path']} not found")
+        pytest.skip(f"data/{dataset['path'].name} not found")
 
     quality_control_summary(
         dataset["path"],
         perturbation_column=dataset["perturbation_column"],
-        output_dir=tmp_output_dir,
+        output_dir=tmp_path,
         data_name="verbose_prefix_test",
         verbose=1,
         **QC_PARAMS,
@@ -597,17 +588,17 @@ class TestFilteringMessaging:
             filter_cells_by_gene_count(path, min_genes=1, verbose=False)
         assert capsys.readouterr().out == ""
 
-    def test_quality_control_summary_reports_perturbation_counts(self, tmp_output_dir, capsys):
+    def test_quality_control_summary_reports_perturbation_counts(self, tmp_path, capsys):
         from crispyx.qc import quality_control_summary
 
         dataset = TEST_DATASETS["csr_small"]
         if not dataset["path"].exists():
-            pytest.skip(f"Dataset {dataset['path']} not found")
+            pytest.skip(f"data/{dataset['path'].name} not found")
 
         quality_control_summary(
             dataset["path"],
             perturbation_column=dataset["perturbation_column"],
-            output_dir=tmp_output_dir,
+            output_dir=tmp_path,
             data_name="pert_count_test",
             verbose=1,
             **QC_PARAMS,

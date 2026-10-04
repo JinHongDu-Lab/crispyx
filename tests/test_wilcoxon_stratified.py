@@ -14,13 +14,6 @@ import sys
 import warnings
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -140,7 +133,8 @@ def _make_h5ad(
 
 _NO_FILTER = dict(
     min_cells_expressed=0,
-    min_pct_both=0.0,
+    min_pct_ctrl=0.0,
+    min_pct_pert=0.0,
     min_mean_ctrl=0.0,
     min_mean_pert=0.0,
 )

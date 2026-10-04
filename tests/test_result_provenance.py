@@ -59,9 +59,9 @@ def _rewrite_labels(path: Path, labels: np.ndarray) -> None:
 
 
 _DE_METHODS = {
-    "wilcoxon": (cx.wilcoxon_test, True, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
-    "t_test": (cx.t_test, True, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
-    "nb_glm": (cx.nb_glm_test, False, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0, n_jobs=1)),
+    "wilcoxon": (cx.wilcoxon_test, True, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
+    "t_test": (cx.t_test, True, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
+    "nb_glm": (cx.nb_glm_test, False, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0, n_jobs=1)),
 }
 
 
@@ -137,7 +137,7 @@ def test_stamp_records_writer_and_inputs(tmp_path):
     assert stamp["schema"] == SCHEMAS["de_result"]
     fingerprint = json.loads(stamp["fingerprint"])
     assert fingerprint["source"] == str(path.resolve())
-    assert fingerprint["params"]["min_pct_both"] == 0.0
+    assert fingerprint["params"]["min_pct_ctrl"] == 0.0
     # How the run was carried out is not part of what it computed.
     assert "chunk_size" not in fingerprint["params"]
     assert "verbose" not in fingerprint["params"]

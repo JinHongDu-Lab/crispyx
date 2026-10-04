@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import pickle
-import sys
 import time
 from pathlib import Path
 
@@ -24,12 +23,6 @@ import pytest
 import scanpy as sc
 import scipy.sparse as sp
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import crispyx as cx
 from crispyx.data import AnnData

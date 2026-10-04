@@ -1,4 +1,3 @@
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,13 +13,6 @@ except ModuleNotFoundError:  # pragma: no cover - executed when benchmarks unava
     DeseqDataSet = None
     DeseqStats = None
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 from crispyx.glm import NBGLMBatchFitter, NBGLMFitter, build_design_matrix
 from crispyx.de import nb_glm_test

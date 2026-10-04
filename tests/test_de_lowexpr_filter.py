@@ -2,15 +2,7 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import numpy as np
 import pandas as pd
@@ -516,7 +508,6 @@ def test_wilcoxon_filtered_genes_are_nan_not_one(tmp_path):
     # Gene 3 is jointly silent -> must be NaN, NOT 1.0
     assert np.isnan(pvals[3]), f"Expected NaN for filtered gene 3, got {pvals[3]}"
     assert pvals[3] != 1.0, "Filtered gene p-value must be NaN, not 1.0"
-
 
 
 # ---------------------------------------------------------------------------

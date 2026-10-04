@@ -1,18 +1,10 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 import anndata as ad
 import scanpy as sc
@@ -141,7 +133,7 @@ def test_gene_symbol_validation(tmp_path):
     adata = ad.AnnData(x, obs=obs, var=var)
     path = tmp_path / "invalid.h5ad"
     adata.write(path)
-    try:
+    with pytest.raises(ValueError, match="Ensembl"):
         quality_control_summary(
             path,
             min_genes=1,
@@ -150,10 +142,6 @@ def test_gene_symbol_validation(tmp_path):
             perturbation_column="perturbation",
             control_label="ctrl",
         )
-    except ValueError as exc:
-        assert "Ensembl" in str(exc)
-    else:
-        raise AssertionError("Expected a ValueError for Ensembl-style identifiers")
 
 
 def test_downstream_effect_outputs(tmp_path):
@@ -511,17 +499,13 @@ def test_empty_perturbation_group_error(tmp_path):
     path = tmp_path / "empty_pert.h5ad"
     adata.write(path)
 
-    # Request a perturbation that doesn't exist
-    try:
+    with pytest.raises(ValueError, match="nonexistent"):
         wilcoxon_test(
             path,
             perturbation_column="perturbation",
             control_label="ctrl",
             perturbations=["nonexistent"],
         )
-        raise AssertionError("Expected ValueError for nonexistent perturbation")
-    except ValueError as e:
-        assert "nonexistent" in str(e).lower() or "no cells" in str(e).lower()
 
 
 def test_single_cell_perturbation(tmp_path):

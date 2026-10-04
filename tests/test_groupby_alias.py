@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import anndata as ad
@@ -22,12 +21,6 @@ import pytest
 import scipy.sparse as sp
 import scanpy as sc
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import crispyx as cx
 from crispyx.de import (
