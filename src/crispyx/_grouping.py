@@ -59,3 +59,15 @@ def resolve_group_reference_aliases(
     if reference is not None:
         control_label = reference
     return perturbation_column, control_label
+
+
+def canonical_call_args(
+    call_args: dict, *, perturbation_column: str, control_label: str | None,
+) -> dict:
+    """``call_args`` (a function's ``locals()`` at entry) with the grouping
+    column and the control under their canonical names, as
+    :func:`resolve_group_reference_aliases` resolved them, so a call made
+    through ``groupby``/``reference`` fingerprints the same as one made
+    through ``perturbation_column``/``control_label``."""
+    args = {k: v for k, v in call_args.items() if k not in ("groupby", "reference")}
+    return {**args, "perturbation_column": perturbation_column, "control_label": control_label}

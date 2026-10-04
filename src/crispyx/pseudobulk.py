@@ -17,7 +17,7 @@ from . import _messages
 from ._checkpoint import _create_progress_context
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import _group_seed, resolve_group_reference_aliases
+from ._grouping import _group_seed, canonical_call_args, resolve_group_reference_aliases
 from .data import (
     AnnData,
     calculate_optimal_chunk_size,
@@ -1059,22 +1059,13 @@ def compute_pseudobulk_effects(
     within-batch effects using harmonic target/control cell-count weights.
     """
     call_args = dict(locals())  # for the result fingerprint, before any other local
-    if groupby is not None and perturbation_column is not None:
-        raise TypeError(
-            "compute_pseudobulk_effects() received both 'perturbation_column' "
-            "and 'groupby'; pass only one."
-        )
-    perturbation_column = groupby if groupby is not None else perturbation_column
-    if perturbation_column is None:
-        raise TypeError(
-            "compute_pseudobulk_effects() requires 'perturbation_column' or 'groupby'."
-        )
-    if reference is not None and control_label is not None:
-        raise TypeError(
-            "compute_pseudobulk_effects() received both 'control_label' and "
-            "'reference'; pass only one."
-        )
-    control_label = reference if reference is not None else control_label
+    perturbation_column, control_label = resolve_group_reference_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        fn_name="compute_pseudobulk_effects",
+    )
     source_path = resolve_data_path(data)
     resolved_output = resolve_output_path(
         source_path,
@@ -1086,7 +1077,11 @@ def compute_pseudobulk_effects(
     # Identified by the caller's input, so a cell-level input's intermediate
     # pseudo-bulk file is an implementation detail of this call; checked
     # before that aggregation streams the matrix.
-    fingerprint = call_fingerprint(source_path, call_args, _OPERATIONAL_ARGS)
+    fingerprint = call_fingerprint(
+        source_path,
+        canonical_call_args(call_args, perturbation_column=perturbation_column, control_label=control_label),
+        _OPERATIONAL_ARGS,
+    )
     if not force and reusable(resolved_output, "pseudobulk_effects", fingerprint, verbose):
         return AnnData(resolved_output)
     input_is_bulk = _has_pseudobulk_marker(source_path)

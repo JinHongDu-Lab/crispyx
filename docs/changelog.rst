@@ -27,6 +27,11 @@ Unreleased
   recomputed or throw away an interrupted run. A ``resume=True`` call that
   cannot use the checkpoint it finds now warns and says why before starting
   over.
+* **Fixed: aliases and** ``cx.tl.rank_genes_groups`` **did not share
+  results.** ``groupby``/``reference`` and ``perturbation_column``/
+  ``control_label`` now name the same call, and ``rank_genes_groups`` reuses
+  (and is reused by) a direct DE call on the same file. ``wilcoxon_test``
+  also checks for a reusable result before reading the input's labels.
 
 Version 0.1.7
 -------------

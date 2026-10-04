@@ -88,7 +88,7 @@ from ._checkpoint import (
 from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import resolve_group_reference_aliases
+from ._grouping import canonical_call_args, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
@@ -442,9 +442,15 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
-def _de_fingerprint(path: Path, call_args: dict, method: str) -> dict:
+def _de_fingerprint(
+    path: Path, call_args: dict, method: str, *, perturbation_column: str, control_label: str | None,
+) -> dict:
     """Identity of a DE call, stamped into its result: see
-    :func:`~crispyx._provenance.call_fingerprint`."""
+    :func:`~crispyx._provenance.call_fingerprint`. The grouping column and
+    control are recorded as resolved from their aliases."""
+    call_args = canonical_call_args(
+        call_args, perturbation_column=perturbation_column, control_label=control_label,
+    )
     return call_fingerprint(path, call_args, _OPERATIONAL_ARGS, method=method)
 
 
@@ -1063,7 +1069,10 @@ def t_test(
         output_path=output_path,
     )
 
-    fingerprint = _de_fingerprint(path, call_args, method="t_test")
+    fingerprint = _de_fingerprint(
+        path, call_args, method="t_test",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
     if (r := _try_load_existing_de_result(
         output_path, force=force, verbose=verbose,
         memory_limit_gb=memory_limit_gb,
@@ -1830,7 +1839,10 @@ def nb_glm_test(
     )
     # Identified by the caller's file: a sorted copy made below is an
     # implementation detail of this run.
-    fingerprint = _de_fingerprint(path, call_args, method="nb_glm")
+    fingerprint = _de_fingerprint(
+        path, call_args, method="nb_glm",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
     if (r := _try_load_existing_de_result(
         _candidate_output_path, force=force, verbose=verbose,
         memory_limit_gb=memory_limit_gb,
@@ -4867,6 +4879,17 @@ def wilcoxon_test(
         output_path=output_path,
     )
 
+    fingerprint = _de_fingerprint(
+        path, call_args, method="wilcoxon",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
+    if (r := _try_load_existing_de_result(
+        output_path, force=force, verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
+        fingerprint=fingerprint,
+    )):
+        return r
+
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
@@ -4911,14 +4934,6 @@ def wilcoxon_test(
 
     n_groups = len(candidates)
 
-    fingerprint = _de_fingerprint(path, call_args, method="wilcoxon")
-    if (r := _try_load_existing_de_result(
-        output_path, force=force, verbose=verbose,
-        memory_limit_gb=memory_limit_gb,
-        fingerprint=fingerprint,
-    )):
-        return r
-    
     # Determine output path and checkpoint path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")

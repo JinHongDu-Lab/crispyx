@@ -189,6 +189,24 @@ def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys
     assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
 
 
+def test_aliases_name_the_same_call(tmp_path, capsys):
+    """``groupby``/``reference`` and ``perturbation_column``/``control_label``
+    are one call, and so is ``cx.tl.rank_genes_groups``, which leaves the
+    control for the DE function to infer as a direct call does."""
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("wilcoxon", path, output)
+    capsys.readouterr()
+    defaults = _DE_METHODS["wilcoxon"][2]
+    cx.wilcoxon_test(path, groupby="perturbation", reference="ctrl", output_path=output, **defaults)
+    assert "Loading existing result" in capsys.readouterr().out
+
+    cx.wilcoxon_test(path, perturbation_column="perturbation", output_dir=tmp_path / "rgg", verbose=False)
+    capsys.readouterr()
+    cx.tl.rank_genes_groups(path, groupby="perturbation", output_dir=tmp_path / "rgg")
+    assert "Loading existing result" in capsys.readouterr().out
+
+
 def _restamp_with_param(output: Path, name: str, value) -> None:
     """Rewrite the stamp as if the writer had an argument ``name`` that this
     version does not have."""
