@@ -1818,6 +1818,10 @@ def nb_glm_test(
           are met. For most large datasets (>500K cells), this auto-enables.
         - True: Force frozen control mode. Raises ValueError if requirements not met.
         - False: Disable frozen control (use raw control matrix).
+
+        The mode used is recorded in ``uns["frozen_control"]`` of the result.
+        With ``None``, an existing result is reused whichever mode the run
+        that wrote it chose; pass ``True`` or ``False`` to require one.
         
         Memory efficiency: Per-worker pickle size is reduced from (control_n × n_genes × 8)
         bytes to just ~1MB of sufficient statistics (W_sum, Wz_sum arrays).
@@ -3068,14 +3072,18 @@ def nb_glm_test(
     _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
     # Per-perturbation results live beside the output until the run finishes,
     # so an interrupted run resumes from its last checkpoint.
+    # freeze_control=None is resolved from free memory above, so it is not
+    # part of the result's identity (an identical call would otherwise be
+    # recomputed whenever free memory shifted); the result records the mode
+    # used instead. A resume, though, must fit the remaining rows with the
+    # same model as the saved ones.
+    frozen_control = bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control))
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        # freeze_control is resolved from free memory above; a resume must
-        # fit the remaining rows with the same model as the saved ones.
         fingerprint=_checkpoint_fingerprint(
             fingerprint,
-            frozen_control=bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control)),
+            frozen_control=frozen_control,
             streaming_control=bool(use_streaming_control),
         ),
         arrays={
@@ -3741,6 +3749,7 @@ def nb_glm_test(
     adata.uns["size_factor_method"] = size_factor_method
     adata.uns["size_factor_scope"] = size_factor_scope
     adata.uns["dispersion_scope"] = dispersion_scope
+    adata.uns["frozen_control"] = frozen_control
     adata.uns[_PROVENANCE_KEY] = stamp("de_result", fingerprint)
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),

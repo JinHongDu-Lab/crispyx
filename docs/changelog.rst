@@ -38,6 +38,9 @@ Unreleased
   block of groups at a time, at any size. The result's provenance is also
   written with it, so a run killed while the result is read back is reused
   rather than recomputed.
+* ``nb_glm_test`` records whether it fitted with frozen control statistics
+  in ``uns["frozen_control"]``. With ``freeze_control=None`` (chosen from the
+  memory available), an existing result is reused whichever mode it used.
 
 Version 0.1.7
 -------------
