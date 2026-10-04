@@ -5,8 +5,6 @@ the original dense path, and that the integration into nb_glm_test works
 correctly when the streaming threshold is triggered.
 """
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest

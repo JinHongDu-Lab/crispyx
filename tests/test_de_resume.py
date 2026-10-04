@@ -310,3 +310,13 @@ def test_fingerprint_tells_array_arguments_apart(screen):
     assert fp(sf) != fp(nudged)
     assert fp(sf.to_numpy()) != fp(nudged.to_numpy())
     assert len(str(fp(np.ones(2_000_000)))) < 1000  # a digest, not the vector
+
+
+@pytest.mark.parametrize(
+    "n_perturbations, requested, expected",
+    [(50, None, 1), (500, None, 10), (5000, None, 50), (500, 3, 3), (500, 0, 1)],
+)
+def test_checkpoint_interval(n_perturbations, requested, expected):
+    from crispyx._checkpoint import _get_checkpoint_interval
+
+    assert _get_checkpoint_interval(n_perturbations, requested) == expected

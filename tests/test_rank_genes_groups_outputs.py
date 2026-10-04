@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import anndata as ad
 import h5py
 import numpy as np

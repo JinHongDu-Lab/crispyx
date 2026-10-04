@@ -403,6 +403,23 @@ def test_deseq2_size_factors_streaming_matches_in_memory(tmp_path, monkeypatch, 
     np.testing.assert_allclose(in_memory, expected, rtol=1e-10)
 
 
+def test_subset_size_factors_equal_deseq2_on_the_subset(tmp_path):
+    """Per-comparison size factors are DESeq2 size factors of the compared cells alone."""
+    from crispyx._size_factors import _compute_subset_size_factors, _deseq2_style_size_factors
+
+    rng = np.random.default_rng(0)
+    X = rng.poisson(lam=8, size=(120, 30)).astype(np.float32) + 1
+    mask = np.zeros(120, dtype=bool)
+    mask[::2] = True
+    path = tmp_path / "subset.h5ad"
+    ad.AnnData(X=sp.csr_matrix(X[mask])).write_h5ad(path)
+    np.testing.assert_allclose(
+        _compute_subset_size_factors(sp.csr_matrix(X), mask),
+        _deseq2_style_size_factors(path),
+        rtol=1e-6,  # the subset path keeps float32 counts
+    )
+
+
 def _write_fmt(path, X, fmt):
     obs = pd.DataFrame(index=[f"c{i}" for i in range(X.shape[0])])
     var = pd.DataFrame(index=[f"g{i}" for i in range(X.shape[1])])

@@ -22,7 +22,7 @@ from crispyx.data import (
     write_uns_dict_to_h5ad,
     write_varm_to_h5ad,
 )
-from crispyx.dimred import _streaming_pca_incremental, _streaming_pca_sparse_cov, neighbors, pca, umap
+from crispyx.dimred import _streaming_pca_incremental, _streaming_pca_sparse_cov, neighbors, umap
 
 
 def _counts(n_obs: int = 400, n_vars: int = 60, seed: int = 0) -> np.ndarray:
@@ -202,6 +202,8 @@ def test_umap_embedding(n_components):
     result = umap(adata, n_components=n_components, min_dist=0.3, spread=1.5, copy=True)
     assert result is not adata
     assert "X_umap" not in adata.obsm
+    assert umap(adata, n_components=n_components) is None  # in place
+    assert adata.obsm["X_umap"].shape == (adata.n_obs, n_components)
     assert result.obsm["X_umap"].shape == (adata.n_obs, n_components)
     assert np.isfinite(result.obsm["X_umap"]).all()
     assert "umap" in result.uns
@@ -216,6 +218,10 @@ def test_pca_neighbors_umap_pipeline_on_a_backed_file(tmp_path):
     path = _write(tmp_path / "pipeline.h5ad", _counts(n_obs=100))
     backed = cx.read_h5ad_ondisk(path)
     cx.pp.pca(backed, n_comps=15, show_progress=False)
+    copied = cx.pp.pca(backed, n_comps=15, copy=True, show_progress=False)
+    assert isinstance(copied, ad.AnnData)
+    copied = cx.pp.neighbors(backed, n_neighbors=5, method="sklearn", copy=True, show_progress=False)
+    assert isinstance(copied, ad.AnnData) and "distances" in copied.obsp
     assert cx.pp.neighbors(backed, n_neighbors=5, method="sklearn", show_progress=False) is None
     cx.tl.umap(backed)
 

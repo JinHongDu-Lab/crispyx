@@ -1297,3 +1297,68 @@ def test_reported_standard_errors_are_invariant_to_the_mean_floor():
         floored._compute_se_batch(floored._wald_weights(coef, alpha)),
         free._compute_se_batch(free._wald_weights(coef, alpha)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-comparison size factors and dispersion
+# ---------------------------------------------------------------------------
+
+def _dense_screen(path: Path, groups: list[str], seed: int = 0) -> tuple[Path, np.ndarray]:
+    """Well-expressed NB counts (every gene non-zero in every cell, so DESeq2
+    size factors have reference genes) with 8 of 40 genes up 3x off control."""
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(groups)
+    mu = rng.gamma(5, 10, 40)
+    effect = np.where(labels[:, None] == "ctrl", 1.0, np.where(np.arange(40) < 8, 3.0, 1.0))
+    counts = _generate_nb_counts(rng, mu[None, :] * effect * rng.uniform(0.5, 2, (labels.size, 1)), 0.1)
+    counts = np.maximum(counts, 1).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(labels.size)])
+    ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(40)])).write(path)
+    return path, counts
+
+
+_NB_KW = dict(perturbation_column="perturbation", control_label="ctrl", verbose=False, n_jobs=1,
+              size_factor_method="deseq2")
+
+
+def test_per_comparison_size_factors_agree_with_global_for_a_single_comparison(tmp_path):
+    """With one perturbation the compared cells are all cells, so the scope
+    should barely matter (the global scope takes the cached-control path,
+    hence not bit-identical)."""
+    path, _ = _dense_screen(tmp_path / "one.h5ad", ["ctrl"] * 150 + ["KO1"] * 150)
+    global_sf = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW)
+    per_comparison = nb_glm_test(path, output_path=tmp_path / "per.h5ad", size_factor_scope="per_comparison", **_NB_KW)
+    np.testing.assert_allclose(per_comparison.logfoldchanges, global_sf.logfoldchanges, atol=0.02)
+    lfc = per_comparison.logfoldchanges[0]
+    # Planted genes are 3x the rest (median-of-ratios on 40 genes shifts both groups alike).
+    assert lfc[:8].mean() - lfc[8:].mean() == pytest.approx(np.log2(3), abs=0.1)
+    assert (per_comparison.pvalues[0, :8] < 1e-6).all()
+
+
+def test_per_comparison_dispersion_scope(tmp_path):
+    """Per-comparison method-of-moments dispersion keeps the coefficients and
+    gives valid Wald tests that still find the planted effects."""
+    path, _ = _dense_screen(tmp_path / "two.h5ad", ["ctrl"] * 150 + ["KO1"] * 75 + ["KO2"] * 75)
+    global_scope = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW)
+    per_comparison = nb_glm_test(path, output_path=tmp_path / "per.h5ad", dispersion_scope="per_comparison", **_NB_KW)
+    np.testing.assert_allclose(per_comparison.logfoldchanges, global_scope.logfoldchanges, rtol=1e-8)
+    assert np.isfinite(per_comparison.pvalues).all()
+    assert (per_comparison.pvalues[:, :8] < 1e-6).all()
+    assert ad.read_h5ad(per_comparison.result_path).uns["dispersion_scope"] == "per_comparison"
+
+
+def test_mom_dispersion_recovers_the_true_dispersion():
+    """At the true coefficients the batched method-of-moments estimator is
+    consistent, and gene batching does not change it."""
+    from crispyx._statistics import _compute_mom_dispersion_batched
+
+    rng = np.random.default_rng(0)
+    n, alpha = 5000, 0.2
+    mu = rng.gamma(2, 5, 30)
+    effect = np.where(np.arange(30) < 6, 3.0, 1.0)
+    Y_ctrl = _generate_nb_counts(rng, np.tile(mu, (n, 1)), alpha).astype(float)
+    Y_pert = _generate_nb_counts(rng, np.tile(mu * effect, (n, 1)), alpha).astype(float)
+    args = (Y_ctrl, Y_pert, np.zeros(n), np.zeros(n), np.log(mu), np.log(effect), np.ones(30, bool))
+    estimate = _compute_mom_dispersion_batched(*args, gene_batch_size=7)
+    np.testing.assert_allclose(estimate, alpha, rtol=0.1)
+    np.testing.assert_array_equal(estimate, _compute_mom_dispersion_batched(*args))

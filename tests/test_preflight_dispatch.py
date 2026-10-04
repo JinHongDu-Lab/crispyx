@@ -158,13 +158,6 @@ class TestEstimateDiskUsage:
         )
         assert {"tempdir", "output"} <= result.keys()
 
-    def test_reachable_via_top_level_crispyx_namespace(self, tmp_path):
-        path = _make_normalised_h5ad(tmp_path)
-        result = cx.estimate_disk_usage(
-            "t_test", path, perturbation_column="perturbation", control_label="control",
-        )
-        assert "output" in result
-
     def test_reachable_via_tl_namespace_and_matches_top_level(self, tmp_path):
         """cx.tl.estimate_disk_usage is the same function as cx.estimate_disk_usage."""
         path = _make_normalised_h5ad(tmp_path)
@@ -174,7 +167,10 @@ class TestEstimateDiskUsage:
         via_tl = cx.tl.estimate_disk_usage(
             "t_test", path, perturbation_column="perturbation", control_label="control",
         )
-        assert via_top_level == via_tl
+        # Free space is read live and can move between the two calls.
+        assert {k: (e.required_bytes, e.path) for k, e in via_top_level.items()} == {
+            k: (e.required_bytes, e.path) for k, e in via_tl.items()
+        }
 
     def test_estimate_matches_scale_of_real_run(self, tmp_path):
         """The estimate should be the right order of magnitude, not just nonzero."""

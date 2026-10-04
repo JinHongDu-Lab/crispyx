@@ -33,7 +33,7 @@ def _make_uneven_screen(path: Path, fmt: str, seed: int = 0) -> Path:
     sizes = [100] + list(range(5, 45, 4))
     labels = np.repeat(["NTC"] + [f"P{i}" for i in range(len(sizes) - 1)], sizes)
     rng.shuffle(labels)
-    n_cells, n_genes = labels.size, 60
+    n_cells, n_genes = labels.size, 300  # enough non-zeros to flush the writer's buffer
     density = np.linspace(0.02, 0.5, n_genes)
     X = (rng.random((n_cells, n_genes)) < density) * rng.integers(1, 10, (n_cells, n_genes))
     X[: n_cells // 10] *= rng.random((n_cells // 10, n_genes)) < 0.1  # some near-empty cells
@@ -68,6 +68,7 @@ def test_streaming_strategies_match_in_memory_qc(tmp_path, fmt, strategy):
     assert 0 < expected.gene_mask.sum() < expected.gene_mask.size
     all_groups = set(ad.read_h5ad(path, backed="r").obs["perturbation"].cat.categories)
     assert {g for g, keep in expected.perturbation_keep.items() if keep} < all_groups
+    assert sp.csr_matrix(ad.read_h5ad(tmp_path / "memory.h5ad").X).nnz > 2 * 8192
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # slow-axis streaming on purpose
