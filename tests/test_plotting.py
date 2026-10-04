@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -72,10 +70,12 @@ def test_de_plotting_functions(small_dataset, tmp_path):
         data_name="toy",
     )
     df = rank_genes_groups_df(result.result_path, group="pert1", n_genes=50)
+    assert len(df) == 25 and set(df["group"]) == {"pert1"}
     ax = plot_volcano(de_df=df, group="pert1", show=False)
-    assert ax is not None
+    assert ax.collections[0].get_offsets().shape == (25, 2)  # one point per gene
+    assert ax.get_title() == "Volcano: pert1"
     ax = plot_top_genes_bar(de_df=df, group="pert1", topn=10, show=False)
-    assert ax is not None
+    assert len(ax.patches) == 10
     ax = plot_ma(
         data=small_dataset,
         de_result=result.result_path,
@@ -86,7 +86,7 @@ def test_de_plotting_functions(small_dataset, tmp_path):
         n_genes=50,
         show=False,
     )
-    assert ax is not None
+    assert ax.collections[0].get_offsets().shape == (25, 2)
 
 
 def test_qc_plotting_functions(small_dataset, tmp_path):
@@ -107,62 +107,52 @@ def test_qc_plotting_functions(small_dataset, tmp_path):
         cell_mask=qc.cell_mask,
         show=False,
     )
-    assert ax is not None
+    # One bar per perturbation, each with its 10 kept cells.
+    assert [bar.get_height() for bar in ax.patches] == [10, 10, 10]
     axes = plot_qc_summary(qc, min_genes=1, min_cells_per_gene=1, show=False)
-    assert axes is not None
+    assert len(axes) == 2 and all(a.has_data() for a in axes)
 
 
 # ============================================================================
 # Feature 5: plot_overlap_heatmap
 # ============================================================================
 
-from crispyx.data import OverlapResult, compute_overlap
+from crispyx.data import compute_overlap
 from crispyx.plotting import plot_overlap_heatmap
 
 
-class TestPlotOverlapHeatmap:
-    def _make_result(self):
-        return compute_overlap({
-            "A": {"x", "y", "z"},
-            "B": {"y", "z", "w"},
-            "C": {"z"},
-        })
+def _overlap():
+    return compute_overlap({"A": {"x", "y", "z"}, "B": {"y", "z", "w"}, "C": {"z"}})
 
-    def test_returns_axes(self):
-        pytest.importorskip("matplotlib")
-        result = self._make_result()
-        ax = plot_overlap_heatmap(result)
-        assert ax is not None
 
-    def test_count_metric(self):
-        pytest.importorskip("matplotlib")
-        result = self._make_result()
-        ax = plot_overlap_heatmap(result, metric="count")
-        assert ax is not None
+@pytest.mark.parametrize(
+    "metric, annot, title, cells",
+    [
+        ("jaccard", True, "Jaccard similarity", ["1.00", "0.50", "0.33"]),
+        ("count", True, "Overlap counts", ["3", "2", "1"]),
+        ("jaccard", False, "Jaccard similarity", []),
+    ],
+    ids=["jaccard", "count", "no-annotations"],
+)
+def test_plot_overlap_heatmap(metric, annot, title, cells):
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
 
-    def test_jaccard_metric(self):
-        pytest.importorskip("matplotlib")
-        result = self._make_result()
-        ax = plot_overlap_heatmap(result, metric="jaccard")
-        assert ax is not None
+    ax = plot_overlap_heatmap(_overlap(), metric=metric, annot=annot)
+    assert ax.get_title() == title
+    assert [t.get_text() for t in ax.get_yticklabels()] == ["A", "B", "C"]
+    texts = [t.get_text() for t in ax.texts]
+    assert len(texts) == (9 if annot else 0)
+    # Row A: A-A, A-B, A-C.
+    assert texts[:3] == cells
+    plt.close("all")
 
-    def test_annotation_toggle(self):
-        pytest.importorskip("matplotlib")
-        result = self._make_result()
-        ax = plot_overlap_heatmap(result, annot=False)
-        assert ax is not None
 
-    def test_custom_title(self):
-        pytest.importorskip("matplotlib")
-        result = self._make_result()
-        ax = plot_overlap_heatmap(result, title="My Title")
-        assert ax.get_title() == "My Title"
+def test_plot_overlap_heatmap_uses_the_given_axes_and_title():
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
 
-    def test_existing_ax_used(self):
-        pytest.importorskip("matplotlib")
-        import matplotlib.pyplot as plt
-        _, provided_ax = plt.subplots()
-        result = self._make_result()
-        returned_ax = plot_overlap_heatmap(result, ax=provided_ax)
-        assert returned_ax is provided_ax
-        plt.close("all")
+    _, provided = plt.subplots()
+    assert plot_overlap_heatmap(_overlap(), ax=provided, title="My Title") is provided
+    assert provided.get_title() == "My Title"
+    plt.close("all")

@@ -24,45 +24,30 @@ def _pretend_public_function():
     warn("pretend_fn", "boom")
 
 
-class TestVprint:
-    def test_prints_at_or_above_level(self, capsys):
-        vprint(1, "pp.demo", "hello")
-        assert capsys.readouterr().out == "[cx] pp.demo: hello\n"
-
-    def test_silent_below_level(self, capsys):
-        vprint(0, "pp.demo", "hello")
-        assert capsys.readouterr().out == ""
-
-    def test_bool_true_counts_as_level_one(self, capsys):
-        vprint(True, "pp.demo", "hello")
-        assert "[cx] pp.demo: hello" in capsys.readouterr().out
-
-    def test_custom_level_gate(self, capsys):
-        vprint(1, "pp.demo", "detail", level=2)
-        assert capsys.readouterr().out == ""
-        vprint(2, "pp.demo", "detail", level=2)
-        assert "detail" in capsys.readouterr().out
+@pytest.mark.parametrize(
+    "verbose, level, printed",
+    [(1, 1, True), (0, 1, False), (True, 1, True), (1, 2, False), (2, 2, True)],
+    ids=["at-level", "below-level", "bool-true-is-1", "below-custom-level", "at-custom-level"],
+)
+def test_vprint_gates_on_level(capsys, verbose, level, printed):
+    vprint(verbose, "pp.demo", "hello", level=level)
+    assert capsys.readouterr().out == ("[cx] pp.demo: hello\n" if printed else "")
 
 
-class TestReadingSavingDone:
-    def test_print_reading_format(self, capsys):
-        print_reading(1, "pp.normalize_total_log1p", "/data/screen.h5ad")
-        assert capsys.readouterr().out == "[cx] pp.normalize_total_log1p: Reading /data/screen.h5ad\n"
-
-    def test_print_saving_uses_literal_arrow(self, capsys):
-        print_saving(1, "pp.normalize_total_log1p", "/out/screen.h5ad")
-        out = capsys.readouterr().out
-        assert out == "[cx] pp.normalize_total_log1p: Saving → /out/screen.h5ad\n"
-
-    def test_print_done_format(self, capsys):
-        print_done(1, "pp.qc_summary", "100/100 cells kept (100%)")
-        assert capsys.readouterr().out == "[cx] pp.qc_summary: Done  100/100 cells kept (100%)\n"
-
-    def test_all_three_silent_by_default_level(self, capsys):
-        print_reading(0, "pp.x", "p")
-        print_saving(0, "pp.x", "p")
-        print_done(0, "pp.x", "m")
-        assert capsys.readouterr().out == ""
+@pytest.mark.parametrize(
+    "printer, arg, expected",
+    [
+        (print_reading, "/data/screen.h5ad", "Reading /data/screen.h5ad"),
+        (print_saving, "/out/screen.h5ad", "Saving → /out/screen.h5ad"),
+        (print_done, "100/100 cells kept (100%)", "Done  100/100 cells kept (100%)"),
+    ],
+    ids=["reading", "saving-literal-arrow", "done"],
+)
+def test_reading_saving_done_format(capsys, printer, arg, expected):
+    printer(0, "pp.x", arg)
+    assert capsys.readouterr().out == ""  # silent at the default level 0
+    printer(1, "pp.qc_summary", arg)
+    assert capsys.readouterr().out == f"[cx] pp.qc_summary: {expected}\n"
 
 
 class TestFormatBytes:

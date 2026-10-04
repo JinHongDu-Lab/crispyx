@@ -5,6 +5,7 @@ import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
+import pytest
 
 
 from crispyx.data import (
@@ -125,84 +126,24 @@ def test_compute_normalized_effects_infers_control(tmp_path, caplog):
 # ============================================================================
 
 
-def test_calculate_nb_glm_chunk_size_returns_max_for_small_dataset():
-    """Small datasets should use max chunk size (256)."""
-    chunk_size = calculate_nb_glm_chunk_size(
-        n_obs=10000,
-        n_vars=5000,
-        n_groups=50,
-        available_memory_gb=128,
-    )
-    assert chunk_size == 256  # max_chunk default
-
-
-def test_calculate_nb_glm_chunk_size_reduces_for_large_dataset():
-    """Large datasets should get reduced chunk size to fit memory."""
-    chunk_size = calculate_nb_glm_chunk_size(
-        n_obs=1200000,  # 1.2M cells (like Feng-ts)
-        n_vars=36000,
-        n_groups=500,
-        available_memory_gb=128,
-    )
-    # Should be less than max_chunk due to memory constraints
-    assert chunk_size < 256
-    assert chunk_size >= 32  # min_chunk default
+@pytest.mark.parametrize(
+    "kwargs, low, high",
+    [
+        (dict(n_obs=10_000, n_vars=5_000, n_groups=50, available_memory_gb=128), 256, 256),
+        (dict(n_obs=1_200_000, n_vars=36_000, n_groups=500, available_memory_gb=128), 32, 255),
+        (dict(n_obs=1_000, n_vars=100, n_groups=10, available_memory_gb=1000, max_chunk=128), 128, 128),
+        (dict(n_obs=10_000_000, n_vars=50_000, n_groups=1000, available_memory_gb=1, min_chunk=64), 64, 64),
+        (dict(n_obs=100_000, n_vars=20_000, n_groups=None, available_memory_gb=64), 32, 256),
+    ],
+    ids=["small-hits-max", "large-reduced", "clamped-to-max", "clamped-to-min", "unknown-groups"],
+)
+def test_calculate_nb_glm_chunk_size(kwargs, low, high):
+    assert low <= calculate_nb_glm_chunk_size(**kwargs) <= high
 
 
 def test_calculate_nb_glm_chunk_size_respects_memory_limit():
-    """memory_limit_gb should cap the available memory."""
-    # With high available memory, should use max
-    chunk_high = calculate_nb_glm_chunk_size(
-        n_obs=500000,
-        n_vars=20000,
-        n_groups=200,
-        available_memory_gb=256,
-    )
-    
-    # With memory_limit_gb, should be constrained
-    chunk_limited = calculate_nb_glm_chunk_size(
-        n_obs=500000,
-        n_vars=20000,
-        n_groups=200,
-        available_memory_gb=256,
-        memory_limit_gb=32,  # Lower limit
-    )
-    
-    assert chunk_limited <= chunk_high
-
-
-def test_calculate_nb_glm_chunk_size_respects_min_max_bounds():
-    """Chunk size should be clamped to [min_chunk, max_chunk]."""
-    # Even with huge memory, don't exceed max_chunk
-    chunk_max = calculate_nb_glm_chunk_size(
-        n_obs=1000,
-        n_vars=100,
-        n_groups=10,
-        available_memory_gb=1000,  # Huge memory
-        max_chunk=128,
-    )
-    assert chunk_max == 128
-    
-    # Even with tiny memory, don't go below min_chunk
-    chunk_min = calculate_nb_glm_chunk_size(
-        n_obs=10000000,  # Very large
-        n_vars=50000,
-        n_groups=1000,
-        available_memory_gb=1,  # Tiny memory
-        min_chunk=64,
-    )
-    assert chunk_min == 64
-
-
-def test_calculate_nb_glm_chunk_size_handles_none_n_groups():
-    """Function should work without n_groups specified."""
-    chunk_size = calculate_nb_glm_chunk_size(
-        n_obs=100000,
-        n_vars=20000,
-        n_groups=None,  # Unknown groups
-        available_memory_gb=64,
-    )
-    assert 32 <= chunk_size <= 256
+    shape = dict(n_obs=500_000, n_vars=20_000, n_groups=200, available_memory_gb=256)
+    assert calculate_nb_glm_chunk_size(**shape, memory_limit_gb=32) < calculate_nb_glm_chunk_size(**shape)
 
 
 # ============================================================================
@@ -239,152 +180,49 @@ def _create_full_dataset(tmp_path: Path) -> Path:
 # Feature 1: load_obs / load_var / write_obs / write_var
 # ============================================================================
 
-class TestBackedMetadataEditing:
-    def test_load_obs_returns_dataframe(self, tmp_path):
-        path = _create_full_dataset(tmp_path)
-        df = load_obs(path)
-        assert isinstance(df, pd.DataFrame)
-        assert list(df.index) == [f"cell_{i}" for i in range(6)]
-        assert "perturbation" in df.columns
-        assert "batch" in df.columns
-
-    def test_load_obs_preserves_categorical(self, tmp_path):
-        path = _create_full_dataset(tmp_path)
-        df = load_obs(path)
+@pytest.mark.parametrize("axis", ["obs", "var"])
+def test_metadata_round_trip_leaves_x_untouched(tmp_path, axis):
+    path = _create_full_dataset(tmp_path)
+    load, write = (load_obs, write_obs) if axis == "obs" else (load_var, write_var)
+    before = ad.read_h5ad(path)
+    df = load(path)
+    pd.testing.assert_frame_equal(df, getattr(before, axis))
+    if axis == "obs":
         assert isinstance(df["perturbation"].dtype, pd.CategoricalDtype)
+    df["extra"] = np.arange(len(df))
+    write(path, df)
+    pd.testing.assert_frame_equal(load(path), df)
+    np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before.X.toarray())
 
-    def test_load_var_returns_dataframe(self, tmp_path):
-        path = _create_full_dataset(tmp_path)
-        df = load_var(path)
-        assert isinstance(df, pd.DataFrame)
-        assert "gene_symbols" in df.columns
-        assert len(df) == 4
 
-    def test_write_obs_round_trip(self, tmp_path):
-        path = _create_full_dataset(tmp_path)
-        df = load_obs(path)
-        df["new_col"] = ["x"] * len(df)
-        write_obs(path, df)
-        df2 = load_obs(path)
-        assert "new_col" in df2.columns
-        assert list(df2["new_col"]) == ["x"] * len(df)
+@pytest.mark.parametrize("axis", ["obs", "var"])
+def test_metadata_write_rejects_the_wrong_row_count(tmp_path, axis):
+    path = _create_full_dataset(tmp_path)
+    load, write = (load_obs, write_obs) if axis == "obs" else (load_var, write_var)
+    with pytest.raises(ValueError, match="rows"):
+        write(path, load(path).iloc[:2])
 
-    def test_write_var_round_trip(self, tmp_path):
-        path = _create_full_dataset(tmp_path)
-        df = load_var(path)
-        df["extra"] = [1, 2, 3, 4]
-        write_var(path, df)
-        df2 = load_var(path)
-        assert "extra" in df2.columns
-        assert list(df2["extra"]) == [1, 2, 3, 4]
 
-    def test_x_untouched_after_write_obs(self, tmp_path):
-        """write_obs must not corrupt the X matrix."""
-        path = _create_full_dataset(tmp_path)
-        import anndata as ad_mod
-        before = ad_mod.read_h5ad(path).X.toarray()
-        df = load_obs(path)
-        df["flag"] = 0
-        write_obs(path, df)
-        after = ad_mod.read_h5ad(path).X.toarray()
-        np.testing.assert_array_equal(before, after)
+def test_metadata_reads_bytes_encoded_attrs(tmp_path):
+    """anndata <= 0.8 stored 'column-order' and '_index' as S-dtype bytes; h5py
+    reads those back as np.bytes_, which must not duplicate or drop columns."""
+    import scipy.sparse as sp
 
-    def test_write_obs_shape_mismatch_raises(self, tmp_path):
-        import pytest as _pytest
-        path = _create_full_dataset(tmp_path)
-        df = load_obs(path).iloc[:3]  # wrong size
-        with _pytest.raises(ValueError, match="rows"):
-            write_obs(path, df)
+    obs = pd.DataFrame({"perturbation": ["ctrl", "KO1", "KO2"]}, index=["c0", "c1", "c2"])
+    var = pd.DataFrame({"gene_symbol": ["BRCA1", "TP53"]}, index=["BRCA1", "TP53"])
+    path = tmp_path / "bytes_attrs.h5ad"
+    ad.AnnData(sp.csr_matrix(np.ones((3, 2), dtype=np.float32)), obs=obs, var=var).write(path)
+    with h5py.File(path, "r+") as f:
+        f["obs"].attrs["column-order"] = np.array(list(obs.columns), dtype="S40")
+        f["var"].attrs["column-order"] = np.array(list(var.columns), dtype="S40")
+        del f["obs"].attrs["_index"]
+        f["obs"].attrs["_index"] = np.bytes_(b"_index")
 
-    def test_write_var_shape_mismatch_raises(self, tmp_path):
-        import pytest as _pytest
-        path = _create_full_dataset(tmp_path)
-        df = load_var(path).iloc[:2]  # wrong size
-        with _pytest.raises(ValueError, match="rows"):
-            write_var(path, df)
-
-    # ------------------------------------------------------------------
-    # Tests for bytes-encoded HDF5 attrs (anndata <=0.8 / S-dtype style)
-    # ------------------------------------------------------------------
-
-    def _write_h5ad_with_bytes_attrs(self, path: Path) -> None:
-        """Write a minimal h5ad with S-dtype (bytes) column-order attribute.
-
-        This reproduces the on-disk format produced by anndata <= 0.8 and by
-        any writer that calls ``np.array([...], dtype='S...')`` for the
-        'column-order' attribute.  h5py reads S-dtype arrays back as
-        ``np.bytes_`` objects rather than Python strings.
-        """
-        import h5py as _h5py
-        import scipy.sparse as sp
-
-        str_dt = _h5py.string_dtype(encoding="utf-8")
-
-        # Write a skeleton obs/var/X so anndata can read the file back.
-        x = np.ones((3, 2), dtype=np.float32)
-        obs = pd.DataFrame(
-            {"perturbation": ["ctrl", "KO1", "KO2"]},
-            index=["c0", "c1", "c2"],
-        )
-        var = pd.DataFrame({"gene_symbol": ["BRCA1", "TP53"]}, index=["BRCA1", "TP53"])
-        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
-        adata.write(path)
-
-        # Now overwrite the obs 'column-order' attr with S-dtype bytes.
-        with _h5py.File(path, "r+") as f:
-            f["obs"].attrs["column-order"] = np.array(
-                list(obs.columns), dtype="S40"
-            )
-            f["var"].attrs["column-order"] = np.array(
-                list(var.columns), dtype="S40"
-            )
-
-    def test_load_obs_bytes_column_order_no_duplicates(self, tmp_path):
-        """load_obs must not duplicate columns when column-order is S-dtype bytes."""
-        path = tmp_path / "bytes_attrs.h5ad"
-        self._write_h5ad_with_bytes_attrs(path)
-        df = load_obs(path)
-        assert list(df.columns) == ["perturbation"], (
-            f"Expected ['perturbation'], got {list(df.columns)}"
-        )
-
-    def test_load_obs_bytes_column_order_correct_values(self, tmp_path):
-        """Column values must be read correctly when column-order uses S-dtype."""
-        path = tmp_path / "bytes_attrs.h5ad"
-        self._write_h5ad_with_bytes_attrs(path)
-        df = load_obs(path)
-        assert list(df["perturbation"]) == ["ctrl", "KO1", "KO2"]
-
-    def test_load_var_bytes_column_order_no_duplicates(self, tmp_path):
-        """load_var must not duplicate columns when column-order is S-dtype bytes."""
-        path = tmp_path / "bytes_attrs_var.h5ad"
-        self._write_h5ad_with_bytes_attrs(path)
-        df = load_var(path)
-        assert list(df.columns) == ["gene_symbol"], (
-            f"Expected ['gene_symbol'], got {list(df.columns)}"
-        )
-
-    def test_load_obs_bytes_index_key_attr(self, tmp_path):
-        """load_obs works when the _index attr is stored as bytes (np.bytes_)."""
-        import h5py as _h5py
-        import scipy.sparse as sp
-
-        # Write a normal file, then monkey-patch _index to bytes.
-        x = np.ones((2, 1), dtype=np.float32)
-        obs = pd.DataFrame({"pert": ["ctrl", "KO1"]}, index=["c0", "c1"])
-        var = pd.DataFrame(index=["g0"])
-        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
-        path = tmp_path / "bytes_index.h5ad"
-        adata.write(path)
-
-        with _h5py.File(path, "r+") as f:
-            # Replace string attr with bytes scalar (np.bytes_ round-trips via h5py)
-            del f["obs"].attrs["_index"]
-            f["obs"].attrs["_index"] = np.bytes_(b"_index")
-
-        df = load_obs(path)
-        assert list(df.index) == ["c0", "c1"]
-        assert "pert" in df.columns
+    loaded_obs = load_obs(path)
+    assert list(loaded_obs.columns) == ["perturbation"]
+    assert list(loaded_obs.index) == ["c0", "c1", "c2"]
+    assert list(loaded_obs["perturbation"]) == ["ctrl", "KO1", "KO2"]
+    assert list(load_var(path).columns) == ["gene_symbol"]
 
 
 # ============================================================================
@@ -582,57 +420,21 @@ class TestAutoDetect:
 # Feature 5: compute_overlap / OverlapResult
 # ============================================================================
 
-class TestComputeOverlap:
-    def test_diagonal_equals_set_size(self):
-        sets = {"A": {"x", "y", "z"}, "B": {"x", "w"}}
-        result = compute_overlap(sets)
-        assert result.count_matrix.loc["A", "A"] == 3
-        assert result.count_matrix.loc["B", "B"] == 2
+def test_compute_overlap_counts_and_jaccard():
+    result = compute_overlap({"A": [1, 1, 2, 3], "B": {2, 3, 4}, "C": set()})
+    assert isinstance(result, OverlapResult)
+    assert result.set_sizes.to_dict() == {"A": 3, "B": 3, "C": 0}  # lists are de-duplicated
+    np.testing.assert_array_equal(result.count_matrix.to_numpy(), [[3, 2, 0], [2, 3, 0], [0, 0, 0]])
+    # An empty set's Jaccard index is 0/0, reported as 0.
+    expected_jaccard = [[1.0, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]]
+    np.testing.assert_allclose(result.jaccard_matrix.to_numpy(), expected_jaccard)
+    assert list(result.count_matrix.index) == ["A", "B", "C"]
 
-    def test_jaccard_matrix_symmetric(self):
-        sets = {"A": {1, 2, 3}, "B": {2, 3, 4}}
-        result = compute_overlap(sets)
-        j = result.jaccard_matrix
-        assert abs(j.loc["A", "B"] - j.loc["B", "A"]) < 1e-12
 
-    def test_jaccard_values_in_range(self):
-        sets = {"A": set(range(10)), "B": set(range(5, 15)), "C": set()}
-        result = compute_overlap(sets)
-        jv = result.jaccard_matrix.values.flatten()
-        assert (jv >= 0).all() and (jv <= 1).all()
-
-    def test_jaccard_diagonal_is_one(self):
-        sets = {"A": {1, 2, 3}, "B": {4, 5}}
-        result = compute_overlap(sets)
-        np.testing.assert_allclose(result.jaccard_matrix.values.diagonal(), 1.0)
-
-    def test_empty_set_intersection_zero(self):
-        sets = {"A": {1, 2}, "B": set()}
-        result = compute_overlap(sets)
-        assert result.count_matrix.loc["A", "B"] == 0
-        assert result.jaccard_matrix.loc["A", "B"] == 0.0
-
-    def test_set_sizes_correct(self):
-        sets = {"A": [1, 2, 3], "B": [1, 2]}
-        result = compute_overlap(sets)
-        assert result.set_sizes["A"] == 3
-        assert result.set_sizes["B"] == 2
-
-    def test_metric_count_only(self):
-        sets = {"A": {1, 2}, "B": {2, 3}}
-        result = compute_overlap(sets, metric="count")
-        assert result.count_matrix.loc["A", "B"] == 1
-        # jaccard_arr was never written, all zeros
-        assert result.jaccard_matrix.values.sum() == 0.0
-
-    def test_list_input_converted_to_set(self):
-        result = compute_overlap({"A": [1, 1, 2], "B": [2, 3]})
-        assert result.set_sizes["A"] == 2  # deduped
-        assert result.count_matrix.loc["A", "B"] == 1
-
-    def test_returns_overlap_result_instance(self):
-        result = compute_overlap({"X": {"a"}, "Y": {"b"}})
-        assert isinstance(result, OverlapResult)
+def test_compute_overlap_count_only_leaves_jaccard_empty():
+    result = compute_overlap({"A": {1, 2}, "B": {2, 3}}, metric="count")
+    assert result.count_matrix.loc["A", "B"] == 1
+    assert result.jaccard_matrix.to_numpy().sum() == 0.0
 
 
 class TestUpdateH5adDataframe:
