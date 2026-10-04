@@ -8,6 +8,7 @@ from typing import Iterable, Literal, Sequence
 import anndata as ad
 import numpy as np
 
+from ._grouping import resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
@@ -839,25 +840,13 @@ class _ToolsNamespace:
         force: bool = False,
         **kwargs,
     ) -> RankGenesGroupsResult:
-        # Resolve groupby / reference aliases
-        if groupby is not None and perturbation_column is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'perturbation_column' and 'groupby'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if groupby is not None:
-            perturbation_column = groupby
-        if perturbation_column is None:
-            raise TypeError(
-                "rank_genes_groups() requires either 'perturbation_column' or its alias 'groupby'."
-            )
-        if reference is not None and control_label is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'control_label' and 'reference'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if reference is not None:
-            control_label = reference
+        perturbation_column, control_label = resolve_group_reference_aliases(
+            perturbation_column=perturbation_column,
+            groupby=groupby,
+            control_label=control_label,
+            reference=reference,
+            fn_name="rank_genes_groups",
+        )
 
         path = resolve_data_path(data)
         method_key = method.lower().replace("_", "-")
