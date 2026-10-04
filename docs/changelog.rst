@@ -10,7 +10,9 @@ Unreleased
   used to be reported as ``score=0``, ``pvalue=1``, ``logfoldchanges=0``, as
   in Scanpy. The rank test is undefined there, so it is now ``NaN`` in every
   derived column, matching ``t_test``, ``nb_glm_test`` and every other
-  untested gene.
+  untested gene -- with or without ``tie_correct`` and with or without
+  ``batch_column`` (where a gene tied within every batch is untested). DE
+  results written by 0.1.7 are therefore recomputed once.
 * **Removed: ``min_pct_both``** from ``t_test``, ``wilcoxon_test`` and
   ``nb_glm_test``. It was deprecated in favour of ``min_pct_ctrl`` and
   ``min_pct_pert``, but the DE functions accepted it without a warning.

@@ -272,10 +272,12 @@ def test_matches_scanpy_on_dense_and_mixed_genes(tmp_path, dense_fraction):
     [dict(memory_limit_gb=128), dict(memory_limit_gb=1e-7), dict(batch_column="batch")],
     ids=["standard", "streaming", "stratified"],
 )
-def test_all_zero_gene_is_untested(tmp_path, path_kwargs):
+@pytest.mark.parametrize("tie_correct", [True, False], ids=["tie-correct", "no-tie-correct"])
+def test_all_zero_gene_is_untested(tmp_path, path_kwargs, tie_correct):
     """With the filters off, a gene that is zero in every cell has no rank
-    test (z = 0/0): NaN in every derived column, like t_test and nb_glm_test,
-    not "tested, no change" (Scanpy reports p = 1 here)."""
+    test: NaN in every derived column, like t_test and nb_glm_test, not
+    "tested, no change" (Scanpy reports p = 1 here) -- on every path, with
+    or without the tie correction."""
     rng = np.random.default_rng(123)
     data = (rng.random((115, 10)) < 0.3) * rng.exponential(2, (115, 10))
     data[:, 0] = 0.0
@@ -286,7 +288,8 @@ def test_all_zero_gene_is_untested(tmp_path, path_kwargs):
     result = wilcoxon_test(path, perturbation_column="perturbation", control_label="control",
                            output_path=tmp_path / "result.h5ad", verbose=False,
                            min_cells_expressed=0, min_pct_ctrl=0.0, min_pct_pert=0.0,
-                           min_mean_ctrl=0.0, min_mean_pert=0.0, **path_kwargs)
+                           min_mean_ctrl=0.0, min_mean_pert=0.0, tie_correct=tie_correct,
+                           **path_kwargs)
     for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size"):
         column = np.asarray(getattr(result, field))
         assert np.isnan(column[:, 0]).all(), field

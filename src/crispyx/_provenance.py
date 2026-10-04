@@ -25,10 +25,11 @@ from ._checkpoint import run_fingerprint
 KEY = "crispyx"
 
 #: Layout version of each output kind. Bump an entry whenever what that kind
-#: stores on disk changes, so existing files of the old layout are recomputed
-#: instead of being read under the new one.
+#: stores on disk changes -- its layout, or the values a call writes into
+#: it -- so existing files of the old layout are recomputed instead of being
+#: read under the new one.
 SCHEMAS = {
-    "de_result": 1,
+    "de_result": 2,  # 2: a Wilcoxon gene whose values are all tied is NaN
     "pseudobulk": 1,
     "pseudobulk_effects": 1,
     "batch": 1,

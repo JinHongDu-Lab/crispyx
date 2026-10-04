@@ -1505,6 +1505,23 @@ def _wilcoxon_all_perts_numba(
 
 
 @nb.njit(cache=True)
+def _all_tied(n_zeros: int, ctrl_sorted: np.ndarray, pert_sorted: np.ndarray) -> bool:
+    """Whether every value of a gene -- ``n_zeros`` zeros plus the sorted
+    control and perturbation non-zeros -- is the same, so that the rank-sum
+    test is undefined (its tie-corrected variance is zero)."""
+    n_nonzero = ctrl_sorted.shape[0] + pert_sorted.shape[0]
+    if n_nonzero == 0:
+        return True
+    if n_zeros > 0:
+        return False
+    if ctrl_sorted.shape[0] == 0:
+        return pert_sorted[0] == pert_sorted[-1]
+    if pert_sorted.shape[0] == 0:
+        return ctrl_sorted[0] == ctrl_sorted[-1]
+    return min(ctrl_sorted[0], pert_sorted[0]) == max(ctrl_sorted[-1], pert_sorted[-1])
+
+
+@nb.njit(cache=True)
 def _rank_sum_pert_bsearch_numba(
     ctrl_sorted: np.ndarray,
     pert_sorted: np.ndarray,
@@ -1662,7 +1679,10 @@ def _wilcoxon_single_pert_presorted(
 
         n_zeros = ctrl_n_zeros[g] + n_pert_zeros
 
-        if n_zeros < n_total:
+        tied = n_zeros == n_total
+        rank_sum = 0.0
+        tie_corr = 1.0
+        if not tied:
             # --- Binary-search ranking (always) ---
             # O(n_pert_nz * log(n_ctrl_nz)) — works for any zero fraction.
             # O(n_pert_nz * log(n_ctrl_nz)) — binary search is always
@@ -1681,6 +1701,7 @@ def _wilcoxon_single_pert_presorted(
             start = ctrl_offsets[g]
             ctrl_sorted = ctrl_sorted_flat[start : start + n_ctrl_nz]
 
+            tied = _all_tied(n_zeros, ctrl_sorted, pert_sorted)
             rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[g]
             )
@@ -1691,10 +1712,14 @@ def _wilcoxon_single_pert_presorted(
             zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
             rank_sum = float(n_pert_zeros) * zero_avg_rank + rank_sum_nz
 
-        else:
-            # All values are zero: rank_sum equals expected, U = expected.
-            rank_sum = n_pert_f * (n_total_f + 1.0) / 2.0
-            tie_corr = 0.0  # std will be 0 → z = 0, p = 1
+        if tied:
+            # Every value tied: the rank test is undefined, not "no change",
+            # with or without the tie correction.
+            u_stat_out[g] = np.nan
+            z_score_out[g] = np.nan
+            pvalue_out[g] = np.nan
+            effect_out[g] = np.nan
+            continue
 
         # Statistics
         expected = n_pert_f * (n_total_f + 1.0) / 2.0
@@ -1707,7 +1732,7 @@ def _wilcoxon_single_pert_presorted(
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
         else:
-            # Every value tied: the rank test is undefined, not "no change".
+            # An empty group: no comparison was made.
             z = np.nan
             pval = np.nan
 
@@ -1865,6 +1890,7 @@ def _wilcoxon_stratified_single_pert(
         var = 0.0        # sum_b Var_b
         u_sum = 0.0      # sum_b U_b
         n1n0_sum = 0.0   # sum_b n1_b * n0_b
+        tied = True      # every contributing stratum has a single value
 
         for s in range(seg_lo, seg_hi):
             b = seg_batch[s]
@@ -1901,6 +1927,8 @@ def _wilcoxon_stratified_single_pert(
             start = ctrl_starts[b, g]
             ctrl_sorted = ctrl_flat[start : start + n_ctrl_nz_b]
 
+            if not _all_tied(n_zeros, ctrl_sorted, pert_sorted):
+                tied = False
             rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[b, g]
             )
@@ -1922,11 +1950,13 @@ def _wilcoxon_stratified_single_pert(
             u_sum += u_b
             n1n0_sum += n1f * n0f
 
-        if var > 0.0:
+        if var > 0.0 and not tied:
             z = num / math.sqrt(var)
             pval = math.erfc(abs(z) / sqrt2)
         else:
-            # Every value tied: the rank test is undefined, not "no change".
+            # No stratum to compare in, or every value tied within each:
+            # the rank test is undefined (with or without the tie
+            # correction), not "no change".
             z = np.nan
             pval = np.nan
 
