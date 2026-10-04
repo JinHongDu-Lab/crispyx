@@ -7,6 +7,7 @@ import scipy.sparse as sp
 import anndata as ad
 import scanpy as sc
 import h5py
+from scipy.stats import mannwhitneyu
 
 import crispyx as cx
 
@@ -42,14 +43,6 @@ def create_test_dataset(tmp_path):
     path = tmp_path / "test.h5ad"
     adata.write(path)
     return path, adata
-
-
-def create_sparse_test_dataset(tmp_path):
-    dense_path, dense = create_test_dataset(tmp_path)
-    sparse = ad.AnnData(sp.csr_matrix(dense.X), obs=dense.obs.copy(), var=dense.var.copy())
-    sparse_path = tmp_path / "test_sparse.h5ad"
-    sparse.write(sparse_path)
-    return sparse_path, sparse
 
 
 def _log_normalise_sparse(adata: ad.AnnData) -> ad.AnnData:
@@ -90,36 +83,13 @@ def test_quality_control_writes_filtered_dataset(tmp_path):
         data_name="qc_test",
     )
     assert isinstance(result.filtered, cx.AnnData)
-    assert result.filtered_path.exists()
-    filtered = result.filtered.to_memory()
-    assert filtered.n_obs == int(result.cell_mask.sum())
-    assert filtered.n_vars == int(result.gene_mask.sum())
-    assert filtered.var["gene_symbols"].tolist() == adata.var["gene_symbol"].tolist()
-    result.filtered.close()
-
-
-def test_quality_control_sparse_roundtrip(tmp_path):
-    path, adata = create_sparse_test_dataset(tmp_path)
-    result = quality_control_summary(
-        path,
-        min_genes=1,
-        min_cells_per_perturbation=2,
-        min_cells_per_gene=1,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbol",
-        output_dir=tmp_path,
-        data_name="qc_sparse",
-    )
     filtered = result.filtered.to_memory()
     expected = adata[result.cell_mask, result.gene_mask]
     np.testing.assert_array_equal(filtered.X.toarray(), expected.X.toarray())
+    assert filtered.var["gene_symbols"].tolist() == expected.var["gene_symbol"].tolist()
     with h5py.File(result.filtered_path) as handle:
         encoding = handle["X"].attrs["encoding-type"]
-        # Handle both bytes and string representations
-        if isinstance(encoding, bytes):
-            encoding = encoding.decode()
-        assert encoding == "csr_matrix"
+        assert (encoding.decode() if isinstance(encoding, bytes) else encoding) == "csr_matrix"
     result.filtered.close()
 
 
@@ -424,29 +394,24 @@ def test_empty_perturbation_group_error(tmp_path):
 
 
 def test_single_cell_perturbation(tmp_path):
-    """Test handling of perturbations with very few cells."""
+    """A one-cell perturbation is still a valid rank-sum test."""
     rng = np.random.default_rng(456)
-    # ctrl: 10 cells, KO1: 1 cell
-    perturbations = np.array(["ctrl"] * 10 + ["KO1"])
     x = rng.normal(5, 1, size=(11, 5))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(11)]
+    obs = pd.DataFrame({"perturbation": ["ctrl"] * 10 + ["KO1"]}, index=[f"cell_{i}" for i in range(11)])
     var = pd.DataFrame(index=[f"gene{j}" for j in range(5)])
-    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
     path = tmp_path / "single_cell.h5ad"
-    adata.write(path)
+    ad.AnnData(sp.csr_matrix(x), obs=obs, var=var).write(path)
 
-    # Should still run, even with single cell perturbation
     result = wilcoxon_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        output_dir=tmp_path,
-        data_name="single",
+        output_path=tmp_path / "single_result.h5ad",
+        verbose=False,
     )
     assert result.groups == ["KO1"]
-    # Results may have NaN or inf, but shouldn't crash
-    assert result.pvalues.shape == (1, 5)
+    expected = mannwhitneyu(x[10:], x[:10], method="asymptotic", use_continuity=False, axis=0).pvalue
+    np.testing.assert_allclose(result.pvalues[0], expected, rtol=1e-10)
 
 
 def test_all_zero_gene(tmp_path):
@@ -472,11 +437,6 @@ def test_all_zero_gene(tmp_path):
         output_dir=tmp_path,
         data_name="zero",
     )
-    # All-zero gene should have p-value=1 or NaN, but not crash
-    assert result.pvalues.shape == (1, 4)
-    # The zero gene should not have a significant p-value (should be clearly non-significant)
-    # We use a relaxed threshold since numerical precision may produce values slightly below 1.0
-    zero_gene_pval = result.pvalues[0, 2]
-    assert zero_gene_pval >= 0.5 or not np.isfinite(zero_gene_pval), (
-        f"Zero gene p-value {zero_gene_pval} is unexpectedly low (should be non-significant)"
-    )
+    # The all-zero gene cannot be fitted: untested, not "no change".
+    assert np.isnan(result.pvalues[0, 2]) and np.isnan(result.logfoldchanges[0, 2])
+    assert np.isfinite(result.pvalues[0, [0, 1, 3]]).all()

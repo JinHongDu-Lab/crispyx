@@ -142,81 +142,38 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
         assert result.result_path == output_path
 
 
-def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
+@pytest.mark.parametrize("method", ["mean_log1p", "log_mean"])
+def test_normalized_effects_match_scanpy(small_adata, tmp_path, method):
+    """mean_log1p: mean(log1p(x)) - control; log_mean: log1p(mean(x)) - control."""
     path, adata = small_adata
     result = compute_normalized_effects(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        method="mean_log1p",
+        method=method,
         gene_name_column="gene_symbols",
         chunk_size=2,
         output_dir=tmp_path,
     )
-
-    output_path = tmp_path / "small_cx_normalized_effects.h5ad"
-    assert output_path.exists()
-
+    assert result.path == tmp_path / "small_cx_normalized_effects.h5ad"
     result_mem = result.to_memory()
-    result_df = pd.DataFrame(
-        result_mem.X, index=result_mem.obs.index, columns=result_mem.var_names
-    )
+    result.close()
 
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
-    sc.pp.log1p(sc_adata)
+    if method == "mean_log1p":
+        sc.pp.log1p(sc_adata)
+    values = _to_dense(sc_adata.X)
+    labels = sc_adata.obs["perturbation"].to_numpy()
 
-    ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
-    ctrl_mean = _to_dense(sc_adata[ctrl_mask].X).mean(axis=0)
-    expected = {}
-    for label in result_df.index:
-        mask = sc_adata.obs["perturbation"] == label
-        mean = _to_dense(sc_adata[mask].X).mean(axis=0)
-        expected[label] = mean - ctrl_mean
-    expected_df = pd.DataFrame(expected).T
-    expected_df.columns = sc_adata.var["gene_symbols"].to_list()
-    expected_df = expected_df.loc[result_df.index, result_df.columns]
+    def summary(mask):
+        mean = values[mask].mean(axis=0)
+        return mean if method == "mean_log1p" else np.log1p(mean)
 
-    np.testing.assert_allclose(result_df.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
-    result.close()
-
-
-def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
-    path, adata = small_adata
-    result = compute_normalized_effects(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        method="log_mean",
-        gene_name_column="gene_symbols",
-        chunk_size=2,
-        output_dir=tmp_path,
-    )
-
-    output_path = tmp_path / "small_cx_normalized_effects.h5ad"
-    assert output_path.exists()
-
-    result_mem = result.to_memory()
-    result_df = pd.DataFrame(
-        result_mem.X, index=result_mem.obs.index, columns=result_mem.var_names
-    )
-
-    sc_adata = adata.copy()
-    sc.pp.normalize_total(sc_adata, target_sum=1e4)
-
-    ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
-    ctrl_mean = _to_dense(sc_adata[ctrl_mask].X).mean(axis=0)
-    expected = {}
-    for label in result_df.index:
-        mask = sc_adata.obs["perturbation"] == label
-        mean = _to_dense(sc_adata[mask].X).mean(axis=0)
-        expected[label] = np.log1p(mean) - np.log1p(ctrl_mean)
-    expected_df = pd.DataFrame(expected).T
-    expected_df.columns = sc_adata.var["gene_symbols"].to_list()
-    expected_df = expected_df.loc[result_df.index, result_df.columns]
-
-    np.testing.assert_allclose(result_df.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
-    result.close()
+    control = summary(labels == "ctrl")
+    expected = np.vstack([summary(labels == label) - control for label in result_mem.obs.index])
+    assert list(result_mem.var_names) == sc_adata.var["gene_symbols"].to_list()
+    np.testing.assert_allclose(result_mem.X, expected, rtol=1e-8, atol=1e-8)
 
 
 def test_t_test_matches_scanpy(small_adata, tmp_path):
@@ -421,69 +378,29 @@ def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
         wilcoxon_test(norm_path, output_path=tmp_path / "n_jobs.h5ad", n_jobs=2, **common)
 
 
-def test_deseq2_size_factors_streaming_parity(tmp_path):
-    """Verify streaming DESeq2 size factors match the dense path exactly."""
-    from crispyx._size_factors import _deseq2_style_size_factors
-    from crispyx.data import iter_matrix_chunks, read_backed
+@pytest.mark.parametrize("zero_gene", [False, True], ids=["all-expressed", "one-gene-with-zeros"])
+def test_deseq2_size_factors_streaming_matches_in_memory(tmp_path, monkeypatch, zero_gene):
+    """Forcing the streaming passes gives the same size factors as the
+    in-memory path, and both match DESeq2's median-of-ratios definition."""
+    import crispyx._size_factors as size_factors
 
-    # Create a small dataset where all genes are expressed in every cell
-    np.random.seed(42)
-    n_cells, n_genes = 200, 50
-    # Poisson counts — ensure every cell-gene has count >= 1
-    X = np.random.poisson(lam=5, size=(n_cells, n_genes)).astype(np.float32) + 1
-    adata = ad.AnnData(X=sp.csr_matrix(X))
-    adata.obs["pert"] = ["ctrl"] * 100 + ["pert_A"] * 100
+    rng = np.random.default_rng(42)
+    X = rng.poisson(lam=5, size=(200, 50)).astype(np.float32) + 1
+    if zero_gene:
+        X[::3, 7] = 0  # gene 7 is not expressed in every cell, so it is left out
+    path = tmp_path / "sf.h5ad"
+    ad.AnnData(X=sp.csr_matrix(X)).write_h5ad(path)
 
-    h5ad_path = tmp_path / "test_sf.h5ad"
-    adata.write_h5ad(str(h5ad_path))
+    in_memory = size_factors._deseq2_style_size_factors(path, chunk_size=64)
+    monkeypatch.setattr(size_factors, "_DESEQ2_STREAMING_THRESHOLD_GB", 0.0)
+    streamed = size_factors._deseq2_style_size_factors(path, chunk_size=64)
+    np.testing.assert_allclose(streamed, in_memory, rtol=1e-10, atol=1e-12)
 
-    # Dense path (small data, threshold not hit)
-    sf_dense = _deseq2_style_size_factors(str(h5ad_path), chunk_size=64)
-
-    # Replicate the streaming logic directly to verify correctness
-    backed = read_backed(str(h5ad_path))
-    n_c = backed.n_obs
-    all_expressed = np.ones(n_genes, dtype=bool)
-    try:
-        for _, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=False):
-            csr = sp.csr_matrix(block)
-            csc = csr.tocsc()
-            nnz_per_gene = np.diff(csc.indptr)
-            all_expressed[nnz_per_gene < csr.shape[0]] = False
-    finally:
-        backed.file.close()
-
-    all_expressed_idx = np.where(all_expressed)[0]
-    n_all_expressed = len(all_expressed_idx)
-    assert n_all_expressed == n_genes  # all genes expressed in all cells
-
-    # Streaming geo_means
-    log_sum = np.zeros(n_all_expressed, dtype=np.float64)
-    backed = read_backed(str(h5ad_path))
-    try:
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=True):
-            block_arr = np.asarray(block, dtype=np.float64)
-            log_sum += np.log(np.maximum(block_arr[:, all_expressed_idx], 1e-300)).sum(axis=0)
-    finally:
-        backed.file.close()
-    geo_means = np.exp(log_sum / n_c)
-
-    # Streaming median of ratios
-    sf_streaming = np.full(n_c, np.nan, dtype=np.float64)
-    backed = read_backed(str(h5ad_path))
-    try:
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=True):
-            block_arr = np.asarray(block, dtype=np.float64)
-            ratios = block_arr[:, all_expressed_idx] / geo_means
-            sf_streaming[slc] = np.median(ratios, axis=1)
-    finally:
-        backed.file.close()
-
-    # Apply same scaling as _deseq2_style_size_factors
-    scale_factor = np.exp(np.mean(np.log(np.clip(sf_streaming, 1e-12, None))))
-    sf_streaming = sf_streaming / scale_factor
-
-    np.testing.assert_allclose(sf_streaming, sf_dense, rtol=1e-10, atol=1e-12)
+    used = (np.delete(X, 7, axis=1) if zero_gene else X).astype(np.float64)
+    geo_means = np.exp(np.log(used).mean(axis=0))
+    expected = np.median(used / geo_means, axis=1)
+    expected /= np.exp(np.log(expected).mean())
+    np.testing.assert_allclose(in_memory, expected, rtol=1e-10)
 
 
 def _write_fmt(path, X, fmt):
