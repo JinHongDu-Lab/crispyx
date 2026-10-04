@@ -207,6 +207,32 @@ def test_aliases_name_the_same_call(tmp_path, capsys):
     assert "Loading existing result" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("lazy", [False, True], ids=["loaded", "too-large-to-load"])
+def test_wilcoxon_scanpy_structure_is_written_however_large(tmp_path, monkeypatch, lazy):
+    """A result too large to load is still written with the Scanpy structure
+    its stamp claims, identical to the one written for a loaded result."""
+    import crispyx._memory as memory
+
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    reference = tmp_path / "reference.h5ad"
+    _run("t_test", path, reference, scanpy_format=True)  # the in-memory writer
+    loaded = _run("wilcoxon", path, tmp_path / "loaded.h5ad", scanpy_format=True)
+    if lazy:
+        monkeypatch.setattr(memory, "_resolve_memory_limit_bytes", lambda _limit: 1)
+    output = tmp_path / "result.h5ad"
+    result = _run("wilcoxon", path, output, scanpy_format=True)
+    assert (result.statistics.size == 0) == lazy
+    with h5py.File(output, "r") as f, h5py.File(tmp_path / "loaded.h5ad", "r") as g:
+        rgg = f["uns/rank_genes_groups"]
+        np.testing.assert_array_equal(rgg["full/scores"][()], loaded.statistics)
+        np.testing.assert_array_equal(rgg["full/pts_rest"][()], loaded.pts_rest)
+        np.testing.assert_array_equal(rgg["order"][()], loaded.order)
+        for name in ("full/pvals", "full/logfoldchanges", "full/auc", "full/u_stat", "full/pts", "names"):
+            np.testing.assert_array_equal(rgg[name][()], g[f"uns/rank_genes_groups/{name}"][()], err_msg=name)
+    with h5py.File(reference, "r") as f, h5py.File(output, "r") as g:
+        assert sorted(f["uns/rank_genes_groups/full"]) == sorted(g["uns/rank_genes_groups/full"])
+
+
 def _restamp_with_param(output: Path, name: str, value) -> None:
     """Rewrite the stamp as if the writer had an argument ``name`` that this
     version does not have."""

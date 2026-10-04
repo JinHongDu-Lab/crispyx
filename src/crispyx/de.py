@@ -528,6 +528,8 @@ def _write_wilcoxon_result_h5ad(
     corr_method: str,
     batch_column: str | None = None,
     stratified_diagnostics: dict[str, object] | None = None,
+    scanpy_format: bool = False,
+    provenance: dict | None = None,
 ) -> None:
     """Write wilcoxon result arrays to h5ad.
 
@@ -539,6 +541,10 @@ def _write_wilcoxon_result_h5ad(
     ``pts_rest`` is the control arm's detection rate, one value per gene, so
     it is stored as ``var["pts_rest"]`` rather than repeated for every
     perturbation.
+
+    The Scanpy structure (``scanpy_format``) and the ``provenance`` stamp go
+    into the same partial file, so ``output_path`` only ever appears
+    complete: a run killed at any point before leaves nothing to reuse.
     """
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
@@ -548,6 +554,8 @@ def _write_wilcoxon_result_h5ad(
         tie_correct=tie_correct, corr_method=corr_method,
         batch_column=batch_column, stratified_diagnostics=stratified_diagnostics,
     )
+    if provenance is not None:
+        uns[_PROVENANCE_KEY] = provenance
     # Written under a partial name, so a run killed mid-write leaves no
     # truncated file at ``output_path``.
     with _replace_on_success(output_path) as partial:
@@ -561,17 +569,11 @@ def _write_wilcoxon_result_h5ad(
             _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
             _create_array(layers_grp, "u_statistic", data=u_matrix)
             _create_array(layers_grp, "pts", data=pts_matrix)
-
-
-def _finish_wilcoxon_result(
-    output_path: Path, result: "RankGenesGroupsResult", *, scanpy_format: bool, fingerprint: dict,
-) -> None:
-    """Add the optional Scanpy ``rank_genes_groups`` structure to a written
-    Wilcoxon result, then its provenance. The stamp goes last, so a run
-    killed before it leaves a file that is recomputed, not reused."""
-    if scanpy_format and result.statistics.size > 0:
-        _write_rank_genes_groups_hdf5(output_path, result)
-    write_stamp(output_path, stamp("de_result", fingerprint))
+        if scanpy_format:
+            _write_wilcoxon_rank_genes_groups(
+                partial, groups=candidates, perturbation_column=perturbation_column,
+                control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
+            )
 
 
 def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
@@ -715,53 +717,111 @@ def _write_rank_genes_groups_hdf5(
     output_path: Path,
     result: "RankGenesGroupsResult",
 ) -> None:
+    """Write rank_genes_groups to HDF5 for Scanpy compatibility, from an
+    in-memory ``result``: see :func:`_write_rank_genes_groups`."""
+
+    def rows(_handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
+        return {
+            "scores": result.statistics[sl], "pvals": result.pvalues[sl],
+            "pvals_adj": result.pvalues_adj[sl], "logfoldchanges": result.logfoldchanges[sl],
+            "auc": result.effect_size[sl], "u_stat": result.u_statistics[sl],
+            "pts": result.pts[sl], "pts_rest": result.pts_rest[sl], "order": result.order[sl],
+        }
+
+    _write_rank_genes_groups(
+        output_path, groups=result.groups, n_genes=len(result.genes), rows=rows,
+        block_rows=max(len(result.groups), 1), groupby=result.groupby, method=result.method,
+        reference=result.control_label, tie_correct=result.tie_correct,
+        corr_method=result.pvalue_correction,
+    )
+
+
+def _write_wilcoxon_rank_genes_groups(
+    path: Path,
+    *,
+    groups: list[str],
+    perturbation_column: str,
+    control_label: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
+    """Write rank_genes_groups for the Wilcoxon result at ``path`` from its
+    own layers, a block of groups at a time, so it is written however large
+    the result is (the result returned to the caller may be too large to
+    load). The values and order match :func:`_build_result_from_h5ad`."""
+
+    def rows(handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
+        layers = handle["layers"]
+        z = layers["z_score"][sl]
+        pts = np.asarray(layers["pts"][sl], dtype=np.float32)
+        pts_rest = np.asarray(handle["var/pts_rest"][:], dtype=np.float32)
+        return {
+            "scores": z, "pvals": layers["pvalue"][sl], "pvals_adj": layers["pvalue_adj"][sl],
+            "logfoldchanges": layers["logfoldchanges"][sl], "auc": handle["X"][sl],
+            "u_stat": layers["u_statistic"][sl], "pts": pts,
+            "pts_rest": np.broadcast_to(pts_rest, pts.shape),
+            "order": np.argsort(-np.abs(z), axis=1, kind="mergesort").astype(np.int64),
+        }
+
+    with h5py.File(path, "r") as handle:
+        n_genes = handle["X"].shape[1]
+    _write_rank_genes_groups(
+        path, groups=groups, n_genes=n_genes, rows=rows,
+        block_rows=max(1, (1 << 22) // max(n_genes, 1)), groupby=perturbation_column,
+        method="wilcoxon", reference=control_label, tie_correct=tie_correct,
+        corr_method=corr_method,
+    )
+
+
+def _write_rank_genes_groups(
+    output_path: Path,
+    *,
+    groups: list[str],
+    n_genes: int,
+    rows,
+    block_rows: int,
+    groupby: str,
+    method: str,
+    reference: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
     """Write rank_genes_groups to HDF5 for Scanpy compatibility.
-    
-    Writes arrays in full matrix order (groups × genes) to uns/rank_genes_groups/full.
-    This format is compatible with Scanpy's rank_genes_groups output but avoids
-    the recarray format which causes HDF5 header size limits for large group counts.
-    
-    Parameters
-    ----------
-    output_path
-        Path to the h5ad file to modify.
-    result
-        RankGenesGroupsResult containing the DE statistics.
-        
-    Notes
-    -----
-    For datasets with many groups (>1000), this adds ~2-6 seconds of I/O overhead.
-    The recarray format (with group names as dtype fields) is avoided because it
-    hits HDF5 header size limits at ~2000+ groups.
+
+    Writes arrays in full matrix order (groups × genes) to
+    uns/rank_genes_groups/full, ``block_rows`` groups at a time:
+    ``rows(handle, slice)`` returns each field's rows for that slice of
+    groups (plus ``order``), reading from the open file if it needs to.
+    This format is compatible with Scanpy's rank_genes_groups output but
+    avoids the recarray format, which hits HDF5 header size limits at
+    ~2000+ groups. For datasets with many groups (>1000), this adds ~2-6
+    seconds of I/O overhead.
     """
+    n_groups = len(groups)
     with h5py.File(output_path, "r+") as handle:
         uns_group = handle.require_group("uns")
         if "rank_genes_groups" in uns_group:
             del uns_group["rank_genes_groups"]
         rgg = uns_group.create_group("rank_genes_groups")
-        
-        # Store full-order matrices (groups × genes)
         full = rgg.create_group("full")
-        full.create_dataset("scores", data=result.statistics)
-        full.create_dataset("pvals", data=result.pvalues)
-        full.create_dataset("pvals_adj", data=result.pvalues_adj)
-        full.create_dataset("logfoldchanges", data=result.logfoldchanges)
-        full.create_dataset("auc", data=result.effect_size)
-        full.create_dataset("u_stat", data=result.u_statistics)
-        full.create_dataset("pts", data=result.pts)
-        full.create_dataset("pts_rest", data=result.pts_rest)
-        
-        # Store order and metadata
-        rgg.create_dataset("order", data=result.order)
-        rgg.create_dataset("names", data=np.array(result.groups, dtype="S"))
-        
+        for start in range(0, n_groups, block_rows) or [0]:
+            sl = slice(start, min(start + block_rows, n_groups))
+            block = rows(handle, sl)
+            for name, values in block.items():
+                target = rgg if name == "order" else full
+                if name not in target:
+                    target.create_dataset(name, shape=(n_groups, n_genes), dtype=values.dtype)
+                target[name][sl] = values
+
+        rgg.create_dataset("names", data=np.array(groups, dtype="S"))
+
         # Store params for compatibility
         params = rgg.create_group("params")
-        params.attrs["groupby"] = result.groupby
-        params.attrs["method"] = result.method
-        params.attrs["reference"] = result.control_label
-        params.attrs["tie_correct"] = result.tie_correct
-        params.attrs["corr_method"] = result.pvalue_correction
+        params.attrs["groupby"] = groupby
+        params.attrs["method"] = method
+        params.attrs["reference"] = reference
+        params.attrs["tie_correct"] = tie_correct
+        params.attrs["corr_method"] = corr_method
 
 
 def _load_completed_de_result(
@@ -4149,6 +4209,13 @@ def _wilcoxon_test_streaming(
     logger.info(f"Completed all {n_batches} group batches")
     if int(verbose) >= 1:
         print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
+    # Completed in the work file, which only then takes the output's name.
+    if scanpy_format:
+        _write_wilcoxon_rank_genes_groups(
+            work_path, groups=candidates, perturbation_column=perturbation_column,
+            control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
+        )
+    write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()
 
@@ -4165,8 +4232,6 @@ def _wilcoxon_test_streaming(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -4651,6 +4716,8 @@ def _wilcoxon_test_stratified(
         corr_method=corr_method,
         batch_column=batch_column,
         stratified_diagnostics=stratified_diagnostics,
+        scanpy_format=scanpy_format,
+        provenance=stamp("de_result", fingerprint),
     )
     # Release the memmaps (and their pages) before reading the result back.
     del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
@@ -4668,8 +4735,6 @@ def _wilcoxon_test_stratified(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -5422,6 +5487,8 @@ def _wilcoxon_test_standard(
         control_label=control_label,
         tie_correct=tie_correct,
         corr_method=corr_method,
+        scanpy_format=scanpy_format,
+        provenance=stamp("de_result", fingerprint),
     )
     # Release the memmaps (and their pages) before reading the result back.
     del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
@@ -5439,8 +5506,6 @@ def _wilcoxon_test_standard(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 

@@ -264,6 +264,31 @@ def test_wilcoxon_killed_while_writing_leaves_no_output(screen, tmp_path, monkey
     _assert_same_result(reference, out)
 
 
+@pytest.mark.parametrize("case", ["wilcoxon", "wilcoxon_stratified", "wilcoxon_streaming"])
+def test_wilcoxon_killed_after_writing_is_reused(screen, tmp_path, monkeypatch, request, case):
+    """The output is stamped as it is written, before the checkpoint goes, so
+    a kill while reading the result back loses no work: the next call reuses
+    the file, with its Scanpy structure."""
+    if case == "wilcoxon_streaming":
+        request.getfixturevalue("streaming")
+    method = "wilcoxon" if case == "wilcoxon_streaming" else case
+    out = tmp_path / "result.h5ad"
+
+    def killed(*args, **kwargs):
+        raise Interrupted
+
+    with monkeypatch.context() as m:
+        m.setattr(de, "_build_result_from_h5ad", killed)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out, scanpy_format=True)
+    assert not out.with_suffix(".progress.json").exists()
+    runs = _record_runs(monkeypatch)
+    result = _run(method, screen, out, scanpy_format=True)
+    assert not runs, "the finished output was recomputed"
+    with h5py.File(out, "r") as f:
+        np.testing.assert_array_equal(f["uns/rank_genes_groups/full/scores"][()], result.statistics)
+
+
 def test_streaming_wilcoxon_restarts_when_its_work_file_is_unreadable(screen, tmp_path, monkeypatch, streaming):
     reference = tmp_path / "reference.h5ad"
     _run("wilcoxon", screen, reference)

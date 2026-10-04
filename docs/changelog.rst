@@ -32,6 +32,12 @@ Unreleased
   ``control_label`` now name the same call, and ``rank_genes_groups`` reuses
   (and is reused by) a direct DE call on the same file. ``wilcoxon_test``
   also checks for a reusable result before reading the input's labels.
+* **Fixed: ``wilcoxon_test(scanpy_format=True)``** skipped
+  ``uns["rank_genes_groups"]`` when the result was too large to load, while
+  recording that it had been written. It is now written from the file, a
+  block of groups at a time, at any size. The result's provenance is also
+  written with it, so a run killed while the result is read back is reused
+  rather than recomputed.
 
 Version 0.1.7
 -------------
