@@ -21,7 +21,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
-from crispyx._provenance import SCHEMAS, read_stamp
+from crispyx._provenance import SCHEMAS, read_stamp, write_stamp
 from crispyx.data import sort_by_perturbation
 
 
@@ -187,6 +187,37 @@ def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys
     stamped = json.loads(read_stamp(output)["fingerprint"])
     unformatted = {**stamped, "params": {**stamped["params"], "scanpy_format": False}}
     assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
+
+
+def _restamp_with_param(output: Path, name: str, value) -> None:
+    """Rewrite the stamp as if the writer had an argument ``name`` that this
+    version does not have."""
+    stamp = read_stamp(output)
+    fingerprint = json.loads(stamp["fingerprint"])
+    fingerprint["params"][name] = value
+    write_stamp(output, {**stamp, "fingerprint": json.dumps(fingerprint, sort_keys=True)})
+
+
+def test_an_argument_left_at_none_does_not_invalidate(tmp_path, capsys):
+    """Adding or removing a None-default parameter must not throw away every
+    existing result (0.1.7 stamps still list arguments left at None)."""
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("t_test", path, output)
+    _restamp_with_param(output, "removed_option", None)
+    capsys.readouterr()
+    _run("t_test", path, output)
+    assert "Loading existing result" in capsys.readouterr().out
+
+
+def test_an_argument_that_was_set_still_invalidates(tmp_path, capsys):
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("t_test", path, output)
+    _restamp_with_param(output, "removed_option", 0.5)
+    capsys.readouterr()
+    _run("t_test", path, output)
+    assert "argument 'removed_option' differs" in capsys.readouterr().out
 
 
 def _delete_uns_key(path: Path, key: str) -> None:

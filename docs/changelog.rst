@@ -8,6 +8,10 @@ Unreleased
   parameter was documented to cap the parallel workers but was never read.
   The worker count is now capped so the workers fit in the budget (or in the
   memory available, when it is ``None``); ``method="stats"`` is unaffected.
+* An argument left at ``None`` no longer counts when deciding whether an
+  existing result can be reused, so adding or removing an optional
+  parameter in a release does not force every cached result to be
+  recomputed.
 
 Version 0.1.7
 -------------

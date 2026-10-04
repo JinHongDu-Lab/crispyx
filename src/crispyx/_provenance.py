@@ -49,6 +49,17 @@ def call_fingerprint(path: Path, call_args: dict, operational: frozenset, **extr
     return run_fingerprint(path, params=params, **extra)
 
 
+def _without_none_params(fingerprint: dict) -> dict:
+    """``fingerprint`` with ``None``-valued params dropped. An argument left
+    at ``None`` and one that does not exist mean the same call, so adding or
+    removing a ``None``-default parameter must not make every existing
+    result look different."""
+    params = fingerprint.get("params")
+    if not isinstance(params, dict):
+        return fingerprint
+    return {**fingerprint, "params": {k: v for k, v in params.items() if v is not None}}
+
+
 def stamp(kind: str, fingerprint: dict) -> dict:
     """The ``uns["crispyx"]`` entry for an output of ``kind`` made by the
     call whose identity is ``fingerprint``."""
@@ -119,9 +130,10 @@ def reuse_mismatch(path: Path, kind: str, fingerprint: dict) -> str | None:
             f"this version writes {kind} layout {SCHEMAS[kind]}"
         )
     try:
-        previous = json.loads(stored.get("fingerprint", ""))
+        previous = _without_none_params(json.loads(stored.get("fingerprint", "")))
     except (TypeError, json.JSONDecodeError):
         return "its recorded inputs cannot be read"
+    fingerprint = _without_none_params(fingerprint)
     if previous == fingerprint:
         return None
     return _describe_difference(previous, fingerprint)
