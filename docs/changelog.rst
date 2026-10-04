@@ -1,6 +1,14 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **Fixed: ``shrink_lfc(method="full")`` ignored ``memory_limit_gb``.** The
+  parameter was documented to cap the parallel workers but was never read.
+  The worker count is now capped so the workers fit in the budget (or in the
+  memory available, when it is ``None``); ``method="stats"`` is unaffected.
+
 Version 0.1.7
 -------------
 

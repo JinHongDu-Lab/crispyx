@@ -1362,3 +1362,51 @@ def test_mom_dispersion_recovers_the_true_dispersion():
     estimate = _compute_mom_dispersion_batched(*args, gene_batch_size=7)
     np.testing.assert_allclose(estimate, alpha, rtol=0.1)
     np.testing.assert_array_equal(estimate, _compute_mom_dispersion_batched(*args))
+
+
+def test_apeglm_worker_count_fits_the_memory_budget(monkeypatch):
+    import crispyx._memory as memory
+    from crispyx._memory import _resolve_n_jobs
+    from crispyx.de import _apeglm_worker_count
+
+    monkeypatch.setattr(memory, "_detected_available_bytes", lambda: 1e15)  # the budget decides
+
+    assert _apeglm_worker_count(-1, 10_000, 128, memory_limit_gb=1e-3) == 1
+    assert _apeglm_worker_count(2, 10_000, 128, memory_limit_gb=1e4) == min(2, _resolve_n_jobs(2))
+    # A worker holds a batch of gene columns, not the whole matrix: ~4 GB for
+    # 1M cells and batch_size=128, so a 64 GB budget still allows many workers.
+    assert _apeglm_worker_count(-1, 1_000_000, 128, memory_limit_gb=64) >= min(8, _resolve_n_jobs(-1))
+
+
+def test_shrink_lfc_full_caps_workers_by_memory_limit(tmp_path, monkeypatch):
+    """memory_limit_gb reaches the apeGLM workers and does not change the result."""
+    import shutil
+
+    import crispyx.de as de_mod
+
+    rng = np.random.default_rng(444)
+    labels = np.array(["control"] * 40 + ["g1"] * 20 + ["g2"] * 20)
+    counts = rng.poisson(15, size=(labels.size, 5))
+    path = tmp_path / "counts.h5ad"
+    ad.AnnData(counts, obs=pd.DataFrame({"perturbation": labels}),
+               var=pd.DataFrame(index=[f"gene{i}" for i in range(5)])).write(path)
+    result = nb_glm_test(path, perturbation_column="perturbation", control_label="control",
+                         output_path=tmp_path / "mle.h5ad", verbose=False)
+
+    seen = []
+    real = de_mod.shrink_lfc_apeglm
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["n_jobs"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(de_mod, "shrink_lfc_apeglm", spy)
+    shrunk = {}
+    for name, limit in [("tight", 1e-6), ("auto", None)]:
+        copy = tmp_path / f"{name}.h5ad"
+        shutil.copy(result.result_path, copy)
+        de_mod.shrink_lfc(copy, method="full", n_jobs=2, memory_limit_gb=limit, verbose=False)
+        shrunk[name] = ad.read_h5ad(copy).X
+    assert seen[:2] == [1, 1]  # one call per perturbation under the tight budget
+    assert all(n >= 1 for n in seen[2:])
+    np.testing.assert_allclose(shrunk["tight"], shrunk["auto"], rtol=1e-10)

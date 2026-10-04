@@ -5473,6 +5473,33 @@ def _wilcoxon_test_standard(
     return result
 
 
+# Resident size of one idle loky worker (interpreter, numpy, scipy).
+_APEGLM_WORKER_BASE_MB = 200.0
+
+
+def _apeglm_worker_count(
+    n_jobs: int, n_cells: int, batch_size: int, memory_limit_gb: float | None
+) -> int:
+    """Workers for apeGLM shrinkage: ``n_jobs``, capped so the workers fit in
+    ``memory_limit_gb`` (or the memory available, when ``None``).
+
+    Each task carries one gene's counts, the two-column design and the log
+    size factors (4 float64 vectors of ``n_cells``); a worker holds a batch
+    of ``batch_size`` tasks and works on one gene at a time (about 8 more
+    vectors).
+    """
+    per_worker_mb = _APEGLM_WORKER_BASE_MB + (4 * batch_size + 8) * n_cells * 8 / 1e6
+    return min(
+        _resolve_n_jobs(n_jobs),
+        _estimate_max_workers(
+            n_cells,
+            1,
+            memory_per_worker_mb=per_worker_mb,
+            memory_limit_mb=None if memory_limit_gb is None else memory_limit_gb * 1e3,
+        ),
+    )
+
+
 def shrink_lfc(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -5561,10 +5588,10 @@ def shrink_lfc(
         - `profiling_enabled`: True
         When False (default), `adata.uns["profiling"]` is set to "NA".
     memory_limit_gb
-        Optional memory budget in gigabytes. When ``method="full"``, this
-        limits the number of parallel ``n_jobs`` so that joblib workers stay
-        within the budget. When ``None`` (default), detects available system
-        memory via ``psutil``.
+        Optional memory budget in gigabytes. With ``method="full"``, the
+        number of parallel workers is capped so that they fit in the budget
+        (``None``, the default, uses the memory currently available).
+        ``method="stats"`` holds no per-worker data and ignores it.
     verbose
         Print basic progress/completion messages. Defaults to ``True``.
 
@@ -5879,7 +5906,7 @@ def shrink_lfc(
                     mle_se=se_group,
                     shrink_index=1,
                     prior_scale=pert_prior_scale,
-                    n_jobs=n_jobs,
+                    n_jobs=_apeglm_worker_count(n_jobs, n_combined, batch_size, memory_limit_gb),
                     batch_size=batch_size,
                     min_mu=min_mu,
                 )

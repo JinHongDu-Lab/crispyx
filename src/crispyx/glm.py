@@ -50,7 +50,6 @@ from ._memory import (
     _get_available_memory_mb,
     _estimate_dense_memory_gb,
     _estimate_gene_batch_size_fitter,
-    _estimate_max_workers,
 )
 
 logger = logging.getLogger(__name__)
