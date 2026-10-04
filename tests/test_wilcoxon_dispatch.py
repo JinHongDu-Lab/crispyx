@@ -1,7 +1,7 @@
 """Wilcoxon kernels, the standard vs streaming paths, and the result file helpers.
 
 Covers:
-- _presort_control_nonzeros and parity of the presorted kernel with the reference kernel
+- _presort_control_nonzeros and the presorted kernel against scipy's ranks
 - Standard (memmap) and streaming (group-batch) paths giving the same result
 - _write_wilcoxon_result_h5ad / _build_result_from_h5ad
 - Agreement with Scanpy on dense and mixed dense/sparse genes
@@ -10,6 +10,7 @@ The memory-based dispatch heuristics are tested in ``test_memory_dispatch.py``.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import anndata as ad
@@ -21,9 +22,9 @@ import scanpy as sc
 import scipy.sparse as sp
 
 from crispyx._kernels import (
+    _compute_ctrl_tie_sums,
     _presort_control_nonzeros,
-    _wilcoxon_presorted_ctrl_numba,
-    _wilcoxon_sparse_batch_numba,
+    _wilcoxon_batch_perts_presorted_numba,
 )
 from crispyx.de import _build_result_from_h5ad, _write_wilcoxon_result_h5ad, wilcoxon_test
 
@@ -88,47 +89,68 @@ def test_presort_returns_each_genes_sorted_nonzeros(ctrl):
         np.testing.assert_array_equal(flat[offsets[g]:offsets[g + 1]], np.sort(ctrl[ctrl[:, g] != 0, g]))
 
 
-def _run_kernel(kernel_args, ctrl, pert, valid, tie_correct):
-    n_genes = ctrl.shape[1]
-    out = (np.zeros(n_genes), np.zeros(n_genes), np.ones(n_genes), np.zeros(n_genes))
-    kernel_args(ctrl, pert, valid, tie_correct, out)
+def _reference_rank_test(ctrl, pert, valid, tie_correct):
+    """U, z, p and effect of each gene from scipy's ranks: NaN where every
+    value is tied, the neutral fill (0, 0, 1, 0) where ``valid`` is False."""
+    from scipy.stats import rankdata, tiecorrect
+    n0, n1 = ctrl.shape[0], pert.shape[0]
+    n = n0 + n1
+    out = np.zeros((4, ctrl.shape[1]))
+    out[2] = 1.0
+    for g in np.flatnonzero(valid):
+        ranks = rankdata(np.concatenate([ctrl[:, g], pert[:, g]]))
+        if tiecorrect(ranks) == 0:
+            out[:, g] = np.nan
+            continue
+        rank_sum = ranks[n0:].sum()
+        u = rank_sum - n1 * (n1 + 1) / 2
+        std = np.sqrt((tiecorrect(ranks) if tie_correct else 1.0) * n1 * n0 * (n + 1) / 12)
+        z = (rank_sum - n1 * (n + 1) / 2) / std
+        out[:, g] = u, z, math.erfc(abs(z) / math.sqrt(2)), u / (n1 * n0) - 0.5
     return out
 
 
+@pytest.mark.parametrize("tie_correct", [True, False], ids=["tie-correct", "no-tie-correct"])
 @pytest.mark.parametrize(
-    "n_ctrl, n_pert, n_genes, sparsity, tie_correct, every_other_invalid",
+    "n_ctrl, n_pert, n_genes, sparsity, every_other_invalid",
     [
-        (50, 30, 32, 0.3, True, False),
-        (500, 200, 64, 0.3, True, False),
-        (50_000, 50, 128, 0.2, True, False),  # Feng-scale control
-        (200, 80, 32, 1.0, False, False),
-        (100, 30, 16, 1.0, True, True),
+        (50, 30, 32, 0.3, False),
+        (500, 200, 64, 0.3, False),
+        (50_000, 50, 128, 0.2, False),  # Feng-scale control
+        (200, 80, 32, 1.0, False),
+        (100, 30, 16, 1.0, True),
     ],
-    ids=["small", "medium", "large-ctrl", "no-tie-correct", "invalid-genes"],
+    ids=["small", "medium", "large-ctrl", "dense", "invalid-genes"],
 )
-def test_presorted_kernel_matches_reference_kernel(n_ctrl, n_pert, n_genes, sparsity, tie_correct, every_other_invalid):
+def test_presorted_kernel_matches_scipy_ranks(n_ctrl, n_pert, n_genes, sparsity, tie_correct, every_other_invalid):
+    """The production kernel against scipy's ranks, on rounded values (so
+    non-zero ties occur) plus genes tied at zero, at a non-zero value and
+    with the perturbation all zero."""
     rng = np.random.default_rng(n_ctrl)
-    ctrl = ((rng.random((n_ctrl, n_genes)) < sparsity) * rng.exponential(3, (n_ctrl, n_genes))).astype(np.float64)
-    pert = ((rng.random((n_pert, n_genes)) < sparsity) * rng.exponential(3, (n_pert, n_genes))).astype(np.float64)
+
+    def draw(n):
+        values = (rng.random((n, n_genes)) < sparsity) * rng.exponential(3, (n, n_genes))
+        return np.round(values, 1)
+
+    ctrl, pert = draw(n_ctrl), draw(n_pert)
+    ctrl[:, 0] = pert[:, 0] = 0.0  # all zero
+    ctrl[:, 1] = pert[:, 1] = 2.5  # tied at one non-zero value
+    pert[:, 2] = 0.0               # perturbation silent, control not
     valid = np.ones(n_genes, dtype=np.bool_)
     if every_other_invalid:
-        valid[1::2] = False
+        valid[3::2] = False
 
-    def reference(c, p, v, t, out):
-        _wilcoxon_sparse_batch_numba(c, p, v, t, 0.5, *out)
-
-    def presorted(c, p, v, t, out):
-        _wilcoxon_presorted_ctrl_numba(c, *_presort_control_nonzeros(c), p, v, t, 0.5, *out)
-
-    expected = _run_kernel(reference, ctrl, pert, valid, tie_correct)
-    actual = _run_kernel(presorted, ctrl, pert, valid, tie_correct)
-    for name, a, e in zip(("u", "z", "p", "effect"), actual, expected):
+    flat, offsets, n_nz, n_z = _presort_control_nonzeros(ctrl)
+    out = np.zeros((4, 1, n_genes))
+    out[2] = 1.0
+    _wilcoxon_batch_perts_presorted_numba(
+        ctrl, flat, offsets, n_nz, n_z, _compute_ctrl_tie_sums(flat, offsets, n_nz),
+        pert, np.array([0, n_pert]), valid[None, :], tie_correct, 0.5, *out,
+    )
+    expected = _reference_rank_test(ctrl, pert, valid, tie_correct)
+    for name, a, e in zip(("u", "z", "p", "effect"), out[:, 0], expected):
         np.testing.assert_allclose(a, e, atol=1e-9, rtol=1e-6, err_msg=name)
-    # Invalid genes keep the neutral fill: u=0, z=0, p=1.
-    u, z, p, _ = actual
-    np.testing.assert_array_equal(u[~valid], 0.0)
-    np.testing.assert_array_equal(z[~valid], 0.0)
-    np.testing.assert_array_equal(p[~valid], 1.0)
+    assert np.isnan(out[:, 0, :2]).all()
 
 
 # ---------------------------------------------------------------------------

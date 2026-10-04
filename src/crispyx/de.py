@@ -73,14 +73,8 @@ from .glm import (
     _estimate_apeglm_prior_scale,
 )
 from ._kernels import (
-    _rankdata_2d_numba,
-    _tie_correction_numba,
-    _compute_rank_sums_batch_numba,
-    _wilcoxon_sparse_batch_numba,
-    _wilcoxon_all_perts_numba,
     _presort_control_nonzeros,
     _compute_ctrl_tie_sums,
-    _wilcoxon_presorted_ctrl_numba,
     _wilcoxon_batch_perts_presorted_numba,
     _wilcoxon_stratified_batch_perts_numba,
     _ZERO_PARTITION_THRESHOLD,
