@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import anndata as ad
@@ -178,12 +179,31 @@ def test_changed_parameters_start_fresh(screen, tmp_path, monkeypatch):
         with pytest.raises(Interrupted):
             _run("t_test", screen, out)
     runs = _record_runs(monkeypatch)
-    _run("t_test", screen, out, resume=True, min_pct_ctrl=0.2)
+    with pytest.warns(UserWarning, match="Not resuming .*argument 'min_pct_ctrl' differs"):
+        _run("t_test", screen, out, resume=True, min_pct_ctrl=0.2)
     assert not runs[-1].resumed
 
     reference = tmp_path / "reference.h5ad"
     _run("t_test", screen, reference, min_pct_ctrl=0.2)
     _assert_same_result(reference, out)
+
+
+def test_checkpoint_listing_an_argument_left_at_none_resumes(screen, tmp_path, monkeypatch, recwarn):
+    """A checkpoint saved by a version with a since-removed ``None``-default
+    argument (0.1.7's ``min_pct_both``) is the same call and resumes."""
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run("t_test", screen, out)
+    checkpoint = out.with_suffix(".progress.json")
+    saved = json.loads(checkpoint.read_text())
+    saved["fingerprint"]["params"]["min_pct_both"] = None
+    checkpoint.write_text(json.dumps(saved))
+    runs = _record_runs(monkeypatch)
+    _run("t_test", screen, out, resume=True)
+    assert runs[-1].resumed
+    assert not [w for w in recwarn if "Not resuming" in str(w.message)]
 
 
 def test_resume_false_discards_a_stale_checkpoint(screen, tmp_path, monkeypatch):

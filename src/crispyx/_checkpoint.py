@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -228,6 +229,44 @@ def run_fingerprint(source_path: Path, **items) -> dict:
     return json.loads(json.dumps(fingerprint, default=_jsonable, sort_keys=True))
 
 
+# Fingerprint keys that identify the input file (see ``run_fingerprint``).
+_SOURCE_KEYS = ("source", "source_size", "source_mtime_ns")
+
+
+def fingerprint_difference(previous: dict, current: dict) -> str | None:
+    """Why the call fingerprinted ``previous`` is not the call ``current``,
+    or ``None`` when it is.
+
+    ``None``-valued params are ignored: an argument left at ``None`` and one
+    that does not exist mean the same call, so adding or removing a
+    ``None``-default parameter does not orphan every existing result and
+    checkpoint.
+    """
+    previous, current = _without_none_params(previous), _without_none_params(current)
+    if previous == current:
+        return None
+    if previous.get("source") != current.get("source"):
+        return "it was computed from another input file"
+    if any(previous.get(key) != current.get(key) for key in _SOURCE_KEYS):
+        return "the input file has changed since"
+    old_params = previous.get("params", {})
+    new_params = current.get("params", {})
+    for name in sorted(set(old_params) | set(new_params)):
+        if old_params.get(name) != new_params.get(name):
+            return f"argument '{name}' differs"
+    for name in sorted(set(previous) | set(current)):
+        if previous.get(name) != current.get(name):
+            return f"'{name}' differs"
+    return "its recorded inputs differ"
+
+
+def _without_none_params(fingerprint: dict) -> dict:
+    params = fingerprint.get("params")
+    if not isinstance(params, dict):
+        return fingerprint
+    return {**fingerprint, "params": {k: v for k, v in params.items() if v is not None}}
+
+
 def _jsonable(value):
     """JSON form of the non-JSON types a DE call's parameters can hold.
 
@@ -272,10 +311,12 @@ class ResumableRun:
     arrays) keeps it in :attr:`directory` too and names it in ``requires``.
 
     A run resumes only when ``resume`` is set, the checkpoint's fingerprint
-    matches this call, and every array exists with the expected shape and
-    dtype (plus every file named in ``requires``). Otherwise the stale
-    checkpoint and directory are discarded and the run starts fresh, so a
-    checkpoint can never be paired with another run's data.
+    matches this call (:func:`fingerprint_difference`), and every array
+    exists with the expected shape and dtype (plus every file named in
+    ``requires``). Otherwise the stale checkpoint and directory are
+    discarded and the run starts fresh, so a checkpoint can never be paired
+    with another run's data; a resume that throws away a checkpoint warns
+    and says why.
     """
 
     def __init__(
@@ -292,9 +333,20 @@ class ResumableRun:
         self.fingerprint = fingerprint
         self.directory = output_path.with_name(f".{output_path.name}.resume")
         checkpoint = _read_checkpoint(checkpoint_path, required_keys=("fingerprint",)) if resume else None
+        mismatch = (
+            fingerprint_difference(checkpoint["fingerprint"], fingerprint)
+            if checkpoint is not None and isinstance(checkpoint["fingerprint"], dict)
+            else "it cannot be read"
+        )
+        if checkpoint is not None and mismatch is not None:
+            warnings.warn(
+                f"Not resuming from the checkpoint at {checkpoint_path}: {mismatch}. "
+                "Discarding it and starting over.",
+                stacklevel=3,
+            )
         self.resumed = (
             checkpoint is not None
-            and checkpoint["fingerprint"] == fingerprint
+            and mismatch is None
             and all((self.directory / name).exists() for name in requires)
             and all(
                 (self.directory / f"{name}.dat").exists()

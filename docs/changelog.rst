@@ -22,9 +22,11 @@ Unreleased
   The worker count is now capped so the workers fit in the budget (or in the
   memory available, when it is ``None``); ``method="stats"`` is unaffected.
 * An argument left at ``None`` no longer counts when deciding whether an
-  existing result can be reused, so adding or removing an optional
-  parameter in a release does not force every cached result to be
-  recomputed.
+  existing result or a checkpoint can be reused, so adding or removing an
+  optional parameter in a release does not force every cached result to be
+  recomputed or throw away an interrupted run. A ``resume=True`` call that
+  cannot use the checkpoint it finds now warns and says why before starting
+  over.
 
 Version 0.1.7
 -------------

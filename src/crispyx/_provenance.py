@@ -20,7 +20,7 @@ from pathlib import Path
 import anndata as ad
 import h5py
 
-from ._checkpoint import run_fingerprint
+from ._checkpoint import fingerprint_difference, run_fingerprint
 
 KEY = "crispyx"
 
@@ -37,9 +37,6 @@ SCHEMAS = {
     "standardized": 1,
 }
 
-# Fingerprint keys that identify the input file (see ``run_fingerprint``).
-_SOURCE_KEYS = ("source", "source_size", "source_mtime_ns")
-
 
 def call_fingerprint(path: Path, call_args: dict, operational: frozenset, **extra) -> dict:
     """:func:`run_fingerprint` of a call: the source file, every argument in
@@ -48,17 +45,6 @@ def call_fingerprint(path: Path, call_args: dict, operational: frozenset, **extr
     and ``extra``."""
     params = {k: v for k, v in call_args.items() if k not in operational}
     return run_fingerprint(path, params=params, **extra)
-
-
-def _without_none_params(fingerprint: dict) -> dict:
-    """``fingerprint`` with ``None``-valued params dropped. An argument left
-    at ``None`` and one that does not exist mean the same call, so adding or
-    removing a ``None``-default parameter must not make every existing
-    result look different."""
-    params = fingerprint.get("params")
-    if not isinstance(params, dict):
-        return fingerprint
-    return {**fingerprint, "params": {k: v for k, v in params.items() if v is not None}}
 
 
 def stamp(kind: str, fingerprint: dict) -> dict:
@@ -131,13 +117,12 @@ def reuse_mismatch(path: Path, kind: str, fingerprint: dict) -> str | None:
             f"this version writes {kind} layout {SCHEMAS[kind]}"
         )
     try:
-        previous = _without_none_params(json.loads(stored.get("fingerprint", "")))
+        previous = json.loads(stored.get("fingerprint", ""))
     except (TypeError, json.JSONDecodeError):
         return "its recorded inputs cannot be read"
-    fingerprint = _without_none_params(fingerprint)
-    if previous == fingerprint:
-        return None
-    return _describe_difference(previous, fingerprint)
+    if not isinstance(previous, dict):
+        return "its recorded inputs cannot be read"
+    return fingerprint_difference(previous, fingerprint)
 
 
 def reusable(path: Path, kind: str, fingerprint: dict, verbose: int | bool) -> bool:
@@ -154,18 +139,3 @@ def reusable(path: Path, kind: str, fingerprint: dict, verbose: int | bool) -> b
             print(f"[cx] Existing result at {path} is not reused: {reason}; rerunning.")
     return reason is None
 
-
-def _describe_difference(previous: dict, current: dict) -> str:
-    if previous.get("source") != current.get("source"):
-        return "it was computed from another input file"
-    if any(previous.get(key) != current.get(key) for key in _SOURCE_KEYS):
-        return "the input file has changed since"
-    old_params = previous.get("params", {})
-    new_params = current.get("params", {})
-    for name in sorted(set(old_params) | set(new_params)):
-        if old_params.get(name) != new_params.get(name):
-            return f"argument '{name}' differs"
-    for name in sorted(set(previous) | set(current)):
-        if previous.get(name) != current.get(name):
-            return f"'{name}' differs"
-    return "its recorded inputs differ"
