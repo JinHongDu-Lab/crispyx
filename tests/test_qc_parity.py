@@ -1,29 +1,24 @@
-"""Tests for QC strategy parity - all strategies should produce identical results."""
+"""QC: every strategy gives the same result, and it matches Scanpy."""
 
 from __future__ import annotations
 
-import pytest
-import numpy as np
 import warnings
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+import anndata as ad
+import numpy as np
+import pandas as pd
+import pytest
+import scipy.sparse as sp
 
-# Test datasets with different storage formats
-TEST_DATASETS = {
-    "csr_small": {
-        "path": DATA_DIR / "Adamson_subset.h5ad",
-        "perturbation_column": "perturbation",
-        "expected_format": "csr",
-    },
-    "csc_medium": {
-        "path": DATA_DIR / "Tian-crispra.h5ad",
-        "perturbation_column": "perturbation",
-        "expected_format": "csc",
-    },
+from crispyx.qc import _qc_column_oriented, _qc_in_memory, _qc_row_oriented, quality_control_summary
+
+ADAMSON = {
+    "path": Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad",
+    "perturbation_column": "perturbation",
 }
 
-# QC parameters used for testing
+# QC parameters used on the real dataset
 QC_PARAMS = {
     "min_genes": 100,
     "min_cells_per_perturbation": 50,
@@ -31,261 +26,68 @@ QC_PARAMS = {
 }
 
 
-def test_get_matrix_storage_format():
-    """Test storage format detection function."""
-    from crispyx.data import get_matrix_storage_format
-    
-    for name, config in TEST_DATASETS.items():
-        if not config["path"].exists():
-            pytest.skip(f"data/{config['path'].name} not found")
-        
-        detected_format = get_matrix_storage_format(config["path"])
-        assert detected_format == config["expected_format"], (
-            f"{name}: expected {config['expected_format']}, got {detected_format}"
-        )
+def _make_uneven_screen(path: Path, fmt: str, seed: int = 0) -> Path:
+    """Perturbation groups of 5-40 cells and genes of varying density, so each
+    QC step (cells, perturbations, genes) removes something."""
+    rng = np.random.default_rng(seed)
+    sizes = [100] + list(range(5, 45, 4))
+    labels = np.repeat(["NTC"] + [f"P{i}" for i in range(len(sizes) - 1)], sizes)
+    rng.shuffle(labels)
+    n_cells, n_genes = labels.size, 60
+    density = np.linspace(0.02, 0.5, n_genes)
+    X = (rng.random((n_cells, n_genes)) < density) * rng.integers(1, 10, (n_cells, n_genes))
+    X[: n_cells // 10] *= rng.random((n_cells // 10, n_genes)) < 0.1  # some near-empty cells
+    X = X.astype(np.float32)
+    obs = pd.DataFrame({"perturbation": pd.Categorical(labels)}, index=[f"c{i}" for i in range(n_cells)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    store = {"csr": sp.csr_matrix, "csc": sp.csc_matrix, "dense": np.asarray}[fmt](X)
+    ad.AnnData(X=store, obs=obs, var=var).write_h5ad(path)
+    return path
 
 
-def test_qc_in_memory_basic(tmp_path):
-    """Test that in-memory QC runs without errors on small dataset."""
-    from crispyx.qc import _qc_in_memory
-    from crispyx.data import read_backed, resolve_control_label
-    
-    dataset = TEST_DATASETS["csr_small"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-    
-    # Get control label
-    backed = read_backed(dataset["path"])
-    labels = backed.obs[dataset["perturbation_column"]].astype(str).to_numpy()
-    control_label = resolve_control_label(labels, None, verbose=False)
-    backed.file.close()
-    
-    output_path = tmp_path / "in_memory.h5ad"
-    result = _qc_in_memory(
-        dataset["path"],
-        perturbation_column=dataset["perturbation_column"],
-        control_label=control_label,
-        gene_name_column=None,
-        output_path=output_path,
-        **QC_PARAMS,
-    )
-    
-    assert result.cell_mask.sum() > 0, "No cells passed filter"
-    assert result.gene_mask.sum() > 0, "No genes passed filter"
-    assert output_path.exists(), "Output file not created"
-    
-    # Verify output file is readable
-    import anndata as ad
-    adata = ad.read_h5ad(output_path)
-    assert adata.n_obs == result.cell_mask.sum()
-    assert adata.n_vars == result.gene_mask.sum()
+_STRATEGIES = {
+    "column": lambda path, out, **kw: _qc_column_oriented(path, output_path=out, chunk_size=7, **kw),
+    "row-memmap-delta": lambda path, out, **kw: _qc_row_oriented(
+        path, output_path=out, chunk_size=7, cache_mode="memmap", delta_threshold=1e9, **kw),
+    "row-memory-recompute": lambda path, out, **kw: _qc_row_oriented(
+        path, output_path=out, chunk_size=7, cache_mode="memory", delta_threshold=0.0, **kw),
+    "row-no-cache": lambda path, out, **kw: _qc_row_oriented(
+        path, output_path=out, chunk_size=7, cache_mode="none", **kw),
+}
 
 
-def test_qc_column_oriented_basic(tmp_path):
-    """Test that column-oriented QC runs without errors on CSC dataset."""
-    from crispyx.qc import _qc_column_oriented
-    from crispyx.data import read_backed, resolve_control_label
-    
-    dataset = TEST_DATASETS["csc_medium"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-    
-    # Get control label
-    backed = read_backed(dataset["path"])
-    labels = backed.obs[dataset["perturbation_column"]].astype(str).to_numpy()
-    control_label = resolve_control_label(labels, None, verbose=False)
-    backed.file.close()
-    
-    output_path = tmp_path / "column_oriented.h5ad"
-    result = _qc_column_oriented(
-        dataset["path"],
-        perturbation_column=dataset["perturbation_column"],
-        control_label=control_label,
-        gene_name_column=None,
-        chunk_size=1024,
-        output_path=output_path,
-        **QC_PARAMS,
-    )
-    
-    assert result.cell_mask.sum() > 0, "No cells passed filter"
-    assert result.gene_mask.sum() > 0, "No genes passed filter"
-    assert output_path.exists(), "Output file not created"
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+@pytest.mark.parametrize("strategy", list(_STRATEGIES))
+def test_streaming_strategies_match_in_memory_qc(tmp_path, fmt, strategy):
+    path = _make_uneven_screen(tmp_path / f"{fmt}.h5ad", fmt)
+    kw = dict(perturbation_column="perturbation", control_label="NTC", gene_name_column=None,
+              min_genes=4, min_cells_per_perturbation=15, min_cells_per_gene=20)
+    expected = _qc_in_memory(path, output_path=tmp_path / "memory.h5ad", **kw)
+    # The fixture must exercise every filter, or the comparison proves little.
+    assert 0 < expected.cell_mask.sum() < expected.cell_mask.size
+    assert 0 < expected.gene_mask.sum() < expected.gene_mask.size
+    all_groups = set(ad.read_h5ad(path, backed="r").obs["perturbation"].cat.categories)
+    assert {g for g, keep in expected.perturbation_keep.items() if keep} < all_groups
 
-
-def test_qc_row_oriented_basic(tmp_path):
-    """Test that row-oriented QC runs without errors on CSR dataset."""
-    from crispyx.qc import _qc_row_oriented
-    from crispyx.data import read_backed, resolve_control_label
-    
-    dataset = TEST_DATASETS["csr_small"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-    
-    # Get control label
-    backed = read_backed(dataset["path"])
-    labels = backed.obs[dataset["perturbation_column"]].astype(str).to_numpy()
-    control_label = resolve_control_label(labels, None, verbose=False)
-    backed.file.close()
-    
-    output_path = tmp_path / "row_oriented.h5ad"
-    result = _qc_row_oriented(
-        dataset["path"],
-        perturbation_column=dataset["perturbation_column"],
-        control_label=control_label,
-        gene_name_column=None,
-        chunk_size=1024,
-        output_path=output_path,
-        cache_mode="memmap",
-        delta_threshold=0.3,
-        **QC_PARAMS,
-    )
-    
-    assert result.cell_mask.sum() > 0, "No cells passed filter"
-    assert result.gene_mask.sum() > 0, "No genes passed filter"
-    assert output_path.exists(), "Output file not created"
-
-
-def test_qc_strategy_parity_csr(tmp_path):
-    """Verify all QC strategies produce identical results on CSR dataset."""
-    from crispyx.qc import _qc_in_memory, _qc_column_oriented, _qc_row_oriented
-    from crispyx.data import read_backed, resolve_control_label
-    
-    dataset = TEST_DATASETS["csr_small"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-    
-    # Get control label
-    backed = read_backed(dataset["path"])
-    labels = backed.obs[dataset["perturbation_column"]].astype(str).to_numpy()
-    control_label = resolve_control_label(labels, None, verbose=False)
-    backed.file.close()
-    
-    common_kwargs = {
-        "perturbation_column": dataset["perturbation_column"],
-        "control_label": control_label,
-        "gene_name_column": None,
-        **QC_PARAMS,
-    }
-    
-    # Run all three strategies
-    result_memory = _qc_in_memory(
-        dataset["path"],
-        output_path=tmp_path / "memory.h5ad",
-        **common_kwargs,
-    )
-    
-    result_column = _qc_column_oriented(
-        dataset["path"],
-        output_path=tmp_path / "column.h5ad",
-        chunk_size=1024,
-        **common_kwargs,
-    )
-    
-    result_row = _qc_row_oriented(
-        dataset["path"],
-        output_path=tmp_path / "row.h5ad",
-        chunk_size=1024,
-        cache_mode="memmap",
-        delta_threshold=0.3,
-        **common_kwargs,
-    )
-    
-    # Verify cell masks are identical
-    assert np.array_equal(result_memory.cell_mask, result_column.cell_mask), (
-        f"Cell mask mismatch (in-memory vs column): "
-        f"{result_memory.cell_mask.sum()} vs {result_column.cell_mask.sum()}"
-    )
-    assert np.array_equal(result_memory.cell_mask, result_row.cell_mask), (
-        f"Cell mask mismatch (in-memory vs row): "
-        f"{result_memory.cell_mask.sum()} vs {result_row.cell_mask.sum()}"
-    )
-    
-    # Verify gene masks are identical
-    assert np.array_equal(result_memory.gene_mask, result_column.gene_mask), (
-        f"Gene mask mismatch (in-memory vs column): "
-        f"{result_memory.gene_mask.sum()} vs {result_column.gene_mask.sum()}"
-    )
-    assert np.array_equal(result_memory.gene_mask, result_row.gene_mask), (
-        f"Gene mask mismatch (in-memory vs row): "
-        f"{result_memory.gene_mask.sum()} vs {result_row.gene_mask.sum()}"
-    )
-    
-    print(f"✓ CSR parity: cells={result_memory.cell_mask.sum()}, genes={result_memory.gene_mask.sum()}")
-
-
-def test_qc_strategy_parity_csc(tmp_path):
-    """Verify all QC strategies produce identical results on CSC dataset."""
-    from crispyx.qc import _qc_in_memory, _qc_column_oriented, _qc_row_oriented
-    from crispyx.data import read_backed, resolve_control_label
-    
-    dataset = TEST_DATASETS["csc_medium"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-    
-    # Get control label
-    backed = read_backed(dataset["path"])
-    labels = backed.obs[dataset["perturbation_column"]].astype(str).to_numpy()
-    control_label = resolve_control_label(labels, None, verbose=False)
-    backed.file.close()
-    
-    common_kwargs = {
-        "perturbation_column": dataset["perturbation_column"],
-        "control_label": control_label,
-        "gene_name_column": None,
-        **QC_PARAMS,
-    }
-    
-    # Run all three strategies
-    result_memory = _qc_in_memory(
-        dataset["path"],
-        output_path=tmp_path / "memory.h5ad",
-        **common_kwargs,
-    )
-    
-    result_column = _qc_column_oriented(
-        dataset["path"],
-        output_path=tmp_path / "column.h5ad",
-        chunk_size=1024,
-        **common_kwargs,
-    )
-    
-    result_row = _qc_row_oriented(
-        dataset["path"],
-        output_path=tmp_path / "row.h5ad",
-        chunk_size=1024,
-        cache_mode="memmap",
-        delta_threshold=0.3,
-        **common_kwargs,
-    )
-    
-    # Verify cell masks are identical
-    assert np.array_equal(result_memory.cell_mask, result_column.cell_mask), (
-        f"Cell mask mismatch (in-memory vs column): "
-        f"{result_memory.cell_mask.sum()} vs {result_column.cell_mask.sum()}"
-    )
-    assert np.array_equal(result_memory.cell_mask, result_row.cell_mask), (
-        f"Cell mask mismatch (in-memory vs row): "
-        f"{result_memory.cell_mask.sum()} vs {result_row.cell_mask.sum()}"
-    )
-    
-    # Verify gene masks are identical
-    assert np.array_equal(result_memory.gene_mask, result_column.gene_mask), (
-        f"Gene mask mismatch (in-memory vs column): "
-        f"{result_memory.gene_mask.sum()} vs {result_column.gene_mask.sum()}"
-    )
-    assert np.array_equal(result_memory.gene_mask, result_row.gene_mask), (
-        f"Gene mask mismatch (in-memory vs row): "
-        f"{result_memory.gene_mask.sum()} vs {result_row.gene_mask.sum()}"
-    )
-    
-    print(f"✓ CSC parity: cells={result_memory.cell_mask.sum()}, genes={result_memory.gene_mask.sum()}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # slow-axis streaming on purpose
+        actual = _STRATEGIES[strategy](path, tmp_path / "streamed.h5ad", **kw)
+    np.testing.assert_array_equal(actual.cell_mask, expected.cell_mask)
+    np.testing.assert_array_equal(actual.gene_mask, expected.gene_mask)
+    assert actual.perturbation_keep == expected.perturbation_keep
+    source = ad.read_h5ad(path)
+    written = ad.read_h5ad(tmp_path / "streamed.h5ad")
+    reference = source[expected.cell_mask][:, expected.gene_mask]
+    np.testing.assert_array_equal(np.asarray(sp.csr_matrix(written.X).todense()),
+                                  np.asarray(sp.csr_matrix(reference.X).todense()))
+    pd.testing.assert_index_equal(written.obs_names, reference.obs_names)
+    pd.testing.assert_index_equal(written.var_names, reference.var_names)
 
 
 def test_quality_control_summary_dispatch(tmp_path):
     """Test that quality_control_summary correctly dispatches based on data size."""
-    from crispyx.qc import quality_control_summary
     
-    dataset = TEST_DATASETS["csr_small"]
+    dataset = ADAMSON
     if not dataset["path"].exists():
         pytest.skip(f"data/{dataset['path'].name} not found")
     
@@ -318,21 +120,16 @@ def test_quality_control_summary_dispatch(tmp_path):
         f"Gene mask mismatch between dispatch modes: "
         f"{result1.gene_mask.sum()} vs {result2.gene_mask.sum()}"
     )
-    
-    print(f"✓ Dispatch parity verified")
 
 
 def test_qc_against_scanpy(tmp_path):
     """Compare crispyx QC results against Scanpy QC as ground truth."""
-    import anndata as ad
     import scanpy as sc
-    import scipy.sparse as sp
     
-    dataset = TEST_DATASETS["csr_small"]
+    dataset = ADAMSON
     if not dataset["path"].exists():
         pytest.skip(f"data/{dataset['path'].name} not found")
     
-    from crispyx.qc import quality_control_summary
     from crispyx.data import resolve_control_label, read_backed
     
     # Get control label
@@ -374,51 +171,10 @@ def test_qc_against_scanpy(tmp_path):
     assert crispyx_result.gene_mask.sum() == adata.n_vars, (
         f"Gene count mismatch: crispyx={crispyx_result.gene_mask.sum()}, scanpy={adata.n_vars}"
     )
-    
-    print(f"✓ Scanpy parity: cells={adata.n_obs}, genes={adata.n_vars}")
-
-
-def test_qc_strategy_selection_thresholds():
-    """Verify the in-memory threshold: file×4 < min(limit×0.6, 50 GB).
-
-    Threshold table (matches qc.py comments):
-      - Small file   (<12.5 GB):  file×4 < 50 GB → in-memory
-      - Medium file  ( 12.5 GB):  file×4 = 50 GB → streaming (edge, just over)
-      - Large file   ( 27 GB):    file×4 = 108 GB → streaming
-
-    This does NOT call the full QC pipeline; it directly validates the
-    decision logic from quality_control_summary.
-    """
-    def _would_use_in_memory(file_size_gb: float, memory_limit_gb: float = 128.0) -> bool:
-        """Mirror the threshold logic from quality_control_summary."""
-        estimated_memory_gb = file_size_gb * 4          # sparse 4× multiplier
-        threshold = min(memory_limit_gb * 0.6, 50.0)   # cap at 50 GB
-        return estimated_memory_gb < threshold
-
-    # Small datasets → in-memory
-    assert _would_use_in_memory(0.05) is True,  "Adamson_subset (50 MB) should be in-memory"
-    assert _would_use_in_memory(2.0) is True,   "Adamson (2 GB) should be in-memory"
-    assert _would_use_in_memory(10.0) is True,  "Frangieh (10 GB) should be in-memory"
-    assert _would_use_in_memory(12.4) is True,  "12.4 GB just under threshold"
-
-    # Large datasets → streaming
-    assert _would_use_in_memory(12.6) is False, "12.6 GB just over threshold → streaming"
-    assert _would_use_in_memory(15.0) is False, "Feng-gwsf (15 GB) should stream"
-    assert _would_use_in_memory(27.0) is False, "Feng-gwsnf (27 GB) should stream"
-    assert _would_use_in_memory(54.0) is False, "Very large file should stream"
-
-    # Cap behaviour: even with 500 GB node, threshold stays at 50 GB
-    assert _would_use_in_memory(12.6, memory_limit_gb=500.0) is False, \
-        "High-memory node should not relax threshold beyond 50 GB cap"
-    assert _would_use_in_memory(10.0, memory_limit_gb=500.0) is True, \
-        "10 GB file should still be in-memory even on 500 GB node"
 
 
 def _make_synthetic_h5ad(dir_path, fmt, seed=0):
     """Write a small synthetic h5ad in the requested storage format ('csr'/'csc')."""
-    import anndata as ad
-    import pandas as pd
-    import scipy.sparse as sp
 
     rng = np.random.default_rng(seed)
     n, g = 400, 60
@@ -443,7 +199,6 @@ def test_masks_only_csc_matches_csr(tmp_path):
     numerically identical to the CSR row-oriented path.
     """
     from crispyx.data import get_matrix_storage_format
-    from crispyx.qc import quality_control_summary
 
     csr_p = _make_synthetic_h5ad(tmp_path, "csr")
     csc_p = _make_synthetic_h5ad(tmp_path, "csc")
@@ -496,31 +251,26 @@ def test_verbose_prefix_matches_current_function_and_namespace_names(tmp_path, c
     rename -- three different names for one function. Guard against that
     drifting again.
     """
-    from crispyx.qc import quality_control_summary
-
-    dataset = TEST_DATASETS["csr_small"]
-    if not dataset["path"].exists():
-        pytest.skip(f"data/{dataset['path'].name} not found")
-
     quality_control_summary(
-        dataset["path"],
-        perturbation_column=dataset["perturbation_column"],
+        _make_synthetic_h5ad(tmp_path, "csr"),
+        perturbation_column="perturbation",
+        control_label="NTC",
+        min_genes=3,
+        min_cells_per_perturbation=10,
+        min_cells_per_gene=5,
         output_dir=tmp_path,
         data_name="verbose_prefix_test",
         verbose=1,
-        **QC_PARAMS,
     )
     out = capsys.readouterr().out
     assert "[cx] pp.qc_summary:" in out
     assert "qc.quality_control" not in out
+    assert "perturbations kept" in out
 
 
 def _make_dataset_for_filtering(tmp_path, n=200, g=30, seed=0):
     """A dataset where roughly a third of cells/genes are near-empty, so a
     strict threshold drops a controllable majority."""
-    import anndata as ad
-    import pandas as pd
-    import scipy.sparse as sp
 
     rng = np.random.default_rng(seed)
     dense = rng.poisson(3, size=(n, g)).astype(np.float32)
@@ -587,25 +337,3 @@ class TestFilteringMessaging:
         with pytest.warns(UserWarning):
             filter_cells_by_gene_count(path, min_genes=1, verbose=False)
         assert capsys.readouterr().out == ""
-
-    def test_quality_control_summary_reports_perturbation_counts(self, tmp_path, capsys):
-        from crispyx.qc import quality_control_summary
-
-        dataset = TEST_DATASETS["csr_small"]
-        if not dataset["path"].exists():
-            pytest.skip(f"data/{dataset['path'].name} not found")
-
-        quality_control_summary(
-            dataset["path"],
-            perturbation_column=dataset["perturbation_column"],
-            output_dir=tmp_path,
-            data_name="pert_count_test",
-            verbose=1,
-            **QC_PARAMS,
-        )
-        out = capsys.readouterr().out
-        assert "perturbations kept" in out
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

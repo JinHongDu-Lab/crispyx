@@ -65,7 +65,9 @@ def _assert_canonical(path: Path, dense: np.ndarray, fmt: str) -> None:
 @pytest.mark.parametrize("source_fmt", ["other", "dense"])
 def test_conversion_is_exact_and_keeps_metadata(tmp_path, target, source_fmt):
     dense = _dense()
-    src = _write(tmp_path / "src.h5ad", dense, OTHER[target] if source_fmt == "other" else "dense")
+    fmt = OTHER[target] if source_fmt == "other" else "dense"
+    src = _write(tmp_path / "src.h5ad", dense, fmt)
+    assert get_matrix_storage_format(src) == fmt
     out = tmp_path / "out.h5ad"
     CONVERT[target](src, output_path=out, verbose=False).close()
     _assert_canonical(out, dense, target)
