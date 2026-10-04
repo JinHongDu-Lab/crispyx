@@ -267,12 +267,28 @@ def test_matches_scanpy_on_dense_and_mixed_genes(tmp_path, dense_fraction):
                                    rtol=1e-4, atol=1e-10, err_msg=label)
 
 
-def test_all_zero_gene_is_not_significant(tmp_path):
+@pytest.mark.parametrize(
+    "path_kwargs",
+    [dict(memory_limit_gb=128), dict(memory_limit_gb=1e-7), dict(batch_column="batch")],
+    ids=["standard", "streaming", "stratified"],
+)
+def test_all_zero_gene_is_untested(tmp_path, path_kwargs):
+    """With the filters off, a gene that is zero in every cell has no rank
+    test (z = 0/0): NaN in every derived column, like t_test and nb_glm_test,
+    not "tested, no change" (Scanpy reports p = 1 here)."""
     rng = np.random.default_rng(123)
     data = (rng.random((115, 10)) < 0.3) * rng.exponential(2, (115, 10))
     data[:, 0] = 0.0
     path = _write_log_normalised(tmp_path / "data.h5ad", data, _labels(100, 3, 5))
+    adata = ad.read_h5ad(path)
+    adata.obs["batch"] = np.resize(["b1", "b2"], adata.n_obs)
+    adata.write(path)
     result = wilcoxon_test(path, perturbation_column="perturbation", control_label="control",
                            output_path=tmp_path / "result.h5ad", verbose=False,
-                           min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0)
-    np.testing.assert_array_equal(result.pvalues[:, 0], 1.0)
+                           min_cells_expressed=0, min_pct_ctrl=0.0, min_pct_pert=0.0,
+                           min_mean_ctrl=0.0, min_mean_pert=0.0, **path_kwargs)
+    for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size"):
+        column = np.asarray(getattr(result, field))
+        assert np.isnan(column[:, 0]).all(), field
+        assert np.isfinite(column[:, 1:]).all(), field
+    assert np.isfinite(result.pts[:, 0]).all()  # the data itself is still described

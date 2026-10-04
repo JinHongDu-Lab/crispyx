@@ -127,15 +127,18 @@ def test_jointly_silent_gene_is_excluded(tmp_path, method):
     assert np.isfinite(pvals[[0, 1, 2, 4]]).all()
 
 
-def test_thresholds_control_what_is_filtered(tmp_path):
+@pytest.mark.parametrize("method", ["t_test", "wilcoxon_test"])
+def test_thresholds_control_what_is_filtered(tmp_path, method):
     path = _make_dataset(tmp_path, log_normalise=True)
+    fn = getattr(cx, method)
     kw = dict(perturbation_column="perturbation", control_label="ctrl", verbose=False)
-    loose = cx.t_test(path, output_path=tmp_path / "loose.h5ad", **kw, **_OFF)
-    strict = cx.t_test(path, output_path=tmp_path / "strict.h5ad", **kw,
-                       min_pct_ctrl=0.99, min_pct_pert=0.99, min_mean_ctrl=1e6, min_mean_pert=1e6)
+    loose = fn(path, output_path=tmp_path / "loose.h5ad", **kw, **_OFF)
+    strict = fn(path, output_path=tmp_path / "strict.h5ad", **kw,
+                min_pct_ctrl=0.99, min_pct_pert=0.99, min_mean_ctrl=1e6, min_mean_pert=1e6)
     loose_p = np.asarray(loose.pvalues[0])
-    # Filter off: only the zero-variance gene is untested.
+    # Filter off: only the all-zero gene is untested, and in every column.
     assert np.isnan(loose_p).tolist() == [False, False, False, True, False]
+    assert np.isnan(loose.logfoldchanges[0][3]) and np.isnan(loose.statistics[0][3])
     assert np.isnan(strict.pvalues[0]).sum() > np.isnan(loose_p).sum()
 
 

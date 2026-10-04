@@ -4109,6 +4109,10 @@ def _wilcoxon_test_streaming(
             finally:
                 backed.file.close()
 
+            # A gene whose values are all tied gets a NaN rank test from the
+            # kernel; it was not tested either.
+            batch_lfc[np.isnan(batch_p)] = np.nan
+
             # P-value adjustment and ordering for this batch
             batch_pvalue_adj = np.ones_like(batch_p)
             _adjust_pvalue_matrix(batch_p, corr_method, out=batch_pvalue_adj)
@@ -4548,6 +4552,9 @@ def _wilcoxon_test_stratified(
                 rank_valid_arr = np.array(rank_valid_masks)
                 invalid_arr = ~rank_valid_arr
                 chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                # A gene whose values are all tied gets a NaN rank test from
+                # the kernel; it was not tested either.
+                chunk_lfc[np.isnan(chunk_p) & rank_valid_arr] = np.nan
                 if invalid_arr.any():
                     chunk_u[invalid_arr] = np.nan
                     chunk_z[invalid_arr] = np.nan
@@ -4730,7 +4737,10 @@ def wilcoxon_test(
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
         ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
-        ``pts`` / ``pts_rest`` still populated.
+        ``pts`` / ``pts_rest`` still populated. A gene whose values are all
+        tied across both groups (e.g. zero in every cell, with the filters
+        off) has no rank test and is untested in the same way; Scanpy
+        reports ``score=0``, ``pvalue=1`` for it instead.
     min_pct_ctrl
         Minimum fraction of expressing cells for the *control* side. A gene is
         excluded only when *both* sides are jointly low. Default ``0.01``.
@@ -5326,7 +5336,9 @@ def _wilcoxon_test_standard(
                 # leaves its defaults in the columns it skips, and a gene
                 # excluded here may be tested for another perturbation.
                 invalid_arr = ~valid_arr
-                chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                # A gene whose values are all tied gets a NaN rank test from
+                # the kernel; it was not tested either.
+                chunk_lfc[:] = np.where(valid_arr & ~np.isnan(chunk_p), raw_lfc, np.nan)
                 if invalid_arr.any():
                     chunk_u[invalid_arr] = np.nan
                     chunk_z[invalid_arr] = np.nan

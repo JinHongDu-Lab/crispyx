@@ -746,8 +746,10 @@ def _compute_rank_sums_batch_numba(
                 abs_z = abs(z)
                 pvalue_out[p_idx, g] = math.erfc(abs_z / math.sqrt(2.0))
             else:
-                z_score_out[p_idx, g] = 0.0
-                pvalue_out[p_idx, g] = 1.0
+                # Every value tied: the rank test is undefined, not "no change".
+                u_stat_out[p_idx, g] = np.nan
+                z_score_out[p_idx, g] = np.nan
+                pvalue_out[p_idx, g] = np.nan
 
 
 # =============================================================================
@@ -1062,8 +1064,9 @@ def _wilcoxon_sparse_batch_numba(
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
         else:
-            z = 0.0
-            pval = 1.0
+            # Every value tied: the rank test is undefined, not "no change".
+            z = np.nan
+            pval = np.nan
         
         # Effect size: U / (n1 * n2) - 0.5
         if n_pert_f > 0 and n_control_f > 0:
@@ -1071,6 +1074,9 @@ def _wilcoxon_sparse_batch_numba(
         else:
             effect = 0.0
         
+        if math.isnan(z):
+            u_stat = np.nan
+            effect = np.nan
         u_stat_out[g] = u_stat
         z_score_out[g] = z
         pvalue_out[g] = pval
@@ -1278,14 +1284,18 @@ def _wilcoxon_presorted_ctrl_numba(
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
         else:
-            z = 0.0
-            pval = 1.0
+            # Every value tied: the rank test is undefined, not "no change".
+            z = np.nan
+            pval = np.nan
 
         if n_pert_f > 0 and n_control_f > 0:
             effect = u_stat / (n_pert_f * n_control_f) - 0.5
         else:
             effect = 0.0
 
+        if math.isnan(z):
+            u_stat = np.nan
+            effect = np.nan
         u_stat_out[g] = u_stat
         z_score_out[g] = z
         pvalue_out[g] = pval
@@ -1476,14 +1486,18 @@ def _wilcoxon_all_perts_numba(
                 abs_z = abs(z)
                 pval = math.erfc(abs_z / math.sqrt(2.0))
             else:
-                z = 0.0
-                pval = 1.0
+                # Every value tied: the rank test is undefined, not "no change".
+                z = np.nan
+                pval = np.nan
             
             if n_pert_f > 0 and n_control_f > 0:
                 effect = u_stat / (n_pert_f * n_control_f) - 0.5
             else:
                 effect = 0.0
             
+            if math.isnan(z):
+                u_stat = np.nan
+                effect = np.nan
             u_stat_out[p_idx, g] = u_stat
             z_score_out[p_idx, g] = z
             pvalue_out[p_idx, g] = pval
@@ -1693,14 +1707,18 @@ def _wilcoxon_single_pert_presorted(
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
         else:
-            z = 0.0
-            pval = 1.0
+            # Every value tied: the rank test is undefined, not "no change".
+            z = np.nan
+            pval = np.nan
 
         if n_pert_f > 0 and n_control_f > 0:
             effect = u_stat / (n_pert_f * n_control_f) - 0.5
         else:
             effect = 0.0
 
+        if math.isnan(z):
+            u_stat = np.nan
+            effect = np.nan
         u_stat_out[g] = u_stat
         z_score_out[g] = z
         pvalue_out[g] = pval
@@ -1908,14 +1926,18 @@ def _wilcoxon_stratified_single_pert(
             z = num / math.sqrt(var)
             pval = math.erfc(abs(z) / sqrt2)
         else:
-            z = 0.0
-            pval = 1.0
+            # Every value tied: the rank test is undefined, not "no change".
+            z = np.nan
+            pval = np.nan
 
         if n1n0_sum > 0.0:
             effect = u_sum / n1n0_sum - 0.5
         else:
             effect = 0.0
 
+        if math.isnan(z):
+            u_sum = np.nan
+            effect = np.nan
         u_stat_out[g] = u_sum
         z_score_out[g] = z
         pvalue_out[g] = pval

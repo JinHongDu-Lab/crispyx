@@ -230,11 +230,14 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
             std = float(np.sqrt(tie * pert_n * control_n * (pert_n + control_n + 1.0) / 12.0))
             u_stat = float(rank_sum - pert_n * (pert_n + 1.0) / 2.0)
             effect = u_stat / (control_n * pert_n) - 0.5
-            effects.append(effect)
             if std == 0 or np.isnan(std):
-                stats.append(0.0)
-                pvals.append(1.0)
+                # Every value tied: crispyx reports the test as undefined
+                # (NaN), where Scanpy reports z = 0, p = 1.
+                effects.append(np.nan)
+                stats.append(np.nan)
+                pvals.append(np.nan)
             else:
+                effects.append(effect)
                 z = (rank_sum - expected) / std
                 stats.append(float(z))
                 pvals.append(float(2 * norm.sf(abs(z))))

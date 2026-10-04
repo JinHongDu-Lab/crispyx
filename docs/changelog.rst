@@ -4,6 +4,13 @@ Changelog
 Unreleased
 ----------
 
+* **Changed: tied genes are untested in ``wilcoxon_test``.** A gene whose
+  values are all tied across control and perturbation (e.g. zero in every
+  cell, which only reaches the test with the low-expression filters off)
+  used to be reported as ``score=0``, ``pvalue=1``, ``logfoldchanges=0``, as
+  in Scanpy. The rank test is undefined there, so it is now ``NaN`` in every
+  derived column, matching ``t_test``, ``nb_glm_test`` and every other
+  untested gene.
 * **Removed: ``min_pct_both``** from ``t_test``, ``wilcoxon_test`` and
   ``nb_glm_test``. It was deprecated in favour of ``min_pct_ctrl`` and
   ``min_pct_pert``, but the DE functions accepted it without a warning.
