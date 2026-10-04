@@ -41,6 +41,8 @@ Unreleased
 * ``nb_glm_test`` records whether it fitted with frozen control statistics
   in ``uns["frozen_control"]``. With ``freeze_control=None`` (chosen from the
   memory available), an existing result is reused whichever mode it used.
+* ``shrink_lfc(method="full")`` also budgets the batches joblib queues for
+  each worker, and sizes the workers once rather than per perturbation.
 
 Version 0.1.7
 -------------

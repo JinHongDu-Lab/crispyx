@@ -5531,9 +5531,11 @@ def _apeglm_worker_count(
     Each task carries one gene's counts, the two-column design and the log
     size factors (4 float64 vectors of ``n_cells``); a worker holds a batch
     of ``batch_size`` tasks and works on one gene at a time (about 8 more
-    vectors).
+    vectors). joblib also keeps up to two more batches per worker queued in
+    the parent (its default ``pre_dispatch="2*n_jobs"``), so each worker
+    accounts for three batches in all.
     """
-    per_worker_mb = _APEGLM_WORKER_BASE_MB + (4 * batch_size + 8) * n_cells * 8 / 1e6
+    per_worker_mb = _APEGLM_WORKER_BASE_MB + (3 * 4 * batch_size + 8) * n_cells * 8 / 1e6
     return min(
         _resolve_n_jobs(n_jobs),
         _estimate_max_workers(
@@ -5893,6 +5895,14 @@ def shrink_lfc(
             control_counts = backed.X[control_idx, :].toarray() if sp.issparse(backed.X[control_idx, :]) else np.asarray(backed.X[control_idx, :])
             control_size_factors = size_factors_all[control_idx]
             
+            # Workers sized once, for the largest comparison: probing free
+            # memory per perturbation would cost thousands of probes.
+            group_sizes = pd.Series(labels).value_counts().reindex(candidates, fill_value=0)
+            largest_pert = int(group_sizes.max()) if len(group_sizes) else 0
+            apeglm_jobs = _apeglm_worker_count(
+                n_jobs, len(control_idx) + largest_pert, batch_size, memory_limit_gb,
+            )
+
             # Process each perturbation
             for group_idx, pert_label in enumerate(candidates):
                 logger.debug(f"Shrinking LFC for perturbation {group_idx + 1}/{n_groups}: {pert_label}")
@@ -5951,7 +5961,7 @@ def shrink_lfc(
                     mle_se=se_group,
                     shrink_index=1,
                     prior_scale=pert_prior_scale,
-                    n_jobs=_apeglm_worker_count(n_jobs, n_combined, batch_size, memory_limit_gb),
+                    n_jobs=apeglm_jobs,
                     batch_size=batch_size,
                     min_mu=min_mu,
                 )

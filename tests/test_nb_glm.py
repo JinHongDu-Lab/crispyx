@@ -1373,9 +1373,11 @@ def test_apeglm_worker_count_fits_the_memory_budget(monkeypatch):
 
     assert _apeglm_worker_count(-1, 10_000, 128, memory_limit_gb=1e-3) == 1
     assert _apeglm_worker_count(2, 10_000, 128, memory_limit_gb=1e4) == min(2, _resolve_n_jobs(2))
-    # A worker holds a batch of gene columns, not the whole matrix: ~4 GB for
-    # 1M cells and batch_size=128, so a 64 GB budget still allows many workers.
-    assert _apeglm_worker_count(-1, 1_000_000, 128, memory_limit_gb=64) >= min(8, _resolve_n_jobs(-1))
+    # A worker costs three batches of gene columns (its own and two queued by
+    # joblib), not the whole matrix: ~12 GB for 1M cells and batch_size=128,
+    # so a 64 GB budget allows a few workers and 256 GB many.
+    assert 2 <= _apeglm_worker_count(-1, 1_000_000, 128, memory_limit_gb=64) <= 5 or _resolve_n_jobs(-1) < 2
+    assert _apeglm_worker_count(-1, 1_000_000, 128, memory_limit_gb=256) >= min(8, _resolve_n_jobs(-1))
 
 
 def test_shrink_lfc_full_caps_workers_by_memory_limit(tmp_path, monkeypatch):
