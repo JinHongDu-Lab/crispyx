@@ -80,14 +80,3 @@ def test_rank_genes_groups_and_readers_report_the_stored_values(screen, tmp_path
             full = f["uns/rank_genes_groups/full"]
             np.testing.assert_array_equal(full["pts_rest"][()], np.asarray(direct.pts_rest))
             np.testing.assert_array_equal(full["logfoldchanges"][()], direct.logfoldchanges)
-
-
-def test_reloading_an_existing_result_matches_the_run(screen, tmp_path):
-    """force=False reloads each method's file into the same result object."""
-    common = dict(perturbation_column="perturbation", control_label="control", verbose=False, output_dir=tmp_path)
-    for fn, source in METHODS.values():
-        first = fn(screen / source, **common)
-        again = fn(screen / source, **common)  # loads the existing file
-        for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest"):
-            np.testing.assert_array_equal(np.asarray(getattr(again, field)), np.asarray(getattr(first, field)), err_msg=field)
-        assert again.method == first.method

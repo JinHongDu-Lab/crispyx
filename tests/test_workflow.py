@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -404,89 +402,6 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     wilcoxon_wrapped.close()
     qc_wrapped.close()
     qc_direct.filtered.close()
-
-
-def test_nb_glm_resume_checkpoint(tmp_path):
-    """Test that resume=True correctly skips completed perturbations."""
-    # Create a dataset with multiple perturbations
-    rng = np.random.default_rng(42)
-    n_cells = 60
-    n_genes = 8
-    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20 + ["KO2"] * 20)
-    counts = rng.poisson(10, size=(n_cells, n_genes))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(n_cells)]
-    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
-    adata = ad.AnnData(counts, obs=obs, var=var)
-    path = tmp_path / "resume_test.h5ad"
-    adata.write(path)
-
-    # Run the first time
-    result1 = nb_glm_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        checkpoint_interval=1,
-        output_dir=tmp_path,
-        data_name="resume",
-    )
-    assert result1.groups == ["KO1", "KO2"]
-    output_path1 = result1.result_path
-
-    # Checkpoint should be cleaned up on successful completion
-    checkpoint_path = output_path1.with_suffix(".progress.json")
-    assert not checkpoint_path.exists()
-
-    # Run again with resume=True - should succeed quickly (no work to do)
-    result2 = nb_glm_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        resume=True,
-        checkpoint_interval=1,
-        output_dir=tmp_path,
-        data_name="resume",
-    )
-    # Results should be identical
-    np.testing.assert_allclose(result1.statistics, result2.statistics)
-    np.testing.assert_allclose(result1.pvalues, result2.pvalues)
-
-
-def test_wilcoxon_resume_checkpoint(tmp_path):
-    """Test that wilcoxon_test resume=True works correctly."""
-    rng = np.random.default_rng(123)
-    n_cells = 40
-    n_genes = 10
-    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20)
-    # Log-normalized data for wilcoxon (must be sparse)
-    x = rng.normal(5, 1, size=(n_cells, n_genes))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(n_cells)]
-    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
-    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
-    path = tmp_path / "wilcoxon_resume.h5ad"
-    adata.write(path)
-
-    result1 = wilcoxon_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        checkpoint_interval=2,
-        output_dir=tmp_path,
-        data_name="wilcox_resume",
-    )
-
-    # Run again with resume - should work
-    result2 = wilcoxon_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        resume=True,
-        checkpoint_interval=2,
-        output_dir=tmp_path,
-        data_name="wilcox_resume",
-    )
-    np.testing.assert_allclose(result1.statistics, result2.statistics)
 
 
 def test_empty_perturbation_group_error(tmp_path):

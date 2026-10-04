@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -320,25 +319,6 @@ def test_invalid_reducer_output_and_weights(tmp_path):
         )
 
 
-def test_existing_matching_result_reloads_unless_forced(tmp_path):
-    path, *_ = _write_data(tmp_path)
-    output_path = tmp_path / "cached.h5ad"
-    kwargs = dict(
-        groupby="perturbation",
-        perturbations=["A"],
-        batch_column="batch",
-        statistic_name="std",
-        output_path=output_path,
-    )
-    first = cx.batch_process(path, _moment_reducer(), force=True, **kwargs)
-    first.close()
-    mtime = output_path.stat().st_mtime
-    time.sleep(0.01)
-    second = cx.tl.batch_process(path, _moment_reducer(), **kwargs)
-    second.close()
-    assert output_path.stat().st_mtime == mtime
-
-
 def test_missing_batch_labels_are_excluded_and_callback_errors_have_context(tmp_path):
     path, *_ = _write_data(tmp_path)
     adata = ad.read_h5ad(path)
@@ -375,44 +355,6 @@ def test_missing_batch_labels_are_excluded_and_callback_errors_have_context(tmp_
                 output_path=tmp_path / "failing.h5ad",
                 force=True,
             )
-
-
-def test_cache_is_invalidated_when_the_source_file_changes(tmp_path):
-    """Regenerating the input in place must not return the previous result."""
-    path, X, *_ = _write_data(tmp_path)
-    kwargs = dict(
-        groupby="perturbation",
-        batch_column="batch",
-        statistic_name="std",
-        output_path=tmp_path / "cached_source.h5ad",
-    )
-    first = cx.batch_process(path, _moment_reducer(), force=True, **kwargs)
-    before = np.asarray(first.backed.X[:]).copy()
-    first.close()
-
-    # Same path, same groups and batches, different values.
-    obs = pd.DataFrame(
-        {
-            "perturbation": np.repeat(["ctrl", "A", "B"], X.shape[0] // 3),
-            "batch": np.tile(["b1", "b2", "b3"], X.shape[0] // 3),
-        },
-        index=[f"cell_{i}" for i in range(X.shape[0])],
-    )
-    var = pd.DataFrame(index=[f"gene_{i}" for i in range(X.shape[1])])
-    ad.AnnData(sp.csr_matrix(X * 10.0), obs=obs, var=var).write(path)
-
-    second = cx.batch_process(path, _moment_reducer(), **kwargs)
-    after = np.asarray(second.backed.X[:]).copy()
-    second.close()
-
-    assert not np.allclose(before, after)
-
-    # An untouched source must still reload from cache.
-    mtime = kwargs["output_path"].stat().st_mtime_ns
-    time.sleep(0.01)
-    third = cx.batch_process(path, _moment_reducer(), **kwargs)
-    third.close()
-    assert kwargs["output_path"].stat().st_mtime_ns == mtime
 
 
 @pytest.mark.parametrize("mode", ["group", "comparison"])

@@ -80,15 +80,36 @@ def de_setup(request, tmp_path):
     return method, path, tmp_path / "result.h5ad"
 
 
+_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest")
+
+
 def test_identical_rerun_reuses_the_result(de_setup, capsys):
     method, path, output = de_setup
     first = _run(method, path, output)
     mtime = output.stat().st_mtime_ns
     capsys.readouterr()
     second = _run(method, path, output)
-    assert "Loading existing result" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Loading existing result" in out
+    assert "force=True" in out
     assert output.stat().st_mtime_ns == mtime
-    np.testing.assert_array_equal(second.pvalues, first.pvalues)
+    # The reloaded result is the run's result, field for field.
+    for field in _RESULT_FIELDS:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(second, field)), np.asarray(getattr(first, field)), err_msg=field
+        )
+    assert second.groups == first.groups
+    assert second.method == first.method
+
+
+def test_force_recomputes(de_setup, capsys):
+    method, path, output = de_setup
+    _run(method, path, output)
+    os.utime(output, ns=(0, 0))
+    capsys.readouterr()
+    _run(method, path, output, force=True)
+    assert "Loading existing result" not in capsys.readouterr().out
+    assert output.stat().st_mtime_ns != 0
 
 
 def test_relabelled_source_is_recomputed(de_setup, capsys):
