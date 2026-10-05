@@ -1,8 +1,10 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.1.8
+-------------
+
+*Released 2026-10-05.*
 
 * **Changed: tied genes are untested in ``wilcoxon_test``.** A gene whose
   values are all tied across control and perturbation (e.g. zero in every
