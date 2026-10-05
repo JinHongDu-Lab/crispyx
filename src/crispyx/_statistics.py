@@ -6,7 +6,6 @@ and batched SE/dispersion computation.
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal
 
 import numpy as np
@@ -22,7 +21,6 @@ def _low_expr_in_both_mask(
     n_control_cells: int,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
 ) -> np.ndarray:
@@ -54,9 +52,6 @@ def _low_expr_in_both_mask(
     min_pct_pert
         Minimum fraction of expressing cells for the *perturbed* side.
         Default 0.002 (lower than ctrl; induction from near-zero baseline is valid).
-    min_pct_both
-        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` and emits a ``DeprecationWarning``.
     min_mean_ctrl
         Minimum mean expression for the *control* side. Default 0.05.
     min_mean_pert
@@ -67,15 +62,6 @@ def _low_expr_in_both_mask(
     ndarray of bool, shape (n_genes,)
         ``True`` for genes that should be dropped from this comparison.
     """
-    if min_pct_both is not None:
-        warnings.warn(
-            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
-
     if (
         (min_pct_ctrl <= 0.0 and min_pct_pert <= 0.0
          and min_mean_ctrl <= 0.0 and min_mean_pert <= 0.0)

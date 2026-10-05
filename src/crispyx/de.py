@@ -73,14 +73,8 @@ from .glm import (
     _estimate_apeglm_prior_scale,
 )
 from ._kernels import (
-    _rankdata_2d_numba,
-    _tie_correction_numba,
-    _compute_rank_sums_batch_numba,
-    _wilcoxon_sparse_batch_numba,
-    _wilcoxon_all_perts_numba,
     _presort_control_nonzeros,
     _compute_ctrl_tie_sums,
-    _wilcoxon_presorted_ctrl_numba,
     _wilcoxon_batch_perts_presorted_numba,
     _wilcoxon_stratified_batch_perts_numba,
     _ZERO_PARTITION_THRESHOLD,
@@ -94,7 +88,7 @@ from ._checkpoint import (
 from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import resolve_group_reference_aliases
+from ._grouping import canonical_call_args, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
@@ -448,9 +442,15 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
-def _de_fingerprint(path: Path, call_args: dict, method: str) -> dict:
+def _de_fingerprint(
+    path: Path, call_args: dict, method: str, *, perturbation_column: str, control_label: str | None,
+) -> dict:
     """Identity of a DE call, stamped into its result: see
-    :func:`~crispyx._provenance.call_fingerprint`."""
+    :func:`~crispyx._provenance.call_fingerprint`. The grouping column and
+    control are recorded as resolved from their aliases."""
+    call_args = canonical_call_args(
+        call_args, perturbation_column=perturbation_column, control_label=control_label,
+    )
     return call_fingerprint(path, call_args, _OPERATIONAL_ARGS, method=method)
 
 
@@ -528,6 +528,8 @@ def _write_wilcoxon_result_h5ad(
     corr_method: str,
     batch_column: str | None = None,
     stratified_diagnostics: dict[str, object] | None = None,
+    scanpy_format: bool = False,
+    provenance: dict | None = None,
 ) -> None:
     """Write wilcoxon result arrays to h5ad.
 
@@ -539,6 +541,10 @@ def _write_wilcoxon_result_h5ad(
     ``pts_rest`` is the control arm's detection rate, one value per gene, so
     it is stored as ``var["pts_rest"]`` rather than repeated for every
     perturbation.
+
+    The Scanpy structure (``scanpy_format``) and the ``provenance`` stamp go
+    into the same partial file, so ``output_path`` only ever appears
+    complete: a run killed at any point before leaves nothing to reuse.
     """
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
@@ -548,6 +554,8 @@ def _write_wilcoxon_result_h5ad(
         tie_correct=tie_correct, corr_method=corr_method,
         batch_column=batch_column, stratified_diagnostics=stratified_diagnostics,
     )
+    if provenance is not None:
+        uns[_PROVENANCE_KEY] = provenance
     # Written under a partial name, so a run killed mid-write leaves no
     # truncated file at ``output_path``.
     with _replace_on_success(output_path) as partial:
@@ -561,17 +569,11 @@ def _write_wilcoxon_result_h5ad(
             _create_array(layers_grp, "logfoldchanges", data=lfc_matrix)
             _create_array(layers_grp, "u_statistic", data=u_matrix)
             _create_array(layers_grp, "pts", data=pts_matrix)
-
-
-def _finish_wilcoxon_result(
-    output_path: Path, result: "RankGenesGroupsResult", *, scanpy_format: bool, fingerprint: dict,
-) -> None:
-    """Add the optional Scanpy ``rank_genes_groups`` structure to a written
-    Wilcoxon result, then its provenance. The stamp goes last, so a run
-    killed before it leaves a file that is recomputed, not reused."""
-    if scanpy_format and result.statistics.size > 0:
-        _write_rank_genes_groups_hdf5(output_path, result)
-    write_stamp(output_path, stamp("de_result", fingerprint))
+        if scanpy_format:
+            _write_wilcoxon_rank_genes_groups(
+                partial, groups=candidates, perturbation_column=perturbation_column,
+                control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
+            )
 
 
 def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
@@ -715,53 +717,111 @@ def _write_rank_genes_groups_hdf5(
     output_path: Path,
     result: "RankGenesGroupsResult",
 ) -> None:
+    """Write rank_genes_groups to HDF5 for Scanpy compatibility, from an
+    in-memory ``result``: see :func:`_write_rank_genes_groups`."""
+
+    def rows(_handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
+        return {
+            "scores": result.statistics[sl], "pvals": result.pvalues[sl],
+            "pvals_adj": result.pvalues_adj[sl], "logfoldchanges": result.logfoldchanges[sl],
+            "auc": result.effect_size[sl], "u_stat": result.u_statistics[sl],
+            "pts": result.pts[sl], "pts_rest": result.pts_rest[sl], "order": result.order[sl],
+        }
+
+    _write_rank_genes_groups(
+        output_path, groups=result.groups, n_genes=len(result.genes), rows=rows,
+        block_rows=max(len(result.groups), 1), groupby=result.groupby, method=result.method,
+        reference=result.control_label, tie_correct=result.tie_correct,
+        corr_method=result.pvalue_correction,
+    )
+
+
+def _write_wilcoxon_rank_genes_groups(
+    path: Path,
+    *,
+    groups: list[str],
+    perturbation_column: str,
+    control_label: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
+    """Write rank_genes_groups for the Wilcoxon result at ``path`` from its
+    own layers, a block of groups at a time, so it is written however large
+    the result is (the result returned to the caller may be too large to
+    load). The values and order match :func:`_build_result_from_h5ad`."""
+
+    def rows(handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
+        layers = handle["layers"]
+        z = layers["z_score"][sl]
+        pts = np.asarray(layers["pts"][sl], dtype=np.float32)
+        pts_rest = np.asarray(handle["var/pts_rest"][:], dtype=np.float32)
+        return {
+            "scores": z, "pvals": layers["pvalue"][sl], "pvals_adj": layers["pvalue_adj"][sl],
+            "logfoldchanges": layers["logfoldchanges"][sl], "auc": handle["X"][sl],
+            "u_stat": layers["u_statistic"][sl], "pts": pts,
+            "pts_rest": np.broadcast_to(pts_rest, pts.shape),
+            "order": np.argsort(-np.abs(z), axis=1, kind="mergesort").astype(np.int64),
+        }
+
+    with h5py.File(path, "r") as handle:
+        n_genes = handle["X"].shape[1]
+    _write_rank_genes_groups(
+        path, groups=groups, n_genes=n_genes, rows=rows,
+        block_rows=max(1, (1 << 22) // max(n_genes, 1)), groupby=perturbation_column,
+        method="wilcoxon", reference=control_label, tie_correct=tie_correct,
+        corr_method=corr_method,
+    )
+
+
+def _write_rank_genes_groups(
+    output_path: Path,
+    *,
+    groups: list[str],
+    n_genes: int,
+    rows,
+    block_rows: int,
+    groupby: str,
+    method: str,
+    reference: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
     """Write rank_genes_groups to HDF5 for Scanpy compatibility.
-    
-    Writes arrays in full matrix order (groups × genes) to uns/rank_genes_groups/full.
-    This format is compatible with Scanpy's rank_genes_groups output but avoids
-    the recarray format which causes HDF5 header size limits for large group counts.
-    
-    Parameters
-    ----------
-    output_path
-        Path to the h5ad file to modify.
-    result
-        RankGenesGroupsResult containing the DE statistics.
-        
-    Notes
-    -----
-    For datasets with many groups (>1000), this adds ~2-6 seconds of I/O overhead.
-    The recarray format (with group names as dtype fields) is avoided because it
-    hits HDF5 header size limits at ~2000+ groups.
+
+    Writes arrays in full matrix order (groups × genes) to
+    uns/rank_genes_groups/full, ``block_rows`` groups at a time:
+    ``rows(handle, slice)`` returns each field's rows for that slice of
+    groups (plus ``order``), reading from the open file if it needs to.
+    This format is compatible with Scanpy's rank_genes_groups output but
+    avoids the recarray format, which hits HDF5 header size limits at
+    ~2000+ groups. For datasets with many groups (>1000), this adds ~2-6
+    seconds of I/O overhead.
     """
+    n_groups = len(groups)
     with h5py.File(output_path, "r+") as handle:
         uns_group = handle.require_group("uns")
         if "rank_genes_groups" in uns_group:
             del uns_group["rank_genes_groups"]
         rgg = uns_group.create_group("rank_genes_groups")
-        
-        # Store full-order matrices (groups × genes)
         full = rgg.create_group("full")
-        full.create_dataset("scores", data=result.statistics)
-        full.create_dataset("pvals", data=result.pvalues)
-        full.create_dataset("pvals_adj", data=result.pvalues_adj)
-        full.create_dataset("logfoldchanges", data=result.logfoldchanges)
-        full.create_dataset("auc", data=result.effect_size)
-        full.create_dataset("u_stat", data=result.u_statistics)
-        full.create_dataset("pts", data=result.pts)
-        full.create_dataset("pts_rest", data=result.pts_rest)
-        
-        # Store order and metadata
-        rgg.create_dataset("order", data=result.order)
-        rgg.create_dataset("names", data=np.array(result.groups, dtype="S"))
-        
+        for start in range(0, n_groups, block_rows) or [0]:
+            sl = slice(start, min(start + block_rows, n_groups))
+            block = rows(handle, sl)
+            for name, values in block.items():
+                target = rgg if name == "order" else full
+                if name not in target:
+                    target.create_dataset(name, shape=(n_groups, n_genes), dtype=values.dtype)
+                target[name][sl] = values
+
+        rgg.create_dataset("names", data=np.array(groups, dtype="S"))
+
         # Store params for compatibility
         params = rgg.create_group("params")
-        params.attrs["groupby"] = result.groupby
-        params.attrs["method"] = result.method
-        params.attrs["reference"] = result.control_label
-        params.attrs["tie_correct"] = result.tie_correct
-        params.attrs["corr_method"] = result.pvalue_correction
+        params.attrs["groupby"] = groupby
+        params.attrs["method"] = method
+        params.attrs["reference"] = reference
+        params.attrs["tie_correct"] = tie_correct
+        params.attrs["corr_method"] = corr_method
 
 
 def _load_completed_de_result(
@@ -850,35 +910,6 @@ def _load_completed_de_result(
 # Shared helpers for public DE functions
 # ---------------------------------------------------------------------------
 
-def _resolve_de_aliases(
-    *,
-    perturbation_column: str | None,
-    groupby: str | None,
-    control_label: str | None,
-    reference: str | None,
-    min_pct_both: float | None,
-    min_pct_ctrl: float,
-    min_pct_pert: float,
-    fn_name: str,
-) -> tuple[str, str | None, float, float]:
-    """Resolve groupby/reference aliases and handle min_pct_both.
-
-    Returns ``(perturbation_column, control_label, min_pct_ctrl, min_pct_pert)``.
-    """
-    perturbation_column, control_label = resolve_group_reference_aliases(
-        perturbation_column=perturbation_column,
-        groupby=groupby,
-        control_label=control_label,
-        reference=reference,
-        fn_name=fn_name,
-    )
-    # min_pct_both silent alias
-    if min_pct_both is not None:
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
-    return perturbation_column, control_label, min_pct_ctrl, min_pct_pert
-
-
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
@@ -939,7 +970,6 @@ def t_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     cell_chunk_size: int | None = None,
@@ -1002,9 +1032,6 @@ def t_test(
         Minimum fraction of expressing cells for the *perturbed* side.
         Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
         biologically valid). Set to ``0.0`` to disable the pct check on pert.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean expression (log1p units) for the *control* side.
         Default ``0.05``. Excluded genes are written as NaN in
@@ -1086,14 +1113,11 @@ def t_test(
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="t_test",
     )
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
@@ -1105,7 +1129,10 @@ def t_test(
         output_path=output_path,
     )
 
-    fingerprint = _de_fingerprint(path, call_args, method="t_test")
+    fingerprint = _de_fingerprint(
+        path, call_args, method="t_test",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
     if (r := _try_load_existing_de_result(
         output_path, force=force, verbose=verbose,
         memory_limit_gb=memory_limit_gb,
@@ -1527,7 +1554,6 @@ def nb_glm_test(
     min_pct_pert: float = 0.002,
     min_cells_ctrl: int = 1,
     min_cells_pert: int = 1,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     min_total_count: float = 1.0,
@@ -1681,9 +1707,6 @@ def nb_glm_test(
         Minimum fraction of expressing cells for the *perturbed* side.
         Default ``0.002``. Combined with ``min_mean_pert`` this forms a dual
         condition that is more robust to doublet / ambient-RNA artefacts.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean (size-factor-normalised) expression for the *control* side.
         Default ``0.05``. Excluded genes appear as NaN in ``pvalue`` /
@@ -1795,6 +1818,10 @@ def nb_glm_test(
           are met. For most large datasets (>500K cells), this auto-enables.
         - True: Force frozen control mode. Raises ValueError if requirements not met.
         - False: Disable frozen control (use raw control matrix).
+
+        The mode used is recorded in ``uns["frozen_control"]`` of the result.
+        With ``None``, an existing result is reused whichever mode the run
+        that wrote it chose; pass ``True`` or ``False`` to require one.
         
         Memory efficiency: Per-worker pickle size is reduced from (control_n × n_genes × 8)
         bytes to just ~1MB of sufficient statistics (W_sum, Wz_sum arrays).
@@ -1840,14 +1867,11 @@ def nb_glm_test(
         ``dispersion_trend`` instead.
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="nb_glm_test",
     )
 
@@ -1879,7 +1903,10 @@ def nb_glm_test(
     )
     # Identified by the caller's file: a sorted copy made below is an
     # implementation detail of this run.
-    fingerprint = _de_fingerprint(path, call_args, method="nb_glm")
+    fingerprint = _de_fingerprint(
+        path, call_args, method="nb_glm",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
     if (r := _try_load_existing_de_result(
         _candidate_output_path, force=force, verbose=verbose,
         memory_limit_gb=memory_limit_gb,
@@ -3045,14 +3072,18 @@ def nb_glm_test(
     _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
     # Per-perturbation results live beside the output until the run finishes,
     # so an interrupted run resumes from its last checkpoint.
+    # freeze_control=None is resolved from free memory above, so it is not
+    # part of the result's identity (an identical call would otherwise be
+    # recomputed whenever free memory shifted); the result records the mode
+    # used instead. A resume, though, must fit the remaining rows with the
+    # same model as the saved ones.
+    frozen_control = bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control))
     run = ResumableRun(
         output_path,
         checkpoint_path,
-        # freeze_control is resolved from free memory above; a resume must
-        # fit the remaining rows with the same model as the saved ones.
         fingerprint=_checkpoint_fingerprint(
             fingerprint,
-            frozen_control=bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control)),
+            frozen_control=frozen_control,
             streaming_control=bool(use_streaming_control),
         ),
         arrays={
@@ -3718,6 +3749,7 @@ def nb_glm_test(
     adata.uns["size_factor_method"] = size_factor_method
     adata.uns["size_factor_scope"] = size_factor_scope
     adata.uns["dispersion_scope"] = dispersion_scope
+    adata.uns["frozen_control"] = frozen_control
     adata.uns[_PROVENANCE_KEY] = stamp("de_result", fingerprint)
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
@@ -4152,6 +4184,10 @@ def _wilcoxon_test_streaming(
             finally:
                 backed.file.close()
 
+            # A gene whose values are all tied gets a NaN rank test from the
+            # kernel; it was not tested either.
+            batch_lfc[np.isnan(batch_p)] = np.nan
+
             # P-value adjustment and ordering for this batch
             batch_pvalue_adj = np.ones_like(batch_p)
             _adjust_pvalue_matrix(batch_p, corr_method, out=batch_pvalue_adj)
@@ -4182,6 +4218,13 @@ def _wilcoxon_test_streaming(
     logger.info(f"Completed all {n_batches} group batches")
     if int(verbose) >= 1:
         print(f"[cx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
+    # Completed in the work file, which only then takes the output's name.
+    if scanpy_format:
+        _write_wilcoxon_rank_genes_groups(
+            work_path, groups=candidates, perturbation_column=perturbation_column,
+            control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
+        )
+    write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()
 
@@ -4198,8 +4241,6 @@ def _wilcoxon_test_streaming(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -4591,6 +4632,9 @@ def _wilcoxon_test_stratified(
                 rank_valid_arr = np.array(rank_valid_masks)
                 invalid_arr = ~rank_valid_arr
                 chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                # A gene whose values are all tied gets a NaN rank test from
+                # the kernel; it was not tested either.
+                chunk_lfc[np.isnan(chunk_p) & rank_valid_arr] = np.nan
                 if invalid_arr.any():
                     chunk_u[invalid_arr] = np.nan
                     chunk_z[invalid_arr] = np.nan
@@ -4681,6 +4725,8 @@ def _wilcoxon_test_stratified(
         corr_method=corr_method,
         batch_column=batch_column,
         stratified_diagnostics=stratified_diagnostics,
+        scanpy_format=scanpy_format,
+        provenance=stamp("de_result", fingerprint),
     )
     # Release the memmaps (and their pages) before reading the result back.
     del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
@@ -4698,8 +4744,6 @@ def _wilcoxon_test_stratified(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
 
 
@@ -4716,7 +4760,6 @@ def wilcoxon_test(
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
     min_pct_pert: float = 0.002,
-    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     chunk_size: int | None = None,
@@ -4774,7 +4817,10 @@ def wilcoxon_test(
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
         ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
-        ``pts`` / ``pts_rest`` still populated.
+        ``pts`` / ``pts_rest`` still populated. A gene whose values are all
+        tied across both groups (e.g. zero in every cell, with the filters
+        off) has no rank test and is untested in the same way; Scanpy
+        reports ``score=0``, ``pvalue=1`` for it instead.
     min_pct_ctrl
         Minimum fraction of expressing cells for the *control* side. A gene is
         excluded only when *both* sides are jointly low. Default ``0.01``.
@@ -4783,9 +4829,6 @@ def wilcoxon_test(
         Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
         biologically valid). Combined with ``min_mean_pert`` this forms a dual
         condition more robust than pct alone.
-    min_pct_both
-        If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean log1p expression for the *control* side. Default ``0.05``.
         Excluded genes are written as NaN in ``score`` / ``pvalue`` /
@@ -4894,14 +4937,11 @@ def wilcoxon_test(
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
-    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        min_pct_both=min_pct_both,
-        min_pct_ctrl=min_pct_ctrl,
-        min_pct_pert=min_pct_pert,
         fn_name="wilcoxon_test",
     )
     validate_format_mismatch_policy(format_mismatch_policy)
@@ -4912,6 +4952,17 @@ def wilcoxon_test(
         path, suffix=output_suffix, output_dir=output_dir, data_name=data_name,
         output_path=output_path,
     )
+
+    fingerprint = _de_fingerprint(
+        path, call_args, method="wilcoxon",
+        perturbation_column=perturbation_column, control_label=control_label,
+    )
+    if (r := _try_load_existing_de_result(
+        output_path, force=force, verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
+        fingerprint=fingerprint,
+    )):
+        return r
 
     backed = read_backed(path)
     try:
@@ -4957,14 +5008,6 @@ def wilcoxon_test(
 
     n_groups = len(candidates)
 
-    fingerprint = _de_fingerprint(path, call_args, method="wilcoxon")
-    if (r := _try_load_existing_de_result(
-        output_path, force=force, verbose=verbose,
-        memory_limit_gb=memory_limit_gb,
-        fingerprint=fingerprint,
-    )):
-        return r
-    
     # Determine output path and checkpoint path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
@@ -5376,7 +5419,9 @@ def _wilcoxon_test_standard(
                 # leaves its defaults in the columns it skips, and a gene
                 # excluded here may be tested for another perturbation.
                 invalid_arr = ~valid_arr
-                chunk_lfc[:] = np.where(valid_arr, raw_lfc, np.nan)
+                # A gene whose values are all tied gets a NaN rank test from
+                # the kernel; it was not tested either.
+                chunk_lfc[:] = np.where(valid_arr & ~np.isnan(chunk_p), raw_lfc, np.nan)
                 if invalid_arr.any():
                     chunk_u[invalid_arr] = np.nan
                     chunk_z[invalid_arr] = np.nan
@@ -5451,6 +5496,8 @@ def _wilcoxon_test_standard(
         control_label=control_label,
         tie_correct=tie_correct,
         corr_method=corr_method,
+        scanpy_format=scanpy_format,
+        provenance=stamp("de_result", fingerprint),
     )
     # Release the memmaps (and their pages) before reading the result back.
     del effect_matrix, u_matrix, pvalue_matrix, pvalue_adj_matrix, z_matrix
@@ -5468,9 +5515,36 @@ def _wilcoxon_test_standard(
         corr_method=corr_method,
         memory_limit_gb=memory_limit_gb,
     )
-
-    _finish_wilcoxon_result(output_path, result, scanpy_format=scanpy_format, fingerprint=fingerprint)
     return result
+
+
+# Resident size of one idle loky worker (interpreter, numpy, scipy).
+_APEGLM_WORKER_BASE_MB = 200.0
+
+
+def _apeglm_worker_count(
+    n_jobs: int, n_cells: int, batch_size: int, memory_limit_gb: float | None
+) -> int:
+    """Workers for apeGLM shrinkage: ``n_jobs``, capped so the workers fit in
+    ``memory_limit_gb`` (or the memory available, when ``None``).
+
+    Each task carries one gene's counts, the two-column design and the log
+    size factors (4 float64 vectors of ``n_cells``); a worker holds a batch
+    of ``batch_size`` tasks and works on one gene at a time (about 8 more
+    vectors). joblib also keeps up to two more batches per worker queued in
+    the parent (its default ``pre_dispatch="2*n_jobs"``), so each worker
+    accounts for three batches in all.
+    """
+    per_worker_mb = _APEGLM_WORKER_BASE_MB + (3 * 4 * batch_size + 8) * n_cells * 8 / 1e6
+    return min(
+        _resolve_n_jobs(n_jobs),
+        _estimate_max_workers(
+            n_cells,
+            1,
+            memory_per_worker_mb=per_worker_mb,
+            memory_limit_mb=None if memory_limit_gb is None else memory_limit_gb * 1e3,
+        ),
+    )
 
 
 def shrink_lfc(
@@ -5561,10 +5635,10 @@ def shrink_lfc(
         - `profiling_enabled`: True
         When False (default), `adata.uns["profiling"]` is set to "NA".
     memory_limit_gb
-        Optional memory budget in gigabytes. When ``method="full"``, this
-        limits the number of parallel ``n_jobs`` so that joblib workers stay
-        within the budget. When ``None`` (default), detects available system
-        memory via ``psutil``.
+        Optional memory budget in gigabytes. With ``method="full"``, the
+        number of parallel workers is capped so that they fit in the budget
+        (``None``, the default, uses the memory currently available).
+        ``method="stats"`` holds no per-worker data and ignores it.
     verbose
         Print basic progress/completion messages. Defaults to ``True``.
 
@@ -5821,6 +5895,14 @@ def shrink_lfc(
             control_counts = backed.X[control_idx, :].toarray() if sp.issparse(backed.X[control_idx, :]) else np.asarray(backed.X[control_idx, :])
             control_size_factors = size_factors_all[control_idx]
             
+            # Workers sized once, for the largest comparison: probing free
+            # memory per perturbation would cost thousands of probes.
+            group_sizes = pd.Series(labels).value_counts().reindex(candidates, fill_value=0)
+            largest_pert = int(group_sizes.max()) if len(group_sizes) else 0
+            apeglm_jobs = _apeglm_worker_count(
+                n_jobs, len(control_idx) + largest_pert, batch_size, memory_limit_gb,
+            )
+
             # Process each perturbation
             for group_idx, pert_label in enumerate(candidates):
                 logger.debug(f"Shrinking LFC for perturbation {group_idx + 1}/{n_groups}: {pert_label}")
@@ -5879,7 +5961,7 @@ def shrink_lfc(
                     mle_se=se_group,
                     shrink_index=1,
                     prior_scale=pert_prior_scale,
-                    n_jobs=n_jobs,
+                    n_jobs=apeglm_jobs,
                     batch_size=batch_size,
                     min_mu=min_mu,
                 )

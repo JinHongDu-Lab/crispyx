@@ -1,15 +1,6 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import numpy as np
 import pandas as pd
@@ -38,7 +29,7 @@ CHUNK_SIZE = 128
 @pytest.fixture(scope="module")
 def subset_dataset(tmp_path_factory):
     if not DATA_PATH.exists():
-        pytest.skip(f"Sample dataset not found at {DATA_PATH}")
+        pytest.skip(f"data/{DATA_PATH.name} not found")
 
     adata = sc.read_h5ad(DATA_PATH)
     # Work on a small but representative subset to keep the test quick.

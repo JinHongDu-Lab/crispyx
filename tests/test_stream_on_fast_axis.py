@@ -9,18 +9,9 @@ files big enough to be genuinely slow.
 from __future__ import annotations
 
 import os
-import sys
 import time
 import warnings
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import anndata as ad
 import numpy as np

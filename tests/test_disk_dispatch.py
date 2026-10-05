@@ -2,19 +2,10 @@
 
 from __future__ import annotations
 
-import sys
 import shutil
 import types
 import warnings
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import pytest
 
@@ -32,36 +23,32 @@ from crispyx._disk import (
 # estimate_bytes / estimate_sparse_output_bytes / estimate_conversion_bytes
 # ---------------------------------------------------------------------------
 
-class TestEstimateBytes:
-    def test_scales_with_extra_dims(self):
-        base = estimate_bytes(1000, 20000)
-        assert estimate_bytes(1000, 20000, 2) == pytest.approx(base * 2)  # n_layers=2
-
-    def test_exact_with_default_overhead(self):
-        assert estimate_bytes(100, 2000, itemsize=8) == 100 * 2000 * 8
-
-    def test_default_itemsize_is_float64(self):
-        assert estimate_bytes(10, 10) == estimate_bytes(10, 10, itemsize=8)
-
-    def test_overhead_multiplies_final_size(self):
-        assert estimate_bytes(100, 2000, overhead=1.10) == pytest.approx(100 * 2000 * 8 * 1.10)
-
-    def test_no_dims_falls_back_to_one_element(self):
-        # Degenerate but should not raise: product of an empty dims sequence
-        # is 1, so this returns a single element's worth of bytes.
-        assert estimate_bytes() == 8.0
+@pytest.mark.parametrize(
+    "args, kwargs, expected",
+    [
+        ((100, 2000), dict(itemsize=8), 100 * 2000 * 8),
+        ((10, 10), {}, 10 * 10 * 8),  # default itemsize is float64
+        ((1000, 20000, 2), {}, 1000 * 20000 * 2 * 8),  # extra dims multiply
+        ((100, 2000), dict(overhead=1.10), 100 * 2000 * 8 * 1.10),
+        ((), {}, 8.0),  # empty dims: one element
+    ],
+    ids=["exact", "default-itemsize", "extra-dims", "overhead", "no-dims"],
+)
+def test_estimate_bytes(args, kwargs, expected):
+    assert estimate_bytes(*args, **kwargs) == pytest.approx(expected)
 
 
-class TestEstimateSparseOutputBytes:
-    def test_scales_with_nnz(self):
-        assert estimate_sparse_output_bytes(1000) == pytest.approx(1000 * (4 + 4) * 1.10)
-
-    def test_zero_nnz_is_zero(self):
-        assert estimate_sparse_output_bytes(0) == 0.0
-
-    def test_custom_itemsizes(self):
-        result = estimate_sparse_output_bytes(100, value_itemsize=8, index_itemsize=8, overhead=1.0)
-        assert result == 100 * 16
+@pytest.mark.parametrize(
+    "nnz, kwargs, expected",
+    [
+        (1000, {}, 1000 * (4 + 4) * 1.10),
+        (0, {}, 0.0),
+        (100, dict(value_itemsize=8, index_itemsize=8, overhead=1.0), 100 * 16),
+    ],
+    ids=["defaults", "zero", "custom-itemsizes"],
+)
+def test_estimate_sparse_output_bytes(nnz, kwargs, expected):
+    assert estimate_sparse_output_bytes(nnz, **kwargs) == pytest.approx(expected)
 
 
 class TestEstimateConversionBytes:

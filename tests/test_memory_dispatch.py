@@ -1,328 +1,141 @@
-"""Tests for adaptive memory dispatch and memory_limit_gb parameter."""
+"""Memory-driven dispatch: the streaming decision, chunk sizing, and ``memory_limit_gb``.
+
+The heuristics are checked against their documented contract plus one table
+of the benchmark datasets they were tuned on; the end-to-end test checks that
+whatever path ``memory_limit_gb`` selects, the DE result is the same.
+"""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
-import pytest
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 import anndata as ad
-import scanpy as sc
 
-from crispyx._memory import (
-    _resolve_memory_limit_bytes,
-    _should_use_streaming,
+import crispyx as cx
+from crispyx._memory import _resolve_memory_limit_bytes, _should_use_streaming
+from crispyx.data import calculate_optimal_gene_chunk_size, calculate_wilcoxon_chunk_size
+
+# Benchmark dataset shapes and the dispatch each must get at 128 GB.
+# (name, n_groups, n_genes, n_cells, streaming_expected)
+DATASETS = [
+    ("Adamson_subset",         2,  11_630,     1_716, False),
+    ("Adamson",               91,  32_738,    65_337, False),
+    ("Frangieh",             248,  23_712,   218_331, False),
+    ("Tian-crispra",         100,  33_538,    21_193, False),
+    ("Tian-crispri",         184,  33_538,    32_300, False),
+    ("Feng-gwsf",          2_254,  36_518,   322_746, False),  # 21 GB peak < 38.4 GB threshold
+    ("Feng-gwsnf",         4_955,  36_518,   396_458, True),   # 46 GB peak > 38.4 GB
+    ("Feng-ts",              444,  36_518, 1_161_864, False),
+    ("Huang-HCT116-est",   7_000,  38_606,   700_000, True),
+    ("Huang-HEK293T",     18_311,  38_606, 4_534_299, True),
+]
+_IDS = [d[0] for d in DATASETS]
+
+
+@pytest.mark.parametrize("limit_gb", [0.5, 128])
+def test_explicit_memory_limit_is_used_as_given(limit_gb):
+    assert _resolve_memory_limit_bytes(limit_gb) == limit_gb * 1e9
+
+
+def test_detected_memory_limit_is_positive():
+    assert _resolve_memory_limit_bytes(None) > 0
+
+
+@pytest.mark.parametrize(
+    "n_groups, n_genes, limit_gb, fraction",
+    [(10, 1_000, 128, 0.30), (1_000, 20_000, 128, 0.30), (1_000, 20_000, 128, 0.03),
+     (200, 36_000, 0.01, 0.30), (20_000, 36_000, 128, 0.30)],
 )
-from crispyx.de import wilcoxon_test, t_test, shrink_lfc
+def test_streaming_decision_follows_its_contract(n_groups, n_genes, limit_gb, fraction):
+    """peak = 5 x the result arrays (7 float64 + 2 float32 per group and gene);
+    stream when peak exceeds ``fraction`` of the budget, in batches of at
+    least 100 groups that fit half that fraction."""
+    use, peak, budget, batch = _should_use_streaming(
+        n_groups, n_genes, memory_limit_gb=limit_gb, threshold_fraction=fraction,
+    )
+    bytes_per_group = n_genes * (7 * 8 + 2 * 4)
+    assert peak == pytest.approx(5.0 * n_groups * bytes_per_group)
+    assert budget == limit_gb * 1e9
+    assert use is (peak > fraction * budget)
+    if use:
+        assert batch == min(n_groups, max(100, int(budget * fraction / 2 / bytes_per_group)))
+    else:
+        assert batch == n_groups
 
 
-# ---------------------------------------------------------------------------
-# _resolve_memory_limit_bytes
-# ---------------------------------------------------------------------------
-
-class TestResolveMemoryLimitBytes:
-    def test_explicit_value(self):
-        result = _resolve_memory_limit_bytes(128)
-        assert result == 128 * 1e9
-
-    def test_none_returns_positive(self):
-        result = _resolve_memory_limit_bytes(None)
-        assert result > 0
-
-    def test_fractional_value(self):
-        result = _resolve_memory_limit_bytes(0.5)
-        assert result == 0.5 * 1e9
+@pytest.mark.parametrize("name, n_groups, n_genes, n_cells, expected", DATASETS, ids=_IDS)
+def test_benchmark_datasets_dispatch_as_tuned(name, n_groups, n_genes, n_cells, expected):
+    use, _, _, batch = _should_use_streaming(n_groups, n_genes, memory_limit_gb=128)
+    assert use is expected
+    if name == "Feng-gwsnf":
+        # One batch covers every group, so wilcoxon_test keeps the memmap path.
+        assert batch >= n_groups
 
 
-# ---------------------------------------------------------------------------
-# _should_use_streaming
-# ---------------------------------------------------------------------------
-
-class TestShouldUseStreaming:
-    def test_small_dataset_no_streaming(self):
-        """Small dataset: 10 groups × 1000 genes should NOT trigger streaming."""
-        use, peak, budget, batch = _should_use_streaming(
-            10, 1000, memory_limit_gb=128,
-        )
-        assert use is False
-        # batch_size equals n_groups when not streaming
-        assert batch == 10
-
-    def test_large_dataset_triggers_streaming(self):
-        """~5000 groups × 36000 genes with 4 GB limit should trigger streaming."""
-        use, peak, budget, batch = _should_use_streaming(
-            5000, 36000, memory_limit_gb=4,
-        )
-        assert use is True
-        assert batch < 5000
-        assert batch >= 100
-
-    def test_128gb_large_dataset(self):
-        """Real-world scenario: 5000 groups × 36K genes under 128 GB.
-        
-        This matches the Feng-gwsnf dataset that OOM'd at 47 GB peak
-        on HPC with 128 GB allocation.  With peak_multiplier=4.0 the
-        dispatch now correctly triggers streaming.
-        """
-        use, peak, budget, batch = _should_use_streaming(
-            5000, 36000, memory_limit_gb=128,
-        )
-        # bytes_per_group = 36000 * (7*8 + 2*4) = 36000 * 64 = 2,304,000
-        # memmap_total = 5000 * 2,304,000 = 11,520,000,000 (~11.5 GB)
-        # peak = 46 GB (×4), threshold = 128*1e9*0.30 = 38.4 GB => streaming
-        assert use is True
-        assert batch <= 5000
-
-    def test_extreme_group_count_triggers_streaming(self):
-        """~20000 groups × 36000 genes under 128 GB should trigger streaming."""
-        use, peak, budget, batch = _should_use_streaming(
-            20000, 36000, memory_limit_gb=128,
-        )
-        # peak = 20000 * 36000 * 64 * 2 = ~92 GB, threshold = 38.4 GB
-        assert use is True
-        assert batch < 20000
-
-    def test_custom_threshold_fraction(self):
-        """Lower threshold_fraction makes streaming trigger earlier."""
-        # Use a medium dataset that does NOT trigger at default 0.30
-        # 1000 groups × 20000 genes: memmap=1.28 GB, peak=5.12 GB(×4)
-        # threshold@0.30 = 38.4 GB → no stream; threshold@0.03 = 3.84 GB → stream
-        use_default, _, _, _ = _should_use_streaming(
-            1000, 20000, memory_limit_gb=128, threshold_fraction=0.30,
-        )
-        use_strict, _, _, _ = _should_use_streaming(
-            1000, 20000, memory_limit_gb=128, threshold_fraction=0.03,
-        )
-        # Strict threshold should trigger while default does not
-        assert use_default is False
-        assert use_strict is True
-
-    def test_returns_positive_budget(self):
-        _, _, budget, _ = _should_use_streaming(10, 100, memory_limit_gb=64)
-        assert budget == 64 * 1e9
-
-    def test_batch_size_bounded(self):
-        """Batch size should be at least 100 and at most n_groups."""
-        use, _, _, batch = _should_use_streaming(
-            200, 36000, memory_limit_gb=0.01,  # tiny limit forces streaming
-        )
-        assert use is True
-        assert batch >= 100
-        assert batch <= 200
+@pytest.mark.parametrize("name, n_groups, n_genes, n_cells, _", DATASETS, ids=_IDS)
+def test_gene_chunk_size_is_bounded_and_capped_by_cell_count(name, n_groups, n_genes, n_cells, _):
+    """Hard caps by cell count apply below 32 GB; at 128 GB the memory formula
+    decides, and never gives a smaller chunk than the capped one."""
+    low = calculate_optimal_gene_chunk_size(n_cells, n_genes, n_groups=n_groups, available_memory_gb=16)
+    high = calculate_optimal_gene_chunk_size(n_cells, n_genes, n_groups=n_groups, available_memory_gb=128)
+    cap = 32 if n_cells > 1_000_000 else 64 if n_cells > 500_000 else 128 if n_cells > 300_000 else 512
+    assert 32 <= low <= cap
+    assert 32 <= high <= 512
+    if n_groups > 2000:
+        assert high <= 384
+    if n_cells > 300_000:
+        assert high >= low
 
 
-# ---------------------------------------------------------------------------
-# wilcoxon_test with memory_limit_gb
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "n_obs, n_vars, n_groups, expected",
+    [(10_000, 5_000, 50, 512), (1_161_864, 33_165, 444, range(32, 512))],
+    ids=["small-hits-max", "Feng-ts-budget-capped"],
+)
+def test_gene_chunk_size_per_chunk_budget(n_obs, n_vars, n_groups, expected):
+    chunk = calculate_optimal_gene_chunk_size(n_obs, n_vars, n_groups=n_groups, available_memory_gb=128.0)
+    assert chunk == expected if isinstance(expected, int) else chunk in expected
 
-def _make_test_h5ad(tmp_path: Path, n_cells: int = 60, n_genes: int = 20, n_perts: int = 3) -> Path:
-    """Create a small normalised sparse h5ad for wilcoxon testing."""
+
+@pytest.mark.parametrize(
+    "n_obs, n_vars, memory_gb, low, high",
+    [
+        (21_071, 22_040, 128, 4096, 4096),       # small: hits max_chunk
+        (393_465, 32_373, 128, 3001, 4096),      # Feng-gwsnf
+        (1_161_864, 33_165, 128, 1001, 4096),    # Feng-ts
+        (1_970_000, 8_248, 128, 701, 4096),      # Replogle-GW
+        (393_465, 32_373, 16, 32, 999),          # Feng-gwsnf on a small node
+    ],
+    ids=["small", "Feng-gwsnf", "Feng-ts", "Replogle-GW", "Feng-gwsnf-16GB"],
+)
+def test_wilcoxon_chunk_size(n_obs, n_vars, memory_gb, low, high):
+    assert low <= calculate_wilcoxon_chunk_size(n_obs, n_vars, available_memory_gb=memory_gb) <= high
+
+
+@pytest.fixture(scope="module")
+def log_screen(tmp_path_factory):
     rng = np.random.default_rng(42)
-    counts = rng.poisson(2, size=(n_cells, n_genes)).astype(float)
-    labels = (["control"] * (n_cells // 2)
-              + [f"pert_{i}" for i in range(n_perts) for _ in range(n_cells // (2 * n_perts))])
-    # pad to n_cells
-    while len(labels) < n_cells:
-        labels.append("control")
-    labels = labels[:n_cells]
-    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(n_cells)])
-    var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
-    adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
-    # Normalise
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    adata.X = sp.csr_matrix(adata.X)
-    path = tmp_path / "test_norm.h5ad"
-    adata.write(path)
+    labels = ["control"] * 30 + [f"pert_{i}" for i in range(3) for _ in range(10)]
+    counts = rng.poisson(2, size=(len(labels), 20)).astype(np.float32)
+    X = np.log1p(counts / np.maximum(counts.sum(axis=1, keepdims=True), 1) * 1e4)
+    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(len(labels))])
+    var = pd.DataFrame(index=[f"gene{i}" for i in range(20)])
+    path = tmp_path_factory.mktemp("memory") / "norm.h5ad"
+    ad.AnnData(sp.csr_matrix(X), obs=obs, var=var).write(path)
     return path
 
 
-class TestWilcoxonMemoryLimit:
-    def test_standard_path_with_memory_limit(self, tmp_path):
-        """memory_limit_gb=128 on a small dataset should use the standard path."""
-        path = _make_test_h5ad(tmp_path)
-        result = wilcoxon_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            memory_limit_gb=128,
-        )
-        assert len(result.groups) == 3
-        assert result.pvalues.shape[1] == 20
-
-    def test_streaming_path_with_tiny_limit(self, tmp_path):
-        """A very small memory_limit_gb should force the streaming path."""
-        path = _make_test_h5ad(tmp_path, n_cells=60, n_genes=20, n_perts=3)
-        # 3 groups * 20 genes is tiny, but memory_limit_gb=0.0000001 forces streaming
-        result = wilcoxon_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            data_name="stream_test",
-            memory_limit_gb=1e-7,
-        )
-        assert len(result.groups) == 3
-        assert result.pvalues.shape[1] == 20
-
-    def test_results_match_across_paths(self, tmp_path):
-        """Standard and streaming paths should produce identical results."""
-        path = _make_test_h5ad(tmp_path)
-
-        standard = wilcoxon_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            data_name="standard",
-            memory_limit_gb=128,
-        )
-        streaming = wilcoxon_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            data_name="streaming",
-            memory_limit_gb=1e-7,  # force streaming
-        )
-
-        np.testing.assert_allclose(standard.pvalues, streaming.pvalues, atol=1e-10)
-        np.testing.assert_allclose(standard.statistics, streaming.statistics, atol=1e-10)
-        np.testing.assert_allclose(standard.logfoldchanges, streaming.logfoldchanges, atol=1e-10)
-        np.testing.assert_allclose(standard.effect_size, streaming.effect_size, atol=1e-10)
-
-    def test_default_none_uses_system_memory(self, tmp_path):
-        """memory_limit_gb=None (default) should still work and not crash."""
-        path = _make_test_h5ad(tmp_path)
-        result = wilcoxon_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-        )
-        assert len(result.groups) == 3
-
-
-# ---------------------------------------------------------------------------
-# t_test with memory_limit_gb
-# ---------------------------------------------------------------------------
-
-class TestTTestMemoryLimit:
-    def test_with_explicit_memory_limit(self, tmp_path):
-        """t_test should accept memory_limit_gb and produce valid results."""
-        path = _make_test_h5ad(tmp_path)
-        result = t_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            memory_limit_gb=128,
-        )
-        assert len(result.groups) == 3
-        assert result.pvalues.shape[1] == 20
-
-    def test_default_none(self, tmp_path):
-        """memory_limit_gb=None (default) should auto-detect and work."""
-        path = _make_test_h5ad(tmp_path)
-        result = t_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-        )
-        assert len(result.groups) == 3
-
-    def test_small_limit_still_works(self, tmp_path):
-        """Even a very small memory_limit_gb should produce valid results."""
-        path = _make_test_h5ad(tmp_path)
-        result = t_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="control",
-            output_dir=tmp_path,
-            data_name="t_test_tiny",
-            memory_limit_gb=0.001,
-        )
-        assert len(result.groups) == 3
-
-
-# ---------------------------------------------------------------------------
-# shrink_lfc with memory_limit_gb
-# ---------------------------------------------------------------------------
-
-def _make_nb_glm_h5ad(tmp_path: Path) -> Path:
-    """Create a minimal NB-GLM-like result h5ad for shrink_lfc testing."""
-    rng = np.random.default_rng(99)
-    n_groups, n_genes = 3, 20
-    obs = pd.DataFrame(
-        {"perturbation": [f"pert_{i}" for i in range(n_groups)]},
-        index=[f"g{i}" for i in range(n_groups)],
-    )
-    # Layout of an unshrunk nb_glm_test result with a global dispersion:
-    # X is the LFC, per-gene dispersion and pts_rest live in var.
-    var = pd.DataFrame(
-        {
-            "pts_rest": rng.uniform(size=n_genes).astype(np.float32),
-            "dispersion": np.abs(rng.standard_normal(n_genes)) + 0.1,
-        },
-        index=[f"gene{i}" for i in range(n_genes)],
-    )
-    lfc = rng.standard_normal((n_groups, n_genes)).astype(np.float64)
-    se = np.abs(rng.standard_normal((n_groups, n_genes))).astype(np.float64) + 0.1
-    adata = ad.AnnData(
-        X=lfc.copy(),
-        obs=obs,
-        var=var,
-        layers={
-            "logfoldchange_raw_ln": lfc * np.log(2),
-            "standard_error": se.copy(),
-            "standard_error_ln": se * np.log(2),
-            "intercept": rng.standard_normal((n_groups, n_genes)),
-            "pvalue": rng.uniform(size=(n_groups, n_genes)),
-            "pvalue_adj": rng.uniform(size=(n_groups, n_genes)),
-            "z_score": rng.standard_normal((n_groups, n_genes)),
-            "pts": rng.uniform(size=(n_groups, n_genes)).astype(np.float32),
-        },
-    )
-    adata.uns["control_label"] = "control"
-    adata.uns["perturbation_column"] = "perturbation"
-    adata.uns["lfc_base"] = "log2"
-    adata.uns["method"] = "nb_glm"
-    adata.uns["lfc_shrinkage_type"] = "none"
-    path = tmp_path / "nb_glm_result.h5ad"
-    adata.write(path)
-    return path
-
-
-class TestShrinkLfcMemoryLimit:
-    def test_with_explicit_memory_limit(self, tmp_path):
-        """shrink_lfc should accept memory_limit_gb and produce valid results."""
-        path = _make_nb_glm_h5ad(tmp_path)
-        result = shrink_lfc(
-            path,
-            output_dir=tmp_path,
-            memory_limit_gb=128,
-        )
-        assert result is not None
-
-    def test_default_none(self, tmp_path):
-        """memory_limit_gb=None (default) should work."""
-        path = _make_nb_glm_h5ad(tmp_path)
-        result = shrink_lfc(
-            path,
-            output_dir=tmp_path,
-            data_name="shrunk_default",
-        )
-        assert result is not None
+@pytest.mark.parametrize("fn", [cx.wilcoxon_test, cx.t_test], ids=["wilcoxon", "t_test"])
+def test_memory_limit_does_not_change_the_result(log_screen, tmp_path, fn):
+    """A tiny limit forces the streaming / smallest-chunk path; the numbers must not move."""
+    results = [
+        fn(log_screen, perturbation_column="perturbation", control_label="control",
+           output_path=tmp_path / f"{i}.h5ad", memory_limit_gb=limit, verbose=False)
+        for i, limit in enumerate([128, None, 1e-7])
+    ]
+    for other in results[1:]:
+        assert other.groups == results[0].groups
+        for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size"):
+            np.testing.assert_allclose(getattr(other, field), getattr(results[0], field), atol=1e-10, err_msg=field)

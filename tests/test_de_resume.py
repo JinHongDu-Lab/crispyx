@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for _p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 import anndata as ad
 import h5py
@@ -184,12 +179,31 @@ def test_changed_parameters_start_fresh(screen, tmp_path, monkeypatch):
         with pytest.raises(Interrupted):
             _run("t_test", screen, out)
     runs = _record_runs(monkeypatch)
-    _run("t_test", screen, out, resume=True, min_pct_ctrl=0.2)
+    with pytest.warns(UserWarning, match="Not resuming .*argument 'min_pct_ctrl' differs"):
+        _run("t_test", screen, out, resume=True, min_pct_ctrl=0.2)
     assert not runs[-1].resumed
 
     reference = tmp_path / "reference.h5ad"
     _run("t_test", screen, reference, min_pct_ctrl=0.2)
     _assert_same_result(reference, out)
+
+
+def test_checkpoint_listing_an_argument_left_at_none_resumes(screen, tmp_path, monkeypatch, recwarn):
+    """A checkpoint saved by a version with a since-removed ``None``-default
+    argument (0.1.7's ``min_pct_both``) is the same call and resumes."""
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run("t_test", screen, out)
+    checkpoint = out.with_suffix(".progress.json")
+    saved = json.loads(checkpoint.read_text())
+    saved["fingerprint"]["params"]["min_pct_both"] = None
+    checkpoint.write_text(json.dumps(saved))
+    runs = _record_runs(monkeypatch)
+    _run("t_test", screen, out, resume=True)
+    assert runs[-1].resumed
+    assert not [w for w in recwarn if "Not resuming" in str(w.message)]
 
 
 def test_resume_false_discards_a_stale_checkpoint(screen, tmp_path, monkeypatch):
@@ -248,6 +262,31 @@ def test_wilcoxon_killed_while_writing_leaves_no_output(screen, tmp_path, monkey
     _run(case, screen, out, resume=True)
     assert runs[-1].resumed
     _assert_same_result(reference, out)
+
+
+@pytest.mark.parametrize("case", ["wilcoxon", "wilcoxon_stratified", "wilcoxon_streaming"])
+def test_wilcoxon_killed_after_writing_is_reused(screen, tmp_path, monkeypatch, request, case):
+    """The output is stamped as it is written, before the checkpoint goes, so
+    a kill while reading the result back loses no work: the next call reuses
+    the file, with its Scanpy structure."""
+    if case == "wilcoxon_streaming":
+        request.getfixturevalue("streaming")
+    method = "wilcoxon" if case == "wilcoxon_streaming" else case
+    out = tmp_path / "result.h5ad"
+
+    def killed(*args, **kwargs):
+        raise Interrupted
+
+    with monkeypatch.context() as m:
+        m.setattr(de, "_build_result_from_h5ad", killed)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out, scanpy_format=True)
+    assert not out.with_suffix(".progress.json").exists()
+    runs = _record_runs(monkeypatch)
+    result = _run(method, screen, out, scanpy_format=True)
+    assert not runs, "the finished output was recomputed"
+    with h5py.File(out, "r") as f:
+        np.testing.assert_array_equal(f["uns/rank_genes_groups/full/scores"][()], result.statistics)
 
 
 def test_streaming_wilcoxon_restarts_when_its_work_file_is_unreadable(screen, tmp_path, monkeypatch, streaming):
@@ -316,3 +355,13 @@ def test_fingerprint_tells_array_arguments_apart(screen):
     assert fp(sf) != fp(nudged)
     assert fp(sf.to_numpy()) != fp(nudged.to_numpy())
     assert len(str(fp(np.ones(2_000_000)))) < 1000  # a digest, not the vector
+
+
+@pytest.mark.parametrize(
+    "n_perturbations, requested, expected",
+    [(50, None, 1), (500, None, 10), (5000, None, 50), (500, 3, 3), (500, 0, 1)],
+)
+def test_checkpoint_interval(n_perturbations, requested, expected):
+    from crispyx._checkpoint import _get_checkpoint_interval
+
+    assert _get_checkpoint_interval(n_perturbations, requested) == expected

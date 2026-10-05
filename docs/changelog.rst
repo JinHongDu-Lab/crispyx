@@ -1,6 +1,51 @@
 Changelog
 =========
 
+Version 0.1.8
+-------------
+
+*Released 2026-10-05.*
+
+* **Changed: tied genes are untested in ``wilcoxon_test``.** A gene whose
+  values are all tied across control and perturbation (e.g. zero in every
+  cell, which only reaches the test with the low-expression filters off)
+  used to be reported as ``score=0``, ``pvalue=1``, ``logfoldchanges=0``, as
+  in Scanpy. The rank test is undefined there, so it is now ``NaN`` in every
+  derived column, matching ``t_test``, ``nb_glm_test`` and every other
+  untested gene -- with or without ``tie_correct`` and with or without
+  ``batch_column`` (where a gene tied within every batch is untested). DE
+  results written by 0.1.7 are therefore recomputed once.
+* **Removed: ``min_pct_both``** from ``t_test``, ``wilcoxon_test`` and
+  ``nb_glm_test``. It was deprecated in favour of ``min_pct_ctrl`` and
+  ``min_pct_pert``, but the DE functions accepted it without a warning.
+  Pass ``min_pct_ctrl`` and ``min_pct_pert`` instead.
+* **Fixed: ``shrink_lfc(method="full")`` ignored ``memory_limit_gb``.** The
+  parameter was documented to cap the parallel workers but was never read.
+  The worker count is now capped so the workers fit in the budget (or in the
+  memory available, when it is ``None``); ``method="stats"`` is unaffected.
+* An argument left at ``None`` no longer counts when deciding whether an
+  existing result or a checkpoint can be reused, so adding or removing an
+  optional parameter in a release does not force every cached result to be
+  recomputed or throw away an interrupted run. A ``resume=True`` call that
+  cannot use the checkpoint it finds now warns and says why before starting
+  over.
+* **Fixed: aliases and** ``cx.tl.rank_genes_groups`` **did not share
+  results.** ``groupby``/``reference`` and ``perturbation_column``/
+  ``control_label`` now name the same call, and ``rank_genes_groups`` reuses
+  (and is reused by) a direct DE call on the same file. ``wilcoxon_test``
+  also checks for a reusable result before reading the input's labels.
+* **Fixed: ``wilcoxon_test(scanpy_format=True)``** skipped
+  ``uns["rank_genes_groups"]`` when the result was too large to load, while
+  recording that it had been written. It is now written from the file, a
+  block of groups at a time, at any size. The result's provenance is also
+  written with it, so a run killed while the result is read back is reused
+  rather than recomputed.
+* ``nb_glm_test`` records whether it fitted with frozen control statistics
+  in ``uns["frozen_control"]``. With ``freeze_control=None`` (chosen from the
+  memory available), an existing result is reused whichever mode it used.
+* ``shrink_lfc(method="full")`` also budgets the batches joblib queues for
+  each worker, and sizes the workers once rather than per perturbation.
+
 Version 0.1.7
 -------------
 

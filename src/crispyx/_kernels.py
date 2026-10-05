@@ -589,492 +589,12 @@ def _wls_solve_2x2_numba(
 
 
 # =============================================================================
-# Wilcoxon rank-sum test kernels
-# =============================================================================
-
-@nb.njit(parallel=True, cache=True)
-def _rankdata_2d_numba(arr: np.ndarray, ranks_out: np.ndarray) -> None:
-    """Compute average ranks for each column of a 2D array in parallel.
-    
-    Ranks are computed along axis=0 (within each column), matching
-    scipy.stats.rankdata(arr, axis=0, method='average').
-    
-    Parameters
-    ----------
-    arr : (n_samples, n_genes)
-        Input matrix to rank.
-    ranks_out : (n_samples, n_genes)
-        Output array for ranks (modified in-place).
-    """
-    n_samples, n_genes = arr.shape
-    
-    for g in nb.prange(n_genes):
-        col = arr[:, g].copy()
-        order = np.argsort(col)
-        
-        # Assign ranks with tie averaging
-        i = 0
-        while i < n_samples:
-            j = i
-            while j < n_samples - 1 and col[order[j + 1]] == col[order[i]]:
-                j += 1
-            avg_rank = (i + j + 2) / 2.0
-            for k in range(i, j + 1):
-                ranks_out[order[k], g] = avg_rank
-            i = j + 1
-
-
-@nb.njit(parallel=True, cache=True)
-def _tie_correction_numba(ranks: np.ndarray, correction_out: np.ndarray) -> None:
-    """Compute tie correction factors for Wilcoxon test in parallel.
-    
-    The tie correction factor is: 1 - sum(t^3 - t) / (n^3 - n)
-    where t is the count of each tied group.
-    
-    Parameters
-    ----------
-    ranks : (n_samples, n_genes)
-        Rank matrix.
-    correction_out : (n_genes,)
-        Output array for correction factors (modified in-place).
-    """
-    n_samples, n_genes = ranks.shape
-    size = float(n_samples)
-    denom = size ** 3 - size
-    
-    for g in nb.prange(n_genes):
-        if denom <= 0 or n_samples < 2:
-            correction_out[g] = 1.0
-            continue
-        
-        # Sort column to find tie groups
-        col = ranks[:, g].copy()
-        col.sort()
-        
-        # Count ties and accumulate t^3 - t
-        tie_sum = 0.0
-        i = 0
-        while i < n_samples:
-            j = i
-            while j < n_samples - 1 and col[j + 1] == col[j]:
-                j += 1
-            count = float(j - i + 1)
-            if count > 1:
-                tie_sum += count ** 3 - count
-            i = j + 1
-        
-        correction_out[g] = 1.0 - tie_sum / denom
-
-
-@nb.njit(parallel=True, cache=True)
-def _compute_rank_sums_batch_numba(
-    ranks: np.ndarray,
-    pert_indices_flat: np.ndarray,
-    pert_offsets: np.ndarray,
-    pert_counts: np.ndarray,
-    n_pert_groups: int,
-    control_n: int,
-    tie_correction: np.ndarray,
-    u_stat_out: np.ndarray,
-    z_score_out: np.ndarray,
-    pvalue_out: np.ndarray,
-) -> None:
-    """Compute Wilcoxon statistics for multiple perturbation groups sharing control.
-    
-    This batched version computes statistics for all perturbations at once,
-    reusing the pre-computed ranks matrix. Each perturbation group's cells
-    are specified by slices into pert_indices_flat.
-    
-    Parameters
-    ----------
-    ranks : (n_total_cells, n_genes)
-        Pre-computed ranks for all cells (control + all perturbation cells).
-        Control cells are at indices [0:control_n).
-    pert_indices_flat : (sum of all pert cell counts,)
-        Flattened array of cell indices for all perturbation groups.
-    pert_offsets : (n_pert_groups,)
-        Start offset into pert_indices_flat for each perturbation group.
-    pert_counts : (n_pert_groups,)
-        Number of cells in each perturbation group.
-    n_pert_groups : int
-        Number of perturbation groups.
-    control_n : int
-        Number of control cells.
-    tie_correction : (n_genes,)
-        Tie correction factors (computed from all-cell ranks).
-    u_stat_out : (n_pert_groups, n_genes)
-        Output U-statistics.
-    z_score_out : (n_pert_groups, n_genes)
-        Output z-scores.
-    pvalue_out : (n_pert_groups, n_genes)
-        Output p-values.
-    """
-    n_genes = ranks.shape[1]
-    control_n_f = float(control_n)
-    
-    # Parallelize over perturbation groups
-    for p_idx in nb.prange(n_pert_groups):
-        n_pert = pert_counts[p_idx]
-        n_pert_f = float(n_pert)
-        n_total = n_pert_f + control_n_f
-        
-        # Get slice of cell indices for this perturbation
-        start_idx = pert_offsets[p_idx]
-        end_idx = start_idx + n_pert
-        
-        expected = n_pert_f * (n_total + 1.0) / 2.0
-        
-        for g in range(n_genes):
-            # Sum ranks for perturbation cells
-            rank_sum = 0.0
-            for i in range(start_idx, end_idx):
-                cell_idx = pert_indices_flat[i]
-                rank_sum += ranks[cell_idx, g]
-            
-            # U-statistic
-            u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
-            u_stat_out[p_idx, g] = u_stat
-            
-            # Standard deviation with tie correction
-            std = math.sqrt(
-                tie_correction[g] * n_pert_f * control_n_f * (n_total + 1.0) / 12.0
-            )
-            
-            if std > 0:
-                z = (rank_sum - expected) / std
-                z_score_out[p_idx, g] = z
-                abs_z = abs(z)
-                pvalue_out[p_idx, g] = math.erfc(abs_z / math.sqrt(2.0))
-            else:
-                z_score_out[p_idx, g] = 0.0
-                pvalue_out[p_idx, g] = 1.0
-
-
-# =============================================================================
-# Optimized Wilcoxon kernels for sparse data with zero-separation
+# Wilcoxon rank-sum test kernels (zero-separated ranking of sparse data)
 # =============================================================================
 
 # Threshold for zero-separation optimization: if >= this fraction of values are zero,
 # use the optimized zero-separated ranking. Otherwise use standard full ranking.
 _ZERO_PARTITION_THRESHOLD = 0.5
-
-
-@nb.njit(cache=True)
-def _merge_sorted_with_ranks_numba(
-    sorted_a: np.ndarray,
-    sorted_b: np.ndarray,
-    ranks_a_out: np.ndarray,
-    ranks_b_out: np.ndarray,
-    zero_offset: int,
-) -> float:
-    """Merge two sorted arrays and compute average ranks with tie handling.
-    
-    Computes ranks as if the arrays were concatenated and ranked together,
-    using average rank for ties. Also computes tie correction factor.
-    
-    Parameters
-    ----------
-    sorted_a : (n_a,)
-        First sorted array (e.g., control non-zero values).
-    sorted_b : (n_b,)
-        Second sorted array (e.g., perturbation non-zero values).
-    ranks_a_out : (n_a,)
-        Output ranks for sorted_a elements.
-    ranks_b_out : (n_b,)
-        Output ranks for sorted_b elements.
-    zero_offset : int
-        Number of zeros (their ranks are 1..zero_offset, avg = (zero_offset+1)/2).
-        Non-zero ranks start at zero_offset + 1.
-        
-    Returns
-    -------
-    float
-        Tie correction factor: 1 - sum(t^3 - t) / (n^3 - n) where t is tie group size.
-    """
-    n_a = sorted_a.shape[0]
-    n_b = sorted_b.shape[0]
-    n_total = n_a + n_b + zero_offset
-    
-    if n_a == 0 and n_b == 0:
-        # Only zeros - tie correction for all-same values
-        if zero_offset > 0:
-            denom = float(zero_offset) ** 3 - float(zero_offset)
-            if denom > 0:
-                tie_sum = float(zero_offset) ** 3 - float(zero_offset)
-                return 1.0 - tie_sum / denom
-        return 1.0
-    
-    # Merge and track which array each element came from
-    # merged_vals[i] = value, merged_src[i] = 0 for a, 1 for b
-    # merged_orig_idx[i] = original index in source array
-    merged_len = n_a + n_b
-    merged_vals = np.empty(merged_len, dtype=np.float64)
-    merged_src = np.empty(merged_len, dtype=np.int32)
-    merged_orig_idx = np.empty(merged_len, dtype=np.int64)
-    
-    # Standard merge
-    i, j, k = 0, 0, 0
-    while i < n_a and j < n_b:
-        if sorted_a[i] <= sorted_b[j]:
-            merged_vals[k] = sorted_a[i]
-            merged_src[k] = 0
-            merged_orig_idx[k] = i
-            i += 1
-        else:
-            merged_vals[k] = sorted_b[j]
-            merged_src[k] = 1
-            merged_orig_idx[k] = j
-            j += 1
-        k += 1
-    while i < n_a:
-        merged_vals[k] = sorted_a[i]
-        merged_src[k] = 0
-        merged_orig_idx[k] = i
-        i += 1
-        k += 1
-    while j < n_b:
-        merged_vals[k] = sorted_b[j]
-        merged_src[k] = 1
-        merged_orig_idx[k] = j
-        j += 1
-        k += 1
-    
-    # Assign ranks with tie averaging
-    # Ranks for non-zeros start at (zero_offset + 1)
-    tie_sum = 0.0
-    
-    # Add zero-group tie contribution
-    if zero_offset > 1:
-        t = float(zero_offset)
-        tie_sum += t ** 3 - t
-    
-    pos = 0
-    while pos < merged_len:
-        # Find all elements with same value (tie group)
-        tie_start = pos
-        while pos < merged_len - 1 and merged_vals[pos + 1] == merged_vals[tie_start]:
-            pos += 1
-        tie_end = pos
-        
-        # Tie group size
-        tie_count = tie_end - tie_start + 1
-        if tie_count > 1:
-            t = float(tie_count)
-            tie_sum += t ** 3 - t
-        
-        # Average rank for this tie group
-        # Ranks are 1-based: first non-zero gets rank (zero_offset + 1)
-        first_rank = zero_offset + tie_start + 1
-        last_rank = zero_offset + tie_end + 1
-        avg_rank = (first_rank + last_rank) / 2.0
-        
-        # Assign to output arrays
-        for idx in range(tie_start, tie_end + 1):
-            if merged_src[idx] == 0:
-                ranks_a_out[merged_orig_idx[idx]] = avg_rank
-            else:
-                ranks_b_out[merged_orig_idx[idx]] = avg_rank
-        
-        pos += 1
-    
-    # Compute tie correction
-    n_total_f = float(n_total)
-    denom = n_total_f ** 3 - n_total_f
-    if denom > 0:
-        return 1.0 - tie_sum / denom
-    return 1.0
-
-
-@nb.njit(parallel=True, cache=True)
-def _wilcoxon_sparse_batch_numba(
-    control_dense: np.ndarray,
-    pert_dense: np.ndarray,
-    valid_genes: np.ndarray,
-    tie_correct: bool,
-    zero_threshold: float,
-    u_stat_out: np.ndarray,
-    z_score_out: np.ndarray,
-    pvalue_out: np.ndarray,
-    effect_out: np.ndarray,
-) -> None:
-    """Compute Wilcoxon statistics for all genes using zero-separation optimization.
-    
-    For sparse data, separates zeros from non-zeros:
-    - Zeros form a tied group with known average rank = (n_zeros + 1) / 2
-    - Only non-zero values need sorting/ranking
-    - Reduces computational work by 10-100x for sparse genes
-    
-    Falls back to standard full ranking when zero fraction < threshold.
-    
-    Parameters
-    ----------
-    control_dense : (n_control, n_genes)
-        Dense control expression matrix.
-    pert_dense : (n_pert, n_genes)
-        Dense perturbation expression matrix.
-    valid_genes : (n_genes,)
-        Boolean mask of genes to process.
-    tie_correct : bool
-        Whether to apply tie correction.
-    zero_threshold : float
-        Minimum fraction of zeros to use zero-separation (e.g., 0.5).
-    u_stat_out : (n_genes,)
-        Output U-statistics.
-    z_score_out : (n_genes,)
-        Output z-scores.
-    pvalue_out : (n_genes,)
-        Output p-values.
-    effect_out : (n_genes,)
-        Output effect sizes.
-    """
-    n_control = control_dense.shape[0]
-    n_pert = pert_dense.shape[0]
-    n_genes = control_dense.shape[1]
-    n_total = n_control + n_pert
-    
-    n_control_f = float(n_control)
-    n_pert_f = float(n_pert)
-    n_total_f = float(n_total)
-    
-    for g in nb.prange(n_genes):
-        if not valid_genes[g]:
-            u_stat_out[g] = 0.0
-            z_score_out[g] = 0.0
-            pvalue_out[g] = 1.0
-            effect_out[g] = 0.0
-            continue
-        
-        # Extract gene column
-        ctrl_col = control_dense[:, g]
-        pert_col = pert_dense[:, g]
-        
-        # Count zeros
-        n_ctrl_zeros = 0
-        n_pert_zeros = 0
-        for i in range(n_control):
-            if ctrl_col[i] == 0.0:
-                n_ctrl_zeros += 1
-        for i in range(n_pert):
-            if pert_col[i] == 0.0:
-                n_pert_zeros += 1
-        
-        n_zeros = n_ctrl_zeros + n_pert_zeros
-        zero_frac = float(n_zeros) / n_total_f
-        
-        # Decide whether to use zero-separation
-        use_zero_sep = zero_frac >= zero_threshold
-        
-        if use_zero_sep and n_zeros < n_total:
-            # Zero-separation path: only sort non-zeros
-            n_ctrl_nonzero = n_control - n_ctrl_zeros
-            n_pert_nonzero = n_pert - n_pert_zeros
-            
-            # Extract non-zeros
-            ctrl_nonzero = np.empty(n_ctrl_nonzero, dtype=np.float64)
-            pert_nonzero = np.empty(n_pert_nonzero, dtype=np.float64)
-            
-            idx = 0
-            for i in range(n_control):
-                if ctrl_col[i] != 0.0:
-                    ctrl_nonzero[idx] = ctrl_col[i]
-                    idx += 1
-            
-            idx = 0
-            for i in range(n_pert):
-                if pert_col[i] != 0.0:
-                    pert_nonzero[idx] = pert_col[i]
-                    idx += 1
-            
-            # Sort non-zeros
-            ctrl_sorted = np.sort(ctrl_nonzero)
-            pert_sorted = np.sort(pert_nonzero)
-            
-            # Get ranks via merge
-            ctrl_ranks = np.empty(n_ctrl_nonzero, dtype=np.float64)
-            pert_ranks = np.empty(n_pert_nonzero, dtype=np.float64)
-            
-            tie_corr = _merge_sorted_with_ranks_numba(
-                ctrl_sorted, pert_sorted, ctrl_ranks, pert_ranks, n_zeros
-            )
-            
-            if not tie_correct:
-                tie_corr = 1.0
-            
-            # Compute rank sum for perturbation
-            # Zero cells in perturbation get average rank (n_zeros + 1) / 2
-            zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
-            rank_sum = float(n_pert_zeros) * zero_avg_rank
-            for i in range(n_pert_nonzero):
-                rank_sum += pert_ranks[i]
-        
-        else:
-            # Standard full ranking path
-            combined = np.empty(n_total, dtype=np.float64)
-            for i in range(n_pert):
-                combined[i] = pert_col[i]
-            for i in range(n_control):
-                combined[n_pert + i] = ctrl_col[i]
-            
-            # Sort and get order
-            order = np.argsort(combined)
-            
-            # Assign ranks with tie averaging
-            ranks = np.empty(n_total, dtype=np.float64)
-            tie_sum = 0.0
-            pos = 0
-            while pos < n_total:
-                tie_start = pos
-                while pos < n_total - 1 and combined[order[pos + 1]] == combined[order[tie_start]]:
-                    pos += 1
-                tie_end = pos
-                
-                tie_count = tie_end - tie_start + 1
-                if tie_count > 1:
-                    t = float(tie_count)
-                    tie_sum += t ** 3 - t
-                
-                avg_rank = (tie_start + tie_end + 2) / 2.0  # 1-based
-                for idx in range(tie_start, tie_end + 1):
-                    ranks[order[idx]] = avg_rank
-                
-                pos += 1
-            
-            # Tie correction
-            denom = n_total_f ** 3 - n_total_f
-            if denom > 0 and tie_correct:
-                tie_corr = 1.0 - tie_sum / denom
-            else:
-                tie_corr = 1.0
-            
-            # Rank sum for perturbation (first n_pert elements)
-            rank_sum = 0.0
-            for i in range(n_pert):
-                rank_sum += ranks[i]
-        
-        # Compute statistics
-        expected = n_pert_f * (n_total_f + 1.0) / 2.0
-        u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
-        
-        std = math.sqrt(tie_corr * n_pert_f * n_control_f * (n_total_f + 1.0) / 12.0)
-        
-        if std > 0.0:
-            z = (rank_sum - expected) / std
-            abs_z = abs(z)
-            pval = math.erfc(abs_z / math.sqrt(2.0))
-        else:
-            z = 0.0
-            pval = 1.0
-        
-        # Effect size: U / (n1 * n2) - 0.5
-        if n_pert_f > 0 and n_control_f > 0:
-            effect = u_stat / (n_pert_f * n_control_f) - 0.5
-        else:
-            effect = 0.0
-        
-        u_stat_out[g] = u_stat
-        z_score_out[g] = z
-        pvalue_out[g] = pval
-        effect_out[g] = effect
 
 
 @nb.njit(parallel=True, cache=True)
@@ -1176,318 +696,21 @@ def _compute_ctrl_tie_sums(
     return ctrl_tie_sums
 
 
-@nb.njit(parallel=True, cache=True)
-def _wilcoxon_presorted_ctrl_numba(
-    control_dense: np.ndarray,
-    ctrl_sorted_flat: np.ndarray,
-    ctrl_offsets: np.ndarray,
-    ctrl_n_nonzero: np.ndarray,
-    ctrl_n_zeros: np.ndarray,
-    pert_dense: np.ndarray,
-    valid_genes: np.ndarray,
-    tie_correct: bool,
-    zero_threshold: float,
-    u_stat_out: np.ndarray,
-    z_score_out: np.ndarray,
-    pvalue_out: np.ndarray,
-    effect_out: np.ndarray,
-) -> None:
-    """Wilcoxon test reusing pre-sorted control non-zeros.
-
-    For the zero-separation path (majority of genes in sparse data),
-    skips the O(n_ctrl * log(n_ctrl)) sort per group, using the
-    pre-sorted array from ``_presort_control_nonzeros`` instead.
-    Falls back to full sorting for the rare low-zero-fraction genes.
-    """
-    n_control = control_dense.shape[0]
-    n_pert = pert_dense.shape[0]
-    n_genes = pert_dense.shape[1]
-    n_total = n_control + n_pert
-
-    n_control_f = float(n_control)
-    n_pert_f = float(n_pert)
-    n_total_f = float(n_total)
-
-    for g in nb.prange(n_genes):
-        if not valid_genes[g]:
-            u_stat_out[g] = 0.0
-            z_score_out[g] = 0.0
-            pvalue_out[g] = 1.0
-            effect_out[g] = 0.0
-            continue
-
-        pert_col = pert_dense[:, g]
-
-        # Count pert zeros
-        n_pert_zeros = 0
-        for i in range(n_pert):
-            if pert_col[i] == 0.0:
-                n_pert_zeros += 1
-
-        n_zeros = ctrl_n_zeros[g] + n_pert_zeros
-
-        if n_zeros < n_total:
-            # --- Zero-separation with pre-sorted control (always) ---
-            # Removing the zero_threshold gate: the merge walk is
-            # O(n_ctrl_nz + n_pert_nz) which is always better than
-            # the O(n_total * log(n_total)) argsort fallback.
-            n_ctrl_nz = ctrl_n_nonzero[g]
-            n_pert_nonzero = n_pert - n_pert_zeros
-
-            # Extract and sort pert non-zeros (typically very few values)
-            pert_nonzero = np.empty(n_pert_nonzero, dtype=np.float64)
-            idx = 0
-            for i in range(n_pert):
-                if pert_col[i] != 0.0:
-                    pert_nonzero[idx] = pert_col[i]
-                    idx += 1
-            pert_sorted = np.sort(pert_nonzero)
-
-            # Use pre-sorted control non-zeros (no sort needed!)
-            start = ctrl_offsets[g]
-            ctrl_sorted = ctrl_sorted_flat[start:start + n_ctrl_nz]
-
-            ctrl_ranks = np.empty(n_ctrl_nz, dtype=np.float64)
-            pert_ranks = np.empty(n_pert_nonzero, dtype=np.float64)
-
-            tie_corr = _merge_sorted_with_ranks_numba(
-                ctrl_sorted, pert_sorted, ctrl_ranks, pert_ranks, n_zeros
-            )
-
-            if not tie_correct:
-                tie_corr = 1.0
-
-            zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
-            rank_sum = float(n_pert_zeros) * zero_avg_rank
-            for i in range(n_pert_nonzero):
-                rank_sum += pert_ranks[i]
-
-        else:
-            # All values are zero: rank_sum equals expected, U = expected.
-            rank_sum = n_pert_f * (n_total_f + 1.0) / 2.0
-            tie_corr = 0.0  # std will be 0 → z = 0, p = 1
-
-        # Statistics
-        expected = n_pert_f * (n_total_f + 1.0) / 2.0
-        u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
-
-        std = math.sqrt(tie_corr * n_pert_f * n_control_f * (n_total_f + 1.0) / 12.0)
-
-        if std > 0.0:
-            z = (rank_sum - expected) / std
-            abs_z = abs(z)
-            pval = math.erfc(abs_z / math.sqrt(2.0))
-        else:
-            z = 0.0
-            pval = 1.0
-
-        if n_pert_f > 0 and n_control_f > 0:
-            effect = u_stat / (n_pert_f * n_control_f) - 0.5
-        else:
-            effect = 0.0
-
-        u_stat_out[g] = u_stat
-        z_score_out[g] = z
-        pvalue_out[g] = pval
-        effect_out[g] = effect
-
-
-@nb.njit(parallel=True, cache=True)
-def _wilcoxon_all_perts_numba(
-    control_dense: np.ndarray,
-    all_pert_dense: np.ndarray,
-    pert_masks: np.ndarray,
-    pert_counts: np.ndarray,
-    valid_masks: np.ndarray,
-    tie_correct: bool,
-    zero_threshold: float,
-    u_stat_out: np.ndarray,
-    z_score_out: np.ndarray,
-    pvalue_out: np.ndarray,
-    effect_out: np.ndarray,
-) -> None:
-    """Compute Wilcoxon statistics for all perturbations and genes in parallel.
-    
-    This is the main optimized kernel that replaces ThreadPoolExecutor.
-    Parallelizes over genes (inner loop) for better cache locality.
-    
-    Parameters
-    ----------
-    control_dense : (n_control, n_chunk_genes)
-        Dense control expression matrix for this chunk.
-    all_pert_dense : (n_total_cells, n_chunk_genes)
-        Dense expression matrix for all cells.
-    pert_masks : (n_perts, n_total_cells)
-        Boolean masks for each perturbation (row = perturbation, col = cell).
-    pert_counts : (n_perts,)
-        Number of cells in each perturbation.
-    valid_masks : (n_perts, n_chunk_genes)
-        Boolean masks for valid genes per perturbation.
-    tie_correct : bool
-        Whether to apply tie correction.
-    zero_threshold : float
-        Minimum fraction of zeros to use zero-separation.
-    u_stat_out : (n_perts, n_chunk_genes)
-        Output U-statistics.
-    z_score_out : (n_perts, n_chunk_genes)
-        Output z-scores.
-    pvalue_out : (n_perts, n_chunk_genes)
-        Output p-values.
-    effect_out : (n_perts, n_chunk_genes)
-        Output effect sizes.
-    """
-    n_perts = pert_counts.shape[0]
-    n_control = control_dense.shape[0]
-    n_chunk_genes = control_dense.shape[1]
-    n_total_cells = all_pert_dense.shape[0]
-    
-    n_control_f = float(n_control)
-    
-    # Process each perturbation sequentially, genes in parallel within
-    for p_idx in range(n_perts):
-        n_pert = pert_counts[p_idx]
-        n_pert_f = float(n_pert)
-        n_total = n_pert + n_control
-        n_total_f = float(n_total)
-        
-        # Extract perturbation cells for this group
-        pert_dense = np.empty((n_pert, n_chunk_genes), dtype=np.float64)
-        cell_idx = 0
-        for i in range(n_total_cells):
-            if pert_masks[p_idx, i]:
-                for g in range(n_chunk_genes):
-                    pert_dense[cell_idx, g] = all_pert_dense[i, g]
-                cell_idx += 1
-        
-        # Process genes in parallel
-        for g in nb.prange(n_chunk_genes):
-            if not valid_masks[p_idx, g]:
-                u_stat_out[p_idx, g] = 0.0
-                z_score_out[p_idx, g] = 0.0
-                pvalue_out[p_idx, g] = 1.0
-                effect_out[p_idx, g] = 0.0
-                continue
-            
-            # Extract gene column
-            ctrl_col = control_dense[:, g]
-            pert_col = pert_dense[:, g]
-            
-            # Count zeros
-            n_ctrl_zeros = 0
-            n_pert_zeros = 0
-            for i in range(n_control):
-                if ctrl_col[i] == 0.0:
-                    n_ctrl_zeros += 1
-            for i in range(n_pert):
-                if pert_col[i] == 0.0:
-                    n_pert_zeros += 1
-            
-            n_zeros = n_ctrl_zeros + n_pert_zeros
-            zero_frac = float(n_zeros) / n_total_f
-            
-            # Decide whether to use zero-separation
-            use_zero_sep = zero_frac >= zero_threshold
-            
-            if use_zero_sep and n_zeros < n_total:
-                # Zero-separation path
-                n_ctrl_nonzero = n_control - n_ctrl_zeros
-                n_pert_nonzero = n_pert - n_pert_zeros
-                
-                ctrl_nonzero = np.empty(n_ctrl_nonzero, dtype=np.float64)
-                pert_nonzero = np.empty(n_pert_nonzero, dtype=np.float64)
-                
-                idx = 0
-                for i in range(n_control):
-                    if ctrl_col[i] != 0.0:
-                        ctrl_nonzero[idx] = ctrl_col[i]
-                        idx += 1
-                
-                idx = 0
-                for i in range(n_pert):
-                    if pert_col[i] != 0.0:
-                        pert_nonzero[idx] = pert_col[i]
-                        idx += 1
-                
-                ctrl_sorted = np.sort(ctrl_nonzero)
-                pert_sorted = np.sort(pert_nonzero)
-                
-                ctrl_ranks = np.empty(n_ctrl_nonzero, dtype=np.float64)
-                pert_ranks = np.empty(n_pert_nonzero, dtype=np.float64)
-                
-                tie_corr = _merge_sorted_with_ranks_numba(
-                    ctrl_sorted, pert_sorted, ctrl_ranks, pert_ranks, n_zeros
-                )
-                
-                if not tie_correct:
-                    tie_corr = 1.0
-                
-                zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
-                rank_sum = float(n_pert_zeros) * zero_avg_rank
-                for i in range(n_pert_nonzero):
-                    rank_sum += pert_ranks[i]
-            
-            else:
-                # Standard full ranking
-                combined = np.empty(n_total, dtype=np.float64)
-                for i in range(n_pert):
-                    combined[i] = pert_col[i]
-                for i in range(n_control):
-                    combined[n_pert + i] = ctrl_col[i]
-                
-                order = np.argsort(combined)
-                ranks = np.empty(n_total, dtype=np.float64)
-                tie_sum = 0.0
-                pos = 0
-                while pos < n_total:
-                    tie_start = pos
-                    while pos < n_total - 1 and combined[order[pos + 1]] == combined[order[tie_start]]:
-                        pos += 1
-                    tie_end = pos
-                    
-                    tie_count = tie_end - tie_start + 1
-                    if tie_count > 1:
-                        t = float(tie_count)
-                        tie_sum += t ** 3 - t
-                    
-                    avg_rank = (tie_start + tie_end + 2) / 2.0
-                    for idx in range(tie_start, tie_end + 1):
-                        ranks[order[idx]] = avg_rank
-                    
-                    pos += 1
-                
-                denom = n_total_f ** 3 - n_total_f
-                if denom > 0 and tie_correct:
-                    tie_corr = 1.0 - tie_sum / denom
-                else:
-                    tie_corr = 1.0
-                
-                rank_sum = 0.0
-                for i in range(n_pert):
-                    rank_sum += ranks[i]
-            
-            # Statistics
-            expected = n_pert_f * (n_total_f + 1.0) / 2.0
-            u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
-            
-            std = math.sqrt(tie_corr * n_pert_f * n_control_f * (n_total_f + 1.0) / 12.0)
-            
-            if std > 0.0:
-                z = (rank_sum - expected) / std
-                abs_z = abs(z)
-                pval = math.erfc(abs_z / math.sqrt(2.0))
-            else:
-                z = 0.0
-                pval = 1.0
-            
-            if n_pert_f > 0 and n_control_f > 0:
-                effect = u_stat / (n_pert_f * n_control_f) - 0.5
-            else:
-                effect = 0.0
-            
-            u_stat_out[p_idx, g] = u_stat
-            z_score_out[p_idx, g] = z
-            pvalue_out[p_idx, g] = pval
-            effect_out[p_idx, g] = effect
+@nb.njit(cache=True)
+def _all_tied(n_zeros: int, ctrl_sorted: np.ndarray, pert_sorted: np.ndarray) -> bool:
+    """Whether every value of a gene -- ``n_zeros`` zeros plus the sorted
+    control and perturbation non-zeros -- is the same, so that the rank-sum
+    test is undefined (its tie-corrected variance is zero)."""
+    n_nonzero = ctrl_sorted.shape[0] + pert_sorted.shape[0]
+    if n_nonzero == 0:
+        return True
+    if n_zeros > 0:
+        return False
+    if ctrl_sorted.shape[0] == 0:
+        return pert_sorted[0] == pert_sorted[-1]
+    if pert_sorted.shape[0] == 0:
+        return ctrl_sorted[0] == ctrl_sorted[-1]
+    return min(ctrl_sorted[0], pert_sorted[0]) == max(ctrl_sorted[-1], pert_sorted[-1])
 
 
 @nb.njit(cache=True)
@@ -1499,11 +722,10 @@ def _rank_sum_pert_bsearch_numba(
 ) -> tuple:
     """Binary-search Wilcoxon rank sum for pert non-zeros vs pre-sorted ctrl.
 
-    Replaces the O(n_ctrl_nz + n_pert_nz) merge walk in
-    ``_merge_sorted_with_ranks_numba`` with an O(n_pert_nz * log(n_ctrl_nz))
-    binary-search pass.  For CRISPR datasets where n_ctrl_nz >> n_pert_nz
-    (e.g. 140 K ctrl vs 11 pert non-zeros), this is ~750x faster per gene
-    per perturbation.
+    An O(n_pert_nz * log(n_ctrl_nz)) binary-search pass rather than an
+    O(n_ctrl_nz + n_pert_nz) merge walk.  For CRISPR datasets where
+    n_ctrl_nz >> n_pert_nz (e.g. 140 K ctrl vs 11 pert non-zeros), this is
+    ~750x faster per gene per perturbation.
 
     Parameters
     ----------
@@ -1610,16 +832,14 @@ def _wilcoxon_single_pert_presorted(
     pvalue_out: np.ndarray,
     effect_out: np.ndarray,
 ) -> None:
-    """Non-parallel single-perturbation Wilcoxon kernel for use inside prange.
+    """Single-perturbation Wilcoxon kernel, called from the prange in
+    :func:`_wilcoxon_batch_perts_presorted_numba` (so not itself parallel:
+    Numba does not support nested parallel launches).
 
-    Identical logic to ``_wilcoxon_presorted_ctrl_numba`` but without
-    ``parallel=True`` so it can be safely called from within a prange loop
-    (Numba does not support nested parallel launches).
-
-    The zero-separation path now uses ``_rank_sum_pert_bsearch_numba`` instead
-    of ``_merge_sorted_with_ranks_numba``, giving O(n_pert_nz * log(n_ctrl_nz))
-    complexity instead of O(n_ctrl_nz + n_pert_nz) (~750x speedup for typical
-    CRISPR datasets with large control groups).
+    Ranks the perturbation's non-zeros against the pre-sorted control
+    non-zeros with :func:`_rank_sum_pert_bsearch_numba`. A gene whose values
+    are all tied has no rank test, whatever ``tie_correct``: its U, z, p and
+    effect are NaN.
     """
     n_control = control_dense.shape[0]
     n_pert = pert_dense.shape[0]
@@ -1648,7 +868,10 @@ def _wilcoxon_single_pert_presorted(
 
         n_zeros = ctrl_n_zeros[g] + n_pert_zeros
 
-        if n_zeros < n_total:
+        tied = n_zeros == n_total
+        rank_sum = 0.0
+        tie_corr = 1.0
+        if not tied:
             # --- Binary-search ranking (always) ---
             # O(n_pert_nz * log(n_ctrl_nz)) — works for any zero fraction.
             # O(n_pert_nz * log(n_ctrl_nz)) — binary search is always
@@ -1667,6 +890,7 @@ def _wilcoxon_single_pert_presorted(
             start = ctrl_offsets[g]
             ctrl_sorted = ctrl_sorted_flat[start : start + n_ctrl_nz]
 
+            tied = _all_tied(n_zeros, ctrl_sorted, pert_sorted)
             rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[g]
             )
@@ -1677,10 +901,14 @@ def _wilcoxon_single_pert_presorted(
             zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
             rank_sum = float(n_pert_zeros) * zero_avg_rank + rank_sum_nz
 
-        else:
-            # All values are zero: rank_sum equals expected, U = expected.
-            rank_sum = n_pert_f * (n_total_f + 1.0) / 2.0
-            tie_corr = 0.0  # std will be 0 → z = 0, p = 1
+        if tied:
+            # Every value tied: the rank test is undefined, not "no change",
+            # with or without the tie correction.
+            u_stat_out[g] = np.nan
+            z_score_out[g] = np.nan
+            pvalue_out[g] = np.nan
+            effect_out[g] = np.nan
+            continue
 
         # Statistics
         expected = n_pert_f * (n_total_f + 1.0) / 2.0
@@ -1693,14 +921,18 @@ def _wilcoxon_single_pert_presorted(
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
         else:
-            z = 0.0
-            pval = 1.0
+            # An empty group: no comparison was made.
+            z = np.nan
+            pval = np.nan
 
         if n_pert_f > 0 and n_control_f > 0:
             effect = u_stat / (n_pert_f * n_control_f) - 0.5
         else:
             effect = 0.0
 
+        if math.isnan(z):
+            u_stat = np.nan
+            effect = np.nan
         u_stat_out[g] = u_stat
         z_score_out[g] = z
         pvalue_out[g] = pval
@@ -1727,10 +959,9 @@ def _wilcoxon_batch_perts_presorted_numba(
 ) -> None:
     """Batch Wilcoxon test: single prange over perturbations.
 
-    Replaces 2254 sequential ``_wilcoxon_presorted_ctrl_numba`` calls per
-    gene chunk with a single ``prange`` over all perturbation groups.  Each
-    parallel thread handles one perturbation and iterates over genes
-    sequentially, eliminating ~2253 redundant Numba thread-pool launches.
+    A single ``prange`` over all perturbation groups of a gene chunk, rather
+    than one parallel launch per perturbation.  Each parallel thread handles
+    one perturbation and iterates over genes sequentially.
 
     Parameters
     ----------
@@ -1847,6 +1078,7 @@ def _wilcoxon_stratified_single_pert(
         var = 0.0        # sum_b Var_b
         u_sum = 0.0      # sum_b U_b
         n1n0_sum = 0.0   # sum_b n1_b * n0_b
+        tied = True      # every contributing stratum has a single value
 
         for s in range(seg_lo, seg_hi):
             b = seg_batch[s]
@@ -1883,6 +1115,8 @@ def _wilcoxon_stratified_single_pert(
             start = ctrl_starts[b, g]
             ctrl_sorted = ctrl_flat[start : start + n_ctrl_nz_b]
 
+            if not _all_tied(n_zeros, ctrl_sorted, pert_sorted):
+                tied = False
             rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[b, g]
             )
@@ -1904,18 +1138,24 @@ def _wilcoxon_stratified_single_pert(
             u_sum += u_b
             n1n0_sum += n1f * n0f
 
-        if var > 0.0:
+        if var > 0.0 and not tied:
             z = num / math.sqrt(var)
             pval = math.erfc(abs(z) / sqrt2)
         else:
-            z = 0.0
-            pval = 1.0
+            # No stratum to compare in, or every value tied within each:
+            # the rank test is undefined (with or without the tie
+            # correction), not "no change".
+            z = np.nan
+            pval = np.nan
 
         if n1n0_sum > 0.0:
             effect = u_sum / n1n0_sum - 0.5
         else:
             effect = 0.0
 
+        if math.isnan(z):
+            u_sum = np.nan
+            effect = np.nan
         u_stat_out[g] = u_sum
         z_score_out[g] = z
         pvalue_out[g] = pval

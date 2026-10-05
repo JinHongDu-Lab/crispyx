@@ -21,7 +21,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
-from crispyx._provenance import SCHEMAS, read_stamp
+from crispyx._provenance import SCHEMAS, read_stamp, write_stamp
 from crispyx.data import sort_by_perturbation
 
 
@@ -59,9 +59,9 @@ def _rewrite_labels(path: Path, labels: np.ndarray) -> None:
 
 
 _DE_METHODS = {
-    "wilcoxon": (cx.wilcoxon_test, True, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
-    "t_test": (cx.t_test, True, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
-    "nb_glm": (cx.nb_glm_test, False, dict(min_pct_both=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0, n_jobs=1)),
+    "wilcoxon": (cx.wilcoxon_test, True, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
+    "t_test": (cx.t_test, True, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0)),
+    "nb_glm": (cx.nb_glm_test, False, dict(min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, min_mean_pert=0.0, n_jobs=1)),
 }
 
 
@@ -80,15 +80,36 @@ def de_setup(request, tmp_path):
     return method, path, tmp_path / "result.h5ad"
 
 
+_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest")
+
+
 def test_identical_rerun_reuses_the_result(de_setup, capsys):
     method, path, output = de_setup
     first = _run(method, path, output)
     mtime = output.stat().st_mtime_ns
     capsys.readouterr()
     second = _run(method, path, output)
-    assert "Loading existing result" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Loading existing result" in out
+    assert "force=True" in out
     assert output.stat().st_mtime_ns == mtime
-    np.testing.assert_array_equal(second.pvalues, first.pvalues)
+    # The reloaded result is the run's result, field for field.
+    for field in _RESULT_FIELDS:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(second, field)), np.asarray(getattr(first, field)), err_msg=field
+        )
+    assert second.groups == first.groups
+    assert second.method == first.method
+
+
+def test_force_recomputes(de_setup, capsys):
+    method, path, output = de_setup
+    _run(method, path, output)
+    os.utime(output, ns=(0, 0))
+    capsys.readouterr()
+    _run(method, path, output, force=True)
+    assert "Loading existing result" not in capsys.readouterr().out
+    assert output.stat().st_mtime_ns != 0
 
 
 def test_relabelled_source_is_recomputed(de_setup, capsys):
@@ -137,7 +158,7 @@ def test_stamp_records_writer_and_inputs(tmp_path):
     assert stamp["schema"] == SCHEMAS["de_result"]
     fingerprint = json.loads(stamp["fingerprint"])
     assert fingerprint["source"] == str(path.resolve())
-    assert fingerprint["params"]["min_pct_both"] == 0.0
+    assert fingerprint["params"]["min_pct_ctrl"] == 0.0
     # How the run was carried out is not part of what it computed.
     assert "chunk_size" not in fingerprint["params"]
     assert "verbose" not in fingerprint["params"]
@@ -166,6 +187,81 @@ def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys
     stamped = json.loads(read_stamp(output)["fingerprint"])
     unformatted = {**stamped, "params": {**stamped["params"], "scanpy_format": False}}
     assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
+
+
+def test_aliases_name_the_same_call(tmp_path, capsys):
+    """``groupby``/``reference`` and ``perturbation_column``/``control_label``
+    are one call, and so is ``cx.tl.rank_genes_groups``, which leaves the
+    control for the DE function to infer as a direct call does."""
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("wilcoxon", path, output)
+    capsys.readouterr()
+    defaults = _DE_METHODS["wilcoxon"][2]
+    cx.wilcoxon_test(path, groupby="perturbation", reference="ctrl", output_path=output, **defaults)
+    assert "Loading existing result" in capsys.readouterr().out
+
+    cx.wilcoxon_test(path, perturbation_column="perturbation", output_dir=tmp_path / "rgg", verbose=False)
+    capsys.readouterr()
+    cx.tl.rank_genes_groups(path, groupby="perturbation", output_dir=tmp_path / "rgg")
+    assert "Loading existing result" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("lazy", [False, True], ids=["loaded", "too-large-to-load"])
+def test_wilcoxon_scanpy_structure_is_written_however_large(tmp_path, monkeypatch, lazy):
+    """A result too large to load is still written with the Scanpy structure
+    its stamp claims, identical to the one written for a loaded result."""
+    import crispyx._memory as memory
+
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    reference = tmp_path / "reference.h5ad"
+    _run("t_test", path, reference, scanpy_format=True)  # the in-memory writer
+    loaded = _run("wilcoxon", path, tmp_path / "loaded.h5ad", scanpy_format=True)
+    if lazy:
+        monkeypatch.setattr(memory, "_resolve_memory_limit_bytes", lambda _limit: 1)
+    output = tmp_path / "result.h5ad"
+    result = _run("wilcoxon", path, output, scanpy_format=True)
+    assert (result.statistics.size == 0) == lazy
+    with h5py.File(output, "r") as f, h5py.File(tmp_path / "loaded.h5ad", "r") as g:
+        rgg = f["uns/rank_genes_groups"]
+        np.testing.assert_array_equal(rgg["full/scores"][()], loaded.statistics)
+        np.testing.assert_array_equal(rgg["full/pts_rest"][()], loaded.pts_rest)
+        np.testing.assert_array_equal(rgg["order"][()], loaded.order)
+        for name in ("full/pvals", "full/logfoldchanges", "full/auc", "full/u_stat", "full/pts", "names"):
+            np.testing.assert_array_equal(rgg[name][()], g[f"uns/rank_genes_groups/{name}"][()], err_msg=name)
+    with h5py.File(reference, "r") as f, h5py.File(output, "r") as g:
+        assert sorted(f["uns/rank_genes_groups/full"]) == sorted(g["uns/rank_genes_groups/full"])
+
+
+def _restamp_with_param(output: Path, name: str, value) -> None:
+    """Rewrite the stamp as if the writer had an argument ``name`` that this
+    version does not have."""
+    stamp = read_stamp(output)
+    fingerprint = json.loads(stamp["fingerprint"])
+    fingerprint["params"][name] = value
+    write_stamp(output, {**stamp, "fingerprint": json.dumps(fingerprint, sort_keys=True)})
+
+
+def test_an_argument_left_at_none_does_not_invalidate(tmp_path, capsys):
+    """Adding or removing a None-default parameter must not throw away every
+    existing result (0.1.7 stamps still list arguments left at None)."""
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("t_test", path, output)
+    _restamp_with_param(output, "removed_option", None)
+    capsys.readouterr()
+    _run("t_test", path, output)
+    assert "Loading existing result" in capsys.readouterr().out
+
+
+def test_an_argument_that_was_set_still_invalidates(tmp_path, capsys):
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
+    output = tmp_path / "result.h5ad"
+    _run("t_test", path, output)
+    _restamp_with_param(output, "removed_option", 0.5)
+    capsys.readouterr()
+    _run("t_test", path, output)
+    assert "argument 'removed_option' differs" in capsys.readouterr().out
 
 
 def _delete_uns_key(path: Path, key: str) -> None:

@@ -1,22 +1,13 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 import anndata as ad
 import scanpy as sc
 import h5py
+from scipy.stats import mannwhitneyu
 
 import crispyx as cx
 
@@ -52,14 +43,6 @@ def create_test_dataset(tmp_path):
     path = tmp_path / "test.h5ad"
     adata.write(path)
     return path, adata
-
-
-def create_sparse_test_dataset(tmp_path):
-    dense_path, dense = create_test_dataset(tmp_path)
-    sparse = ad.AnnData(sp.csr_matrix(dense.X), obs=dense.obs.copy(), var=dense.var.copy())
-    sparse_path = tmp_path / "test_sparse.h5ad"
-    sparse.write(sparse_path)
-    return sparse_path, sparse
 
 
 def _log_normalise_sparse(adata: ad.AnnData) -> ad.AnnData:
@@ -100,36 +83,13 @@ def test_quality_control_writes_filtered_dataset(tmp_path):
         data_name="qc_test",
     )
     assert isinstance(result.filtered, cx.AnnData)
-    assert result.filtered_path.exists()
-    filtered = result.filtered.to_memory()
-    assert filtered.n_obs == int(result.cell_mask.sum())
-    assert filtered.n_vars == int(result.gene_mask.sum())
-    assert filtered.var["gene_symbols"].tolist() == adata.var["gene_symbol"].tolist()
-    result.filtered.close()
-
-
-def test_quality_control_sparse_roundtrip(tmp_path):
-    path, adata = create_sparse_test_dataset(tmp_path)
-    result = quality_control_summary(
-        path,
-        min_genes=1,
-        min_cells_per_perturbation=2,
-        min_cells_per_gene=1,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbol",
-        output_dir=tmp_path,
-        data_name="qc_sparse",
-    )
     filtered = result.filtered.to_memory()
     expected = adata[result.cell_mask, result.gene_mask]
     np.testing.assert_array_equal(filtered.X.toarray(), expected.X.toarray())
+    assert filtered.var["gene_symbols"].tolist() == expected.var["gene_symbol"].tolist()
     with h5py.File(result.filtered_path) as handle:
         encoding = handle["X"].attrs["encoding-type"]
-        # Handle both bytes and string representations
-        if isinstance(encoding, bytes):
-            encoding = encoding.decode()
-        assert encoding == "csr_matrix"
+        assert (encoding.decode() if isinstance(encoding, bytes) else encoding) == "csr_matrix"
     result.filtered.close()
 
 
@@ -141,7 +101,7 @@ def test_gene_symbol_validation(tmp_path):
     adata = ad.AnnData(x, obs=obs, var=var)
     path = tmp_path / "invalid.h5ad"
     adata.write(path)
-    try:
+    with pytest.raises(ValueError, match="Ensembl"):
         quality_control_summary(
             path,
             min_genes=1,
@@ -150,10 +110,6 @@ def test_gene_symbol_validation(tmp_path):
             perturbation_column="perturbation",
             control_label="ctrl",
         )
-    except ValueError as exc:
-        assert "Ensembl" in str(exc)
-    else:
-        raise AssertionError("Expected a ValueError for Ensembl-style identifiers")
 
 
 def test_downstream_effect_outputs(tmp_path):
@@ -418,89 +374,6 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     qc_direct.filtered.close()
 
 
-def test_nb_glm_resume_checkpoint(tmp_path):
-    """Test that resume=True correctly skips completed perturbations."""
-    # Create a dataset with multiple perturbations
-    rng = np.random.default_rng(42)
-    n_cells = 60
-    n_genes = 8
-    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20 + ["KO2"] * 20)
-    counts = rng.poisson(10, size=(n_cells, n_genes))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(n_cells)]
-    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
-    adata = ad.AnnData(counts, obs=obs, var=var)
-    path = tmp_path / "resume_test.h5ad"
-    adata.write(path)
-
-    # Run the first time
-    result1 = nb_glm_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        checkpoint_interval=1,
-        output_dir=tmp_path,
-        data_name="resume",
-    )
-    assert result1.groups == ["KO1", "KO2"]
-    output_path1 = result1.result_path
-
-    # Checkpoint should be cleaned up on successful completion
-    checkpoint_path = output_path1.with_suffix(".progress.json")
-    assert not checkpoint_path.exists()
-
-    # Run again with resume=True - should succeed quickly (no work to do)
-    result2 = nb_glm_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        resume=True,
-        checkpoint_interval=1,
-        output_dir=tmp_path,
-        data_name="resume",
-    )
-    # Results should be identical
-    np.testing.assert_allclose(result1.statistics, result2.statistics)
-    np.testing.assert_allclose(result1.pvalues, result2.pvalues)
-
-
-def test_wilcoxon_resume_checkpoint(tmp_path):
-    """Test that wilcoxon_test resume=True works correctly."""
-    rng = np.random.default_rng(123)
-    n_cells = 40
-    n_genes = 10
-    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20)
-    # Log-normalized data for wilcoxon (must be sparse)
-    x = rng.normal(5, 1, size=(n_cells, n_genes))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(n_cells)]
-    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
-    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
-    path = tmp_path / "wilcoxon_resume.h5ad"
-    adata.write(path)
-
-    result1 = wilcoxon_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        checkpoint_interval=2,
-        output_dir=tmp_path,
-        data_name="wilcox_resume",
-    )
-
-    # Run again with resume - should work
-    result2 = wilcoxon_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        resume=True,
-        checkpoint_interval=2,
-        output_dir=tmp_path,
-        data_name="wilcox_resume",
-    )
-    np.testing.assert_allclose(result1.statistics, result2.statistics)
-
-
 def test_empty_perturbation_group_error(tmp_path):
     """Test that empty perturbation groups raise helpful errors."""
     x = np.array([[1, 2], [3, 4]], dtype=float)
@@ -511,43 +384,34 @@ def test_empty_perturbation_group_error(tmp_path):
     path = tmp_path / "empty_pert.h5ad"
     adata.write(path)
 
-    # Request a perturbation that doesn't exist
-    try:
+    with pytest.raises(ValueError, match="nonexistent"):
         wilcoxon_test(
             path,
             perturbation_column="perturbation",
             control_label="ctrl",
             perturbations=["nonexistent"],
         )
-        raise AssertionError("Expected ValueError for nonexistent perturbation")
-    except ValueError as e:
-        assert "nonexistent" in str(e).lower() or "no cells" in str(e).lower()
 
 
 def test_single_cell_perturbation(tmp_path):
-    """Test handling of perturbations with very few cells."""
+    """A one-cell perturbation is still a valid rank-sum test."""
     rng = np.random.default_rng(456)
-    # ctrl: 10 cells, KO1: 1 cell
-    perturbations = np.array(["ctrl"] * 10 + ["KO1"])
     x = rng.normal(5, 1, size=(11, 5))
-    obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(11)]
+    obs = pd.DataFrame({"perturbation": ["ctrl"] * 10 + ["KO1"]}, index=[f"cell_{i}" for i in range(11)])
     var = pd.DataFrame(index=[f"gene{j}" for j in range(5)])
-    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
     path = tmp_path / "single_cell.h5ad"
-    adata.write(path)
+    ad.AnnData(sp.csr_matrix(x), obs=obs, var=var).write(path)
 
-    # Should still run, even with single cell perturbation
     result = wilcoxon_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        output_dir=tmp_path,
-        data_name="single",
+        output_path=tmp_path / "single_result.h5ad",
+        verbose=False,
     )
     assert result.groups == ["KO1"]
-    # Results may have NaN or inf, but shouldn't crash
-    assert result.pvalues.shape == (1, 5)
+    expected = mannwhitneyu(x[10:], x[:10], method="asymptotic", use_continuity=False, axis=0).pvalue
+    np.testing.assert_allclose(result.pvalues[0], expected, rtol=1e-10)
 
 
 def test_all_zero_gene(tmp_path):
@@ -573,11 +437,6 @@ def test_all_zero_gene(tmp_path):
         output_dir=tmp_path,
         data_name="zero",
     )
-    # All-zero gene should have p-value=1 or NaN, but not crash
-    assert result.pvalues.shape == (1, 4)
-    # The zero gene should not have a significant p-value (should be clearly non-significant)
-    # We use a relaxed threshold since numerical precision may produce values slightly below 1.0
-    zero_gene_pval = result.pvalues[0, 2]
-    assert zero_gene_pval >= 0.5 or not np.isfinite(zero_gene_pval), (
-        f"Zero gene p-value {zero_gene_pval} is unexpectedly low (should be non-significant)"
-    )
+    # The all-zero gene cannot be fitted: untested, not "no change".
+    assert np.isnan(result.pvalues[0, 2]) and np.isnan(result.logfoldchanges[0, 2])
+    assert np.isfinite(result.pvalues[0, [0, 1, 3]]).all()

@@ -8,6 +8,7 @@ from typing import Iterable, Literal, Sequence
 import anndata as ad
 import numpy as np
 
+from ._grouping import resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
@@ -17,8 +18,6 @@ from .data import (
     convert_to_csr,
     downsample_counts,
     normalize_total_log1p,
-    read_backed,
-    resolve_control_label,
     resolve_data_path,
 )
 from .de import (
@@ -58,30 +57,6 @@ from .qc import (
     quality_control_summary,
 )
 from .sample import subsample
-
-
-# ---------------------------------------------------------------------------
-# Helpers used only by _ToolsNamespace
-# ---------------------------------------------------------------------------
-
-def _infer_control_label(
-    path: Path,
-    perturbation_column: str,
-    control_label: str | None,
-) -> str:
-    if control_label is not None:
-        return str(control_label)
-    backed = read_backed(path)
-    try:
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                "Perturbation column '%s' was not found in adata.obs. Available columns: %s"
-                % (perturbation_column, list(backed.obs.columns))
-            )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-    finally:
-        backed.file.close()
-    return resolve_control_label(labels, None)
 
 
 # ---------------------------------------------------------------------------
@@ -839,25 +814,13 @@ class _ToolsNamespace:
         force: bool = False,
         **kwargs,
     ) -> RankGenesGroupsResult:
-        # Resolve groupby / reference aliases
-        if groupby is not None and perturbation_column is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'perturbation_column' and 'groupby'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if groupby is not None:
-            perturbation_column = groupby
-        if perturbation_column is None:
-            raise TypeError(
-                "rank_genes_groups() requires either 'perturbation_column' or its alias 'groupby'."
-            )
-        if reference is not None and control_label is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'control_label' and 'reference'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if reference is not None:
-            control_label = reference
+        perturbation_column, control_label = resolve_group_reference_aliases(
+            perturbation_column=perturbation_column,
+            groupby=groupby,
+            control_label=control_label,
+            reference=reference,
+            fn_name="rank_genes_groups",
+        )
 
         path = resolve_data_path(data)
         method_key = method.lower().replace("_", "-")
@@ -872,11 +835,12 @@ class _ToolsNamespace:
             "nb-glm-test": "nb_glm",
         }
         normalised = method_map.get(method_key, method_key)
-        control = _infer_control_label(path, perturbation_column, control_label)
-
+        # The control, when not given, is inferred by the DE function itself,
+        # so this call records the same arguments as a direct one and reuses
+        # (and is reused by) its result.
         base_kwargs = dict(
             perturbation_column=perturbation_column,
-            control_label=control,
+            control_label=control_label,
             gene_name_column=gene_name_column,
             perturbations=perturbations,
             output_dir=output_dir,
@@ -889,7 +853,7 @@ class _ToolsNamespace:
 
         if normalised == "wilcoxon":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
                 "checkpoint_interval",
                 "batch_column",
@@ -922,7 +886,7 @@ class _ToolsNamespace:
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
-                "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl",
                 "min_mean_pert",
                 "min_total_count",
@@ -949,7 +913,7 @@ class _ToolsNamespace:
 
         if normalised == "t_test":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
                 "n_jobs",
                 "checkpoint_interval",
