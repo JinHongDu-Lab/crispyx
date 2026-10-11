@@ -468,6 +468,22 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
+def _align_labels(labels: pd.Series, obs_names: pd.Index) -> np.ndarray:
+    """Per-cell labels given as a Series, in ``obs_names`` order."""
+    labels = labels.set_axis(labels.index.astype(str))
+    if not labels.index.is_unique:
+        raise ValueError("The labels Series must be indexed by cell, each cell once.")
+    names = pd.Index(obs_names).astype(str)
+    aligned = labels.reindex(names)
+    missing = names[aligned.isna().to_numpy()]
+    if len(missing):
+        raise ValueError(
+            f"The labels Series has no label for {len(missing)} of {len(names)} cells "
+            f"(e.g. {missing[:3].tolist()}); index it by obs_names."
+        )
+    return aligned.astype(str).to_numpy()
+
+
 def _de_fingerprint(
     path: Path, call_args: dict, method: str, *, perturbation_column: str, control_label: str | None,
 ) -> dict:
@@ -3917,6 +3933,7 @@ def _wilcoxon_test_streaming(
     *,
     gene_symbols: pd.Index,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     candidates: list[str],
     n_genes: int,
@@ -4053,7 +4070,6 @@ def _wilcoxon_test_streaming(
             # Stream gene chunks from backed file
             backed = read_backed(path)
             try:
-                labels = backed.obs[perturbation_column].astype(str).to_numpy()
                 control_mask = labels == control_label
                 control_n = int(control_mask.sum())
                 # Precompute integer row indices (faster than boolean indexing
@@ -4311,6 +4327,7 @@ def _wilcoxon_test_stratified(
     *,
     gene_symbols,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     batch_column: str,
     candidates: list[str],
@@ -4383,7 +4400,6 @@ def _wilcoxon_test_stratified(
 
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         control_n = int(control_mask.sum())
 
@@ -4812,8 +4828,8 @@ def _wilcoxon_test_stratified(
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    perturbation_column: str | None = None,
-    groupby: str | None = None,
+    perturbation_column: str | pd.Series | None = None,
+    groupby: str | pd.Series | None = None,
     control_label: str | None = None,
     reference: str | None = None,
     gene_name_column: str | None = None,
@@ -4852,7 +4868,17 @@ def wilcoxon_test(
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         normalised, log-transformed data.
     perturbation_column
-        Column in `adata.obs` indicating perturbation labels.
+        Column in `adata.obs` indicating perturbation labels, or the labels
+        themselves as a ``pd.Series`` indexed by cell (``obs_names``), e.g.
+        shuffled labels for a permutation null, so no relabelled copy of the
+        data has to be written. The Series is aligned to ``obs_names`` by
+        index, so its order does not matter, but every cell needs a label;
+        its ``name`` (default ``"perturbation"``) names the column in the
+        result. A different Series is a different call: a result computed
+        with one is not reused for another. On a CSR input each call makes a
+        temporary CSC copy (see ``format_mismatch_policy``); for many
+        shuffles, convert once with :func:`crispyx.pp.convert_to_csc` and pass
+        the converted file.
     groupby
         Alias for ``perturbation_column`` (Scanpy-compatible).
         Mutually exclusive with ``perturbation_column``.
@@ -5038,11 +5064,14 @@ def wilcoxon_test(
         fingerprint=fingerprint,
     )):
         return r
+    given_labels = perturbation_column if isinstance(perturbation_column, pd.Series) else None
+    if given_labels is not None:
+        perturbation_column = "perturbation" if given_labels.name is None else str(given_labels.name)
 
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
-        if perturbation_column not in backed.obs.columns:
+        if given_labels is None and perturbation_column not in backed.obs.columns:
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
@@ -5050,7 +5079,10 @@ def wilcoxon_test(
             raise KeyError(
                 f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = (
+            backed.obs[perturbation_column].astype(str).to_numpy() if given_labels is None
+            else _align_labels(given_labels, backed.obs_names)
+        )
         control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -5107,6 +5139,7 @@ def wilcoxon_test(
                 stream_path,
                 gene_symbols=gene_symbols,
                 perturbation_column=perturbation_column,
+                labels=labels,
                 control_label=control_label,
                 batch_column=batch_column,
                 candidates=candidates,
@@ -5149,6 +5182,7 @@ def wilcoxon_test(
                 stream_path,
                 gene_symbols=gene_symbols,
                 perturbation_column=perturbation_column,
+                labels=labels,
                 control_label=control_label,
                 candidates=candidates,
                 n_genes=n_genes,
@@ -5176,6 +5210,7 @@ def wilcoxon_test(
             stream_path,
             gene_symbols=gene_symbols,
             perturbation_column=perturbation_column,
+            labels=labels,
             control_label=control_label,
             candidates=candidates,
             n_genes=n_genes,
@@ -5203,6 +5238,7 @@ def _wilcoxon_test_standard(
     *,
     gene_symbols,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     candidates: list[str],
     n_genes: int,
@@ -5273,7 +5309,6 @@ def _wilcoxon_test_standard(
 
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         control_n = int(control_mask.sum())
         # Precompute integer row indices (faster than boolean indexing
@@ -6200,7 +6235,7 @@ def _estimate_shape_for_nb_glm_test(
 def _estimate_shape_for_wilcoxon_test(
     path: Path,
     *,
-    perturbation_column: str,
+    perturbation_column: str | pd.Series,
     control_label: str | None = None,
     perturbations: Iterable[str] | None = None,
     batch_column: str | None = None,
@@ -6212,7 +6247,11 @@ def _estimate_shape_for_wilcoxon_test(
     validate_format_mismatch_policy(format_mismatch_policy)
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = (
+            _align_labels(perturbation_column, backed.obs_names)
+            if isinstance(perturbation_column, pd.Series)
+            else backed.obs[perturbation_column].astype(str).to_numpy()
+        )
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
