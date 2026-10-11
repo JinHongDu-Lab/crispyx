@@ -1314,11 +1314,17 @@ def run_pydeseq2_base(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
     This function runs PyDESeq2 without LFC shrinkage, saving base results.
     Shrinkage is handled by a separate run_pydeseq2_lfcshrink step.
+    
+    If ``max_perturbations`` is set, only a seeded random subset of that many
+    perturbations is fitted (each against the full control), and only those
+    cells are read into memory -- for datasets too large to load whole.
     
     Returns timing and memory metrics for the base fitting only.
     """
@@ -1338,13 +1344,25 @@ def run_pydeseq2_base(
     
     # Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+        # Get unique perturbations (excluding control)
+        perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    else:
+        backed = sc.read_h5ad(str(dataset_path), backed="r")
+        all_perturbations = sorted(
+            str(p) for p in backed.obs[perturbation_column].unique() if p != control_label
+        )
+        rng = np.random.default_rng(subset_seed)
+        n_pick = min(max_perturbations, len(all_perturbations))
+        perturbations = sorted(rng.choice(all_perturbations, size=n_pick, replace=False).tolist())
+        keep = backed.obs[perturbation_column].astype(str).isin([control_label, *perturbations]).to_numpy()
+        adata = backed[np.flatnonzero(keep)].to_memory()
+        backed.file.close()
+        adata.obs[perturbation_column] = adata.obs[perturbation_column].astype(str).astype("category")
     t_load_end = time.perf_counter()
     gc.collect()
     gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
-    
-    # Get unique perturbations (excluding control)
-    perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     
     t_process_start = time.perf_counter()
     all_base_results = []
@@ -1445,6 +1463,7 @@ def run_pydeseq2_base(
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
         "failed_groups": n_failed,
+        "subsampled": max_perturbations is not None,
     }
 
 
@@ -1652,6 +1671,11 @@ class BenchmarkConfig:
     chunk_size: Optional[int] = None  # Override chunk size for all operations
     use_docker: bool = False  # Run benchmarks inside Docker containers
     docker_image: str = "crispyx-benchmark:latest"  # Docker image name
+    # Run the PyDESeq2 reference on a seeded random subset of perturbations
+    # (each against the full control) when the full run is infeasible, e.g.
+    # genome-wide screens. None = all perturbations.
+    pydeseq2_max_perturbations: Optional[int] = None
+    pydeseq2_subset_seed: int = 0
 
     @classmethod
     def from_dict(
@@ -1737,6 +1761,8 @@ class BenchmarkConfig:
             chunk_size=chunk_size,
             use_docker=use_docker,
             docker_image=docker_image,
+            pydeseq2_max_perturbations=data.get("pydeseq2_max_perturbations"),
+            pydeseq2_subset_seed=data.get("pydeseq2_subset_seed", 0),
         )
 
     @classmethod
@@ -4557,6 +4583,8 @@ def create_benchmark_suite(
     n_cores: int | None = None,
     chunk_size: int | None = None,
     memory_limit_gb: float | None = None,
+    pydeseq2_max_perturbations: int | None = None,
+    pydeseq2_subset_seed: int = 0,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -4897,6 +4925,8 @@ def create_benchmark_suite(
                 "control_label": shared_kwargs["control_label"],
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
+                "max_perturbations": pydeseq2_max_perturbations,
+                "subset_seed": pydeseq2_subset_seed,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_qc_filtered",
@@ -5402,6 +5432,8 @@ def _run_single_benchmark(
         n_cores=config.n_cores,
         chunk_size=config.chunk_size,
         memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
+        pydeseq2_max_perturbations=config.pydeseq2_max_perturbations,
+        pydeseq2_subset_seed=config.pydeseq2_subset_seed,
     )
     
     # Define optional methods (excluded by default, only run when explicitly requested)

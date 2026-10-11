@@ -80,6 +80,14 @@ else
     echo "WARNING: ORIGIN_DATA_DIR '$ORIGIN_DATA_DIR' not found — large-dataset configs will fail."
 fi
 
+# Optional: run against a different crispyx source tree (e.g. a newer release
+# staged outside the repo) by bind-mounting it over /workspace/src.
+#   CRISPYX_SRC=$PROJECT_ROOT/crispyx-0.1.8/src ./submit_benchmark.sh ...
+if [ -n "${CRISPYX_SRC:-}" ]; then
+    ORIGIN_BIND="$ORIGIN_BIND --bind $CRISPYX_SRC:/workspace/src"
+    echo "crispyx source: $CRISPYX_SRC"
+fi
+
 # Note: PROJECT_ROOT is bound to /workspace to preserve all relative paths.
 # Memory is enforced by SLURM (--mem). Singularity --memory requires cgroups v2
 # unified mode, which most HPC clusters do not support.
@@ -93,7 +101,7 @@ fi
 # single thread keeps LLVM memory usage low and avoids OOM on large-CPU nodes.
 # Skip compilation if the index file for the batch-perts kernel already exists
 # in the workspace __pycache__ (i.e. warmup was done on a previous run).
-NUMBA_CACHE_SENTINEL="$PROJECT_ROOT/src/crispyx/__pycache__/_kernels._wilcoxon_batch_perts_presorted_numba-1784.py311.nbi"
+NUMBA_CACHE_SENTINEL="${CRISPYX_SRC:-$PROJECT_ROOT/src}/crispyx/__pycache__/_kernels._wilcoxon_batch_perts_presorted_numba-1784.py311.nbi"
 if [ -f "$NUMBA_CACHE_SENTINEL" ]; then
     echo "Numba kernel cache found — skipping warmup."
 else
