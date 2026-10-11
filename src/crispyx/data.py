@@ -1523,14 +1523,41 @@ def _extract_csr_components_dense(
     return data, indices, row_nnz, total_nnz
 
 
+@dataclass(frozen=True)
+class _RowSegment:
+    """Rows of one source matrix to stream into an output matrix:
+    ``cell_mask`` picks the rows (kept in source order) and ``gene_indices``
+    the columns, in output order. ``read_matrix`` extracts the matrix from a
+    freshly-opened backed AnnData (``lambda b: b.X`` or
+    ``lambda b: b.layers[key]``)."""
+
+    source_path: Path
+    read_matrix: Any
+    cell_mask: np.ndarray
+    gene_indices: np.ndarray
+
+
+def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
+    """The selected rows and columns of ``segment``, a row chunk at a time."""
+    backed = read_backed(segment.source_path)
+    try:
+        matrix = segment.read_matrix(backed)
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
+        ):
+            local_mask = segment.cell_mask[slc]
+            if not np.any(local_mask):
+                continue
+            block = block[local_mask]
+            yield block[:, segment.gene_indices] if segment.gene_indices.size else block[:, []]
+    finally:
+        backed.file.close()
+
+
 def _stream_write_matrix_subset(
-    source_path: Path,
+    segments: Sequence[_RowSegment],
     *,
-    read_matrix,
     dest_group: str,
-    cell_mask: np.ndarray,
-    gene_indices: np.ndarray,
-    n_obs: int,
     n_vars: int,
     output_path: Path,
     chunk_size: int,
@@ -1539,52 +1566,36 @@ def _stream_write_matrix_subset(
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
 ) -> None:
-    """Stream one CSR-shaped matrix (``X`` or a layer) filtered by
-    ``cell_mask``/``gene_indices`` into ``dest_group`` of ``output_path``.
+    """Stream the rows of ``segments``, one after another, into the CSR
+    matrix ``dest_group`` (``X`` or a layer) of ``output_path``.
 
-    ``read_matrix`` extracts the source matrix from a freshly-opened backed
-    AnnData (``lambda b: b.X`` or ``lambda b: b.layers[key]``). Shared by
-    ``write_filtered_subset`` for ``X`` (where a ``chunk_cache`` from
-    ``qc.py``'s gene-filter pass can skip re-reading the source) and for each
-    ``layers`` key (which always re-reads, since that cache is keyed to ``X``
-    only).
+    A counting pass sizes ``data``/``indices``/``indptr`` once; the rows are
+    then written in order without holding the matrix. One segment is
+    :func:`write_filtered_subset` (where a ``chunk_cache`` from ``qc.py``'s
+    gene-filter pass can skip re-reading the source's ``X``); several are
+    :func:`concat_h5ad`. Columns selected out of order are re-sorted within
+    each row, as anndata expects.
     """
+    if chunk_cache is not None and len(segments) != 1:
+        raise ValueError("chunk_cache describes a single source's X")
+    n_obs = int(sum(int(np.count_nonzero(segment.cell_mask)) for segment in segments))
     need_counting_pass = row_nnz is None or total_nnz is None or data_dtype is None
 
     if need_counting_pass:
         row_nnz = np.zeros(n_obs, dtype=np.int64)
         total_nnz = 0
-        data_dtype_local: np.dtype | None = None
-
-        backed = read_backed(source_path)
-        try:
-            matrix = read_matrix(backed)
-            row_offset = 0
-            for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
-            ):
-                local_mask = cell_mask[slc]
-                if not np.any(local_mask):
-                    continue
-                block = block[local_mask]
-                if gene_indices.size:
-                    block = block[:, gene_indices]
-                else:
-                    block = block[:, []]
+        dtypes: list[np.dtype] = []
+        row_offset = 0
+        for segment in segments:
+            for block in _segment_blocks(segment, chunk_size):
                 csr = _ensure_csr(block)
                 counts = np.diff(csr.indptr)
-                size = counts.size
-                row_nnz[row_offset : row_offset + size] = counts
+                row_nnz[row_offset : row_offset + counts.size] = counts
                 total_nnz += int(csr.nnz)
-                if data_dtype_local is None and csr.nnz:
-                    data_dtype_local = csr.data.dtype
-                row_offset += size
-        finally:
-            backed.file.close()
-
-        if data_dtype_local is None:
-            data_dtype_local = np.float32
-        data_dtype = data_dtype_local
+                if csr.nnz:
+                    dtypes.append(csr.data.dtype)
+                row_offset += counts.size
+        data_dtype = np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
 
     warn_if_disk_space_low(
         estimate_sparse_output_bytes(total_nnz), output_path,
@@ -1608,15 +1619,10 @@ def _stream_write_matrix_subset(
         indptr = np.zeros(n_obs + 1, dtype=np.int64)
         np.cumsum(row_nnz, out=indptr[1:])
 
-        # Phase 2 I/O Optimization: Use larger HDF5 chunks and write buffering
-        # Optimal chunk size: balance between I/O overhead and cache efficiency
-        # Target ~1MB chunks for data (assuming float32 = 4 bytes -> ~256K elements)
-        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))  # 8K to 256K elements
-
-        # Write buffer size: accumulate data before writing to reduce I/O syscalls
-        write_buffer_size = hdf5_chunk_size * 2  # Buffer 2x chunk size before flushing
-
-        # Use explicit chunk sizes for better I/O performance
+        # ~1 MB HDF5 chunks (8K to 256K elements), written from a buffer of
+        # two chunks to keep the number of writes down.
+        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+        write_buffer_size = hdf5_chunk_size * 2
         data_ds = grp.create_dataset(
             "data",
             shape=(total_nnz,),
@@ -1632,98 +1638,50 @@ def _stream_write_matrix_subset(
         grp.create_dataset("indptr", data=indptr)
         grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        # Stream data with write buffering
+        offset = 0
+        data_buffer: list[np.ndarray] = []
+        indices_buffer: list[np.ndarray] = []
+        buffer_nnz = 0
+
+        def flush() -> None:
+            nonlocal offset, data_buffer, indices_buffer, buffer_nnz
+            if buffer_nnz:
+                data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
+                indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
+                offset += buffer_nnz
+            data_buffer, indices_buffer, buffer_nnz = [], [], 0
+
+        def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
+            nonlocal buffer_nnz
+            if len(chunk_data):
+                data_buffer.append(chunk_data)
+                indices_buffer.append(chunk_indices)
+                buffer_nnz += len(chunk_data)
+                if buffer_nnz >= write_buffer_size:
+                    flush()
+
         if chunk_cache is not None:
-            # Read from cached CSR chunks (avoids re-reading the original matrix)
-            offset = 0
-            data_buffer = []
-            indices_buffer = []
-            buffer_nnz = 0
-
-            for filtered_data, filtered_indices, n_cells in chunk_cache.iter_filtered_chunks(
-                gene_indices, data_dtype
+            # Cached CSR chunks of X (avoids re-reading the source matrix).
+            for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
+                segments[0].gene_indices, data_dtype
             ):
-                nnz = len(filtered_data)
-                if nnz:
-                    data_buffer.append(filtered_data)
-                    indices_buffer.append(filtered_indices)
-                    buffer_nnz += nnz
-
-                    # Flush buffer when it exceeds threshold
-                    if buffer_nnz >= write_buffer_size:
-                        combined_data = np.concatenate(data_buffer)
-                        combined_indices = np.concatenate(indices_buffer)
-                        data_ds[offset : offset + buffer_nnz] = combined_data
-                        indices_ds[offset : offset + buffer_nnz] = combined_indices
-                        offset += buffer_nnz
-                        data_buffer = []
-                        indices_buffer = []
-                        buffer_nnz = 0
-
-            # Flush remaining buffer
-            if buffer_nnz > 0:
-                combined_data = np.concatenate(data_buffer)
-                combined_indices = np.concatenate(indices_buffer)
-                data_ds[offset : offset + buffer_nnz] = combined_data
-                indices_ds[offset : offset + buffer_nnz] = combined_indices
+                append(filtered_data, filtered_indices)
         else:
-            # Read from source matrix (fallback when cache not available)
-            backed = read_backed(source_path)
-            try:
-                matrix = read_matrix(backed)
-                offset = 0
-                data_buffer = []
-                indices_buffer = []
-                buffer_nnz = 0
-
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
-                ):
-                    local_mask = cell_mask[slc]
-                    if not np.any(local_mask):
-                        continue
-                    block = block[local_mask]
-                    if gene_indices.size:
-                        block = block[:, gene_indices]
-                    else:
-                        block = block[:, []]
-
-                    # Use optimized extraction for dense, scipy for sparse
+            for segment in segments:
+                for block in _segment_blocks(segment, chunk_size):
                     if sp.issparse(block):
                         csr = _ensure_csr(block, dtype=data_dtype)
-                        chunk_data = csr.data
-                        chunk_indices = csr.indices.astype(np.int32, copy=False)
-                        nnz = int(csr.nnz)
+                        if not csr.has_sorted_indices:
+                            csr = csr.copy()
+                            csr.sort_indices()
+                        append(csr.data, csr.indices.astype(np.int32, copy=False))
                     else:
-                        # Dense: use numba-accelerated direct extraction
-                        chunk_data, chunk_indices, _row_nnz, nnz = _extract_csr_components_dense(
+                        # Dense: numba-accelerated direct extraction.
+                        chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
                             block, data_dtype
                         )
-
-                    if nnz:
-                        data_buffer.append(chunk_data)
-                        indices_buffer.append(chunk_indices)
-                        buffer_nnz += nnz
-
-                        # Flush buffer when it exceeds threshold
-                        if buffer_nnz >= write_buffer_size:
-                            combined_data = np.concatenate(data_buffer)
-                            combined_indices = np.concatenate(indices_buffer)
-                            data_ds[offset : offset + buffer_nnz] = combined_data
-                            indices_ds[offset : offset + buffer_nnz] = combined_indices
-                            offset += buffer_nnz
-                            data_buffer = []
-                            indices_buffer = []
-                            buffer_nnz = 0
-
-                # Flush remaining buffer
-                if buffer_nnz > 0:
-                    combined_data = np.concatenate(data_buffer)
-                    combined_indices = np.concatenate(indices_buffer)
-                    data_ds[offset : offset + buffer_nnz] = combined_data
-                    indices_ds[offset : offset + buffer_nnz] = combined_indices
-            finally:
-                backed.file.close()
+                        append(chunk_data, chunk_indices)
+        flush()
 
 
 def write_filtered_subset(
@@ -1839,12 +1797,8 @@ def write_filtered_subset(
     adata.write(output_path)
 
     _stream_write_matrix_subset(
-        source_path,
-        read_matrix=lambda b: b.X,
+        [_RowSegment(source_path, lambda b: b.X, cell_mask, gene_indices)],
         dest_group="X",
-        cell_mask=cell_mask,
-        gene_indices=gene_indices,
-        n_obs=n_obs,
         n_vars=n_vars,
         output_path=output_path,
         chunk_size=chunk_size,
@@ -1856,12 +1810,8 @@ def write_filtered_subset(
 
     for key in layer_keys:
         _stream_write_matrix_subset(
-            source_path,
-            read_matrix=(lambda b, _key=key: b.layers[_key]),
+            [_RowSegment(source_path, lambda b, _key=key: b.layers[_key], cell_mask, gene_indices)],
             dest_group=f"layers/{key}",
-            cell_mask=cell_mask,
-            gene_indices=gene_indices,
-            n_obs=n_obs,
             n_vars=n_vars,
             output_path=output_path,
             chunk_size=chunk_size,
