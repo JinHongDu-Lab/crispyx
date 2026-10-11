@@ -8,6 +8,7 @@ import logging
 import os
 import warnings
 import threading
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -572,7 +573,10 @@ def _write_wilcoxon_result_h5ad(
     complete: a run killed at any point before leaves nothing to reuse.
     """
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    obs = pd.DataFrame(
+        {perturbation_column: obs_index.to_list(), "n_genes_tested": _count_tested(pvalue_matrix)},
+        index=obs_index,
+    )
     var = pd.DataFrame({"pts_rest": np.asarray(pts_rest, dtype=np.float32)}, index=gene_symbols.astype(str))
     uns = _wilcoxon_uns(
         control_label=control_label, perturbation_column=perturbation_column,
@@ -607,6 +611,30 @@ def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
     ds.attrs["encoding-type"] = "array"
     ds.attrs["encoding-version"] = "0.2.0"
     return ds
+
+
+def _count_tested(pvalues) -> np.ndarray:
+    """Genes tested per perturbation: the finite p-values of each row of
+    ``pvalues`` (an array, memmap or h5py dataset), read a block of rows at a
+    time so a large result is never held whole."""
+    n_rows, n_genes = pvalues.shape
+    step = max(1, (1 << 22) // max(n_genes, 1))
+    counts = np.empty(n_rows, dtype=np.int64)
+    for start in range(0, n_rows, step):
+        block = np.asarray(pvalues[start:start + step])
+        counts[start:start + step] = np.isfinite(block).sum(axis=1)
+    return counts
+
+
+def _replace_obs(path: Path, obs: pd.DataFrame) -> None:
+    """Replace the ``obs`` table of the h5ad at ``path`` in place. The table
+    is encoded by anndata (into a scratch file) and copied across."""
+    with tempfile.TemporaryDirectory(prefix="cx_obs_") as tmpdir:
+        donor = Path(tmpdir) / "obs.h5ad"
+        ad.AnnData(obs=obs).write(donor)
+        with h5py.File(donor, "r") as src, h5py.File(path, "r+") as dest:
+            del dest["obs"]
+            src.copy(src["obs"], dest, name="obs")
 
 
 def _wilcoxon_uns(
@@ -1125,7 +1153,8 @@ def t_test(
         The h5ad file holds one row per perturbation: the difference of means
         (``mean_difference``) in ``X`` and the layers ``z_score``, ``pvalue``,
         ``pvalue_adj``, ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
-        arm, so it is the per-gene column ``var["pts_rest"]``.
+        arm, so it is the per-gene column ``var["pts_rest"]``. ``obs["n_genes_tested"]``
+        counts the genes each perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -1523,6 +1552,7 @@ def t_test(
     # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
     # which fails with HDF5 header size limits for large group counts)
     var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=gene_symbols)
+    obs["n_genes_tested"] = _count_tested(pval_matrix)
     adata = ad.AnnData(effect_matrix, obs=obs, var=var)
     adata.layers["z_score"] = stat_matrix  # t-statistic (converges to z for large n)
     adata.layers["pvalue"] = pval_matrix
@@ -1892,7 +1922,8 @@ def nb_glm_test(
         columns: ``pts_rest``, and, when a global dispersion is fitted,
         ``dispersion`` and ``dispersion_trend``; a per-comparison dispersion
         is stored as the layers ``dispersion``, ``dispersion_raw`` and
-        ``dispersion_trend`` instead.
+        ``dispersion_trend`` instead. ``obs["n_genes_tested"]`` counts the
+        genes each perturbation was tested on, after the filters.
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -3745,6 +3776,7 @@ def nb_glm_test(
             logfc_raw_matrix = logfc_raw_matrix / ln2
         se_matrix = se_matrix / ln2
 
+    obs["n_genes_tested"] = _count_tested(pvalue_matrix)
     adata = ad.AnnData(logfc_matrix, obs=obs, var=var)
     adata.layers["z_score"] = statistic_matrix
     adata.layers["pvalue"] = pvalue_matrix
@@ -4251,6 +4283,9 @@ def _wilcoxon_test_streaming(
             work_path, groups=candidates, perturbation_column=perturbation_column,
             control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
         )
+    with h5py.File(work_path, "r") as hf:
+        obs["n_genes_tested"] = _count_tested(hf["layers/pvalue"])
+    _replace_obs(work_path, obs)
     write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()
@@ -4946,10 +4981,21 @@ def wilcoxon_test(
         ``z_score``, ``pvalue``, ``pvalue_adj``, ``logfoldchanges``,
         ``u_statistic`` and ``pts``. ``pts_rest``
         describes the control arm, so it is the per-gene column
-        ``var["pts_rest"]``.
+        ``var["pts_rest"]``. ``obs["n_genes_tested"]`` counts the genes each
+        perturbation was tested on, after the filters.
 
     Notes
     -----
+    **Differences from** ``scanpy.tl.rank_genes_groups(method="wilcoxon")``.
+    Scanpy tests every gene; crispyx applies four low-expression filters by
+    default (``min_pct_ctrl=0.01``, ``min_pct_pert=0.002``,
+    ``min_mean_ctrl=0.05``, ``min_mean_pert=0.005``) and reports the genes
+    they exclude as untested (``NaN``), which also keeps them out of the
+    multiple-testing correction. ``obs["n_genes_tested"]`` says how many
+    genes each comparison kept. Setting all four to ``0`` tests Scanpy's gene
+    set; a gene whose values are all tied is still untested here, where
+    Scanpy reports ``score=0``, ``pvalue=1``.
+
     The rank test itself runs in a numba ``prange`` kernel over perturbations
     and uses every CPU the process is allowed to run on; there is no separate
     worker-count parameter.

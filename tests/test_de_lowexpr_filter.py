@@ -537,3 +537,18 @@ def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
         )
     _assert_untested_is_uniform(standard, standard.groups.index("KO1"))
     _assert_untested_is_uniform(streaming, streaming.groups.index("KO1"))
+
+
+@pytest.mark.parametrize("fn", ["wilcoxon_test", "t_test", "nb_glm_test"])
+@pytest.mark.parametrize("memory_limit_gb", [128, 1e-7], ids=["standard", "streaming"])
+def test_n_genes_tested_counts_what_the_filters_kept(tmp_path, fn, memory_limit_gb):
+    """obs["n_genes_tested"] is the number of finite p-values in each row,
+    on every result path."""
+    path = _make_dataset_partly_tested(tmp_path)
+    result = getattr(cx, fn)(
+        path, output_dir=tmp_path, data_name=fn, memory_limit_gb=memory_limit_gb, **_UNTESTED_KW
+    )
+    obs = ad.read_h5ad(result.result_path).obs
+    expected = np.isfinite(np.asarray(result.pvalues)).sum(axis=1)
+    assert (expected < len(result.genes)).any(), "fixture should exclude some genes"
+    np.testing.assert_array_equal(obs["n_genes_tested"].to_numpy(), expected)
