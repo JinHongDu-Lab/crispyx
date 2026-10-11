@@ -562,6 +562,12 @@ def run_wilcoxon_with_csc(
     # calculate_optimal_gene_chunk_size (max_chunk=512), independent of the
     # QC cell-chunk size. This avoids the O(n_ctrl * chunk_size) dense
     # allocation exploding for datasets with large control groups like Feng-gwsnf.
+    # crispyx >= 0.1.3 dropped wilcoxon_test's n_jobs (it was never read;
+    # parallelism comes from numba prange), so pass it only where accepted.
+    import inspect
+    extra_kwargs = {}
+    if "n_jobs" in inspect.signature(wilcoxon_test).parameters:
+        extra_kwargs["n_jobs"] = n_jobs
     t_de_start = time.perf_counter()
     de_result = wilcoxon_test(
         data=data_path,
@@ -570,9 +576,9 @@ def run_wilcoxon_with_csc(
         gene_name_column=gene_name_column,
         output_dir=output_dir,
         data_name=data_name,
-        n_jobs=n_jobs,
         memory_limit_gb=memory_limit_gb,
         chunk_size=None,  # auto-calculated per calculate_optimal_gene_chunk_size
+        **extra_kwargs,
     )
     de_seconds = time.perf_counter() - t_de_start
 
