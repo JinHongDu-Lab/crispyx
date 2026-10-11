@@ -158,6 +158,7 @@ def test_effects_from_cells_equal_effects_from_saved_bulk(tmp_path):
     bulk = cx.pb.aggregate(
         path,
         groupby=["perturbation", "batch"],
+        method="mean_log1p",
         min_cells=4,
         bootstrap_size=7,
         random_state=3,
@@ -221,6 +222,7 @@ def test_matching_profile_result_reloads(tmp_path):
     first = cx.aggregate_pseudobulk(
         path,
         groupby=["perturbation", "batch"],
+        method="mean_log1p",
         min_cells=4,
         output_path=output,
     )
@@ -229,6 +231,7 @@ def test_matching_profile_result_reloads(tmp_path):
     second = cx.pb.aggregate(
         path,
         groupby=["perturbation", "batch"],
+        method="mean_log1p",
         min_cells=4,
         output_path=output,
     )
@@ -245,6 +248,7 @@ def test_perturbations_filter_is_independent_of_groupby_order(tmp_path, groupby)
     result = cx.pb.aggregate(
         path,
         groupby=groupby,
+        method="mean_log1p",
         perturbations=["A"],
         min_cells=1,
         output_path=tmp_path / f"filtered_{'_'.join(groupby)}.h5ad",
@@ -264,6 +268,7 @@ def test_unknown_perturbation_still_raises(tmp_path):
         cx.pb.aggregate(
             path,
             groupby=["perturbation", "batch"],
+            method="mean_log1p",
             perturbations=["missing"],
             min_cells=1,
             output_path=tmp_path / "missing.h5ad",
@@ -297,3 +302,68 @@ def test_method_literal_is_exactly_what_each_function_accepts(tmp_path, fn, allo
     for method in rejected:
         with pytest.raises(ValueError, match="method must be"):
             fn(path, method=method, output_path=tmp_path / "bad.h5ad", **kwargs)
+
+
+def _write_donor_screen(tmp_path: Path) -> Path:
+    """Two donors x two subclasses; sex and disease are donor-level, the
+    cell-level QC metric varies within every profile."""
+    rng = np.random.default_rng(0)
+    records = []
+    for donor, sex, disease in (("d1", "F", "AD"), ("d2", "M", "control")):
+        for subclass, n in (("L2/3 IT", 6), ("L4 IT", 3)):
+            for _ in range(n):
+                records.append({"donor": donor, "subclass": subclass, "sex": sex,
+                                "disease": disease, "pct_mito": rng.random()})
+    obs = pd.DataFrame(records, index=[f"c{i}" for i in range(len(records))])
+    obs["sex"] = obs["sex"].astype("category")
+    counts = rng.poisson(3, (len(obs), 4)).astype(np.float32)
+    path = tmp_path / "donors.h5ad"
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(4)])).write(path)
+    return path
+
+
+def test_profiles_are_named_by_group_and_keep_donor_covariates(tmp_path, capsys):
+    path = _write_donor_screen(tmp_path)
+    result = cx.pb.aggregate(
+        path, groupby=["donor", "subclass"], method="sum", min_cells=1,
+        output_path=tmp_path / "pb.h5ad", verbose=True,
+    )
+    obs = result.backed.obs.copy()
+    result.close()
+    assert obs.index.tolist() == ["d1|L2/3 IT", "d1|L4 IT", "d2|L2/3 IT", "d2|L4 IT"]
+    assert obs["sex"].astype(str).tolist() == ["F", "F", "M", "M"]
+    assert obs["disease"].tolist() == ["AD", "AD", "control", "control"]
+    assert "pct_mito" not in obs
+    assert "not carried over: ['pct_mito']" in capsys.readouterr().out
+    # n_cells over two grouping columns is their composition table.
+    table = obs.pivot(index="donor", columns="subclass", values="n_cells")
+    assert table.loc["d1", "L2/3 IT"] == 6 and table.loc["d2", "L4 IT"] == 3
+
+
+def test_one_grouping_column_names_profiles_by_its_value(tmp_path):
+    path = _write_donor_screen(tmp_path)
+    result = cx.pb.aggregate(
+        path, groupby="donor", method="sum", min_cells=1, output_path=tmp_path / "pb.h5ad",
+    )
+    assert result.backed.obs_names.tolist() == ["d1", "d2"]
+    result.close()
+
+
+def test_ambiguous_profile_names_raise(tmp_path):
+    """("d1", "a|b") and ("d1|a", "b") would both be named "d1|a|b"."""
+    obs = pd.DataFrame(
+        {"donor": ["d1"] * 3 + ["d1|a"] * 3, "subclass": ["a|b"] * 3 + ["b"] * 3},
+        index=[f"c{i}" for i in range(6)],
+    )
+    path = tmp_path / "clash.h5ad"
+    ad.AnnData(sp.csr_matrix(np.ones((6, 2), dtype=np.float32)), obs=obs).write(path)
+    with pytest.raises(ValueError, match="ambiguous"):
+        cx.pb.aggregate(
+            path, groupby=["donor", "subclass"], method="sum", min_cells=1,
+            output_path=tmp_path / "pb.h5ad",
+        )
+
+
+def test_method_is_required():
+    with pytest.raises(TypeError, match="method"):
+        cx.aggregate_pseudobulk("unused.h5ad", groupby="donor")

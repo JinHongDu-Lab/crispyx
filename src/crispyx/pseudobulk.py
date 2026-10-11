@@ -724,11 +724,48 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
+#: obs columns aggregate_pseudobulk writes itself; a source column of the
+#: same name is not carried over.
+_PROFILE_COLUMNS = ("n_cells", "n_cells_aggregated", "sampled_with_replacement")
+
+
+def _profile_names(keys: list[tuple[str, ...]]) -> pd.Index:
+    """Name each profile by its group key: the value itself for one grouping
+    column, the values joined with ``"|"`` for several."""
+    names = pd.Index(["|".join(key) for key in keys], name="pseudobulk_id")
+    if not names.is_unique:
+        clashes = names[names.duplicated()].unique().tolist()
+        raise ValueError(
+            f"Grouping values containing '|' make profile names ambiguous: {clashes[:5]}. "
+            "Rename those values before aggregating."
+        )
+    return names
+
+
+def _constant_covariates(
+    obs: pd.DataFrame, group_codes: np.ndarray, n_groups: int, *, exclude: Sequence[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """The obs columns that hold one value within every profile (donor sex,
+    age, disease, ...), one row per profile; and the names of the columns
+    that vary within some profile and so cannot be carried over."""
+    candidates = [column for column in obs.columns if column not in exclude]
+    selected = np.flatnonzero(group_codes >= 0)
+    if not candidates or selected.size == 0:
+        return pd.DataFrame(index=pd.RangeIndex(n_groups)), []
+    frame = obs.iloc[selected][candidates].reset_index(drop=True)
+    grouped = frame.groupby(group_codes[selected], sort=True, observed=True)
+    constant = grouped.nunique(dropna=False).le(1).all()
+    keep = [column for column in candidates if constant[column]]
+    varying = [column for column in candidates if not constant[column]]
+    first = grouped[keep].first() if keep else pd.DataFrame(index=pd.RangeIndex(n_groups))
+    return first.reindex(pd.RangeIndex(n_groups)), varying
+
+
 def aggregate_pseudobulk(
     data: str | Path | AnnData | ad.AnnData,
     *,
     groupby: str | Sequence[str],
-    method: PseudobulkMethod = "mean_log1p",
+    method: PseudobulkMethod,
     layer: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -758,11 +795,14 @@ def aggregate_pseudobulk(
         One observation column, or an ordered sequence of columns defining a
         pseudo-bulk sample.
     method
-        ``"sum"`` sums raw counts and therefore requires finite,
-        non-negative, integer-valued input. ``"mean_log1p"`` computes the
-        mean of per-cell log1p expression. Integer count input is transformed
-        with ``log1p`` first; continuous input is treated as already
-        log1p-transformed and averaged unchanged.
+        Required; there is no default because each choice is wrong for the
+        other use. ``"sum"`` sums raw counts -- what count models need
+        (DESeq2, edgeR, :func:`nb_glm_test`, causarray) -- and therefore
+        requires finite, non-negative, integer-valued input. ``"mean_log1p"``
+        computes the mean of per-cell log1p expression, for contrasts on the
+        log scale. Integer count input is transformed with ``log1p`` first;
+        continuous input is treated as already log1p-transformed and averaged
+        unchanged.
     layer
         Expression layer to aggregate. Uses ``X`` when omitted.
     gene_name_column
@@ -802,10 +842,16 @@ def aggregate_pseudobulk(
     Returns
     -------
     AnnData
-        On-disk result with absolute profiles in ``X``; grouping columns,
-        ``n_cells``, and ``n_cells_aggregated`` in ``obs``; a
-        ``uns['crispyx_pseudobulk']`` description of the aggregation; and the
-        ``uns['crispyx']`` provenance stamp.
+        On-disk result with absolute profiles in ``X``, one row per profile
+        named by its group key (the value for one ``groupby`` column, the
+        values joined with ``"|"`` for several, e.g. ``"donor1|L2/3 IT"``).
+        ``obs`` holds the grouping columns, ``n_cells`` and
+        ``n_cells_aggregated``, and every other source ``obs`` column that is
+        constant within each profile (donor sex, age, disease, ...); columns
+        that vary within a profile are left out. ``n_cells`` pivoted over two
+        grouping columns is their composition table, e.g. cells per donor and
+        cell type. ``uns['crispyx_pseudobulk']`` describes the aggregation and
+        ``uns['crispyx']`` is the provenance stamp.
     """
     call_args = dict(locals())  # for the result fingerprint, before any other local
     _check_method(
@@ -998,11 +1044,18 @@ def aggregate_pseudobulk(
 
             obs = pd.DataFrame(
                 {column: [key[i] for key in keys] for i, column in enumerate(columns)},
-                index=pd.Index(
-                    [f"pseudobulk_{i:08d}" for i in range(len(keys))],
-                    name="pseudobulk_id",
-                ),
+                index=_profile_names(keys),
             )
+            covariates, varying = _constant_covariates(
+                backed.obs, group_codes, len(keys), exclude=[*columns, *_PROFILE_COLUMNS],
+            )
+            for column in covariates.columns:
+                obs[column] = covariates[column].to_numpy()
+            if varying:
+                _messages.vprint(
+                    verbose, "pb.aggregate",
+                    f"obs columns that vary within a profile are not carried over: {varying}",
+                )
             obs["n_cells"] = counts
             obs["n_cells_aggregated"] = aggregated_counts
             obs["sampled_with_replacement"] = bootstrap_size is not None

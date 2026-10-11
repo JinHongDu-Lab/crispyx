@@ -30,7 +30,7 @@ KEY = "crispyx"
 #: read under the new one.
 SCHEMAS = {
     "de_result": 3,  # 2: all-tied Wilcoxon genes NaN; 3: Wilcoxon X is the AUC (was AUC - 0.5)
-    "pseudobulk": 1,
+    "pseudobulk": 2,  # 2: profiles named by group key, constant obs columns carried over
     "pseudobulk_effects": 1,
     "batch": 1,
     "sorted": 1,

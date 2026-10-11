@@ -543,7 +543,7 @@ class _PseudobulkNamespace:
         data: str | Path | ad.AnnData,
         *,
         groupby: str | Sequence[str],
-        method: PseudobulkMethod = "mean_log1p",
+        method: PseudobulkMethod,
         layer: str | None = None,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
