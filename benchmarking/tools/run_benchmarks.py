@@ -5335,14 +5335,26 @@ def _run_single_benchmark(
     if not config.quiet:
         print(f"\nStandardizing dataset: {config.dataset_path.name}")
     
-    standardized_path = standardize_dataset(
-        dataset_path=config.dataset_path,
-        perturbation_column=config.perturbation_column,
-        control_label=config.control_label,
-        gene_name_column=config.gene_name_column,
-        output_dir=config.output_dir,
-        force=config.force_restandardize,
+    # Reuse an existing standardized file ourselves: crispyx >= 0.1.7 only
+    # reuses outputs carrying its provenance stamp, so it would rewrite every
+    # file made by an older release (tens of GB on genome-wide data) although
+    # standardization itself is unchanged.
+    existing_standardized = (
+        config.output_dir / ".cache" / f"standardized_{config.dataset_path.stem}.h5ad"
     )
+    if existing_standardized.exists() and not config.force_restandardize:
+        standardized_path = existing_standardized
+        if not config.quiet:
+            print(f"  ✓ Reusing standardized file: {standardized_path.name}")
+    else:
+        standardized_path = standardize_dataset(
+            dataset_path=config.dataset_path,
+            perturbation_column=config.perturbation_column,
+            control_label=config.control_label,
+            gene_name_column=config.gene_name_column,
+            output_dir=config.output_dir,
+            force=config.force_restandardize,
+        )
 
     # Ensure a CSR copy exists for efficient row-wise access (adaptive QC,
     # NB-GLM, size factors).  On CSC or dense standardized files this avoids
