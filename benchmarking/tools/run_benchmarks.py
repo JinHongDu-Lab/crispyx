@@ -1291,6 +1291,22 @@ def run_lfcshrink(
     }
 
 
+def _make_var_names_unique_for_pydeseq2(adata) -> Dict[str, str]:
+    """Give ``adata`` unique var names in place; return ``{unique: original}``.
+
+    PyDESeq2 (0.5.x) raises "cannot reindex on an axis with duplicate labels"
+    in ``fit_dispersion_trend`` when gene names repeat (e.g. Nadig-HEPG2), so
+    every per-perturbation fit fails. Output rows are mapped back to the
+    original names so they still line up with the other methods' results.
+    """
+    original = adata.var_names.astype(str).tolist()
+    if len(set(original)) == len(original):
+        return {name: name for name in original}
+    unique = [f"{name}__{i}" for i, name in enumerate(original)]
+    adata.var_names = unique
+    return dict(zip(unique, original))
+
+
 def run_pydeseq2_base(
     dataset_path: Path,
     *,
@@ -1325,12 +1341,15 @@ def run_pydeseq2_base(
     adata = sc.read_h5ad(str(dataset_path))
     t_load_end = time.perf_counter()
     gc.collect()
+    gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
     
     # Get unique perturbations (excluding control)
     perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     
     t_process_start = time.perf_counter()
     all_base_results = []
+    n_failed = 0
+    first_error = None
     
     for pert in perturbations:
         # Subset to control + current perturbation
@@ -1373,17 +1392,27 @@ def run_pydeseq2_base(
                 base_results_df["log2FoldChange"] = -base_results_df["log2FoldChange"]
                 if "stat" in base_results_df.columns:
                     base_results_df["stat"] = -base_results_df["stat"]
-                base_results_df["gene"] = base_results_df.index
+                base_results_df["gene"] = base_results_df.index.map(gene_name_map)
                 base_results_df[perturbation_column] = pert
                 # Store dds and stat_res references for lfcShrink step
                 base_results_df["_coeff_name"] = f"{perturbation_column}[T.{control_label}]"
                 base_results_df = base_results_df.reset_index(drop=True)
                 all_base_results.append(base_results_df)
                 
-            except Exception:
+            except Exception as exc:
+                n_failed += 1
+                if first_error is None:
+                    first_error = f"{pert}: {type(exc).__name__}: {exc}"
                 continue
     
     t_process_end = time.perf_counter()
+    
+    # Per-perturbation failures are skipped, but an all-failed run must not be
+    # reported as success with an empty CSV.
+    if not all_base_results and perturbations:
+        raise RuntimeError(
+            f"PyDESeq2 failed for all {len(perturbations)} perturbations; first error: {first_error}"
+        )
     
     # Format and save base results
     if all_base_results:
@@ -1415,6 +1444,7 @@ def run_pydeseq2_base(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "failed_groups": n_failed,
     }
 
 
@@ -1452,11 +1482,13 @@ def run_pydeseq2_lfcshrink(
     # Load data
     adata = sc.read_h5ad(str(dataset_path))
     gc.collect()
+    gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
     
     # Get unique perturbations (excluding control)
     perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     
     all_shrunk_results = []
+    first_error = None
     total_shrinkage_seconds = 0.0
     
     for pert in perturbations:
@@ -1520,14 +1552,21 @@ def run_pydeseq2_lfcshrink(
                 shrunk_results_df["log2FoldChange"] = -shrunk_results_df["log2FoldChange"]
                 if "stat" in shrunk_results_df.columns:
                     shrunk_results_df["stat"] = -shrunk_results_df["stat"]
-                shrunk_results_df["gene"] = shrunk_results_df.index
+                shrunk_results_df["gene"] = shrunk_results_df.index.map(gene_name_map)
                 shrunk_results_df[perturbation_column] = pert
                 shrunk_results_df["shrinkage_applied"] = shrinkage_applied
                 shrunk_results_df = shrunk_results_df.reset_index(drop=True)
                 all_shrunk_results.append(shrunk_results_df)
                 
-            except Exception:
+            except Exception as exc:
+                if first_error is None:
+                    first_error = f"{pert}: {type(exc).__name__}: {exc}"
                 continue
+    
+    if not all_shrunk_results and perturbations:
+        raise RuntimeError(
+            f"PyDESeq2 lfcShrink failed for all {len(perturbations)} perturbations; first error: {first_error}"
+        )
     
     # Format and save shrunk results
     if all_shrunk_results:
