@@ -480,7 +480,7 @@ def highly_variable_genes(
     Parameters
     ----------
     data
-        Path to h5ad file, or a crispyx/anndata AnnData object.
+        Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
     flavor
         HVG selection method:
 

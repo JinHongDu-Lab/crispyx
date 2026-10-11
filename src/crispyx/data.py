@@ -688,8 +688,9 @@ def resolve_data_path(
             result = Path(filename)
         else:
             raise TypeError(
-                "Operations in crispyx expect a backed AnnData object or file path. "
-                "The provided AnnData appears to be in-memory (no .filename attribute)."
+                "This AnnData is in memory, but crispyx streams its input from disk. "
+                'Save it first with adata.write_h5ad("data.h5ad") and pass the path '
+                "(or an AnnData opened with anndata.read_h5ad(path, backed='r'))."
             )
     else:
         raise TypeError(

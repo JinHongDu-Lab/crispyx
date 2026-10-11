@@ -22,6 +22,7 @@ from crispyx.data import (
     normalise_perturbation_labels,
     read_h5ad_ondisk,
     resolve_control_label,
+    resolve_data_path,
     standardise_gene_names,
     write_obs,
     write_var,
@@ -465,3 +466,19 @@ class TestUpdateH5adDataframe:
         result = ad.read_h5ad(h5ad_path)
         assert list(result.obs["label"]) == ["a", "b", "c"]
         assert list(result.obs["count"]) == [1, 2, 3]
+
+
+def test_in_memory_anndata_is_rejected_with_the_fix(tmp_path):
+    """crispyx streams from disk: an in-memory AnnData is refused with the
+    one line that makes it acceptable, and the saved or backed form works."""
+    adata = ad.AnnData(np.ones((3, 2), dtype=np.float32))
+    with pytest.raises(TypeError, match=r'adata\.write_h5ad\("data\.h5ad"\)'):
+        resolve_data_path(adata)
+    path = tmp_path / "data.h5ad"
+    adata.write_h5ad(path)
+    assert resolve_data_path(path) == path
+    backed = ad.read_h5ad(path, backed="r")
+    try:
+        assert resolve_data_path(backed) == path
+    finally:
+        backed.file.close()

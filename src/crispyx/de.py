@@ -1003,7 +1003,7 @@ def t_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         log-transformed expression data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
@@ -1592,7 +1592,7 @@ def nb_glm_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         raw count data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
@@ -4787,7 +4787,7 @@ def wilcoxon_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         normalised, log-transformed data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
@@ -5589,7 +5589,7 @@ def shrink_lfc(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         NB-GLM results from `nb_glm_test`. Must have required layers and
         metadata in `uns`.
     output_dir

@@ -282,6 +282,24 @@ HPC / SLURM tips
 * ``drop_file_cache()`` is called automatically to prevent cgroup-cached
   pages from counting toward memory limits.
 
+Can I pass an in-memory ``AnnData``?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No.  crispyx streams its input from disk, so every function takes a path to
+an ``.h5ad`` file, a :class:`crispyx.AnnData`, or an ``anndata.AnnData``
+opened with ``backed="r"``.  An in-memory object -- for example one returned
+by ``cellxgene_census.get_anndata`` -- raises a ``TypeError``.  Save it
+first; that is one line, and it keeps the on-disk copy explicit and under
+your control:
+
+.. code-block:: python
+
+   adata.write_h5ad("data.h5ad")
+   cx.pb.aggregate("data.h5ad", groupby=["donor", "cell_type"], method="sum")
+
+The saved file is also what lets crispyx tell later whether a result it
+finds is still current (see the next question).
+
 My DE result is loaded instantly on the second call — is that expected?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
