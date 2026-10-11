@@ -1,5 +1,11 @@
 # Benchmark Configuration for Marson-CD4T
 
+# NOTE: single-donor subset. This file holds donor D4 only, all in the
+# Rest condition (1,749,091 cells; 1,737,645 after QC). The full Marson
+# CD4+ T-cell screen has 4 donors (D1-D4, 7,386,295 cells, all Rest); the
+# benchmark deliberately keeps D4 only. The file is the strict_qc subset
+# from the Cardiomyocyte project (~/Cardiomyocyte/code/data/strict_qc/
+# origin/Marson-CD4T.h5ad on hydra; full 4-donor file: .../data/origin/).
 dataset_path: "/data/origin/Marson-CD4T.h5ad"
 output_dir: "benchmarking/results/Marson-CD4T"
 
