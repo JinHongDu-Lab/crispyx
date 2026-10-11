@@ -855,7 +855,7 @@ def _wilcoxon_single_pert_presorted(
             u_stat_out[g] = 0.0
             z_score_out[g] = 0.0
             pvalue_out[g] = 1.0
-            effect_out[g] = 0.0
+            effect_out[g] = 0.5  # the AUC of no shift
             continue
 
         pert_col = pert_dense[:, g]
@@ -926,9 +926,9 @@ def _wilcoxon_single_pert_presorted(
             pval = np.nan
 
         if n_pert_f > 0 and n_control_f > 0:
-            effect = u_stat / (n_pert_f * n_control_f) - 0.5
+            effect = u_stat / (n_pert_f * n_control_f)  # AUC
         else:
-            effect = 0.0
+            effect = 0.5
 
         if math.isnan(z):
             u_stat = np.nan
@@ -1055,7 +1055,7 @@ def _wilcoxon_stratified_single_pert(
     which is the stratified Wilcoxon / van Elteren test.  Strata where either
     ``n1`` or ``n0`` is zero contribute nothing (they carry no information about
     the comparison).  The combined common-language effect size is
-    ``sum_b U_b / sum_b (n1_b * n0_b) - 0.5``.
+    ``sum_b U_b / sum_b (n1_b * n0_b)``, the stratified AUC.
 
     Notes
     -----
@@ -1071,7 +1071,7 @@ def _wilcoxon_stratified_single_pert(
             u_stat_out[g] = 0.0
             z_score_out[g] = 0.0
             pvalue_out[g] = 1.0
-            effect_out[g] = 0.0
+            effect_out[g] = 0.5  # the AUC of no shift
             continue
 
         num = 0.0        # sum_b (R_b - E_b)
@@ -1149,9 +1149,9 @@ def _wilcoxon_stratified_single_pert(
             pval = np.nan
 
         if n1n0_sum > 0.0:
-            effect = u_sum / n1n0_sum - 0.5
+            effect = u_sum / n1n0_sum  # AUC
         else:
-            effect = 0.0
+            effect = 0.5
 
         if math.isnan(z):
             u_sum = np.nan

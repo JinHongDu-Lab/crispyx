@@ -466,10 +466,13 @@ def _assert_untested_is_uniform(res, row):
     pvals = np.asarray(res.pvalues[row])
     lfc = np.asarray(res.logfoldchanges[row])
     stat = np.asarray(res.statistics[row])
-    eff = np.asarray(res.effect_size[row])
+    columns = [("logfoldchanges", lfc), ("statistics", stat)]
+    for name in ("auc", "mean_difference"):
+        if getattr(res, name) is not None:
+            columns.append((name, np.asarray(getattr(res, name)[row])))
     untested = np.isnan(pvals)
     assert untested.any(), "fixture should exclude at least one gene"
-    for name, col in (("logfoldchanges", lfc), ("statistics", stat), ("effect_size", eff)):
+    for name, col in columns:
         assert np.isnan(col[untested]).all(), f"{name} is finite where the p-value is NaN"
         assert np.isfinite(col[~untested]).all(), f"{name} is NaN where the p-value is not"
     # Nothing is spelled as "tested, no change".
@@ -505,7 +508,9 @@ def test_a_row_does_not_depend_on_the_other_perturbations_in_the_run(tmp_path, f
     )
     row_both = both.groups.index("KO1")
     row_alone = alone.groups.index("KO1")
-    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size"):
+    for attr in ("pvalues", "statistics", "logfoldchanges", "auc", "mean_difference"):
+        if getattr(both, attr) is None:
+            continue
         np.testing.assert_allclose(
             np.asarray(getattr(both, attr)[row_both]),
             np.asarray(getattr(alone, attr)[row_alone]),
@@ -523,7 +528,7 @@ def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
         path, output_dir=tmp_path, data_name="stream", memory_limit_gb=1e-7, **_UNTESTED_KW
     )
     assert np.isnan(standard.pvalues).any()
-    for attr in ("pvalues", "statistics", "logfoldchanges", "effect_size", "pts", "pts_rest"):
+    for attr in ("pvalues", "statistics", "logfoldchanges", "auc", "pts", "pts_rest"):
         np.testing.assert_allclose(
             np.asarray(getattr(standard, attr)),
             np.asarray(getattr(streaming, attr)),

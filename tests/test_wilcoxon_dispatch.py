@@ -30,7 +30,7 @@ from crispyx.de import _build_result_from_h5ad, _write_wilcoxon_result_h5ad, wil
 
 ADAMSON_PATH = Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad"
 
-_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest")
+_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "auc", "pts", "pts_rest")
 
 
 def _write_log_normalised(path: Path, data: np.ndarray, labels: list[str]) -> Path:
@@ -90,13 +90,14 @@ def test_presort_returns_each_genes_sorted_nonzeros(ctrl):
 
 
 def _reference_rank_test(ctrl, pert, valid, tie_correct):
-    """U, z, p and effect of each gene from scipy's ranks: NaN where every
-    value is tied, the neutral fill (0, 0, 1, 0) where ``valid`` is False."""
+    """U, z, p and AUC of each gene from scipy's ranks: NaN where every
+    value is tied, the neutral fill (0, 0, 1, 0.5) where ``valid`` is False."""
     from scipy.stats import rankdata, tiecorrect
     n0, n1 = ctrl.shape[0], pert.shape[0]
     n = n0 + n1
     out = np.zeros((4, ctrl.shape[1]))
     out[2] = 1.0
+    out[3] = 0.5
     for g in np.flatnonzero(valid):
         ranks = rankdata(np.concatenate([ctrl[:, g], pert[:, g]]))
         if tiecorrect(ranks) == 0:
@@ -106,7 +107,7 @@ def _reference_rank_test(ctrl, pert, valid, tie_correct):
         u = rank_sum - n1 * (n1 + 1) / 2
         std = np.sqrt((tiecorrect(ranks) if tie_correct else 1.0) * n1 * n0 * (n + 1) / 12)
         z = (rank_sum - n1 * (n + 1) / 2) / std
-        out[:, g] = u, z, math.erfc(abs(z) / math.sqrt(2)), u / (n1 * n0) - 0.5
+        out[:, g] = u, z, math.erfc(abs(z) / math.sqrt(2)), u / (n1 * n0)
     return out
 
 
@@ -148,7 +149,7 @@ def test_presorted_kernel_matches_scipy_ranks(n_ctrl, n_pert, n_genes, sparsity,
         pert, np.array([0, n_pert]), valid[None, :], tie_correct, 0.5, *out,
     )
     expected = _reference_rank_test(ctrl, pert, valid, tie_correct)
-    for name, a, e in zip(("u", "z", "p", "effect"), out[:, 0], expected):
+    for name, a, e in zip(("u", "z", "p", "auc"), out[:, 0], expected):
         np.testing.assert_allclose(a, e, atol=1e-9, rtol=1e-6, err_msg=name)
     assert np.isnan(out[:, 0, :2]).all()
 
@@ -190,7 +191,7 @@ def test_streaming_matches_standard_on_real_data(tmp_path):
 def _result_arrays(n_groups: int, n_genes: int, seed: int = 0) -> dict:
     rng = np.random.default_rng(seed)
     return dict(
-        effect_matrix=rng.standard_normal((n_groups, n_genes)),
+        auc_matrix=rng.random((n_groups, n_genes)),
         z_matrix=rng.standard_normal((n_groups, n_genes)),
         pvalue_matrix=rng.random((n_groups, n_genes)),
         pvalue_adj_matrix=rng.random((n_groups, n_genes)),
@@ -220,7 +221,7 @@ def test_write_result_layout(tmp_path):
     out = tmp_path / "result.h5ad"
     meta, arrs = _write_result(out, tie_correct=False, corr_method="bonferroni")
     with h5py.File(out, "r") as hf:
-        np.testing.assert_allclose(hf["X"][:], arrs["effect_matrix"])
+        np.testing.assert_allclose(hf["X"][:], arrs["auc_matrix"])
         for layer, key in [
             ("z_score", "z_matrix"), ("pvalue", "pvalue_matrix"), ("pvalue_adj", "pvalue_adj_matrix"),
             ("logfoldchanges", "lfc_matrix"), ("u_statistic", "u_matrix"), ("pts", "pts_matrix"),
@@ -244,7 +245,7 @@ def test_build_result_reads_the_file_back(tmp_path):
     assert list(result.groups) == meta["candidates"]
     assert list(result.genes) == list(meta["gene_symbols"])
     np.testing.assert_allclose(result.statistics, arrs["z_matrix"])
-    np.testing.assert_allclose(result.effect_size, arrs["effect_matrix"])
+    np.testing.assert_allclose(result.auc, arrs["auc_matrix"])
     np.testing.assert_allclose(result.pvalues, arrs["pvalue_matrix"])
     np.testing.assert_allclose(result.logfoldchanges, arrs["lfc_matrix"])
     np.testing.assert_array_equal(result.pts_rest, np.broadcast_to(arrs["pts_rest"], result.pts.shape))
@@ -312,7 +313,7 @@ def test_all_zero_gene_is_untested(tmp_path, path_kwargs, tie_correct):
                            min_cells_expressed=0, min_pct_ctrl=0.0, min_pct_pert=0.0,
                            min_mean_ctrl=0.0, min_mean_pert=0.0, tie_correct=tie_correct,
                            **path_kwargs)
-    for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size"):
+    for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "auc"):
         column = np.asarray(getattr(result, field))
         assert np.isnan(column[:, 0]).all(), field
         assert np.isfinite(column[:, 1:]).all(), field

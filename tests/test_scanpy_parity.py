@@ -297,7 +297,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
     for label, expected in expected_wald.items():
         result = wald_results[label]
         # Use looser tolerance due to float32 intermediate values in crispyx
-        np.testing.assert_allclose(result.effect_size, expected, atol=1e-5, rtol=1e-4)
+        np.testing.assert_allclose(result.mean_difference, expected, atol=1e-5, rtol=1e-4)
         np.testing.assert_allclose(result.statistic, expected_wald_z[label], atol=1e-5, rtol=1e-4)
         # p-values can have slightly larger differences due to floating point accumulation
         np.testing.assert_allclose(result.pvalue, expected_wald_p[label], atol=1e-4, rtol=1e-4)
@@ -326,7 +326,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
             z[valid] = (rank_sum[valid] - expected) / std[valid]
         p[valid] = 2 * norm.sf(np.abs(z[valid]))
         effect = np.zeros(filtered.n_vars, dtype=float)
-        effect[valid] = u_stat[valid] / (n_cells * control_n) - 0.5
+        effect[valid] = u_stat[valid] / (n_cells * control_n)  # AUC
         expected_wilcoxon_effect[label] = effect
         expected_wilcoxon_z[label] = z
         expected_wilcoxon_p[label] = p
@@ -377,7 +377,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
     for label, result in wilcoxon_results.items():
         group_df = grouped[label].reindex(result.genes)
         np.testing.assert_allclose(
-            result.effect_size,
+            result.auc,
             expected_wilcoxon_effect[label],
             atol=1e-4,
             rtol=1e-2,

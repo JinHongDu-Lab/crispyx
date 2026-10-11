@@ -41,7 +41,7 @@ def _van_elteren_reference(
     """Rank-within-batch Wilcoxon combined with unit weights (van Elteren).
 
     Returns dicts keyed by perturbation label -> per-gene arrays of
-    ``(z, pvalue, effect_size, u_statistic)``.
+    ``(z, pvalue, auc, u_statistic)``.
     """
     n_genes = X.shape[1]
     groups = [g for g in pd.Index(labels).unique().tolist() if g != control_label]
@@ -94,7 +94,7 @@ def _van_elteren_reference(
                 z, pval = 0.0, 1.0
             z_g[g] = z
             p_g[g] = pval
-            eff_g[g] = (u_sum / n1n0 - 0.5) if n1n0 > 0 else 0.0
+            eff_g[g] = (u_sum / n1n0) if n1n0 > 0 else 0.5  # AUC
             u_g[g] = u_sum
         z_out[group] = z_g
         p_out[group] = p_g
@@ -181,7 +181,7 @@ class TestStratifiedCorrectness:
             col = [gene_order.index(f"gene{j}") for j in range(n_genes)]
             got_z = result.statistics[i][col]
             got_p = result.pvalues[i][col]
-            got_eff = result.effect_size[i][col]
+            got_eff = result.auc[i][col]
             got_u = result.u_statistics[i][col]
             np.testing.assert_allclose(got_z, ref_z[group], rtol=1e-4, atol=1e-4)
             np.testing.assert_allclose(got_p, ref_p[group], rtol=1e-4, atol=1e-4)
@@ -228,7 +228,7 @@ class TestSingleBatchEquivalence:
             strat.statistics, pooled.statistics, rtol=1e-5, atol=1e-6
         )
         np.testing.assert_allclose(
-            strat.effect_size, pooled.effect_size, rtol=1e-5, atol=1e-6
+            strat.auc, pooled.auc, rtol=1e-5, atol=1e-6
         )
         np.testing.assert_allclose(
             strat.pvalues, pooled.pvalues, rtol=1e-5, atol=1e-6
@@ -385,7 +385,7 @@ class TestUntestableBatchLayouts:
         assert np.isnan(result.statistics[0]).all()
         assert np.isnan(result.pvalues[0]).all()
         assert np.isnan(result.pvalues_adj[0]).all()
-        assert np.isnan(result.effect_size[0]).all()
+        assert np.isnan(result.auc[0]).all()
         assert np.isnan(result.u_statistics[0]).all()
         assert np.isfinite(result.logfoldchanges[0]).any()
         with h5py.File(result.result_path, "r") as hf:

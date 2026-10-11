@@ -80,7 +80,9 @@ def de_setup(request, tmp_path):
     return method, path, tmp_path / "result.h5ad"
 
 
-_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest")
+_RESULT_FIELDS = (
+    "statistics", "pvalues", "pvalues_adj", "logfoldchanges", "auc", "mean_difference", "pts", "pts_rest",
+)
 
 
 def test_identical_rerun_reuses_the_result(de_setup, capsys):
@@ -229,8 +231,9 @@ def test_wilcoxon_scanpy_structure_is_written_however_large(tmp_path, monkeypatc
         np.testing.assert_array_equal(rgg["order"][()], loaded.order)
         for name in ("full/pvals", "full/logfoldchanges", "full/auc", "full/u_stat", "full/pts", "names"):
             np.testing.assert_array_equal(rgg[name][()], g[f"uns/rank_genes_groups/{name}"][()], err_msg=name)
+    # Same structure as the in-memory writer's, plus the AUC only a rank test has.
     with h5py.File(reference, "r") as f, h5py.File(output, "r") as g:
-        assert sorted(f["uns/rank_genes_groups/full"]) == sorted(g["uns/rank_genes_groups/full"])
+        assert sorted([*f["uns/rank_genes_groups/full"], "auc"]) == sorted(g["uns/rank_genes_groups/full"])
 
 
 def _restamp_with_param(output: Path, name: str, value) -> None:
