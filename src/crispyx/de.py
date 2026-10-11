@@ -5843,35 +5843,19 @@ def shrink_lfc(
         if original_dataset_path is None:
             raise ValueError(
                 f"Input file '{path}' does not have 'original_dataset_path' in uns. "
-                "method='full' requires NB-GLM results from nb_glm_test v0.4.0+. "
+                "method='full' requires a result written by nb_glm_test. "
                 "Use method='stats' or re-run nb_glm_test."
             )
         
-        # Strip /workspace/ prefix from Docker paths if present
-        if original_dataset_path.startswith("/workspace/"):
-            original_dataset_path = original_dataset_path[len("/workspace/"):]
-        
         original_path = Path(original_dataset_path)
         if not original_path.exists():
-            # Also try the input file's parent as base directory
-            input_parent = path.parent
-            relative_name = Path(original_dataset_path).name
-            alternative_paths = [
-                input_parent.parent / ".cache" / relative_name,  # Try ../..cache/
-                input_parent / ".cache" / relative_name,  # Try ../.cache/
-                input_parent.parent.parent / ".cache" / relative_name,  # Try ../../../.cache/
-            ]
-            for alt_path in alternative_paths:
-                if alt_path.exists():
-                    original_path = alt_path
-                    break
-            else:
-                raise FileNotFoundError(
-                    f"Original dataset not found: {original_dataset_path}. "
-                    "method='full' requires access to the original count data. "
-                    "Use method='stats' to shrink without original data."
-                )
-        
+            raise FileNotFoundError(
+                f"Original dataset not found: {original_dataset_path} (recorded "
+                f"in {path} by nb_glm_test). method='full' refits on the original "
+                "counts; move the file back or use method='stats', which needs "
+                "only the stored statistics."
+            )
+
         # Load original dataset for streaming
         backed = read_backed(original_path)
         try:
