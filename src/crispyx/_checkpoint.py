@@ -249,6 +249,8 @@ def fingerprint_difference(previous: dict, current: dict) -> str | None:
         return "it was computed from another input file"
     if any(previous.get(key) != current.get(key) for key in _SOURCE_KEYS):
         return "the input file has changed since"
+    if previous.get("inputs") != current.get("inputs"):
+        return "an input file has changed since"
     old_params = previous.get("params", {})
     new_params = current.get("params", {})
     for name in sorted(set(old_params) | set(new_params)):

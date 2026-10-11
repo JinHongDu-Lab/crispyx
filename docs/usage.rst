@@ -333,6 +333,29 @@ roughly 2× the source file's size, since the source and destination coexist
 until the caller deletes the source -- see :ref:`the CSC conversion note below
 <csc-disk-note>`.
 
+Combining files that share cells
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A screen delivered as several files often repeats the same control cells in
+each. :func:`crispyx.pp.concat_h5ad` concatenates the files on disk and keeps
+one copy of every shared cell:
+
+.. code-block:: python
+
+   cx.pp.concat_h5ad(
+       ["pilot_a.h5ad", "pilot_b.h5ad"], output_path="pilot.h5ad", label="source",
+   )
+
+Cells are matched by ``obs_names``. A barcode in more than one file must be
+the same cell there -- the same values in the ``obs`` columns the files share
+and the same expression over the shared genes -- or the call raises; pass
+``shared_cells="error"`` to refuse any overlap instead of dropping it. The
+result keeps the genes every file has (in the first file's order), ``X`` and
+the layers present in every file, the union of the ``obs`` columns, and
+``obsm`` entries every file has; ``label`` records each cell's source file.
+Cell-cell graphs (``obsp``), ``varm``/``varp`` and ``.raw`` describe one file
+and are not carried over; ``verbose=1`` lists what was dropped.
+
 .. _compress-h5ad:
 
 Compressing results
@@ -702,6 +725,30 @@ Key properties:
   ``stratified_median_shared_batches_per_perturbation``.
 * The output file receives the suffix ``_cx_wilcoxon_stratified.h5ad`` to
   distinguish it from the pooled result.
+
+Permutation nulls without copying the data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``wilcoxon_test`` also takes the labels themselves as a ``pd.Series`` indexed
+by cell, so a label-permutation null needs no relabelled copy of the file:
+
+.. code-block:: python
+
+   labels = cx.load_obs("screen_csc.h5ad")["perturbation"]
+   rng = np.random.default_rng(0)
+   for i in range(100):
+       shuffled = pd.Series(rng.permutation(labels.to_numpy()), index=labels.index, name="shuffle")
+       null = cx.tl.wilcoxon_test(
+           "screen_csc.h5ad", perturbation_column=shuffled, control_label="control",
+           output_path=f"null/shuffle_{i}.h5ad",
+       )
+
+The Series is aligned to ``obs_names`` by its index and needs a label for
+every cell; its ``name`` names the column in the result. Each shuffle is a
+different call, so a result at a fixed ``output_path`` is recomputed for a new
+Series and reused for the same one. Convert a CSR file to CSC once beforehand
+(:func:`crispyx.convert_to_csc`): otherwise every call makes its own temporary
+CSC copy.
 
 
 on-disk results. The plotting functions materialise only the metadata needed

@@ -35,6 +35,7 @@ SCHEMAS = {
     "batch": 1,
     "sorted": 1,
     "standardized": 1,
+    "concat": 1,
 }
 
 
