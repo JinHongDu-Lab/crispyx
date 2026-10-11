@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import typing
 from pathlib import Path
 
 import anndata as ad
@@ -268,3 +269,31 @@ def test_unknown_perturbation_still_raises(tmp_path):
             output_path=tmp_path / "missing.h5ad",
             force=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("fn", "allowed"),
+    [
+        (cx.aggregate_pseudobulk, cx.PseudobulkMethod),
+        (cx.compute_pseudobulk_effects, cx.PseudobulkMethod),
+        (cx.compute_normalized_effects, cx.pseudobulk.NormalizedEffectMethod),
+    ],
+    ids=["aggregate", "pseudobulk_effects", "normalized_effects"],
+)
+def test_method_literal_is_exactly_what_each_function_accepts(tmp_path, fn, allowed):
+    """Every value a function's type hint advertises runs; any other is
+    rejected up front."""
+    path, _, _ = _write_screen(tmp_path)
+    if fn is cx.aggregate_pseudobulk:
+        kwargs = dict(groupby=["perturbation", "batch"], min_cells=1)
+    elif fn is cx.compute_pseudobulk_effects:
+        kwargs = dict(perturbation_column="perturbation", batch_column="batch",
+                      control_label="control", min_cells=1)
+    else:
+        kwargs = dict(perturbation_column="perturbation", control_label="control")
+    for method in typing.get_args(allowed):
+        fn(path, method=method, output_path=tmp_path / f"{method}.h5ad", **kwargs).close()
+    rejected = {"mean_log1p", "sum", "log_mean"} - set(typing.get_args(allowed))
+    for method in rejected:
+        with pytest.raises(ValueError, match="method must be"):
+            fn(path, method=method, output_path=tmp_path / "bad.h5ad", **kwargs)

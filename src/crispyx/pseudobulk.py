@@ -6,7 +6,7 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence, get_args
 
 import anndata as ad
 import numpy as np
@@ -32,10 +32,18 @@ from .data import (
 )
 
 
-PseudobulkMethod = Literal["mean_log1p", "sum", "log_mean"]
-# The subset compute_normalized_effects accepts. "sum" belongs to aggregate_pseudobulk,
-# so keeping the public hint narrow stops a type checker from waving it through.
+# What aggregate_pseudobulk (and compute_pseudobulk_effects, which aggregates
+# through it) computes per profile, and what compute_normalized_effects
+# contrasts. Each function validates against its own Literal, so the type
+# hint and the accepted values cannot drift apart.
+PseudobulkMethod = Literal["mean_log1p", "sum"]
 NormalizedEffectMethod = Literal["mean_log1p", "log_mean"]
+
+
+def _check_method(method: str, allowed, fn_name: str, hint: str = "") -> None:
+    if method not in get_args(allowed):
+        options = " or ".join(repr(m) for m in get_args(allowed))
+        raise ValueError(f"{fn_name}: method must be {options}; received {method!r}.{hint}")
 
 # Output naming for compute_normalized_effects. "modern" is the only layout in
 # use; the dict is keyed for symmetry with other per-method naming tables.
@@ -383,11 +391,10 @@ def _normalized_effects_impl(
         reference=reference,
         fn_name="compute_normalized_effects",
     )
-    if method not in ("mean_log1p", "log_mean"):
-        raise ValueError(
-            "method must be 'mean_log1p' or 'log_mean'; "
-            f"received {method!r}. Use aggregate_pseudobulk for method='sum'."
-        )
+    _check_method(
+        method, NormalizedEffectMethod, "compute_normalized_effects",
+        " Use aggregate_pseudobulk for method='sum'.",
+    )
     if baseline_count <= 0:
         raise ValueError("baseline_count must be positive")
     naming = _NORMALIZED_LAYOUTS[layout]
@@ -801,8 +808,10 @@ def aggregate_pseudobulk(
         ``uns['crispyx']`` provenance stamp.
     """
     call_args = dict(locals())  # for the result fingerprint, before any other local
-    if method not in ("mean_log1p", "sum"):
-        raise ValueError("method must be 'mean_log1p' or 'sum'")
+    _check_method(
+        method, PseudobulkMethod, "aggregate_pseudobulk",
+        " Use compute_normalized_effects for method='log_mean'.",
+    )
     if min_cells < 1:
         raise ValueError("min_cells must be at least 1")
     if bootstrap_size is not None and bootstrap_size < 1:
@@ -1059,6 +1068,7 @@ def compute_pseudobulk_effects(
     within-batch effects using harmonic target/control cell-count weights.
     """
     call_args = dict(locals())  # for the result fingerprint, before any other local
+    _check_method(method, PseudobulkMethod, "compute_pseudobulk_effects")
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
