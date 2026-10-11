@@ -33,6 +33,7 @@ methods_to_run:
   - crispyx_pb_pseudobulk
   - crispyx_de_t_test
   - crispyx_de_wilcoxon
+  - crispyx_de_nb_glm
   - scanpy_qc_filtered
   - scanpy_de_t_test
   - scanpy_de_wilcoxon
