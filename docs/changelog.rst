@@ -1,6 +1,58 @@
 Changelog
 =========
 
+Version 0.1.9
+-------------
+
+*Released 2026-10-11.*
+
+Follow-ups from using crispyx in the causarray preprocessing. Several
+changes alter what results contain, so DE and pseudo-bulk results written by
+0.1.8 are recomputed once.
+
+* **Changed: each DE effect quantity is named for what it is.**
+  ``effect_size`` is gone from ``RankGenesGroupsResult`` and from the
+  per-group ``result[label]``. It meant ``AUC - 0.5`` for ``wilcoxon_test``,
+  the difference of means for ``t_test`` and the log fold change for
+  ``nb_glm_test``, and ``to_rank_genes_groups_dict()`` exported all three as
+  ``"auc"``. Now ``logfoldchanges`` is on every result (including
+  ``result[label].logfoldchanges``); ``auc`` (``wilcoxon_test``) and
+  ``mean_difference`` (``t_test``) are ``None`` for the other methods, and
+  ``"auc"`` is written to the Scanpy structure only for Wilcoxon.
+* **Changed: a Wilcoxon result's** ``X`` **is the AUC**, ``U / (n_pert *
+  n_ctrl)`` on ``[0, 1]`` with 0.5 for no shift, instead of ``AUC - 0.5``.
+  Layer names are unchanged.
+* **Changed: ``aggregate_pseudobulk`` requires** ``method``, names each
+  profile by its group key (``"donor1|L2/3 IT"`` instead of
+  ``pseudobulk_00000000``) and carries every ``obs`` column that is constant
+  within a profile (donor sex, age, disease, ...); columns that vary within
+  one are listed at ``verbose=1``. ``method="sum"`` is what count models
+  need; the old ``"mean_log1p"`` default was silently wrong for them. The
+  usage guide shows how ``n_cells`` forms the donor x cell-type composition
+  table, a check before pooling cell types.
+* **New: ``cx.pp.concat_h5ad``** concatenates h5ad files on disk and keeps
+  one copy of the cells they share (checked to be the same cell), or refuses
+  any overlap with ``shared_cells="error"``. It keeps the genes every file
+  has, ``X`` and the common layers, the union of ``obs``, and can label each
+  cell's source file.
+* **New: ``wilcoxon_test`` accepts the labels as a ``pd.Series``** indexed by
+  cell, so a label-permutation null needs no relabelled copy of the data.
+  Each Series is its own call: a fixed ``output_path`` is recomputed for a new
+  shuffle and reused for the same one.
+* **New: ``obs["n_genes_tested"]``** in every DE result counts the genes each
+  perturbation was tested on after the low-expression filters, and the
+  ``wilcoxon_test`` docstring explains how those filters differ from
+  ``scanpy.tl.rank_genes_groups``.
+* **Fixed: ``PseudobulkMethod`` listed** ``"log_mean"``, which
+  ``aggregate_pseudobulk`` rejects (it belongs to
+  ``compute_normalized_effects``). Each function now validates against its
+  own ``Literal``.
+* An in-memory ``AnnData`` is rejected with the line that fixes it
+  (``adata.write_h5ad(...)``), and the ``data`` docstrings say a backed one.
+* ``shrink_lfc(method="full")`` no longer strips a ``/workspace/`` prefix or
+  searches ``.cache`` directories for a missing original dataset; it says
+  which path is missing.
+
 Version 0.1.8
 -------------
 
