@@ -34,7 +34,9 @@ lscpu | grep -E "Model name|^CPU\(s\)"
 mkdir -p "$T/.cache" "$T/preprocessing" "$BENCH/config/timing"
 for f in "$SRC_DIR"/.cache/standardized_"$D".h5ad "$SRC_DIR"/.cache/standardized_"$D"_sorted.h5ad \
          "$SRC_DIR"/preprocessing/standardized_csr_"$D".h5ad "$SRC_DIR"/preprocessing/standardized_csr_"$D"_sorted.h5ad; do
-    [ -e "$f" ] && ln -sfn "$f" "$T/${f#"$SRC_DIR"/}"
+    # Relative links: the container mounts the project at /workspace, so
+    # absolute /lustre1 targets would dangle in there.
+    [ -e "$f" ] && ln -sfnr "$f" "$T/${f#"$SRC_DIR"/}"
 done
 # Same config, results redirected to the timing directory.
 sed "s#^output_dir: .*#output_dir: \"benchmarking/results_timing/$D\"#" \
