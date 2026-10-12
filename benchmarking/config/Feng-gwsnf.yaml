@@ -32,6 +32,7 @@ scanpy_subset_seed: 0
 method_resource_limits:
   scanpy_de_wilcoxon:
     memory_limit: 240.0
+    time_limit: 86400  # 24 h, as for the other large datasets
 
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
