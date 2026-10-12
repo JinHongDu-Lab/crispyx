@@ -191,6 +191,18 @@ def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys
     assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
 
 
+def test_checkpoint_from_an_older_result_layout_is_not_resumed(monkeypatch):
+    """Saved progress is in the layout of the version that wrote it: a run
+    interrupted before a schema bump restarts rather than mixing layouts."""
+    from crispyx import _provenance
+    from crispyx.de import _checkpoint_fingerprint
+
+    fingerprint = {"source": "data.h5ad", "params": {"method": "wilcoxon"}}
+    before = _checkpoint_fingerprint(fingerprint)
+    monkeypatch.setitem(_provenance.SCHEMAS, "de_result", _provenance.SCHEMAS["de_result"] + 1)
+    assert _checkpoint_fingerprint(fingerprint) != before
+
+
 def test_aliases_name_the_same_call(tmp_path, capsys):
     """``groupby``/``reference`` and ``perturbation_column``/``control_label``
     are one call, and so is ``cx.tl.rank_genes_groups``, which leaves the

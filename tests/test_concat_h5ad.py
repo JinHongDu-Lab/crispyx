@@ -6,6 +6,7 @@ the shared cells removed by hand."""
 from __future__ import annotations
 
 import os
+import warnings
 
 import anndata as ad
 import numpy as np
@@ -104,11 +105,100 @@ def test_same_barcode_different_cell_raises(tmp_path):
     with pytest.raises(ValueError, match="with different expression"):
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
 
-    paths, _, second = _pilot(tmp_path)
+
+
+def test_shared_cells_with_different_obs_warn_and_keep_the_first(tmp_path):
+    paths, first, second = _pilot(tmp_path)
     second.obs.loc["ctrl0", "perturbation"] = "KO_B"
     second.write(paths[1])
-    with pytest.raises(ValueError, match=r"different obs\['perturbation'\]"):
+    with pytest.warns(UserWarning, match=r"different values in obs columns \['perturbation'\]"):
+        result = cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
+    assert ad.read_h5ad(result.path).obs.loc["ctrl0", "perturbation"] == "control"
+
+
+def test_obs_compared_by_value_not_dtype(tmp_path):
+    """An int column in one file and a float one in the other agree."""
+    paths, first, second = _pilot(tmp_path)
+    first.obs["n"] = np.arange(first.n_obs)
+    second.obs["n"] = np.arange(second.n_obs).astype(np.float64)
+    first.write(paths[0])
+    second.write(paths[1])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
+
+
+def test_obs_columns_only_some_files_have(tmp_path):
+    """A bool or int column one file lacks stays writable; a shared cell
+    takes the values its first file lacks from its later copy."""
+    paths, first, second = _pilot(tmp_path)
+    first.obs["flag"] = np.arange(first.n_obs) % 2 == 0
+    second.obs["guide_umi"] = np.arange(second.n_obs) + 10
+    first.write(paths[0])
+    second.write(paths[1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False).path)
+    assert got.obs["flag"].iloc[: first.n_obs].tolist() == first.obs["flag"].tolist()
+    assert got.obs["flag"].iloc[first.n_obs :].isna().all()
+    # ctrl0..5 come from the first file, which has no guide_umi.
+    expected = pd.Series(second.obs["guide_umi"].to_numpy(), index=second.obs_names)
+    assert got.obs["guide_umi"].reindex(second.obs_names).tolist() == expected.tolist()
+    assert got.obs["guide_umi"].iloc[6 : first.n_obs].isna().all()
+
+
+def test_sparse_and_dataframe_obsm(tmp_path):
+    paths, first, second = _pilot(tmp_path)
+    for a in (first, second):
+        a.obsm["guides"] = sp.csr_matrix(np.eye(a.n_obs, 4, dtype=np.float32))
+        a.obsm["meta"] = pd.DataFrame({"q": np.arange(a.n_obs)}, index=a.obs_names)
+    first.write(paths[0])
+    second.write(paths[1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False).path)
+    expected, _ = _expected(first, second)
+    assert sp.issparse(got.obsm["guides"])
+    np.testing.assert_array_equal(got.obsm["guides"].toarray(), _dense(expected.obsm["guides"]))
+    assert list(got.obsm["meta"].columns) == ["q"]
+    assert got.obsm["meta"]["q"].tolist() == expected.obsm["meta"]["q"].tolist()
+
+
+def test_label_falls_back_to_paths_when_stems_repeat(tmp_path):
+    paths, first, second = _pilot(tmp_path)
+    (tmp_path / "rep1").mkdir()
+    (tmp_path / "rep2").mkdir()
+    renamed = [tmp_path / "rep1" / "filtered.h5ad", tmp_path / "rep2" / "filtered.h5ad"]
+    for old, new in zip(paths, renamed):
+        old.rename(new)
+    got = ad.read_h5ad(
+        cx.pp.concat_h5ad(renamed, output_path=tmp_path / "x.h5ad", label="src", verbose=False).path
+    )
+    assert got.obs["src"].cat.categories.tolist() == [str(p) for p in renamed]
+    assert got.obs["src"].value_counts()[str(renamed[1])] == 4
+
+
+def test_label_clash_fails_before_reading_matrices(tmp_path, monkeypatch):
+    paths, _, _ = _pilot(tmp_path)
+
+    def no_reads(*args, **kwargs):
+        raise AssertionError("a matrix was read")
+
+    monkeypatch.setattr(cx.data, "_segment_blocks", no_reads)
+    with pytest.raises(ValueError, match="label column 'batch' already exists"):
+        cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", label="batch", verbose=False)
+
+
+def test_each_matrix_is_read_twice(tmp_path, monkeypatch):
+    """One pass sizes the output and checks the shared cells, one writes it."""
+    paths, _, _ = _pilot(tmp_path)
+    reads = []
+    original = cx.data._segment_blocks
+
+    def counting(segment, chunk_size):
+        reads.append(segment.source_path)
+        return original(segment, chunk_size)
+
+    monkeypatch.setattr(cx.data, "_segment_blocks", counting)
+    cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
+    # X: scan + write per file; the "counts" layer: counting + write per file.
+    assert reads.count(paths[0]) == 4 and reads.count(paths[1]) == 4
 
 
 def test_rerun_reuses_until_an_input_changes(tmp_path, capsys):

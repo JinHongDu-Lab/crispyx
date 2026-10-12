@@ -87,7 +87,7 @@ from ._checkpoint import (
     _DummyProgress,
 )
 from . import _messages
-from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp, write_stamp
+from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import canonical_call_args, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
@@ -498,11 +498,12 @@ def _de_fingerprint(
 
 def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
     """A checkpoint's identity: the result ``fingerprint`` without
-    ``scanpy_format``, which only changes the final write, plus ``extra``,
-    what the saved progress also depends on (e.g. the gene chunk width it
-    is counted in)."""
+    ``scanpy_format``, which only changes the final write, plus the result
+    schema the saved values are in (a run interrupted by an older layout is
+    restarted, not finished in the new one) and ``extra``, what the saved
+    progress also depends on (e.g. the gene chunk width it is counted in)."""
     params = {k: v for k, v in fingerprint["params"].items() if k != "scanpy_format"}
-    return {**fingerprint, "params": params, **extra}
+    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], **extra}
 
 
 # Disk a DE run needs beside its output: the resumable partial arrays plus

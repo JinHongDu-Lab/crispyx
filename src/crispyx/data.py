@@ -1565,6 +1565,7 @@ def _stream_write_matrix_subset(
     total_nnz: int | None = None,
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
+    context: str,
 ) -> None:
     """Stream the rows of ``segments``, one after another, into the CSR
     matrix ``dest_group`` (``X`` or a layer) of ``output_path``.
@@ -1599,7 +1600,7 @@ def _stream_write_matrix_subset(
 
     warn_if_disk_space_low(
         estimate_sparse_output_bytes(total_nnz), output_path,
-        context=f"write_filtered_subset ({dest_group})",
+        context=context,
     )
 
     with h5py.File(output_path, "r+", libver='latest') as dest:
@@ -1806,6 +1807,7 @@ def write_filtered_subset(
         total_nnz=total_nnz,
         data_dtype=data_dtype,
         chunk_cache=chunk_cache,
+        context="write_filtered_subset (X)",
     )
 
     for key in layer_keys:
@@ -1815,6 +1817,7 @@ def write_filtered_subset(
             n_vars=n_vars,
             output_path=output_path,
             chunk_size=chunk_size,
+            context=f"write_filtered_subset (layers/{key})",
         )
 
     if obsm_keys or varm_keys or obsp_keys or varp_keys:
@@ -1852,19 +1855,61 @@ def _uns_equal(a: Any, b: Any) -> bool:
         return False
 
 
-def _row_signature(
-    path: Path, cell_mask: np.ndarray, gene_indices: np.ndarray, chunk_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Non-zero count and sum of each selected row over ``gene_indices``, in
-    source row order: enough to tell two copies of a cell from two cells."""
-    nnz, sums = [], []
-    for block in _segment_blocks(_RowSegment(path, lambda b: b.X, cell_mask, gene_indices), chunk_size):
+def _scan_rows(
+    path: Path, n_obs: int, gene_indices: np.ndarray, chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.dtype | None]:
+    """Non-zero count and sum of each of the ``n_obs`` rows of ``path``'s
+    ``X`` over ``gene_indices``, and the dtype of its stored values (``None``
+    if there are none): the counting pass :func:`_stream_write_matrix_subset`
+    would make, plus enough to tell two copies of a cell from two cells."""
+    nnz, sums, dtype = [], [], None
+    segment = _RowSegment(path, lambda b: b.X, np.ones(n_obs, dtype=bool), gene_indices)
+    for block in _segment_blocks(segment, chunk_size):
         csr = _ensure_csr(block)
         nnz.append(np.diff(csr.indptr))
         sums.append(np.asarray(csr.sum(axis=1), dtype=np.float64).ravel())
+        if csr.nnz:
+            dtype = csr.data.dtype if dtype is None else np.result_type(dtype, csr.data.dtype)
     if not nnz:
-        return np.zeros(0, dtype=np.int64), np.zeros(0)
-    return np.concatenate(nnz), np.concatenate(sums)
+        return np.zeros(0, dtype=np.int64), np.zeros(0), dtype
+    return np.concatenate(nnz).astype(np.int64), np.concatenate(sums), dtype
+
+
+def _obsm_kind(value: Any) -> str:
+    return "frame" if isinstance(value, pd.DataFrame) else "sparse" if sp.issparse(value) else "array"
+
+
+def _obsm_compatible(values: Sequence[Any]) -> bool:
+    """Whether ``obsm`` values from several files can be stacked: the same
+    kind (array, sparse or DataFrame), width and, for DataFrames, columns."""
+    first = values[0]
+    return all(
+        _obsm_kind(v) == _obsm_kind(first) and v.shape[1:] == first.shape[1:]
+        and (_obsm_kind(v) != "frame" or v.columns.equals(first.columns))
+        for v in values[1:]
+    )
+
+
+def _stack_obsm(parts: Sequence[Any], obs_names: pd.Index) -> Any:
+    """Row-stack ``obsm`` values of one kind (see :func:`_obsm_compatible`)."""
+    kind = _obsm_kind(parts[0])
+    if kind == "frame":
+        return pd.concat(parts).set_axis(obs_names)
+    if kind == "sparse":
+        return sp.vstack([sp.csr_matrix(part) for part in parts], format="csr")
+    return np.concatenate([np.asarray(part) for part in parts])
+
+
+def _obs_differs(a: pd.Series, b: pd.Series) -> np.ndarray:
+    """Where two obs columns of the same cells hold different values:
+    numbers (and bools) compared as numbers, so ``0`` and ``0.0`` agree,
+    anything else as text; missing in both counts as equal."""
+    both_missing = a.isna().to_numpy() & b.isna().to_numpy()
+    if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+        same = a.to_numpy(dtype=np.float64, na_value=np.nan) == b.to_numpy(dtype=np.float64, na_value=np.nan)
+    else:
+        same = a.astype(str).to_numpy() == b.astype(str).to_numpy()
+    return ~(same | both_missing)
 
 
 def concat_h5ad(
@@ -1882,12 +1927,14 @@ def concat_h5ad(
     Screens are often delivered as several files that each carry the same
     control cells; concatenating them as they are counts every shared cell
     once per file. Cells are matched by ``obs_names``: a barcode that occurs
-    in more than one file must be the same cell there -- equal values in
-    every ``obs`` column the files share, and the same number of non-zeros
-    and the same total over the shared genes -- or the call raises.
+    in more than one file must be the same cell there -- the same number of
+    non-zeros and the same total over the shared genes -- or the call
+    raises. ``obs`` values that differ between the copies (e.g. QC metrics
+    computed per file) are warned about, and the first file's are kept.
 
-    The matrices are streamed row chunk by row chunk into one CSR matrix,
-    never held in memory.
+    Each file's matrix is read twice, row chunk by row chunk: once to size
+    the output and check the shared cells, once to write it into one CSR
+    matrix. It is never held in memory.
 
     Parameters
     ----------
@@ -1901,7 +1948,8 @@ def concat_h5ad(
         ``"error"`` raises if any cell occurs in more than one file.
     label
         If given, the name of an ``obs`` column recording each cell's source
-        file (its stem), in the order of ``paths``.
+        file, in the order of ``paths``: the file's stem, or the path as
+        given if two files share a stem.
     chunk_size
         Number of cells read per streaming block.
     verbose
@@ -1919,11 +1967,12 @@ def concat_h5ad(
         first file's order, with the first file's ``var`` columns; genes
         missing from any file are dropped. ``X`` (always CSR) and every
         layer present in all files are concatenated; ``obs`` is the union of
-        the files' columns (missing values are NaN); ``obsm`` keys present in
-        all files with the same width are concatenated; ``uns`` keeps the
-        keys every file has with equal values. ``obsp`` (cell-cell graphs),
-        ``varm``/``varp`` and ``.raw`` describe a single file and are not
-        carried over.
+        the files' columns (missing values are NA; a shared cell takes the
+        values its first file lacks from a later copy); ``obsm`` keys
+        present in all files as the same kind (array, sparse or DataFrame)
+        and width are concatenated; ``uns`` keeps the keys every file has
+        with equal values. ``obsp`` (cell-cell graphs), ``varm``/``varp``
+        and ``.raw`` describe a single file and are not carried over.
 
     Examples
     --------
@@ -1931,7 +1980,6 @@ def concat_h5ad(
     ...     ["pilot_a.h5ad", "pilot_b.h5ad"], output_path="pilot.h5ad", label="source",
     ... )
     """
-    call_args = dict(locals())
     sources = [resolve_data_path(path) for path in paths]
     if not sources:
         raise ValueError("concat_h5ad needs at least one input file")
@@ -1951,7 +1999,7 @@ def concat_h5ad(
     if not force and reusable(output_path, "concat", fingerprint, verbose):
         return AnnData(output_path)
 
-    # ---- metadata of every file (obs/var/uns are small) ----
+    # ---- metadata of every file (obs/var/obsm/uns are small) ----
     metas = []
     for source in sources:
         backed = read_backed(source)
@@ -1968,7 +2016,7 @@ def concat_h5ad(
                 "var": backed.var.copy(),
                 "var_names": var_names,
                 "layers": [key for key in backed.layers.keys() if key is not None],
-                "obsm": {key: np.asarray(backed.obsm[key]) for key in backed.obsm.keys()},
+                "obsm": {key: backed.obsm[key] for key in backed.obsm.keys()},
                 "uns": {k: v for k, v in backed.uns.items() if k != _PROVENANCE_KEY},
                 "extra": [slot for slot in ("obsp", "varm", "varp") if len(getattr(backed, slot))]
                 + (["raw"] if backed.raw is not None else []),
@@ -1976,6 +2024,8 @@ def concat_h5ad(
         finally:
             backed.file.close()
     name = "pp.concat_h5ad"
+    if label is not None and any(label in meta["obs"].columns for meta in metas):
+        raise ValueError(f"label column {label!r} already exists in obs")
 
     # ---- genes: those every file has, in the first file's order ----
     genes = metas[0]["var_names"]
@@ -1986,8 +2036,9 @@ def concat_h5ad(
         _messages.vprint(verbose, name, f"{len(all_genes) - len(genes)} genes not in every file are dropped")
     gene_indices = [meta["var_names"].get_indexer(genes).astype(np.int64) for meta in metas]
 
-    # ---- cells: drop later copies of a shared cell, after checking them ----
+    # ---- cells: a shared cell is kept where it first occurs ----
     keep = [np.ones(len(meta["obs"]), dtype=bool) for meta in metas]
+    pairs = []  # (earlier file, later file, the cells they share)
     first_seen = pd.Series(dtype=np.int64)  # obs_name -> file index of its first occurrence
     for i, meta in enumerate(metas):
         names = meta["obs"].index
@@ -2000,32 +2051,84 @@ def concat_h5ad(
                     f"(e.g. {shared_names[:3].tolist()}); pass shared_cells='drop' to keep one copy."
                 )
             for j in np.unique(first_seen[shared_names].to_numpy()):
-                pair = shared_names[first_seen[shared_names].to_numpy() == j]
-                _check_same_cells(
-                    pair, earlier=(sources[j], metas[j]), later=(sources[i], meta),
-                    gene_indices=(gene_indices[j], gene_indices[i]), chunk_size=chunk_size,
-                )
+                pairs.append((j, i, shared_names[first_seen[shared_names].to_numpy() == j]))
             keep[i] = ~shared
             _messages.vprint(
                 verbose, name,
                 f"{int(shared.sum())} cells of {sources[i]} already in an earlier file are dropped",
             )
-        new = names[~shared]
-        first_seen = pd.concat([first_seen, pd.Series(i, index=new, dtype=np.int64)])
+        first_seen = pd.concat([first_seen, pd.Series(i, index=names[~shared], dtype=np.int64)])
 
-    # ---- obs, var, uns, layers, obsm ----
-    obs = pd.concat([meta["obs"][mask] for meta, mask in zip(metas, keep)], join="outer")
-    categorical = {c for meta in metas for c in meta["obs"].columns
-                   if isinstance(meta["obs"][c].dtype, pd.CategoricalDtype)}
+    # ---- one pass over each X: the output's row sizes and the shared-cell check ----
+    scans = [
+        _scan_rows(source, len(meta["obs"]), indices, chunk_size)
+        for source, meta, indices in zip(sources, metas, gene_indices)
+    ]
+    for j, i, names in pairs:
+        rows_a = metas[j]["obs"].index.get_indexer(names)
+        rows_b = metas[i]["obs"].index.get_indexer(names)
+        (nnz_a, sums_a, _), (nnz_b, sums_b, _) = scans[j], scans[i]
+        differs = (nnz_a[rows_a] != nnz_b[rows_b]) | ~np.isclose(
+            sums_a[rows_a], sums_b[rows_b], rtol=1e-6, atol=1e-6,
+        )
+        if differs.any():
+            raise ValueError(
+                f"Cell {names[np.flatnonzero(differs)[0]]!r} occurs in {sources[j]} and {sources[i]} "
+                "with different expression; shared barcodes must be the same cell."
+            )
+    for j, i, names in pairs:
+        obs_a, obs_b = metas[j]["obs"].loc[names], metas[i]["obs"].loc[names]
+        columns = [
+            c for c in obs_a.columns.intersection(obs_b.columns)
+            if _obs_differs(obs_a[c], obs_b[c]).any()
+        ]
+        if columns:
+            _messages.warn(
+                name,
+                f"cells shared by {sources[j]} and {sources[i]} have different values in obs "
+                f"columns {columns}; keeping those of {sources[j]}",
+            )
+    row_nnz = np.concatenate([nnz[mask] for (nnz, _, _), mask in zip(scans, keep)])
+    dtypes = [dtype for _, _, dtype in scans if dtype is not None]
+    data_dtype = np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
+
+    # ---- obs: union of columns; a shared cell fills what its first file lacks ----
+    partial_columns = {
+        c for meta in metas for c in meta["obs"].columns
+        if not all(c in other["obs"].columns for other in metas)
+    }
+    frames = []
+    for meta in metas:
+        frame = meta["obs"].copy()
+        for column in partial_columns.intersection(frame.columns):
+            # Nullable dtypes keep bools and ints writable beside the NA of
+            # the files without the column.
+            if pd.api.types.is_bool_dtype(frame[column]):
+                frame[column] = frame[column].astype("boolean")
+            elif pd.api.types.is_integer_dtype(frame[column]):
+                frame[column] = frame[column].astype("Int64")
+        frames.append(frame)
+    obs = pd.concat([frame[mask] for frame, mask in zip(frames, keep)], join="outer")
+    categorical = {
+        c for meta in metas for c in meta["obs"].columns
+        if isinstance(meta["obs"][c].dtype, pd.CategoricalDtype)
+    }
+    for column in categorical:
+        obs[column] = obs[column].astype(object)
+    for frame, mask in zip(frames, keep):
+        if not mask.all():
+            obs.update(frame[~mask], overwrite=False)
     for column in categorical:
         obs[column] = obs[column].astype("category")
     if label is not None:
-        if label in obs.columns:
-            raise ValueError(f"label column {label!r} already exists in obs")
-        stems = [source.stem for source in sources]
+        labels = [source.stem for source in sources]
+        if len(set(labels)) < len(labels):
+            labels = [str(source) for source in sources]
         obs[label] = pd.Categorical(
-            np.repeat(stems, [int(mask.sum()) for mask in keep]), categories=list(dict.fromkeys(stems)),
+            np.repeat(labels, [int(mask.sum()) for mask in keep]), categories=labels,
         )
+
+    # ---- var, uns, layers, obsm ----
     var = metas[0]["var"].copy()
     var.index = metas[0]["var_names"]
     var = var.loc[genes]
@@ -2036,9 +2139,10 @@ def concat_h5ad(
     uns[_PROVENANCE_KEY] = stamp("concat", fingerprint)
     layers = [key for key in metas[0]["layers"] if all(key in meta["layers"] for meta in metas[1:])]
     obsm = {
-        key: np.concatenate([meta["obsm"][key][mask] for meta, mask in zip(metas, keep)])
-        for key, first in metas[0]["obsm"].items()
-        if all(key in meta["obsm"] and meta["obsm"][key].shape[1:] == first.shape[1:] for meta in metas[1:])
+        key: _stack_obsm([meta["obsm"][key][mask] for meta, mask in zip(metas, keep)], obs.index)
+        for key in metas[0]["obsm"]
+        if all(key in meta["obsm"] for meta in metas[1:])
+        and _obsm_compatible([meta["obsm"][key] for meta in metas])
     }
     not_carried = sorted(
         {f"layers/{k}" for meta in metas for k in meta["layers"] if k not in layers}
@@ -2057,66 +2161,24 @@ def concat_h5ad(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with _replace_on_success(output_path) as partial:
-        ad.AnnData(sp.csr_matrix((len(obs), len(genes)), dtype=np.float32), obs=obs, var=var, uns=uns).write(partial)
+        ad.AnnData(
+            sp.csr_matrix((len(obs), len(genes)), dtype=np.float32),
+            obs=obs, var=var, obsm=obsm, uns=uns,
+        ).write(partial)
         _stream_write_matrix_subset(
             segments(lambda b: b.X), dest_group="X", n_vars=len(genes),
-            output_path=partial, chunk_size=chunk_size,
+            output_path=partial, chunk_size=chunk_size, context=f"{name} (X)",
+            row_nnz=row_nnz, total_nnz=int(row_nnz.sum()), data_dtype=data_dtype,
         )
         for key in layers:
             _stream_write_matrix_subset(
                 segments(lambda b, _key=key: b.layers[_key]), dest_group=f"layers/{key}",
                 n_vars=len(genes), output_path=partial, chunk_size=chunk_size,
+                context=f"{name} (layers/{key})",
             )
-        if obsm:
-            with h5py.File(partial, "r+") as handle:
-                for key, values in obsm.items():
-                    write_obsm_to_h5ad(handle, key, values)
     _messages.print_done(verbose, name, f"{len(obs)} cells × {len(genes)} genes")
     _messages.print_saving(verbose, name, output_path)
     return AnnData(output_path)
-
-
-def _check_same_cells(
-    names: pd.Index,
-    *,
-    earlier: tuple[Path, dict],
-    later: tuple[Path, dict],
-    gene_indices: tuple[np.ndarray, np.ndarray],
-    chunk_size: int,
-) -> None:
-    """Raise unless the cells ``names`` are the same in both files: equal
-    values in the obs columns the files share, and the same non-zero count
-    and total over the shared genes."""
-    (path_a, meta_a), (path_b, meta_b) = earlier, later
-    obs_a, obs_b = meta_a["obs"].loc[names], meta_b["obs"].loc[names]
-    for column in obs_a.columns.intersection(obs_b.columns):
-        a = obs_a[column].astype(str).to_numpy()
-        b = obs_b[column].astype(str).to_numpy()
-        if (a != b).any():
-            cell = names[np.flatnonzero(a != b)[0]]
-            raise ValueError(
-                f"Cell {cell!r} occurs in {path_a} and {path_b} with different "
-                f"obs[{column!r}]; shared barcodes must be the same cell."
-            )
-    rows_a = meta_a["obs"].index.get_indexer(names)
-    rows_b = meta_b["obs"].index.get_indexer(names)
-    signatures = []
-    for path, meta, rows, indices in ((path_a, meta_a, rows_a, gene_indices[0]),
-                                      (path_b, meta_b, rows_b, gene_indices[1])):
-        mask = np.zeros(len(meta["obs"]), dtype=bool)
-        mask[rows] = True
-        nnz, sums = _row_signature(path, mask, indices, chunk_size)
-        # _row_signature returns source row order; put both in ``names`` order.
-        order = np.argsort(np.argsort(rows))
-        signatures.append((nnz[order], sums[order]))
-    (nnz_a, sums_a), (nnz_b, sums_b) = signatures
-    differs = (nnz_a != nnz_b) | ~np.isclose(sums_a, sums_b, rtol=1e-6, atol=1e-6)
-    if differs.any():
-        cell = names[np.flatnonzero(differs)[0]]
-        raise ValueError(
-            f"Cell {cell!r} occurs in {path_a} and {path_b} with different expression; "
-            "shared barcodes must be the same cell."
-        )
 
 
 def normalize_total_log1p(

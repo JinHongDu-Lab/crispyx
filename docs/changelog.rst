@@ -31,14 +31,20 @@ changes alter what results contain, so DE and pseudo-bulk results written by
   usage guide shows how ``n_cells`` forms the donor x cell-type composition
   table, a check before pooling cell types.
 * **New: ``cx.pp.concat_h5ad``** concatenates h5ad files on disk and keeps
-  one copy of the cells they share (checked to be the same cell), or refuses
-  any overlap with ``shared_cells="error"``. It keeps the genes every file
-  has, ``X`` and the common layers, the union of ``obs``, and can label each
-  cell's source file.
+  one copy of the cells they share (checked to be the same cell by their
+  expression; differing ``obs`` values are warned about), or refuses any
+  overlap with ``shared_cells="error"``. It keeps the genes every file has,
+  ``X`` and the common layers, the union of ``obs``, the common ``obsm``
+  entries (arrays, sparse matrices and DataFrames), and can label each
+  cell's source file. Each file's matrix is read twice: once to size the
+  output and check the shared cells, once to write it.
+* **Fixed: a DE run interrupted under an older result layout restarts**
+  instead of resuming, so a 0.1.8 Wilcoxon checkpoint is not finished with
+  0.1.9's AUC values next to its ``AUC - 0.5`` ones.
 * **New: ``wilcoxon_test`` accepts the labels as a ``pd.Series``** indexed by
   cell, so a label-permutation null needs no relabelled copy of the data.
-  Each Series is its own call: a fixed ``output_path`` is recomputed for a new
-  shuffle and reused for the same one.
+  Each Series (its values and name) is its own call: a fixed ``output_path``
+  is recomputed for a new shuffle and reused for the same one.
 * **New: ``obs["n_genes_tested"]``** in every DE result counts the genes each
   perturbation was tested on after the low-expression filters, and the
   ``wilcoxon_test`` docstring explains how those filters differ from

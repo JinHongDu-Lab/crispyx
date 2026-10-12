@@ -92,3 +92,19 @@ def test_disk_estimate_accepts_series_labels(screen):
         cx.wilcoxon_test, path, perturbation_column=obs["perturbation"], control_label="ctrl",
     )
     assert "output" in estimate
+
+
+def test_renamed_series_is_a_new_result(tmp_path, screen, capsys):
+    """The Series name becomes the result's grouping column, so the same
+    labels under a new name are not served the result named after the old one."""
+    path, obs = screen
+    output = tmp_path / "null.h5ad"
+    common = dict(control_label="ctrl", output_path=output, verbose=True, **_NO_FILTER)
+    labels = obs["perturbation"]
+    cx.wilcoxon_test(path, perturbation_column=labels.rename("shuffle"), **common)
+    capsys.readouterr()
+    cx.wilcoxon_test(path, perturbation_column=labels.rename("perturbation"), **common)
+    assert "argument 'perturbation_column' differs" in capsys.readouterr().out
+    written = ad.read_h5ad(output)
+    assert written.uns["perturbation_column"] == "perturbation"
+    assert "perturbation" in written.obs
