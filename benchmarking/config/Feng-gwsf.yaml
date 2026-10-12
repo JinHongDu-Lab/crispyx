@@ -23,6 +23,18 @@ resource_limits:
 parallel_config:
   n_cores: 32  # 128 GB, 32 cores for all datasets
 
+# Scanpy DE references run on a seeded random subset of perturbations (each
+# vs the full control): the full runs timed out or ran out of memory. The
+# input is pre-normalized over all cells, so each tested perturbation's
+# result equals the full run's. Sizes keep the run inside the 24 h method
+# limit; the same size and seed as PyDESeq2 selects the same perturbations.
+scanpy_max_perturbations:
+  wilcoxon: 50
+scanpy_subset_seed: 0
+method_resource_limits:
+  scanpy_de_wilcoxon:
+    memory_limit: 240.0
+
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
 adaptive_qc_mode: conservative  # or 'aggressive'

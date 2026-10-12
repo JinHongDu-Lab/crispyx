@@ -598,8 +598,16 @@ def run_scanpy_de(
     method: str,
     output_dir: Path,
     preprocess: bool = True,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
 ) -> Dict[str, Any]:
-    """Run Scanpy DE on filtered dataset."""
+    """Run Scanpy DE on filtered dataset.
+
+    If ``max_perturbations`` is set, only control and a seeded random subset
+    of perturbations are read and tested (each against the full control).
+    With ``preprocess=False`` the input is already normalized over all
+    cells, so each tested perturbation's result equals the full run's.
+    """
     import gc
     import time
     
@@ -610,7 +618,17 @@ def run_scanpy_de(
     
     # Phase 1: Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+        groups = "all"
+    else:
+        if preprocess:
+            # normalize_total's default target is the median over the cells
+            # it sees, so a subset would not reproduce the full run.
+            raise ValueError("max_perturbations requires preprocess=False (pre-normalized input)")
+        adata, groups = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed
+        )
     t_load_end = time.perf_counter()
     gc.collect()
     
@@ -626,6 +644,7 @@ def run_scanpy_de(
     sc.tl.rank_genes_groups(
         adata,
         groupby=perturbation_column,
+        groups=groups,
         method=method,
         reference=control_label,
         n_genes=adata.n_vars,
@@ -654,6 +673,7 @@ def run_scanpy_de(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
     }
 
 def run_edger_de(
@@ -1297,6 +1317,40 @@ def run_lfcshrink(
     }
 
 
+def _seeded_perturbation_subset(
+    labels, control_label: str, max_perturbations: int, seed: int
+) -> List[str]:
+    """Return a seeded random subset of perturbation labels (control excluded).
+
+    Shared by the reference methods so that, for the same size and seed,
+    PyDESeq2 and Scanpy are run on the same perturbations.
+    """
+    import numpy as np
+
+    candidates = sorted(str(p) for p in set(labels) if str(p) != control_label)
+    rng = np.random.default_rng(seed)
+    n_pick = min(max_perturbations, len(candidates))
+    return sorted(rng.choice(candidates, size=n_pick, replace=False).tolist())
+
+
+def _load_perturbation_subset(path: Path, perturbation_column: str, control_label: str,
+                              max_perturbations: int, seed: int):
+    """Read only control + a seeded perturbation subset of ``path`` into memory."""
+    import numpy as np
+    import scanpy as sc
+
+    backed = sc.read_h5ad(str(path), backed="r")
+    try:
+        labels = backed.obs[perturbation_column].astype(str)
+        perturbations = _seeded_perturbation_subset(labels.unique(), control_label, max_perturbations, seed)
+        keep = labels.isin([control_label, *perturbations]).to_numpy()
+        adata = backed[np.flatnonzero(keep)].to_memory()
+    finally:
+        backed.file.close()
+    adata.obs[perturbation_column] = adata.obs[perturbation_column].astype(str).astype("category")
+    return adata, perturbations
+
+
 def _make_var_names_unique_for_pydeseq2(adata) -> Dict[str, str]:
     """Give ``adata`` unique var names in place; return ``{unique: original}``.
 
@@ -1355,17 +1409,9 @@ def run_pydeseq2_base(
         # Get unique perturbations (excluding control)
         perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     else:
-        backed = sc.read_h5ad(str(dataset_path), backed="r")
-        all_perturbations = sorted(
-            str(p) for p in backed.obs[perturbation_column].unique() if p != control_label
+        adata, perturbations = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed
         )
-        rng = np.random.default_rng(subset_seed)
-        n_pick = min(max_perturbations, len(all_perturbations))
-        perturbations = sorted(rng.choice(all_perturbations, size=n_pick, replace=False).tolist())
-        keep = backed.obs[perturbation_column].astype(str).isin([control_label, *perturbations]).to_numpy()
-        adata = backed[np.flatnonzero(keep)].to_memory()
-        backed.file.close()
-        adata.obs[perturbation_column] = adata.obs[perturbation_column].astype(str).astype("category")
     t_load_end = time.perf_counter()
     gc.collect()
     gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
@@ -1682,6 +1728,15 @@ class BenchmarkConfig:
     # genome-wide screens. None = all perturbations.
     pydeseq2_max_perturbations: Optional[int] = None
     pydeseq2_subset_seed: int = 0
+    # Same for the Scanpy DE references, per method ("t-test", "wilcoxon"),
+    # e.g. {"wilcoxon": 300}. The same size and seed as PyDESeq2 selects
+    # the same perturbations.
+    scanpy_max_perturbations: Optional[Dict[str, int]] = None
+    scanpy_subset_seed: int = 0
+    # Per-method overrides of resource_limits, e.g.
+    # {"scanpy_de_wilcoxon": {"memory_limit": 240}}; unset keys fall back
+    # to resource_limits.
+    method_resource_limits: Optional[Dict[str, Dict[str, float]]] = None
 
     @classmethod
     def from_dict(
@@ -1769,6 +1824,9 @@ class BenchmarkConfig:
             docker_image=docker_image,
             pydeseq2_max_perturbations=data.get("pydeseq2_max_perturbations"),
             pydeseq2_subset_seed=data.get("pydeseq2_subset_seed", 0),
+            scanpy_max_perturbations=data.get("scanpy_max_perturbations"),
+            scanpy_subset_seed=data.get("scanpy_subset_seed", 0),
+            method_resource_limits=data.get("method_resource_limits"),
         )
 
     @classmethod
@@ -4591,6 +4649,8 @@ def create_benchmark_suite(
     memory_limit_gb: float | None = None,
     pydeseq2_max_perturbations: int | None = None,
     pydeseq2_subset_seed: int = 0,
+    scanpy_max_perturbations: Dict[str, int] | None = None,
+    scanpy_subset_seed: int = 0,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -4889,6 +4949,8 @@ def create_benchmark_suite(
                 "method": "t-test",
                 "output_dir": de_dir,
                 "preprocess": False,
+                "max_perturbations": (scanpy_max_perturbations or {}).get("t-test"),
+                "subset_seed": scanpy_subset_seed,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_preprocess",
@@ -4904,6 +4966,8 @@ def create_benchmark_suite(
                 "method": "wilcoxon",
                 "output_dir": de_dir,
                 "preprocess": False,
+                "max_perturbations": (scanpy_max_perturbations or {}).get("wilcoxon"),
+                "subset_seed": scanpy_subset_seed,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_preprocess",
@@ -5452,6 +5516,8 @@ def _run_single_benchmark(
         memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
         pydeseq2_max_perturbations=config.pydeseq2_max_perturbations,
         pydeseq2_subset_seed=config.pydeseq2_subset_seed,
+        scanpy_max_perturbations=config.scanpy_max_perturbations,
+        scanpy_subset_seed=config.scanpy_subset_seed,
     )
     
     # Define optional methods (excluded by default, only run when explicitly requested)
@@ -5741,8 +5807,20 @@ def _run_single_benchmark(
         if show_progress:
             method_iterator.set_description(f"Running {method.name}")  # type: ignore
         
+        method_memory_limit_bytes = memory_limit_bytes
+        method_time_limit = config.resource_limits.time_limit
+        override = (config.method_resource_limits or {}).get(method.name, {})
+        if "memory_limit" in override:
+            method_memory_limit_bytes = (
+                int(override["memory_limit"] * 1024 * 1024 * 1024) if override["memory_limit"] > 0 else None
+            )
+        if "time_limit" in override:
+            method_time_limit = override["time_limit"]
+        if override and not config.quiet:
+            print(f"  Limits for {method.name}: {override}")
+
         result = _run_with_limits(
-            method, context, memory_limit_bytes, config.resource_limits.time_limit,
+            method, context, method_memory_limit_bytes, method_time_limit,
             use_docker=config.use_docker, docker_runner=docker_runner,
         )
         
