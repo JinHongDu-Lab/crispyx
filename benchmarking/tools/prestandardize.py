@@ -46,7 +46,8 @@ def main(config_path: str) -> None:
     if standardized.exists() and not config.force_restandardize:
         print(f"{standardized.name} already exists, nothing to do")
         return
-    crispyx.data.shutil.copy2 = _verified_copy
+    # standardize_dataset imports shutil locally, so patch the module itself.
+    shutil.copy2 = _verified_copy
     path = crispyx.data.standardize_dataset(
         dataset_path=config.dataset_path,
         perturbation_column=config.perturbation_column,
