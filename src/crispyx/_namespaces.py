@@ -16,6 +16,7 @@ from .data import (
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
+    concat_h5ad,
     downsample_counts,
     normalize_total_log1p,
     resolve_data_path,
@@ -375,6 +376,32 @@ class _PreprocessingNamespace:
             verbose=verbose,
         )
 
+    def concat_h5ad(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        output_path: str | Path,
+        shared_cells: Literal["drop", "error"] = "drop",
+        label: str | None = None,
+        chunk_size: int = 4096,
+        verbose: int | bool = True,
+        force: bool = False,
+    ) -> AnnData:
+        """Concatenate h5ad files along cells on disk, dropping shared cells.
+
+        See :func:`crispyx.data.concat_h5ad` for the full parameter
+        documentation.
+        """
+        return concat_h5ad(
+            paths,
+            output_path=output_path,
+            shared_cells=shared_cells,
+            label=label,
+            chunk_size=chunk_size,
+            verbose=verbose,
+            force=force,
+        )
+
     def highly_variable_genes(
         self,
         data: str | Path | ad.AnnData,
@@ -543,7 +570,7 @@ class _PseudobulkNamespace:
         data: str | Path | ad.AnnData,
         *,
         groupby: str | Sequence[str],
-        method: PseudobulkMethod = "mean_log1p",
+        method: PseudobulkMethod,
         layer: str | None = None,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,

@@ -331,7 +331,7 @@ def test_t_test_failed_perturbation_is_nan_not_significant(screen, tmp_path):
 def test_t_test_result_does_not_map_the_deleted_partial_files(screen, tmp_path):
     result = _run("t_test", screen, tmp_path / "result.h5ad")
     for array in (result.statistics, result.pvalues, result.pvalues_adj, result.logfoldchanges,
-                  result.effect_size, result.pts, result.order):
+                  result.mean_difference, result.pts, result.order):
         assert type(array) is np.ndarray and array.base is None
 
 

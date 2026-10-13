@@ -998,7 +998,7 @@ def plot_pca(
     Parameters
     ----------
     data
-        Path to h5ad, crispyx.AnnData, or anndata.AnnData with X_pca computed.
+        Path to h5ad, crispyx.AnnData, or backed anndata.AnnData with X_pca computed.
     color
         Keys for annotations of observations in .obs or variables in .var.
     components
@@ -1097,7 +1097,7 @@ def plot_pca_variance_ratio(
     Parameters
     ----------
     data
-        Path to h5ad, crispyx.AnnData, or anndata.AnnData with PCA computed.
+        Path to h5ad, crispyx.AnnData, or backed anndata.AnnData with PCA computed.
     n_pcs
         Number of PCs to show. Default shows all computed.
     log
@@ -1157,7 +1157,7 @@ def plot_pca_loadings(
     Parameters
     ----------
     data
-        Path to h5ad, crispyx.AnnData, or anndata.AnnData with PCA computed.
+        Path to h5ad, crispyx.AnnData, or backed anndata.AnnData with PCA computed.
     components
         Which PCs to plot loadings for. e.g. [1, 2, 3] or '1,2,3'.
         Default shows first few components.
@@ -1250,7 +1250,7 @@ def plot_umap(
     Parameters
     ----------
     data
-        Path to h5ad, crispyx.AnnData, or anndata.AnnData with X_umap computed.
+        Path to h5ad, crispyx.AnnData, or backed anndata.AnnData with X_umap computed.
     color
         Keys for annotations of observations in .obs or variables in .var.
     components

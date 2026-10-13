@@ -249,6 +249,8 @@ def fingerprint_difference(previous: dict, current: dict) -> str | None:
         return "it was computed from another input file"
     if any(previous.get(key) != current.get(key) for key in _SOURCE_KEYS):
         return "the input file has changed since"
+    if previous.get("inputs") != current.get("inputs"):
+        return "an input file has changed since"
     old_params = previous.get("params", {})
     new_params = current.get("params", {})
     for name in sorted(set(old_params) | set(new_params)):
@@ -273,15 +275,18 @@ def _jsonable(value):
     Arrays and pandas objects (e.g. ``size_factors``) become a digest of
     their contents: a ``repr`` is truncated and rounded, so two different
     vectors could share one, and ``tolist()`` of a per-cell vector is tens of
-    megabytes rewritten into the checkpoint on every save.
+    megabytes rewritten into the checkpoint on every save. A Series' name is
+    kept beside the digest, which ignores it: per-cell labels given as a
+    Series name the result's grouping column.
     """
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, (pd.Series, pd.DataFrame, pd.Index)):
         hashes = pd.util.hash_pandas_object(value, index=not isinstance(value, pd.Index))
         columns = [str(c) for c in value.columns] if isinstance(value, pd.DataFrame) else None
+        name = None if not isinstance(value, pd.Series) or value.name is None else str(value.name)
         return {"type": type(value).__name__, "shape": list(value.shape), "columns": columns,
-                "sha256": _sha256(hashes.to_numpy())}
+                "name": name, "sha256": _sha256(hashes.to_numpy())}
     if isinstance(value, np.ndarray):
         if value.dtype == object:
             return value.tolist()

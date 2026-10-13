@@ -185,8 +185,8 @@ def test_crispyx_streaming_matches_on_compressed_input(tmp_path):
     src, dst = tmp_path / "sc.h5ad", tmp_path / "sc.gz.h5ad"
     _single_cell().write(src)
     compress_h5ad(src, dst)
-    raw = cx.aggregate_pseudobulk(src, groupby="perturbation", output_dir=tmp_path / "raw", verbose=False)
-    gz = cx.aggregate_pseudobulk(dst, groupby="perturbation", output_dir=tmp_path / "gz", verbose=False)
+    raw = cx.aggregate_pseudobulk(src, groupby="perturbation", method="mean_log1p", output_dir=tmp_path / "raw", verbose=False)
+    gz = cx.aggregate_pseudobulk(dst, groupby="perturbation", method="mean_log1p", output_dir=tmp_path / "gz", verbose=False)
     assert np.array_equal(np.asarray(raw.to_memory().X), np.asarray(gz.to_memory().X))
     pd.testing.assert_frame_equal(cx.load_obs(src), cx.load_obs(dst))
 

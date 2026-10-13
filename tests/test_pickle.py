@@ -74,7 +74,8 @@ def test_differential_expression_result_round_trip():
     rng = np.random.default_rng(0)
     der = DifferentialExpressionResult(
         genes=pd.Index([f"gene{i}" for i in range(10)]),
-        effect_size=rng.random(10),
+        logfoldchanges=rng.random(10),
+        auc=rng.random(10),
         statistic=rng.random(10),
         pvalue=rng.random(10),
         method="wilcoxon",
@@ -84,6 +85,7 @@ def test_differential_expression_result_round_trip():
     )
     restored = pickle.loads(pickle.dumps(der))
     np.testing.assert_array_equal(restored.genes, der.genes)
-    np.testing.assert_array_equal(restored.effect_size, der.effect_size)
+    np.testing.assert_array_equal(restored.logfoldchanges, der.logfoldchanges)
+    np.testing.assert_array_equal(restored.auc, der.auc)
     np.testing.assert_array_equal(restored.pvalue_adj, der.pvalue_adj)
     assert restored.result is None

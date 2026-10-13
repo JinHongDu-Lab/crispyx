@@ -194,7 +194,9 @@ def test_downstream_effect_outputs(tmp_path):
     assert (tmp_path / "wilcoxon_cx_wilcoxon.h5ad").exists()
 
     ko1_result = wald["KO1"]
-    assert ko1_result.effect_size.shape[0] == 4
+    assert ko1_result.logfoldchanges.shape[0] == 4
+    assert ko1_result.mean_difference.shape[0] == 4
+    assert ko1_result.auc is None
     assert ko1_result.method == "t_test"
     ko2_result = wilcoxon["KO2"]
     assert ko2_result.pvalue.shape[0] == 4
@@ -321,7 +323,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     wald_mem = wald_wrapped.to_memory()
     wrapped_groups = wald_mem.obs_names.tolist()
     assert wrapped_groups == list(wald_direct.groups)
-    direct_effect = np.vstack([wald_direct[group].effect_size for group in wrapped_groups])
+    direct_effect = np.vstack([wald_direct[group].mean_difference for group in wrapped_groups])
     direct_stat = np.vstack([wald_direct[group].statistic for group in wrapped_groups])
     direct_p = np.vstack([wald_direct[group].pvalue for group in wrapped_groups])
     np.testing.assert_array_equal(wald_mem.X, direct_effect)

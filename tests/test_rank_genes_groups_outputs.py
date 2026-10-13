@@ -51,7 +51,9 @@ def test_rank_genes_groups_and_readers_report_the_stored_values(screen, tmp_path
     # The wrapper returns the method's own result file.
     wrapped_mem = wrapped.to_memory()
     assert wrapped_mem.uns["method"] == ("t_test" if method == "t-test" else method)
-    np.testing.assert_array_equal(wrapped_mem.X, direct.effect_size)
+    # X holds the method's own effect size.
+    x_field = {"t-test": "mean_difference", "wilcoxon": "auc", "nb_glm": "logfoldchanges"}[method]
+    np.testing.assert_array_equal(wrapped_mem.X, getattr(direct, x_field))
     np.testing.assert_array_equal(wrapped_mem.var["pts_rest"].to_numpy(), direct.pts_rest[0])
     wrapped.close()
 

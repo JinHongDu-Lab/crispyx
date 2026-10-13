@@ -137,5 +137,8 @@ def test_memory_limit_does_not_change_the_result(log_screen, tmp_path, fn):
     ]
     for other in results[1:]:
         assert other.groups == results[0].groups
-        for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size"):
+        for field in ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "auc", "mean_difference"):
+            if getattr(results[0], field) is None:
+                assert getattr(other, field) is None
+                continue
             np.testing.assert_allclose(getattr(other, field), getattr(results[0], field), atol=1e-10, err_msg=field)

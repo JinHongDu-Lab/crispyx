@@ -8,6 +8,7 @@ import logging
 import os
 import warnings
 import threading
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -86,7 +87,7 @@ from ._checkpoint import (
     _DummyProgress,
 )
 from . import _messages
-from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp, write_stamp
+from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import canonical_call_args, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
@@ -114,13 +115,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DifferentialExpressionResult:
+    """One perturbation's per-gene results; see :class:`RankGenesGroupsResult`
+    for what each field holds."""
+
     genes: pd.Index
-    effect_size: np.ndarray
+    logfoldchanges: np.ndarray
     statistic: np.ndarray
     pvalue: np.ndarray
     method: str
     perturbation: str
     pvalue_adj: np.ndarray | None = None
+    auc: np.ndarray | None = None
+    mean_difference: np.ndarray | None = None
     result: AnnData | None = field(default=None, repr=False)
 
     @property
@@ -158,13 +164,26 @@ class DifferentialExpressionResult:
 
 @dataclass
 class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
+    """Per-perturbation x per-gene DE results; rows follow ``groups``.
+
+    ``logfoldchanges`` is the log2 fold change of mean expression for every
+    method: for ``wilcoxon_test`` and ``t_test``,
+    ``log2((expm1(mean_pert) + 1e-9) / (expm1(mean_ctrl) + 1e-9))`` on the
+    log1p input (Scanpy's convention); for ``nb_glm_test``, the fitted
+    perturbation coefficient on the log2 scale (``lfc_base="ln"``: natural
+    log). The method-specific effect sizes are ``auc`` (``wilcoxon_test``:
+    ``U / (n_pert * n_ctrl)``, the probability that a perturbed cell
+    exceeds a control cell, 0.5 for no shift) and ``mean_difference``
+    (``t_test``: the difference of means on the input's own scale); each is
+    ``None`` for the other methods.
+    """
+
     genes: pd.Index
     groups: list[str]
     statistics: np.ndarray
     pvalues: np.ndarray
     pvalues_adj: np.ndarray
     logfoldchanges: np.ndarray
-    effect_size: np.ndarray
     u_statistics: np.ndarray
     pts: np.ndarray
     pts_rest: np.ndarray
@@ -174,6 +193,8 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
     control_label: str
     tie_correct: bool
     pvalue_correction: Literal["benjamini-hochberg", "bonferroni"]
+    auc: np.ndarray | None = None
+    mean_difference: np.ndarray | None = None
     result: AnnData | None = field(default=None, repr=False)
     _group_cache: Dict[str, DifferentialExpressionResult] = field(
         init=False, repr=False, default_factory=dict
@@ -210,12 +231,14 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         for idx, group in enumerate(self.groups):
             self._group_cache[group] = DifferentialExpressionResult(
                 genes=self.genes,
-                effect_size=self.effect_size[idx],
+                logfoldchanges=self.logfoldchanges[idx],
                 statistic=self.statistics[idx],
                 pvalue=self.pvalues[idx],
                 method=self.method,
                 perturbation=group,
                 pvalue_adj=self.pvalues_adj[idx],
+                auc=None if self.auc is None else self.auc[idx],
+                mean_difference=None if self.mean_difference is None else self.mean_difference[idx],
                 result=self.result,
             )
 
@@ -256,7 +279,8 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         dict
             Dictionary with keys ``'params'``, ``'names'``, ``'scores'``,
             ``'logfoldchanges'``, ``'pvals'``, ``'pvals_adj'``, ``'pts'``,
-            ``'pts_rest'``, ``'auc'``, ``'u_stat'``, and ``'full'``.
+            ``'pts_rest'``, ``'u_stat'``, ``'full'``, and ``'auc'`` when the
+            method has one (``wilcoxon_test``).
             Each value (except ``'params'`` and ``'full'``) is a NumPy
             record array sorted by descending absolute score.
         """
@@ -268,7 +292,6 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         sorted_padj = np.take_along_axis(self.pvalues_adj, self.order, axis=1)
         sorted_pts = np.take_along_axis(self.pts, self.order, axis=1)
         sorted_pts_rest = np.take_along_axis(self.pts_rest, self.order, axis=1)
-        sorted_effect = np.take_along_axis(self.effect_size, self.order, axis=1)
         sorted_u = np.take_along_axis(self.u_statistics, self.order, axis=1)
 
         def to_recarray(matrix: np.ndarray) -> np.recarray:
@@ -290,9 +313,10 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             "pvals_adj": to_recarray(sorted_padj),
             "pts": to_recarray(sorted_pts),
             "pts_rest": to_recarray(sorted_pts_rest),
-            "auc": to_recarray(sorted_effect),
             "u_stat": to_recarray(sorted_u),
         }
+        if self.auc is not None:
+            rank_genes_groups["auc"] = to_recarray(np.take_along_axis(self.auc, self.order, axis=1))
         rank_genes_groups["full"] = self.to_full_order_dict()
         return rank_genes_groups
 
@@ -306,20 +330,22 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         -------
         dict
             Keys: ``'scores'``, ``'pvals'``, ``'pvals_adj'``,
-            ``'logfoldchanges'``, ``'auc'``, ``'u_stat'``, ``'pts'``,
-            ``'pts_rest'``.  Each value is a 2-D ``(n_groups, n_genes)``
-            NumPy array (copy).
+            ``'logfoldchanges'``, ``'u_stat'``, ``'pts'``, ``'pts_rest'``,
+            and ``'auc'`` when the method has one.  Each value is a 2-D
+            ``(n_groups, n_genes)`` NumPy array (copy).
         """
-        return {
+        full = {
             "scores": self.statistics.copy(),
             "pvals": self.pvalues.copy(),
             "pvals_adj": self.pvalues_adj.copy(),
             "logfoldchanges": self.logfoldchanges.copy(),
-            "auc": self.effect_size.copy(),
             "u_stat": self.u_statistics.copy(),
             "pts": self.pts.copy(),
             "pts_rest": self.pts_rest.copy(),
         }
+        if self.auc is not None:
+            full["auc"] = self.auc.copy()
+        return full
 
 
 def _load_layered_de_result(
@@ -337,10 +363,10 @@ def _load_layered_de_result(
     statistic_matrix = np.array(adata.layers["z_score"])
     pvalue_matrix = np.array(adata.layers["pvalue"])
     pvalue_adj_matrix = np.array(adata.layers["pvalue_adj"])
-    # X is the effect size. t_test stores a separate scanpy-style fold change;
-    # for nb_glm the fold change is the effect size.
-    effect_matrix = np.array(adata.X)
-    logfc_matrix = np.array(adata.layers["logfoldchanges"]) if "logfoldchanges" in adata.layers else effect_matrix
+    # t_test stores its difference of means in X beside a Scanpy-style fold
+    # change; nb_glm stores the fold change itself in X.
+    x_matrix = np.array(adata.X)
+    logfc_matrix = np.array(adata.layers["logfoldchanges"]) if method == "t_test" else x_matrix
     pts_matrix = np.array(adata.layers["pts"])
     pts_rest_matrix = np.broadcast_to(adata.var["pts_rest"].to_numpy(dtype=np.float32), pts_matrix.shape)
     
@@ -357,8 +383,7 @@ def _load_layered_de_result(
         pvalues=pvalue_matrix,
         pvalues_adj=pvalue_adj_matrix,
         logfoldchanges=logfc_matrix,
-        effect_size=effect_matrix,
-        u_statistics=np.zeros_like(effect_matrix),
+        u_statistics=np.zeros_like(x_matrix),
         pts=pts_matrix,
         pts_rest=pts_rest_matrix,
         order=order_matrix,
@@ -367,6 +392,7 @@ def _load_layered_de_result(
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
+        mean_difference=x_matrix if method == "t_test" else None,
         result=AnnData(output_path),
     )
 
@@ -442,6 +468,22 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
+def _align_labels(labels: pd.Series, obs_names: pd.Index) -> np.ndarray:
+    """Per-cell labels given as a Series, in ``obs_names`` order."""
+    labels = labels.set_axis(labels.index.astype(str))
+    if not labels.index.is_unique:
+        raise ValueError("The labels Series must be indexed by cell, each cell once.")
+    names = pd.Index(obs_names).astype(str)
+    aligned = labels.reindex(names)
+    missing = names[aligned.isna().to_numpy()]
+    if len(missing):
+        raise ValueError(
+            f"The labels Series has no label for {len(missing)} of {len(names)} cells "
+            f"(e.g. {missing[:3].tolist()}); index it by obs_names."
+        )
+    return aligned.astype(str).to_numpy()
+
+
 def _de_fingerprint(
     path: Path, call_args: dict, method: str, *, perturbation_column: str, control_label: str | None,
 ) -> dict:
@@ -456,11 +498,12 @@ def _de_fingerprint(
 
 def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
     """A checkpoint's identity: the result ``fingerprint`` without
-    ``scanpy_format``, which only changes the final write, plus ``extra``,
-    what the saved progress also depends on (e.g. the gene chunk width it
-    is counted in)."""
+    ``scanpy_format``, which only changes the final write, plus the result
+    schema the saved values are in (a run interrupted by an older layout is
+    restarted, not finished in the new one) and ``extra``, what the saved
+    progress also depends on (e.g. the gene chunk width it is counted in)."""
     params = {k: v for k, v in fingerprint["params"].items() if k != "scanpy_format"}
-    return {**fingerprint, "params": params, **extra}
+    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], **extra}
 
 
 # Disk a DE run needs beside its output: the resumable partial arrays plus
@@ -512,7 +555,7 @@ def _release_chunk_memory() -> None:
 def _write_wilcoxon_result_h5ad(
     output_path: Path,
     *,
-    effect_matrix: np.ndarray,
+    auc_matrix: np.ndarray,
     z_matrix: np.ndarray,
     pvalue_matrix: np.ndarray,
     pvalue_adj_matrix: np.ndarray,
@@ -547,7 +590,10 @@ def _write_wilcoxon_result_h5ad(
     complete: a run killed at any point before leaves nothing to reuse.
     """
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    obs = pd.DataFrame(
+        {perturbation_column: obs_index.to_list(), "n_genes_tested": _count_tested(pvalue_matrix)},
+        index=obs_index,
+    )
     var = pd.DataFrame({"pts_rest": np.asarray(pts_rest, dtype=np.float32)}, index=gene_symbols.astype(str))
     uns = _wilcoxon_uns(
         control_label=control_label, perturbation_column=perturbation_column,
@@ -561,7 +607,7 @@ def _write_wilcoxon_result_h5ad(
     with _replace_on_success(output_path) as partial:
         ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
         with h5py.File(partial, "r+") as hf:
-            _create_array(hf, "X", data=effect_matrix)
+            _create_array(hf, "X", data=auc_matrix)
             layers_grp = hf.require_group("layers")
             _create_array(layers_grp, "z_score", data=z_matrix)
             _create_array(layers_grp, "pvalue", data=pvalue_matrix)
@@ -582,6 +628,30 @@ def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
     ds.attrs["encoding-type"] = "array"
     ds.attrs["encoding-version"] = "0.2.0"
     return ds
+
+
+def _count_tested(pvalues) -> np.ndarray:
+    """Genes tested per perturbation: the finite p-values of each row of
+    ``pvalues`` (an array, memmap or h5py dataset), read a block of rows at a
+    time so a large result is never held whole."""
+    n_rows, n_genes = pvalues.shape
+    step = max(1, (1 << 22) // max(n_genes, 1))
+    counts = np.empty(n_rows, dtype=np.int64)
+    for start in range(0, n_rows, step):
+        block = np.asarray(pvalues[start:start + step])
+        counts[start:start + step] = np.isfinite(block).sum(axis=1)
+    return counts
+
+
+def _replace_obs(path: Path, obs: pd.DataFrame) -> None:
+    """Replace the ``obs`` table of the h5ad at ``path`` in place. The table
+    is encoded by anndata (into a scratch file) and copied across."""
+    with tempfile.TemporaryDirectory(prefix="cx_obs_") as tmpdir:
+        donor = Path(tmpdir) / "obs.h5ad"
+        ad.AnnData(obs=obs).write(donor)
+        with h5py.File(donor, "r") as src, h5py.File(path, "r+") as dest:
+            del dest["obs"]
+            src.copy(src["obs"], dest, name="obs")
 
 
 def _wilcoxon_uns(
@@ -663,7 +733,6 @@ def _build_result_from_h5ad(
             pvalues=empty_f64,
             pvalues_adj=empty_f64,
             logfoldchanges=empty_f64,
-            effect_size=empty_f64,
             u_statistics=empty_f64,
             pts=empty_f32,
             pts_rest=empty_f32,
@@ -682,7 +751,7 @@ def _build_result_from_h5ad(
         pval_arr = hf["layers/pvalue"][:]
         pval_adj_arr = hf["layers/pvalue_adj"][:]
         lfc_arr = hf["layers/logfoldchanges"][:]
-        effect_arr = hf["X"][:]
+        auc_arr = hf["X"][:]
         u_arr = hf["layers/u_statistic"][:]
         pts_arr = np.array(hf["layers/pts"][:], dtype=np.float32)
         pts_rest_arr = np.broadcast_to(
@@ -698,7 +767,6 @@ def _build_result_from_h5ad(
         pvalues=pval_arr,
         pvalues_adj=pval_adj_arr,
         logfoldchanges=lfc_arr,
-        effect_size=effect_arr,
         u_statistics=u_arr,
         pts=pts_arr,
         pts_rest=pts_rest_arr,
@@ -708,6 +776,7 @@ def _build_result_from_h5ad(
         control_label=control_label,
         tie_correct=tie_correct,
         pvalue_correction=corr_method,
+        auc=auc_arr,
     )
     result.result = AnnData(output_path)
     return result
@@ -721,12 +790,15 @@ def _write_rank_genes_groups_hdf5(
     in-memory ``result``: see :func:`_write_rank_genes_groups`."""
 
     def rows(_handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
-        return {
+        block = {
             "scores": result.statistics[sl], "pvals": result.pvalues[sl],
             "pvals_adj": result.pvalues_adj[sl], "logfoldchanges": result.logfoldchanges[sl],
-            "auc": result.effect_size[sl], "u_stat": result.u_statistics[sl],
+            "u_stat": result.u_statistics[sl],
             "pts": result.pts[sl], "pts_rest": result.pts_rest[sl], "order": result.order[sl],
         }
+        if result.auc is not None:
+            block["auc"] = result.auc[sl]
+        return block
 
     _write_rank_genes_groups(
         output_path, groups=result.groups, n_genes=len(result.genes), rows=rows,
@@ -1003,7 +1075,7 @@ def t_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         log-transformed expression data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
@@ -1022,7 +1094,7 @@ def t_test(
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
-        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``score`` / ``pvalue`` / ``logfoldchanges`` and the effect size, with
         ``pts`` / ``pts_rest`` still populated.
     min_pct_ctrl
         Minimum fraction of expressing cells for the *control* side. A gene is
@@ -1035,7 +1107,7 @@ def t_test(
     min_mean_ctrl
         Minimum mean expression (log1p units) for the *control* side.
         Default ``0.05``. Excluded genes are written as NaN in
-        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``;
+        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``mean_difference``;
         ``pts`` and ``pts_rest`` remain populated.
     min_mean_pert
         Minimum mean expression for the *perturbed* side. Default ``0.005``.
@@ -1091,13 +1163,15 @@ def t_test(
     -------
     RankGenesGroupsResult
         Differential expression results. Access results via dict-like interface:
-        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
-        path is available at `result.result_path`.
+        `result[label].logfoldchanges`, `result[label].mean_difference`,
+        `result[label].pvalue`, etc. The h5ad file path is available at
+        `result.result_path`.
 
-        The h5ad file holds one row per perturbation: the effect size in
-        ``X`` and the layers ``z_score``, ``pvalue``, ``pvalue_adj``,
-        ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
-        arm, so it is the per-gene column ``var["pts_rest"]``.
+        The h5ad file holds one row per perturbation: the difference of means
+        (``mean_difference``) in ``X`` and the layers ``z_score``, ``pvalue``,
+        ``pvalue_adj``, ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
+        arm, so it is the per-gene column ``var["pts_rest"]``. ``obs["n_genes_tested"]``
+        counts the genes each perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -1271,7 +1345,7 @@ def t_test(
             "pvalues": (shape, np.float64, np.nan),
             "pvalues_adj": (shape, np.float64, np.nan),
             "logfoldchanges": (shape, np.float32, np.nan),
-            "effect_size": (shape, np.float32, np.nan),
+            "mean_difference": (shape, np.float32, np.nan),
             "pts": (shape, np.float32, 0),
             "order": (shape, np.int64, 0),
         },
@@ -1285,7 +1359,7 @@ def t_test(
     stat_memmap = run.arrays["statistics"]
     pval_memmap = run.arrays["pvalues"]
     lfc_memmap = run.arrays["logfoldchanges"]
-    effect_memmap = run.arrays["effect_size"]
+    effect_memmap = run.arrays["mean_difference"]
     pts_memmap = run.arrays["pts"]
     order_memmap = run.arrays["order"]
 
@@ -1479,7 +1553,7 @@ def t_test(
         pvalues=pval_matrix,
         pvalues_adj=pval_adj_matrix,
         logfoldchanges=lfc_matrix,
-        effect_size=effect_matrix,
+        mean_difference=effect_matrix,
         u_statistics=np.zeros(shape, dtype=np.float32),
         pts=pts_matrix,
         pts_rest=np.broadcast_to(pts_rest_vector, shape),
@@ -1495,6 +1569,7 @@ def t_test(
     # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
     # which fails with HDF5 header size limits for large group counts)
     var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=gene_symbols)
+    obs["n_genes_tested"] = _count_tested(pval_matrix)
     adata = ad.AnnData(effect_matrix, obs=obs, var=var)
     adata.layers["z_score"] = stat_matrix  # t-statistic (converges to z for large n)
     adata.layers["pvalue"] = pval_matrix
@@ -1592,7 +1667,7 @@ def nb_glm_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         raw count data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
@@ -1696,7 +1771,7 @@ def nb_glm_test(
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
-        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``score`` / ``pvalue`` / ``logfoldchanges`` and the effect size, with
         ``pts`` / ``pts_rest`` still populated.
     min_total_count
         Minimum total count across all cells for a gene to be tested.
@@ -1850,8 +1925,8 @@ def nb_glm_test(
     -------
     RankGenesGroupsResult
         Differential expression results. Access results via dict-like interface:
-        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
-        path is available at `result.result_path`.
+        `result[label].logfoldchanges`, `result[label].pvalue`, etc. The h5ad
+        file path is available at `result.result_path`.
 
         The h5ad file holds one row per perturbation. ``X`` is the fold
         change in ``lfc_base`` (shrunk under ``lfc_shrinkage_type="apeglm"``).
@@ -1864,7 +1939,8 @@ def nb_glm_test(
         columns: ``pts_rest``, and, when a global dispersion is fitted,
         ``dispersion`` and ``dispersion_trend``; a per-comparison dispersion
         is stored as the layers ``dispersion``, ``dispersion_raw`` and
-        ``dispersion_trend`` instead.
+        ``dispersion_trend`` instead. ``obs["n_genes_tested"]`` counts the
+        genes each perturbation was tested on, after the filters.
     """
     call_args = dict(locals())  # for the resume fingerprint, before any other local
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -3717,6 +3793,7 @@ def nb_glm_test(
             logfc_raw_matrix = logfc_raw_matrix / ln2
         se_matrix = se_matrix / ln2
 
+    obs["n_genes_tested"] = _count_tested(pvalue_matrix)
     adata = ad.AnnData(logfc_matrix, obs=obs, var=var)
     adata.layers["z_score"] = statistic_matrix
     adata.layers["pvalue"] = pvalue_matrix
@@ -3782,7 +3859,6 @@ def nb_glm_test(
         pvalues=pvalue_matrix,
         pvalues_adj=pvalue_adj_matrix,
         logfoldchanges=logfc_matrix,
-        effect_size=logfc_matrix,
         u_statistics=np.zeros_like(logfc_matrix),
         pts=pts_matrix,
         pts_rest=np.broadcast_to(pts_rest_vector, pts_matrix.shape),
@@ -3858,6 +3934,7 @@ def _wilcoxon_test_streaming(
     *,
     gene_symbols: pd.Index,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     candidates: list[str],
     n_genes: int,
@@ -3994,7 +4071,6 @@ def _wilcoxon_test_streaming(
             # Stream gene chunks from backed file
             backed = read_backed(path)
             try:
-                labels = backed.obs[perturbation_column].astype(str).to_numpy()
                 control_mask = labels == control_label
                 control_n = int(control_mask.sum())
                 # Precompute integer row indices (faster than boolean indexing
@@ -4224,6 +4300,9 @@ def _wilcoxon_test_streaming(
             work_path, groups=candidates, perturbation_column=perturbation_column,
             control_label=control_label, tie_correct=tie_correct, corr_method=corr_method,
         )
+    with h5py.File(work_path, "r") as hf:
+        obs["n_genes_tested"] = _count_tested(hf["layers/pvalue"])
+    _replace_obs(work_path, obs)
     write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()
@@ -4249,6 +4328,7 @@ def _wilcoxon_test_stratified(
     *,
     gene_symbols,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     batch_column: str,
     candidates: list[str],
@@ -4321,7 +4401,6 @@ def _wilcoxon_test_stratified(
 
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         control_n = int(control_mask.sum())
 
@@ -4709,7 +4788,7 @@ def _wilcoxon_test_stratified(
     }
     _write_wilcoxon_result_h5ad(
         output_path,
-        effect_matrix=effect_matrix,
+        auc_matrix=effect_matrix,
         z_matrix=z_matrix,
         pvalue_matrix=pvalue_matrix,
         pvalue_adj_matrix=pvalue_adj_matrix,
@@ -4750,8 +4829,8 @@ def _wilcoxon_test_stratified(
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    perturbation_column: str | None = None,
-    groupby: str | None = None,
+    perturbation_column: str | pd.Series | None = None,
+    groupby: str | pd.Series | None = None,
     control_label: str | None = None,
     reference: str | None = None,
     gene_name_column: str | None = None,
@@ -4787,10 +4866,20 @@ def wilcoxon_test(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         normalised, log-transformed data.
     perturbation_column
-        Column in `adata.obs` indicating perturbation labels.
+        Column in `adata.obs` indicating perturbation labels, or the labels
+        themselves as a ``pd.Series`` indexed by cell (``obs_names``), e.g.
+        shuffled labels for a permutation null, so no relabelled copy of the
+        data has to be written. The Series is aligned to ``obs_names`` by
+        index, so its order does not matter, but every cell needs a label;
+        its ``name`` (default ``"perturbation"``) names the column in the
+        result. A different Series is a different call: a result computed
+        with one is not reused for another. On a CSR input each call makes a
+        temporary CSC copy (see ``format_mismatch_policy``); for many
+        shuffles, convert once with :func:`crispyx.pp.convert_to_csc` and pass
+        the converted file.
     groupby
         Alias for ``perturbation_column`` (Scanpy-compatible).
         Mutually exclusive with ``perturbation_column``.
@@ -4816,7 +4905,7 @@ def wilcoxon_test(
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
-        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``, with
+        ``score`` / ``pvalue`` / ``logfoldchanges`` and the effect size, with
         ``pts`` / ``pts_rest`` still populated. A gene whose values are all
         tied across both groups (e.g. zero in every cell, with the filters
         off) has no rank test and is untested in the same way; Scanpy
@@ -4832,7 +4921,7 @@ def wilcoxon_test(
     min_mean_ctrl
         Minimum mean log1p expression for the *control* side. Default ``0.05``.
         Excluded genes are written as NaN in ``score`` / ``pvalue`` /
-        ``logfoldchanges`` / ``effect_size``; ``pts`` / ``pts_rest`` remain
+        ``logfoldchanges`` / ``auc``; ``pts`` / ``pts_rest`` remain
         populated. Set to ``0.0`` together with pct thresholds to disable.
     min_mean_pert
         Minimum mean expression for the *perturbed* side. Default ``0.005``.
@@ -4910,17 +4999,30 @@ def wilcoxon_test(
     -------
     RankGenesGroupsResult
         Differential expression results. Access results via dict-like interface:
-        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
-        path is available at `result.result_path`.
+        `result[label].logfoldchanges`, `result[label].auc`,
+        `result[label].pvalue`, etc. The h5ad file path is available at
+        `result.result_path`.
 
-        The h5ad file holds one row per perturbation: the effect size in
-        ``X`` and the layers ``z_score``, ``pvalue``, ``pvalue_adj``,
-        ``logfoldchanges``, ``u_statistic`` and ``pts``. ``pts_rest``
+        The h5ad file holds one row per perturbation: the AUC
+        (``U / (n_pert * n_ctrl)``, 0.5 for no shift) in ``X`` and the layers
+        ``z_score``, ``pvalue``, ``pvalue_adj``, ``logfoldchanges``,
+        ``u_statistic`` and ``pts``. ``pts_rest``
         describes the control arm, so it is the per-gene column
-        ``var["pts_rest"]``.
+        ``var["pts_rest"]``. ``obs["n_genes_tested"]`` counts the genes each
+        perturbation was tested on, after the filters.
 
     Notes
     -----
+    **Differences from** ``scanpy.tl.rank_genes_groups(method="wilcoxon")``.
+    Scanpy tests every gene; crispyx applies four low-expression filters by
+    default (``min_pct_ctrl=0.01``, ``min_pct_pert=0.002``,
+    ``min_mean_ctrl=0.05``, ``min_mean_pert=0.005``) and reports the genes
+    they exclude as untested (``NaN``), which also keeps them out of the
+    multiple-testing correction. ``obs["n_genes_tested"]`` says how many
+    genes each comparison kept. Setting all four to ``0`` tests Scanpy's gene
+    set; a gene whose values are all tied is still untested here, where
+    Scanpy reports ``score=0``, ``pvalue=1``.
+
     The rank test itself runs in a numba ``prange`` kernel over perturbations
     and uses every CPU the process is allowed to run on; there is no separate
     worker-count parameter.
@@ -4963,11 +5065,14 @@ def wilcoxon_test(
         fingerprint=fingerprint,
     )):
         return r
+    given_labels = perturbation_column if isinstance(perturbation_column, pd.Series) else None
+    if given_labels is not None:
+        perturbation_column = "perturbation" if given_labels.name is None else str(given_labels.name)
 
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
-        if perturbation_column not in backed.obs.columns:
+        if given_labels is None and perturbation_column not in backed.obs.columns:
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
@@ -4975,7 +5080,10 @@ def wilcoxon_test(
             raise KeyError(
                 f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = (
+            backed.obs[perturbation_column].astype(str).to_numpy() if given_labels is None
+            else _align_labels(given_labels, backed.obs_names)
+        )
         control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -5032,6 +5140,7 @@ def wilcoxon_test(
                 stream_path,
                 gene_symbols=gene_symbols,
                 perturbation_column=perturbation_column,
+                labels=labels,
                 control_label=control_label,
                 batch_column=batch_column,
                 candidates=candidates,
@@ -5074,6 +5183,7 @@ def wilcoxon_test(
                 stream_path,
                 gene_symbols=gene_symbols,
                 perturbation_column=perturbation_column,
+                labels=labels,
                 control_label=control_label,
                 candidates=candidates,
                 n_genes=n_genes,
@@ -5101,6 +5211,7 @@ def wilcoxon_test(
             stream_path,
             gene_symbols=gene_symbols,
             perturbation_column=perturbation_column,
+            labels=labels,
             control_label=control_label,
             candidates=candidates,
             n_genes=n_genes,
@@ -5128,6 +5239,7 @@ def _wilcoxon_test_standard(
     *,
     gene_symbols,
     perturbation_column: str,
+    labels: np.ndarray,
     control_label: str,
     candidates: list[str],
     n_genes: int,
@@ -5198,7 +5310,6 @@ def _wilcoxon_test_standard(
 
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         control_n = int(control_mask.sum())
         # Precompute integer row indices (faster than boolean indexing
@@ -5482,7 +5593,7 @@ def _wilcoxon_test_standard(
         print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
     _write_wilcoxon_result_h5ad(
         output_path,
-        effect_matrix=effect_matrix,
+        auc_matrix=effect_matrix,
         z_matrix=z_matrix,
         pvalue_matrix=pvalue_matrix,
         pvalue_adj_matrix=pvalue_adj_matrix,
@@ -5589,7 +5700,7 @@ def shrink_lfc(
     Parameters
     ----------
     data
-        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         NB-GLM results from `nb_glm_test`. Must have required layers and
         metadata in `uns`.
     output_dir
@@ -5650,7 +5761,7 @@ def shrink_lfc(
         - `logfoldchange`: shrunken LFC values
         - `logfoldchange_raw`: original MLE LFC values (preserved)
         - `standard_error`: posterior SE reflecting shrinkage uncertainty
-        - `X`: updated to shrunken LFC (effect_size)
+        - `X`: updated to the shrunken LFC
     
     Examples
     --------
@@ -5843,35 +5954,19 @@ def shrink_lfc(
         if original_dataset_path is None:
             raise ValueError(
                 f"Input file '{path}' does not have 'original_dataset_path' in uns. "
-                "method='full' requires NB-GLM results from nb_glm_test v0.4.0+. "
+                "method='full' requires a result written by nb_glm_test. "
                 "Use method='stats' or re-run nb_glm_test."
             )
         
-        # Strip /workspace/ prefix from Docker paths if present
-        if original_dataset_path.startswith("/workspace/"):
-            original_dataset_path = original_dataset_path[len("/workspace/"):]
-        
         original_path = Path(original_dataset_path)
         if not original_path.exists():
-            # Also try the input file's parent as base directory
-            input_parent = path.parent
-            relative_name = Path(original_dataset_path).name
-            alternative_paths = [
-                input_parent.parent / ".cache" / relative_name,  # Try ../..cache/
-                input_parent / ".cache" / relative_name,  # Try ../.cache/
-                input_parent.parent.parent / ".cache" / relative_name,  # Try ../../../.cache/
-            ]
-            for alt_path in alternative_paths:
-                if alt_path.exists():
-                    original_path = alt_path
-                    break
-            else:
-                raise FileNotFoundError(
-                    f"Original dataset not found: {original_dataset_path}. "
-                    "method='full' requires access to the original count data. "
-                    "Use method='stats' to shrink without original data."
-                )
-        
+            raise FileNotFoundError(
+                f"Original dataset not found: {original_dataset_path} (recorded "
+                f"in {path} by nb_glm_test). method='full' refits on the original "
+                "counts; move the file back or use method='stats', which needs "
+                "only the stored statistics."
+            )
+
         # Load original dataset for streaming
         backed = read_backed(original_path)
         try:
@@ -6066,7 +6161,6 @@ def shrink_lfc(
         pvalues=np.asarray(pvalue_matrix),
         pvalues_adj=np.asarray(pvalue_adj_matrix),
         logfoldchanges=shrunk_lfc,
-        effect_size=shrunk_lfc,
         u_statistics=np.zeros_like(shrunk_lfc),
         pts=np.asarray(pts_matrix, dtype=np.float32),
         pts_rest=np.asarray(pts_rest_matrix, dtype=np.float32),
@@ -6142,7 +6236,7 @@ def _estimate_shape_for_nb_glm_test(
 def _estimate_shape_for_wilcoxon_test(
     path: Path,
     *,
-    perturbation_column: str,
+    perturbation_column: str | pd.Series,
     control_label: str | None = None,
     perturbations: Iterable[str] | None = None,
     batch_column: str | None = None,
@@ -6154,7 +6248,11 @@ def _estimate_shape_for_wilcoxon_test(
     validate_format_mismatch_policy(format_mismatch_policy)
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = (
+            _align_labels(perturbation_column, backed.obs_names)
+            if isinstance(perturbation_column, pd.Series)
+            else backed.obs[perturbation_column].astype(str).to_numpy()
+        )
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars

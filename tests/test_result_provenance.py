@@ -80,7 +80,9 @@ def de_setup(request, tmp_path):
     return method, path, tmp_path / "result.h5ad"
 
 
-_RESULT_FIELDS = ("statistics", "pvalues", "pvalues_adj", "logfoldchanges", "effect_size", "pts", "pts_rest")
+_RESULT_FIELDS = (
+    "statistics", "pvalues", "pvalues_adj", "logfoldchanges", "auc", "mean_difference", "pts", "pts_rest",
+)
 
 
 def test_identical_rerun_reuses_the_result(de_setup, capsys):
@@ -189,6 +191,18 @@ def test_scanpy_format_counts_for_the_result_not_the_checkpoint(tmp_path, capsys
     assert _checkpoint_fingerprint(stamped) == _checkpoint_fingerprint(unformatted)
 
 
+def test_checkpoint_from_an_older_result_layout_is_not_resumed(monkeypatch):
+    """Saved progress is in the layout of the version that wrote it: a run
+    interrupted before a schema bump restarts rather than mixing layouts."""
+    from crispyx import _provenance
+    from crispyx.de import _checkpoint_fingerprint
+
+    fingerprint = {"source": "data.h5ad", "params": {"method": "wilcoxon"}}
+    before = _checkpoint_fingerprint(fingerprint)
+    monkeypatch.setitem(_provenance.SCHEMAS, "de_result", _provenance.SCHEMAS["de_result"] + 1)
+    assert _checkpoint_fingerprint(fingerprint) != before
+
+
 def test_aliases_name_the_same_call(tmp_path, capsys):
     """``groupby``/``reference`` and ``perturbation_column``/``control_label``
     are one call, and so is ``cx.tl.rank_genes_groups``, which leaves the
@@ -229,8 +243,9 @@ def test_wilcoxon_scanpy_structure_is_written_however_large(tmp_path, monkeypatc
         np.testing.assert_array_equal(rgg["order"][()], loaded.order)
         for name in ("full/pvals", "full/logfoldchanges", "full/auc", "full/u_stat", "full/pts", "names"):
             np.testing.assert_array_equal(rgg[name][()], g[f"uns/rank_genes_groups/{name}"][()], err_msg=name)
+    # Same structure as the in-memory writer's, plus the AUC only a rank test has.
     with h5py.File(reference, "r") as f, h5py.File(output, "r") as g:
-        assert sorted(f["uns/rank_genes_groups/full"]) == sorted(g["uns/rank_genes_groups/full"])
+        assert sorted([*f["uns/rank_genes_groups/full"], "auc"]) == sorted(g["uns/rank_genes_groups/full"])
 
 
 def _restamp_with_param(output: Path, name: str, value) -> None:

@@ -135,7 +135,7 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
 
         # Use looser tolerance due to float32 intermediate values in crispyx
         # (matches scanpy's approach for memory efficiency)
-        np.testing.assert_allclose(result.effect_size, effect, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(result.mean_difference, effect, rtol=1e-4, atol=1e-5)
         np.testing.assert_allclose(result.statistic, z, rtol=1e-3, atol=0.1)
         # p-values need slightly looser tolerance for Welch df calculations with float32 intermediates
         np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-3, atol=1e-6)
@@ -229,7 +229,7 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
             expected = pert_n * (pert_n + control_n + 1.0) / 2.0
             std = float(np.sqrt(tie * pert_n * control_n * (pert_n + control_n + 1.0) / 12.0))
             u_stat = float(rank_sum - pert_n * (pert_n + 1.0) / 2.0)
-            effect = u_stat / (control_n * pert_n) - 0.5
+            effect = u_stat / (control_n * pert_n)  # AUC
             if std == 0 or np.isnan(std):
                 # Every value tied: crispyx reports the test as undefined
                 # (NaN), where Scanpy reports z = 0, p = 1.
@@ -242,7 +242,7 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
                 stats.append(float(z))
                 pvals.append(float(2 * norm.sf(abs(z))))
 
-        np.testing.assert_allclose(result.effect_size, np.asarray(effects), atol=1e-12, rtol=1e-12)
+        np.testing.assert_allclose(result.auc, np.asarray(effects), atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(result.statistic, np.asarray(stats), atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(result.pvalue, np.asarray(pvals), atol=1e-9, rtol=1e-7)
         assert result.result_path == output_path
@@ -296,8 +296,8 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
     assert set(results_parallel.keys()) == set(results_serial.keys())
     for label in results_parallel.keys():
         np.testing.assert_allclose(
-            results_parallel[label].effect_size,
-            results_serial[label].effect_size,
+            results_parallel[label].mean_difference,
+            results_serial[label].mean_difference,
             rtol=1e-10,
             atol=1e-10,
         )
@@ -354,7 +354,7 @@ def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
 
     assert set(converted.keys()) == set(native.keys())
     for label in converted.keys():
-        for field in ("effect_size", "statistic", "pvalue", "pvalue_adj"):
+        for field in ("auc", "statistic", "pvalue", "pvalue_adj"):
             np.testing.assert_allclose(
                 getattr(converted[label], field), getattr(native[label], field),
                 rtol=1e-10, atol=1e-10, err_msg=f"{label}.{field}",

@@ -29,12 +29,13 @@ KEY = "crispyx"
 #: it -- so existing files of the old layout are recomputed instead of being
 #: read under the new one.
 SCHEMAS = {
-    "de_result": 2,  # 2: a Wilcoxon gene whose values are all tied is NaN
-    "pseudobulk": 1,
+    "de_result": 3,  # 2: all-tied Wilcoxon genes NaN; 3: Wilcoxon X is the AUC (was AUC - 0.5)
+    "pseudobulk": 2,  # 2: profiles named by group key, constant obs columns carried over
     "pseudobulk_effects": 1,
     "batch": 1,
     "sorted": 1,
     "standardized": 1,
+    "concat": 1,
 }
 
 

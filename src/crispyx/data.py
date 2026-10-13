@@ -22,7 +22,7 @@ import scipy.sparse as sp
 from . import _messages
 from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context, run_fingerprint
-from ._provenance import KEY as _PROVENANCE_KEY, reuse_mismatch, stamp, write_stamp
+from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
 from ._disk import (
     assess_bytes,
     estimate_bytes,
@@ -688,8 +688,9 @@ def resolve_data_path(
             result = Path(filename)
         else:
             raise TypeError(
-                "Operations in crispyx expect a backed AnnData object or file path. "
-                "The provided AnnData appears to be in-memory (no .filename attribute)."
+                "This AnnData is in memory, but crispyx streams its input from disk. "
+                'Save it first with adata.write_h5ad("data.h5ad") and pass the path '
+                "(or an AnnData opened with anndata.read_h5ad(path, backed='r'))."
             )
     else:
         raise TypeError(
@@ -1522,14 +1523,41 @@ def _extract_csr_components_dense(
     return data, indices, row_nnz, total_nnz
 
 
+@dataclass(frozen=True)
+class _RowSegment:
+    """Rows of one source matrix to stream into an output matrix:
+    ``cell_mask`` picks the rows (kept in source order) and ``gene_indices``
+    the columns, in output order. ``read_matrix`` extracts the matrix from a
+    freshly-opened backed AnnData (``lambda b: b.X`` or
+    ``lambda b: b.layers[key]``)."""
+
+    source_path: Path
+    read_matrix: Any
+    cell_mask: np.ndarray
+    gene_indices: np.ndarray
+
+
+def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
+    """The selected rows and columns of ``segment``, a row chunk at a time."""
+    backed = read_backed(segment.source_path)
+    try:
+        matrix = segment.read_matrix(backed)
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
+        ):
+            local_mask = segment.cell_mask[slc]
+            if not np.any(local_mask):
+                continue
+            block = block[local_mask]
+            yield block[:, segment.gene_indices] if segment.gene_indices.size else block[:, []]
+    finally:
+        backed.file.close()
+
+
 def _stream_write_matrix_subset(
-    source_path: Path,
+    segments: Sequence[_RowSegment],
     *,
-    read_matrix,
     dest_group: str,
-    cell_mask: np.ndarray,
-    gene_indices: np.ndarray,
-    n_obs: int,
     n_vars: int,
     output_path: Path,
     chunk_size: int,
@@ -1537,57 +1565,42 @@ def _stream_write_matrix_subset(
     total_nnz: int | None = None,
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
+    context: str,
 ) -> None:
-    """Stream one CSR-shaped matrix (``X`` or a layer) filtered by
-    ``cell_mask``/``gene_indices`` into ``dest_group`` of ``output_path``.
+    """Stream the rows of ``segments``, one after another, into the CSR
+    matrix ``dest_group`` (``X`` or a layer) of ``output_path``.
 
-    ``read_matrix`` extracts the source matrix from a freshly-opened backed
-    AnnData (``lambda b: b.X`` or ``lambda b: b.layers[key]``). Shared by
-    ``write_filtered_subset`` for ``X`` (where a ``chunk_cache`` from
-    ``qc.py``'s gene-filter pass can skip re-reading the source) and for each
-    ``layers`` key (which always re-reads, since that cache is keyed to ``X``
-    only).
+    A counting pass sizes ``data``/``indices``/``indptr`` once; the rows are
+    then written in order without holding the matrix. One segment is
+    :func:`write_filtered_subset` (where a ``chunk_cache`` from ``qc.py``'s
+    gene-filter pass can skip re-reading the source's ``X``); several are
+    :func:`concat_h5ad`. Columns selected out of order are re-sorted within
+    each row, as anndata expects.
     """
+    if chunk_cache is not None and len(segments) != 1:
+        raise ValueError("chunk_cache describes a single source's X")
+    n_obs = int(sum(int(np.count_nonzero(segment.cell_mask)) for segment in segments))
     need_counting_pass = row_nnz is None or total_nnz is None or data_dtype is None
 
     if need_counting_pass:
         row_nnz = np.zeros(n_obs, dtype=np.int64)
         total_nnz = 0
-        data_dtype_local: np.dtype | None = None
-
-        backed = read_backed(source_path)
-        try:
-            matrix = read_matrix(backed)
-            row_offset = 0
-            for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
-            ):
-                local_mask = cell_mask[slc]
-                if not np.any(local_mask):
-                    continue
-                block = block[local_mask]
-                if gene_indices.size:
-                    block = block[:, gene_indices]
-                else:
-                    block = block[:, []]
+        dtypes: list[np.dtype] = []
+        row_offset = 0
+        for segment in segments:
+            for block in _segment_blocks(segment, chunk_size):
                 csr = _ensure_csr(block)
                 counts = np.diff(csr.indptr)
-                size = counts.size
-                row_nnz[row_offset : row_offset + size] = counts
+                row_nnz[row_offset : row_offset + counts.size] = counts
                 total_nnz += int(csr.nnz)
-                if data_dtype_local is None and csr.nnz:
-                    data_dtype_local = csr.data.dtype
-                row_offset += size
-        finally:
-            backed.file.close()
-
-        if data_dtype_local is None:
-            data_dtype_local = np.float32
-        data_dtype = data_dtype_local
+                if csr.nnz:
+                    dtypes.append(csr.data.dtype)
+                row_offset += counts.size
+        data_dtype = np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
 
     warn_if_disk_space_low(
         estimate_sparse_output_bytes(total_nnz), output_path,
-        context=f"write_filtered_subset ({dest_group})",
+        context=context,
     )
 
     with h5py.File(output_path, "r+", libver='latest') as dest:
@@ -1607,15 +1620,10 @@ def _stream_write_matrix_subset(
         indptr = np.zeros(n_obs + 1, dtype=np.int64)
         np.cumsum(row_nnz, out=indptr[1:])
 
-        # Phase 2 I/O Optimization: Use larger HDF5 chunks and write buffering
-        # Optimal chunk size: balance between I/O overhead and cache efficiency
-        # Target ~1MB chunks for data (assuming float32 = 4 bytes -> ~256K elements)
-        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))  # 8K to 256K elements
-
-        # Write buffer size: accumulate data before writing to reduce I/O syscalls
-        write_buffer_size = hdf5_chunk_size * 2  # Buffer 2x chunk size before flushing
-
-        # Use explicit chunk sizes for better I/O performance
+        # ~1 MB HDF5 chunks (8K to 256K elements), written from a buffer of
+        # two chunks to keep the number of writes down.
+        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+        write_buffer_size = hdf5_chunk_size * 2
         data_ds = grp.create_dataset(
             "data",
             shape=(total_nnz,),
@@ -1631,98 +1639,50 @@ def _stream_write_matrix_subset(
         grp.create_dataset("indptr", data=indptr)
         grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        # Stream data with write buffering
+        offset = 0
+        data_buffer: list[np.ndarray] = []
+        indices_buffer: list[np.ndarray] = []
+        buffer_nnz = 0
+
+        def flush() -> None:
+            nonlocal offset, data_buffer, indices_buffer, buffer_nnz
+            if buffer_nnz:
+                data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
+                indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
+                offset += buffer_nnz
+            data_buffer, indices_buffer, buffer_nnz = [], [], 0
+
+        def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
+            nonlocal buffer_nnz
+            if len(chunk_data):
+                data_buffer.append(chunk_data)
+                indices_buffer.append(chunk_indices)
+                buffer_nnz += len(chunk_data)
+                if buffer_nnz >= write_buffer_size:
+                    flush()
+
         if chunk_cache is not None:
-            # Read from cached CSR chunks (avoids re-reading the original matrix)
-            offset = 0
-            data_buffer = []
-            indices_buffer = []
-            buffer_nnz = 0
-
-            for filtered_data, filtered_indices, n_cells in chunk_cache.iter_filtered_chunks(
-                gene_indices, data_dtype
+            # Cached CSR chunks of X (avoids re-reading the source matrix).
+            for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
+                segments[0].gene_indices, data_dtype
             ):
-                nnz = len(filtered_data)
-                if nnz:
-                    data_buffer.append(filtered_data)
-                    indices_buffer.append(filtered_indices)
-                    buffer_nnz += nnz
-
-                    # Flush buffer when it exceeds threshold
-                    if buffer_nnz >= write_buffer_size:
-                        combined_data = np.concatenate(data_buffer)
-                        combined_indices = np.concatenate(indices_buffer)
-                        data_ds[offset : offset + buffer_nnz] = combined_data
-                        indices_ds[offset : offset + buffer_nnz] = combined_indices
-                        offset += buffer_nnz
-                        data_buffer = []
-                        indices_buffer = []
-                        buffer_nnz = 0
-
-            # Flush remaining buffer
-            if buffer_nnz > 0:
-                combined_data = np.concatenate(data_buffer)
-                combined_indices = np.concatenate(indices_buffer)
-                data_ds[offset : offset + buffer_nnz] = combined_data
-                indices_ds[offset : offset + buffer_nnz] = combined_indices
+                append(filtered_data, filtered_indices)
         else:
-            # Read from source matrix (fallback when cache not available)
-            backed = read_backed(source_path)
-            try:
-                matrix = read_matrix(backed)
-                offset = 0
-                data_buffer = []
-                indices_buffer = []
-                buffer_nnz = 0
-
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
-                ):
-                    local_mask = cell_mask[slc]
-                    if not np.any(local_mask):
-                        continue
-                    block = block[local_mask]
-                    if gene_indices.size:
-                        block = block[:, gene_indices]
-                    else:
-                        block = block[:, []]
-
-                    # Use optimized extraction for dense, scipy for sparse
+            for segment in segments:
+                for block in _segment_blocks(segment, chunk_size):
                     if sp.issparse(block):
                         csr = _ensure_csr(block, dtype=data_dtype)
-                        chunk_data = csr.data
-                        chunk_indices = csr.indices.astype(np.int32, copy=False)
-                        nnz = int(csr.nnz)
+                        if not csr.has_sorted_indices:
+                            csr = csr.copy()
+                            csr.sort_indices()
+                        append(csr.data, csr.indices.astype(np.int32, copy=False))
                     else:
-                        # Dense: use numba-accelerated direct extraction
-                        chunk_data, chunk_indices, _row_nnz, nnz = _extract_csr_components_dense(
+                        # Dense: numba-accelerated direct extraction.
+                        chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
                             block, data_dtype
                         )
-
-                    if nnz:
-                        data_buffer.append(chunk_data)
-                        indices_buffer.append(chunk_indices)
-                        buffer_nnz += nnz
-
-                        # Flush buffer when it exceeds threshold
-                        if buffer_nnz >= write_buffer_size:
-                            combined_data = np.concatenate(data_buffer)
-                            combined_indices = np.concatenate(indices_buffer)
-                            data_ds[offset : offset + buffer_nnz] = combined_data
-                            indices_ds[offset : offset + buffer_nnz] = combined_indices
-                            offset += buffer_nnz
-                            data_buffer = []
-                            indices_buffer = []
-                            buffer_nnz = 0
-
-                # Flush remaining buffer
-                if buffer_nnz > 0:
-                    combined_data = np.concatenate(data_buffer)
-                    combined_indices = np.concatenate(indices_buffer)
-                    data_ds[offset : offset + buffer_nnz] = combined_data
-                    indices_ds[offset : offset + buffer_nnz] = combined_indices
-            finally:
-                backed.file.close()
+                        append(chunk_data, chunk_indices)
+        flush()
 
 
 def write_filtered_subset(
@@ -1838,12 +1798,8 @@ def write_filtered_subset(
     adata.write(output_path)
 
     _stream_write_matrix_subset(
-        source_path,
-        read_matrix=lambda b: b.X,
+        [_RowSegment(source_path, lambda b: b.X, cell_mask, gene_indices)],
         dest_group="X",
-        cell_mask=cell_mask,
-        gene_indices=gene_indices,
-        n_obs=n_obs,
         n_vars=n_vars,
         output_path=output_path,
         chunk_size=chunk_size,
@@ -1851,19 +1807,17 @@ def write_filtered_subset(
         total_nnz=total_nnz,
         data_dtype=data_dtype,
         chunk_cache=chunk_cache,
+        context="write_filtered_subset (X)",
     )
 
     for key in layer_keys:
         _stream_write_matrix_subset(
-            source_path,
-            read_matrix=(lambda b, _key=key: b.layers[_key]),
+            [_RowSegment(source_path, lambda b, _key=key: b.layers[_key], cell_mask, gene_indices)],
             dest_group=f"layers/{key}",
-            cell_mask=cell_mask,
-            gene_indices=gene_indices,
-            n_obs=n_obs,
             n_vars=n_vars,
             output_path=output_path,
             chunk_size=chunk_size,
+            context=f"write_filtered_subset (layers/{key})",
         )
 
     if obsm_keys or varm_keys or obsp_keys or varp_keys:
@@ -1881,6 +1835,350 @@ def write_filtered_subset(
             )
         finally:
             backed.file.close()
+
+
+def _file_identity(path: Path) -> dict:
+    stat = path.stat()
+    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _uns_equal(a: Any, b: Any) -> bool:
+    """Whether two ``uns`` values are the same (dicts recursively, arrays
+    element-wise); anything that cannot be compared counts as different."""
+    try:
+        if isinstance(a, Mapping) and isinstance(b, Mapping):
+            return a.keys() == b.keys() and all(_uns_equal(a[k], b[k]) for k in a)
+        if isinstance(a, (np.ndarray, pd.Series, pd.DataFrame)) or isinstance(b, (np.ndarray, pd.Series, pd.DataFrame)):
+            return np.array_equal(np.asarray(a), np.asarray(b))
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def _scan_rows(
+    path: Path, n_obs: int, gene_indices: np.ndarray, chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.dtype | None]:
+    """Non-zero count and sum of each of the ``n_obs`` rows of ``path``'s
+    ``X`` over ``gene_indices``, and the dtype of its stored values (``None``
+    if there are none): the counting pass :func:`_stream_write_matrix_subset`
+    would make, plus enough to tell two copies of a cell from two cells."""
+    nnz, sums, dtype = [], [], None
+    segment = _RowSegment(path, lambda b: b.X, np.ones(n_obs, dtype=bool), gene_indices)
+    for block in _segment_blocks(segment, chunk_size):
+        csr = _ensure_csr(block)
+        nnz.append(np.diff(csr.indptr))
+        sums.append(np.asarray(csr.sum(axis=1), dtype=np.float64).ravel())
+        if csr.nnz:
+            dtype = csr.data.dtype if dtype is None else np.result_type(dtype, csr.data.dtype)
+    if not nnz:
+        return np.zeros(0, dtype=np.int64), np.zeros(0), dtype
+    return np.concatenate(nnz).astype(np.int64), np.concatenate(sums), dtype
+
+
+def _obsm_kind(value: Any) -> str:
+    return "frame" if isinstance(value, pd.DataFrame) else "sparse" if sp.issparse(value) else "array"
+
+
+def _obsm_compatible(values: Sequence[Any]) -> bool:
+    """Whether ``obsm`` values from several files can be stacked: the same
+    kind (array, sparse or DataFrame), width and, for DataFrames, columns."""
+    first = values[0]
+    return all(
+        _obsm_kind(v) == _obsm_kind(first) and v.shape[1:] == first.shape[1:]
+        and (_obsm_kind(v) != "frame" or v.columns.equals(first.columns))
+        for v in values[1:]
+    )
+
+
+def _stack_obsm(parts: Sequence[Any], obs_names: pd.Index) -> Any:
+    """Row-stack ``obsm`` values of one kind (see :func:`_obsm_compatible`)."""
+    kind = _obsm_kind(parts[0])
+    if kind == "frame":
+        return pd.concat(parts).set_axis(obs_names)
+    if kind == "sparse":
+        return sp.vstack([sp.csr_matrix(part) for part in parts], format="csr")
+    return np.concatenate([np.asarray(part) for part in parts])
+
+
+def _obs_differs(a: pd.Series, b: pd.Series) -> np.ndarray:
+    """Where two obs columns of the same cells hold different values:
+    numbers (and bools) compared as numbers, so ``0`` and ``0.0`` agree,
+    anything else as text; missing in both counts as equal."""
+    both_missing = a.isna().to_numpy() & b.isna().to_numpy()
+    if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+        same = a.to_numpy(dtype=np.float64, na_value=np.nan) == b.to_numpy(dtype=np.float64, na_value=np.nan)
+    else:
+        same = a.astype(str).to_numpy() == b.astype(str).to_numpy()
+    return ~(same | both_missing)
+
+
+def concat_h5ad(
+    paths: Sequence[str | Path],
+    *,
+    output_path: str | Path,
+    shared_cells: Literal["drop", "error"] = "drop",
+    label: str | None = None,
+    chunk_size: int = 4096,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Concatenate h5ad files along cells, on disk, dropping cells they share.
+
+    Screens are often delivered as several files that each carry the same
+    control cells; concatenating them as they are counts every shared cell
+    once per file. Cells are matched by ``obs_names``: a barcode that occurs
+    in more than one file must be the same cell there -- the same number of
+    non-zeros and the same total over the shared genes -- or the call
+    raises. ``obs`` values that differ between the copies (e.g. QC metrics
+    computed per file) are warned about, and the first file's are kept.
+
+    Each file's matrix is read twice, row chunk by row chunk: once to size
+    the output and check the shared cells, once to write it into one CSR
+    matrix. It is never held in memory.
+
+    Parameters
+    ----------
+    paths
+        The h5ad files, in output order.
+    output_path
+        Where to write the result (not one of ``paths``).
+    shared_cells
+        ``"drop"`` (default) keeps each shared cell where it first occurs and
+        drops its later copies, after checking they are the same cell.
+        ``"error"`` raises if any cell occurs in more than one file.
+    label
+        If given, the name of an ``obs`` column recording each cell's source
+        file, in the order of ``paths``: the file's stem, or the path as
+        given if two files share a stem.
+    chunk_size
+        Number of cells read per streaming block.
+    verbose
+        Level 1 reports the cells and genes dropped and what was not carried
+        over.
+    force
+        Recompute even when ``output_path`` holds a result of this call: same
+        files (path, size, modification time), in the same order, with the
+        same arguments, as recorded in its ``uns["crispyx"]``.
+
+    Returns
+    -------
+    AnnData
+        The concatenated file. ``var`` holds the genes every file has, in the
+        first file's order, with the first file's ``var`` columns; genes
+        missing from any file are dropped. ``X`` (always CSR) and every
+        layer present in all files are concatenated; ``obs`` is the union of
+        the files' columns (missing values are NA; a shared cell takes the
+        values its first file lacks from a later copy); ``obsm`` keys
+        present in all files as the same kind (array, sparse or DataFrame)
+        and width are concatenated; ``uns`` keeps the keys every file has
+        with equal values. ``obsp`` (cell-cell graphs), ``varm``/``varp``
+        and ``.raw`` describe a single file and are not carried over.
+
+    Examples
+    --------
+    >>> cx.pp.concat_h5ad(
+    ...     ["pilot_a.h5ad", "pilot_b.h5ad"], output_path="pilot.h5ad", label="source",
+    ... )
+    """
+    sources = [resolve_data_path(path) for path in paths]
+    if not sources:
+        raise ValueError("concat_h5ad needs at least one input file")
+    if shared_cells not in ("drop", "error"):
+        raise ValueError(f"shared_cells must be 'drop' or 'error'; received {shared_cells!r}")
+    output_path = Path(output_path)
+    if any(output_path.resolve() == source.resolve() for source in sources):
+        raise ValueError("output_path must not be one of the input files")
+    if len({source.resolve() for source in sources}) != len(sources):
+        raise ValueError("an input file is listed more than once")
+
+    fingerprint = run_fingerprint(
+        sources[0],
+        params={"shared_cells": shared_cells, "label": label},
+        inputs=[_file_identity(source) for source in sources],
+    )
+    if not force and reusable(output_path, "concat", fingerprint, verbose):
+        return AnnData(output_path)
+
+    # ---- metadata of every file (obs/var/obsm/uns are small) ----
+    metas = []
+    for source in sources:
+        backed = read_backed(source)
+        try:
+            obs = backed.obs.copy()
+            obs.index = obs.index.astype(str)
+            if not obs.index.is_unique:
+                raise ValueError(f"{source} has duplicate obs_names; make them unique first")
+            var_names = pd.Index(backed.var_names.astype(str))
+            if not var_names.is_unique:
+                raise ValueError(f"{source} has duplicate var_names; make them unique first")
+            metas.append({
+                "obs": obs,
+                "var": backed.var.copy(),
+                "var_names": var_names,
+                "layers": [key for key in backed.layers.keys() if key is not None],
+                "obsm": {key: backed.obsm[key] for key in backed.obsm.keys()},
+                "uns": {k: v for k, v in backed.uns.items() if k != _PROVENANCE_KEY},
+                "extra": [slot for slot in ("obsp", "varm", "varp") if len(getattr(backed, slot))]
+                + (["raw"] if backed.raw is not None else []),
+            })
+        finally:
+            backed.file.close()
+    name = "pp.concat_h5ad"
+    if label is not None and any(label in meta["obs"].columns for meta in metas):
+        raise ValueError(f"label column {label!r} already exists in obs")
+
+    # ---- genes: those every file has, in the first file's order ----
+    genes = metas[0]["var_names"]
+    for meta in metas[1:]:
+        genes = genes[genes.isin(meta["var_names"])]
+    all_genes = set().union(*(set(meta["var_names"]) for meta in metas))
+    if len(all_genes) > len(genes):
+        _messages.vprint(verbose, name, f"{len(all_genes) - len(genes)} genes not in every file are dropped")
+    gene_indices = [meta["var_names"].get_indexer(genes).astype(np.int64) for meta in metas]
+
+    # ---- cells: a shared cell is kept where it first occurs ----
+    keep = [np.ones(len(meta["obs"]), dtype=bool) for meta in metas]
+    pairs = []  # (earlier file, later file, the cells they share)
+    first_seen = pd.Series(dtype=np.int64)  # obs_name -> file index of its first occurrence
+    for i, meta in enumerate(metas):
+        names = meta["obs"].index
+        shared = names.isin(first_seen.index)
+        if shared.any():
+            shared_names = names[shared]
+            if shared_cells == "error":
+                raise ValueError(
+                    f"{int(shared.sum())} cells of {sources[i]} also occur in an earlier file "
+                    f"(e.g. {shared_names[:3].tolist()}); pass shared_cells='drop' to keep one copy."
+                )
+            for j in np.unique(first_seen[shared_names].to_numpy()):
+                pairs.append((j, i, shared_names[first_seen[shared_names].to_numpy() == j]))
+            keep[i] = ~shared
+            _messages.vprint(
+                verbose, name,
+                f"{int(shared.sum())} cells of {sources[i]} already in an earlier file are dropped",
+            )
+        first_seen = pd.concat([first_seen, pd.Series(i, index=names[~shared], dtype=np.int64)])
+
+    # ---- one pass over each X: the output's row sizes and the shared-cell check ----
+    scans = [
+        _scan_rows(source, len(meta["obs"]), indices, chunk_size)
+        for source, meta, indices in zip(sources, metas, gene_indices)
+    ]
+    for j, i, names in pairs:
+        rows_a = metas[j]["obs"].index.get_indexer(names)
+        rows_b = metas[i]["obs"].index.get_indexer(names)
+        (nnz_a, sums_a, _), (nnz_b, sums_b, _) = scans[j], scans[i]
+        differs = (nnz_a[rows_a] != nnz_b[rows_b]) | ~np.isclose(
+            sums_a[rows_a], sums_b[rows_b], rtol=1e-6, atol=1e-6,
+        )
+        if differs.any():
+            raise ValueError(
+                f"Cell {names[np.flatnonzero(differs)[0]]!r} occurs in {sources[j]} and {sources[i]} "
+                "with different expression; shared barcodes must be the same cell."
+            )
+    for j, i, names in pairs:
+        obs_a, obs_b = metas[j]["obs"].loc[names], metas[i]["obs"].loc[names]
+        columns = [
+            c for c in obs_a.columns.intersection(obs_b.columns)
+            if _obs_differs(obs_a[c], obs_b[c]).any()
+        ]
+        if columns:
+            _messages.warn(
+                name,
+                f"cells shared by {sources[j]} and {sources[i]} have different values in obs "
+                f"columns {columns}; keeping those of {sources[j]}",
+            )
+    row_nnz = np.concatenate([nnz[mask] for (nnz, _, _), mask in zip(scans, keep)])
+    dtypes = [dtype for _, _, dtype in scans if dtype is not None]
+    data_dtype = np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
+
+    # ---- obs: union of columns; a shared cell fills what its first file lacks ----
+    partial_columns = {
+        c for meta in metas for c in meta["obs"].columns
+        if not all(c in other["obs"].columns for other in metas)
+    }
+    frames = []
+    for meta in metas:
+        frame = meta["obs"].copy()
+        for column in partial_columns.intersection(frame.columns):
+            # Nullable dtypes keep bools and ints writable beside the NA of
+            # the files without the column.
+            if pd.api.types.is_bool_dtype(frame[column]):
+                frame[column] = frame[column].astype("boolean")
+            elif pd.api.types.is_integer_dtype(frame[column]):
+                frame[column] = frame[column].astype("Int64")
+        frames.append(frame)
+    obs = pd.concat([frame[mask] for frame, mask in zip(frames, keep)], join="outer")
+    categorical = {
+        c for meta in metas for c in meta["obs"].columns
+        if isinstance(meta["obs"][c].dtype, pd.CategoricalDtype)
+    }
+    for column in categorical:
+        obs[column] = obs[column].astype(object)
+    for frame, mask in zip(frames, keep):
+        if not mask.all():
+            obs.update(frame[~mask], overwrite=False)
+    for column in categorical:
+        obs[column] = obs[column].astype("category")
+    if label is not None:
+        labels = [source.stem for source in sources]
+        if len(set(labels)) < len(labels):
+            labels = [str(source) for source in sources]
+        obs[label] = pd.Categorical(
+            np.repeat(labels, [int(mask.sum()) for mask in keep]), categories=labels,
+        )
+
+    # ---- var, uns, layers, obsm ----
+    var = metas[0]["var"].copy()
+    var.index = metas[0]["var_names"]
+    var = var.loc[genes]
+    uns = {
+        key: value for key, value in metas[0]["uns"].items()
+        if all(key in meta["uns"] and _uns_equal(value, meta["uns"][key]) for meta in metas[1:])
+    }
+    uns[_PROVENANCE_KEY] = stamp("concat", fingerprint)
+    layers = [key for key in metas[0]["layers"] if all(key in meta["layers"] for meta in metas[1:])]
+    obsm = {
+        key: _stack_obsm([meta["obsm"][key][mask] for meta, mask in zip(metas, keep)], obs.index)
+        for key in metas[0]["obsm"]
+        if all(key in meta["obsm"] for meta in metas[1:])
+        and _obsm_compatible([meta["obsm"][key] for meta in metas])
+    }
+    not_carried = sorted(
+        {f"layers/{k}" for meta in metas for k in meta["layers"] if k not in layers}
+        | {f"obsm/{k}" for meta in metas for k in meta["obsm"] if k not in obsm}
+        | {f"uns/{k}" for meta in metas for k in meta["uns"] if k not in uns}
+        | {slot for meta in metas for slot in meta["extra"]}
+    )
+    if not_carried:
+        _messages.vprint(verbose, name, f"not carried over: {not_carried}")
+
+    def segments(read_matrix):
+        return [
+            _RowSegment(source, read_matrix, mask, indices)
+            for source, mask, indices in zip(sources, keep, gene_indices)
+        ]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with _replace_on_success(output_path) as partial:
+        ad.AnnData(
+            sp.csr_matrix((len(obs), len(genes)), dtype=np.float32),
+            obs=obs, var=var, obsm=obsm, uns=uns,
+        ).write(partial)
+        _stream_write_matrix_subset(
+            segments(lambda b: b.X), dest_group="X", n_vars=len(genes),
+            output_path=partial, chunk_size=chunk_size, context=f"{name} (X)",
+            row_nnz=row_nnz, total_nnz=int(row_nnz.sum()), data_dtype=data_dtype,
+        )
+        for key in layers:
+            _stream_write_matrix_subset(
+                segments(lambda b, _key=key: b.layers[_key]), dest_group=f"layers/{key}",
+                n_vars=len(genes), output_path=partial, chunk_size=chunk_size,
+                context=f"{name} (layers/{key})",
+            )
+    _messages.print_done(verbose, name, f"{len(obs)} cells × {len(genes)} genes")
+    _messages.print_saving(verbose, name, output_path)
+    return AnnData(output_path)
 
 
 def normalize_total_log1p(

@@ -335,11 +335,11 @@ def test_nb_glm_test_streaming_control_e2e(tmp_path):
 
     # Effect sizes should be correlated (not identical due to different
     # code paths, but same direction and similar magnitude)
-    valid = np.isfinite(ref_g1.effect_size) & np.isfinite(stream_g1.effect_size)
+    valid = np.isfinite(ref_g1.logfoldchanges) & np.isfinite(stream_g1.logfoldchanges)
     assert valid.sum() >= 4, f"Too few valid genes: {valid.sum()}"
 
     from scipy.stats import pearsonr
-    r, _ = pearsonr(ref_g1.effect_size[valid], stream_g1.effect_size[valid])
+    r, _ = pearsonr(ref_g1.logfoldchanges[valid], stream_g1.logfoldchanges[valid])
     assert r > 0.8, f"Effect size correlation too low: {r:.3f}"
 
     # Both should detect gene0 as top hit (strongest effect)
@@ -393,9 +393,9 @@ def test_streaming_vs_dense_frozen_e2e(tmp_path):
     )
 
     # Same frozen-control algorithm, so the results agree to rounding.
-    for field in ("effect_size", "statistic", "pvalue", "pvalue_adj"):
+    for field in ("logfoldchanges", "statistic", "pvalue", "pvalue_adj"):
         np.testing.assert_allclose(
             getattr(result_stream["g1"], field), getattr(result_dense["g1"], field),
             rtol=1e-10, atol=1e-12, err_msg=field,
         )
-    assert np.isfinite(result_dense["g1"].effect_size).all()
+    assert np.isfinite(result_dense["g1"].logfoldchanges).all()

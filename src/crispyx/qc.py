@@ -373,7 +373,7 @@ def filter_cells_by_gene_count(
     Parameters
     ----------
     data
-        Path to h5ad file, or a crispyx/anndata AnnData object.
+        Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
     min_genes
         Minimum number of expressed genes per cell.
     gene_name_column
@@ -457,7 +457,7 @@ def filter_perturbations_by_cell_count(
     Parameters
     ----------
     data
-        Path to h5ad file, or a crispyx/anndata AnnData object.
+        Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
     perturbation_column
         Column in obs containing perturbation labels.
     control_label
@@ -537,7 +537,7 @@ def filter_genes_by_cell_count(
     Parameters
     ----------
     data
-        Path to h5ad file, or a crispyx/anndata AnnData object.
+        Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
     min_cells
         Minimum number of cells expressing each gene.
     cell_mask
@@ -1709,7 +1709,7 @@ def quality_control_summary(
     Parameters
     ----------
     data
-        Path to h5ad file, or a crispyx/anndata AnnData object.
+        Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
     min_genes
         Minimum number of expressed genes per cell.
     min_cells_per_perturbation

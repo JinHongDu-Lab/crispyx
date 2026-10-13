@@ -96,13 +96,23 @@ analyses:
        output_path="pseudobulk/screen_by_batch.h5ad",
    )
 
-``method="mean_log1p"`` computes the mean of per-cell log1p values. Raw count
-input is log-transformed automatically; continuous non-negative input is
-treated as already transformed. ``method="sum"`` is stricter and accepts only
-finite, non-negative integer counts, typically supplied with
-``layer="counts"``. Set ``bootstrap_size=N`` to sample exactly ``N`` cells once
-with replacement from every retained group. The output records grouping and
-cell-count columns in ``obs``, a description of the aggregation under
+``method`` has no default, because each choice is wrong for the other use.
+``method="sum"`` sums raw counts -- what count models such as DESeq2, edgeR,
+:func:`crispyx.nb_glm_test` or causarray need -- and accepts only finite,
+non-negative integer counts, typically supplied with ``layer="counts"``.
+``method="mean_log1p"`` computes the mean of per-cell log1p values for
+contrasts on the log scale; raw count input is log-transformed automatically
+and continuous non-negative input is treated as already transformed. Set
+``bootstrap_size=N`` to sample exactly ``N`` cells once with replacement from
+every retained group.
+
+Each profile is named by its group key -- the value for one grouping column,
+the values joined with ``"|"`` for several (``"KO_A|batch1"``). ``obs`` holds
+the grouping columns, the cell counts ``n_cells`` and ``n_cells_aggregated``,
+and every other ``obs`` column of the input that is constant within each
+profile, so donor-level covariates (sex, age, disease) arrive with the
+profiles; columns that vary within a profile (a per-cell QC metric) are left
+out and listed at ``verbose=1``. A description of the aggregation is under
 ``uns['crispyx_pseudobulk']``, and the input and arguments it was computed
 from under ``uns['crispyx']``.
 
@@ -112,6 +122,31 @@ holds the labels irrespective of its position in ``groupby``, and every observed
 combination of the remaining columns is preserved. With
 ``groupby=["perturbation", "batch"]``, passing ``perturbations=["KO_A"]`` returns
 one profile per batch for ``KO_A``.
+
+Check cell-type composition before pooling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Pooling cell types into one pseudo-bulk per donor turns any difference in
+their proportions between conditions into apparent differential expression:
+if cases have fewer cells of a highly expressing subtype, its genes look
+down-regulated in every case donor, and a latent-factor adjustment cannot
+separate the two. Aggregating by donor *and* cell type keeps the subtypes
+apart, and its ``n_cells`` column is the composition table:
+
+.. code-block:: python
+
+   pb = cx.pb.aggregate(
+       "brain.h5ad", groupby=["donor", "subclass"], method="sum", min_cells=1,
+   )
+   obs = pb.backed.obs
+   cells = obs.pivot(index="donor", columns="subclass", values="n_cells").fillna(0)
+   share = cells.div(cells.sum(axis=1), axis=0)          # per-donor proportions
+   disease = obs.groupby("donor", observed=True)["disease"].first()
+   share.groupby(disease).mean().T                       # mean share per condition
+
+A subclass whose share differs clearly between conditions should be analysed
+on its own (one pseudo-bulk per donor and subclass) rather than pooled.
+``disease`` is available here because it is constant within each profile.
 
 Within-batch effects can be calculated from the saved profiles without
 re-reading the single-cell matrix:
@@ -297,6 +332,32 @@ needed. Whole-file conversions (:func:`crispyx.convert_to_csc`,
 roughly 2× the source file's size, since the source and destination coexist
 until the caller deletes the source -- see :ref:`the CSC conversion note below
 <csc-disk-note>`.
+
+Combining files that share cells
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A screen delivered as several files often repeats the same control cells in
+each. :func:`crispyx.pp.concat_h5ad` concatenates the files on disk and keeps
+one copy of every shared cell:
+
+.. code-block:: python
+
+   cx.pp.concat_h5ad(
+       ["pilot_a.h5ad", "pilot_b.h5ad"], output_path="pilot.h5ad", label="source",
+   )
+
+Cells are matched by ``obs_names``. A barcode in more than one file must be
+the same cell there -- the same expression over the shared genes -- or the
+call raises; ``obs`` values that differ between the copies (such as QC
+metrics computed per file) are warned about and the first file's are kept.
+Pass ``shared_cells="error"`` to refuse any overlap instead of dropping it.
+The result keeps the genes every file has (in the first file's order), ``X``
+and the layers present in every file, the union of the ``obs`` columns, and
+the ``obsm`` entries every file has in the same form (array, sparse or
+DataFrame); ``label`` records each cell's source file (its stem, or its path
+if two files share a stem).
+Cell-cell graphs (``obsp``), ``varm``/``varp`` and ``.raw`` describe one file
+and are not carried over; ``verbose=1`` lists what was dropped.
 
 .. _compress-h5ad:
 
@@ -667,6 +728,30 @@ Key properties:
   ``stratified_median_shared_batches_per_perturbation``.
 * The output file receives the suffix ``_cx_wilcoxon_stratified.h5ad`` to
   distinguish it from the pooled result.
+
+Permutation nulls without copying the data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``wilcoxon_test`` also takes the labels themselves as a ``pd.Series`` indexed
+by cell, so a label-permutation null needs no relabelled copy of the file:
+
+.. code-block:: python
+
+   labels = cx.load_obs("screen_csc.h5ad")["perturbation"]
+   rng = np.random.default_rng(0)
+   for i in range(100):
+       shuffled = pd.Series(rng.permutation(labels.to_numpy()), index=labels.index, name="shuffle")
+       null = cx.tl.wilcoxon_test(
+           "screen_csc.h5ad", perturbation_column=shuffled, control_label="control",
+           output_path=f"null/shuffle_{i}.h5ad",
+       )
+
+The Series is aligned to ``obs_names`` by its index and needs a label for
+every cell; its ``name`` names the column in the result. Each shuffle is a
+different call, so a result at a fixed ``output_path`` is recomputed for a new
+Series and reused for the same one. Convert a CSR file to CSC once beforehand
+(:func:`crispyx.convert_to_csc`): otherwise every call makes its own temporary
+CSC copy.
 
 
 on-disk results. The plotting functions materialise only the metadata needed
