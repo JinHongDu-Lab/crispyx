@@ -18,6 +18,7 @@ from . import batch as _batch
 from . import data as _data
 from . import de as _de
 from . import pseudobulk as _pseudobulk
+from . import residual as _residual
 from ._disk import DiskEstimate, assess_bytes
 from .data import AnnData, resolve_data_path, resolve_output_path
 
@@ -25,6 +26,7 @@ _RESOLVERS: dict[str, Callable[..., dict[str, float]]] = {
     "compute_normalized_effects": _pseudobulk._estimate_shape_for_normalized_effects,
     "aggregate_pseudobulk": _pseudobulk._estimate_shape_for_aggregate_pseudobulk,
     "compute_pseudobulk_effects": _pseudobulk._estimate_shape_for_pseudobulk_effects,
+    "residual_effects": _residual._estimate_shape_for_residual_effects,
     "t_test": _de._estimate_shape_for_t_test,
     "wilcoxon_test": _de._estimate_shape_for_wilcoxon_test,
     "nb_glm_test": _de._estimate_shape_for_nb_glm_test,
