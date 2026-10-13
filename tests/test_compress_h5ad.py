@@ -368,14 +368,21 @@ def test_decoder_falls_back_for_unwritten_chunks(tmp_path):
             assert np.array_equal(_h5codec.read_rows(ds, start, stop), ds[start:stop], equal_nan=True)
 
 
-def test_uncompressed_files_keep_the_plain_slicing_path(tmp_path):
+def test_uncompressed_sparse_files_are_sliced_directly(tmp_path):
     from crispyx.data import _decoded_block_reader, read_backed
 
     path = tmp_path / "raw.h5ad"
     _single_cell(n_obs=500).write(path)
     backed = read_backed(path)
     try:
-        assert _decoded_block_reader(backed.X, "csr", 0, backed.n_obs, backed.n_vars) is None
+        read_block = _decoded_block_reader(backed.X, "csr", 0, backed.n_obs, backed.n_vars)
+        assert read_block is not None
+        for start, stop in ((0, 1), (0, 128), (120, 377), (499, 500)):
+            expected = backed.X[start:stop]
+            block = read_block(start, stop)
+            assert type(block) is type(expected)
+            assert (block != expected).nnz == 0
+        assert _decoded_block_reader(backed.X, "csr", 1, backed.n_obs, backed.n_vars) is None
     finally:
         backed.file.close()
 
