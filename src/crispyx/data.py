@@ -1543,18 +1543,54 @@ class _RowSegment:
 
 
 def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
-    """The selected rows and columns of ``segment``, a row chunk at a time."""
+    """The selected rows and columns of ``segment``, a row chunk at a time.
+    Chunks without a selected row are not read, and the columns are not
+    re-indexed when the segment keeps all of them in order."""
     backed = read_backed(segment.source_path)
     try:
         matrix = segment.read_matrix(backed)
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix
-        ):
-            local_mask = segment.cell_mask[slc]
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        fmt = _detect_backed_sparse_format(matrix)
+        if fmt == "csc":
+            _warn_slow_axis(fmt, 0)
+        read_block = _decoded_block_reader(matrix, fmt, 0, n_obs, n_vars) or (
+            lambda start, end: matrix[start:end]
+        )
+        all_columns = _keeps_all_columns(segment.gene_indices, n_vars)
+        for start in range(0, n_obs, chunk_size):
+            local_mask = segment.cell_mask[start : start + chunk_size]
             if not np.any(local_mask):
                 continue
-            block = block[local_mask]
-            yield block[:, segment.gene_indices] if segment.gene_indices.size else block[:, []]
+            block = read_block(start, min(start + chunk_size, n_obs))
+            if not np.all(local_mask):
+                block = block[local_mask]
+            if all_columns:
+                yield block
+            else:
+                yield block[:, segment.gene_indices] if segment.gene_indices.size else block[:, []]
+    finally:
+        backed.file.close()
+
+
+def _keeps_all_columns(gene_indices: np.ndarray, n_vars: int) -> bool:
+    return gene_indices.size == n_vars and np.array_equal(gene_indices, np.arange(n_vars))
+
+
+def _segment_row_nnz(segment: _RowSegment) -> tuple[np.ndarray, np.dtype] | None:
+    """Non-zeros of each selected row and the data dtype, read from
+    ``indptr`` alone, when ``segment`` keeps every column of a CSR source in
+    order; ``None`` otherwise (the rows must then be read to count them)."""
+    backed = read_backed(segment.source_path)
+    try:
+        matrix = segment.read_matrix(backed)
+        group = getattr(matrix, "group", None)
+        if (
+            _detect_backed_sparse_format(matrix) != "csr"
+            or not isinstance(group, h5py.Group)
+            or not _keeps_all_columns(segment.gene_indices, backed.n_vars)
+        ):
+            return None
+        return np.diff(group["indptr"][:])[segment.cell_mask], group["data"].dtype
     finally:
         backed.file.close()
 
@@ -1593,6 +1629,15 @@ def _stream_write_matrix_subset(
         dtypes: list[np.dtype] = []
         row_offset = 0
         for segment in segments:
+            from_indptr = _segment_row_nnz(segment)
+            if from_indptr is not None:
+                counts, dtype = from_indptr
+                row_nnz[row_offset : row_offset + counts.size] = counts
+                total_nnz += int(counts.sum())
+                if counts.sum():
+                    dtypes.append(dtype)
+                row_offset += counts.size
+                continue
             for block in _segment_blocks(segment, chunk_size):
                 csr = _ensure_csr(block)
                 counts = np.diff(csr.indptr)
