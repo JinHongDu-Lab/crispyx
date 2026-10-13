@@ -253,3 +253,31 @@ def test_disk_usage_estimate(tmp_path):
     estimate = cx.estimate_disk_usage("residual_effects", path, perturbation_column="perturbation",
                                       control_label="ctrl", min_cells=1)
     assert estimate["output"].required_bytes == pytest.approx(3 * len(GENES) * 4 * 8 * 1.10)
+
+
+def test_segments_never_split_a_group():
+    from crispyx.residual import _segments
+
+    rng = np.random.default_rng(0)
+    groups = rng.integers(-1, 30, size=500)
+    row_nnz = rng.integers(1, 100, size=500)
+    for workers in (1, 3, 8, 64):
+        rows, bounds, controls, control_bounds = _segments(groups, row_nnz, workers)
+        assert len(bounds) == len(control_bounds) == workers + 1
+        assert np.all(np.diff(bounds) >= 0) and np.all(np.diff(control_bounds) >= 0)
+        assert sorted(rows) == sorted(np.flatnonzero(groups > 0))
+        assert sorted(controls) == sorted(np.flatnonzero(groups == 0))
+        owners = [set(groups[rows[bounds[w]:bounds[w + 1]]]) for w in range(workers)]
+        for a in range(workers):
+            for b in range(a + 1, workers):
+                assert not owners[a] & owners[b]
+
+
+def test_results_do_not_depend_on_n_jobs(tmp_path):
+    path, *_ = _screen(tmp_path)
+    one = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "log_total_counts"],
+                                    min_cells=1, n_jobs=1, output_path=tmp_path / "one.h5ad", verbose=False))
+    many = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "log_total_counts"],
+                                     min_cells=1, n_jobs=4, output_path=tmp_path / "many.h5ad", verbose=False))
+    np.testing.assert_allclose(one.X, many.X, rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(one.layers["z_score"], many.layers["z_score"], rtol=1e-10, equal_nan=True)

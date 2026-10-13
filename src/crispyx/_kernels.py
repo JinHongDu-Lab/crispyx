@@ -1471,12 +1471,27 @@ def _compute_row_medians_csr(
 # Residual effects: one pass of sufficient statistics over CSR rows
 # =============================================================================
 
-@nb.njit(nogil=True, cache=True)
+@nb.njit(inline="always")
+def _row_totals(indptr, indices, data, is_mito, r, base):
+    total = 0.0
+    mito_counts = 0.0
+    for j in range(indptr[r] - base, indptr[r + 1] - base):
+        total += data[j]
+        if is_mito[indices[j]]:
+            mito_counts += data[j]
+    return total, mito_counts
+
+
+@nb.njit(parallel=True, nogil=True, cache=True)
 def _residual_effects_rows(
     indptr: np.ndarray,
     indices: np.ndarray,
     data: np.ndarray,
     groups: np.ndarray,
+    target_rows: np.ndarray,
+    target_bounds: np.ndarray,
+    control_rows: np.ndarray,
+    control_bounds: np.ndarray,
     category_columns: np.ndarray,
     continuous: np.ndarray,
     continuous_columns: np.ndarray,
@@ -1491,55 +1506,64 @@ def _residual_effects_rows(
 ) -> None:
     """Accumulate :func:`crispyx.residual_effects`' statistics for a row chunk.
 
-    Each row is a cell of raw counts. Its total and mitochondrial share are
-    written to ``totals`` / ``mito``; a cell with a group (``groups >= 0``)
-    and a non-zero total adds its ``log1p(CP10k)`` values to row
-    ``groups[r]`` of ``sums``. Group 0 is the control: its cells also add
-    ``x * y`` to ``control_xty`` (genes x design columns) and ``y * y`` to
-    ``control_sumsq``, where ``x`` is the cell's design row -- 1 in column 0
-    (intercept), 1 in each ``category_columns[r]`` column (``-1`` for a
-    reference level), ``continuous[r]`` in ``continuous_columns``, and the
-    log total / mitochondrial share in ``total_column`` / ``mito_column``
-    (``-1`` when not in the design). ``x`` is never formed.
+    Each row is a cell of raw counts; its total and mitochondrial share are
+    written to ``totals`` / ``mito``. A perturbed cell with a non-zero total
+    adds its ``log1p(CP10k)`` values to row ``groups[r]`` of ``sums``; a
+    control cell (group 0) adds ``x * y`` to ``control_xty[w]`` (genes x
+    design columns) and ``y * y`` to ``control_sumsq[w]``, where ``x`` is the cell's
+    design row -- 1 in column 0 (intercept), 1 in each ``category_columns[r]``
+    column (``-1`` for a reference level), ``continuous[r]`` in
+    ``continuous_columns``, and the log total / mitochondrial share in
+    ``total_column`` / ``mito_column`` (``-1`` when not in the design). ``x``
+    is never formed.
+
+    Work is split into segments run in parallel, without locks: segment
+    ``w`` handles ``target_rows[target_bounds[w]:target_bounds[w + 1]]``
+    (rows ordered by group and cut at group boundaries, so no two segments
+    write the same row of ``sums``) and ``control_rows[control_bounds[w]:
+    control_bounds[w + 1]]``, into its own ``control_xty[w]`` and
+    ``control_sumsq[w]``. The controls' sum is the intercept column of
+    ``control_xty``, so they do not touch ``sums``.
     """
     n_categories = category_columns.shape[1]
     n_continuous = continuous_columns.shape[0]
     base = indptr[0]
-    for r in range(indptr.shape[0] - 1):
-        start = indptr[r] - base
-        end = indptr[r + 1] - base
-        total = 0.0
-        mito_counts = 0.0
-        for j in range(start, end):
-            value = data[j]
-            total += value
-            if is_mito[indices[j]]:
-                mito_counts += value
-        totals[r] = total
-        mito[r] = mito_counts / total if total > 0 else 0.0
-        group = groups[r]
-        if group < 0 or total <= 0:
-            continue
-        scale = 1e4 / total
-        if group != 0:
-            for j in range(start, end):
+    for w in nb.prange(target_bounds.shape[0] - 1):
+        for i in range(target_bounds[w], target_bounds[w + 1]):
+            r = target_rows[i]
+            total, mito_counts = _row_totals(indptr, indices, data, is_mito, r, base)
+            totals[r] = total
+            mito[r] = mito_counts / total if total > 0 else 0.0
+            if total <= 0:
+                continue
+            scale = 1e4 / total
+            group = groups[r]
+            for j in range(indptr[r] - base, indptr[r + 1] - base):
                 sums[group, indices[j]] += math.log1p(data[j] * scale)
-            continue
-        log_total = math.log(total)
-        share = mito_counts / total
-        for j in range(start, end):
-            gene = indices[j]
-            y = math.log1p(data[j] * scale)
-            sums[0, gene] += y
-            control_sumsq[gene] += y * y
-            control_xty[gene, 0] += y
-            for c in range(n_categories):
-                column = category_columns[r, c]
-                if column >= 0:
-                    control_xty[gene, column] += y
-            for c in range(n_continuous):
-                control_xty[gene, continuous_columns[c]] += continuous[r, c] * y
-            if total_column >= 0:
-                control_xty[gene, total_column] += log_total * y
-            if mito_column >= 0:
-                control_xty[gene, mito_column] += share * y
+        xty = control_xty[w]
+        sumsq = control_sumsq[w]
+        for i in range(control_bounds[w], control_bounds[w + 1]):
+            r = control_rows[i]
+            total, mito_counts = _row_totals(indptr, indices, data, is_mito, r, base)
+            totals[r] = total
+            mito[r] = mito_counts / total if total > 0 else 0.0
+            if total <= 0:
+                continue
+            scale = 1e4 / total
+            log_total = math.log(total)
+            share = mito_counts / total
+            for j in range(indptr[r] - base, indptr[r + 1] - base):
+                gene = indices[j]
+                y = math.log1p(data[j] * scale)
+                sumsq[gene] += y * y
+                xty[gene, 0] += y
+                for c in range(n_categories):
+                    column = category_columns[r, c]
+                    if column >= 0:
+                        xty[gene, column] += y
+                for c in range(n_continuous):
+                    xty[gene, continuous_columns[c]] += continuous[r, c] * y
+                if total_column >= 0:
+                    xty[gene, total_column] += log_total * y
+                if mito_column >= 0:
+                    xty[gene, mito_column] += share * y

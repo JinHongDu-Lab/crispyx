@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, Literal, Sequence, get_args
 
 import anndata as ad
 import h5py
+import numba
 import numpy as np
 import pandas as pd
 import scipy.sparse as sparse
@@ -16,7 +18,7 @@ from . import _messages
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._kernels import _residual_effects_rows
-from ._memory import _resolve_memory_limit_bytes
+from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._statistics import _adjust_pvalue_matrix
 from .data import (
@@ -40,7 +42,7 @@ COMPUTED_COVARIATES = ("log_total_counts", "mito_fraction")
 
 #: Arguments that decide how a call runs but not what it writes.
 _OPERATIONAL_ARGS = frozenset({
-    "data", "chunk_size", "memory_limit_gb", "data_name", "output_path", "verbose", "force",
+    "data", "chunk_size", "n_jobs", "memory_limit_gb", "data_name", "output_path", "verbose", "force",
 })
 
 _NAME = "residual_effects"
@@ -58,6 +60,7 @@ def residual_effects(
     perturbations: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     chunk_size: int | None = None,
+    n_jobs: int | None = None,
     memory_limit_gb: float | None = None,
     data_name: str | None = None,
     output_path: str | Path | None = None,
@@ -138,6 +141,10 @@ def residual_effects(
         omitted.
     chunk_size
         Cells read per chunk. Auto-selected when omitted.
+    n_jobs
+        Threads for the per-chunk computation (a chunk's perturbations are
+        split between them); the next chunk is read meanwhile. All cores when
+        omitted. Results do not depend on it.
     memory_limit_gb
         Memory budget. The perturbations x genes accumulator must fit in it
         three times over (accumulator, effect, robust spread), else the call
@@ -218,9 +225,11 @@ def residual_effects(
         f"{len(targets):,} perturbations, {int((groups == 0).sum()):,} control cells, "
         f"design: {len(design.columns)} columns",
     )
+    workers = max(1, min(_resolve_n_jobs(n_jobs), numba.config.NUMBA_NUM_THREADS))
+    # Row 0 (the controls) stays zero: their sum is control_xty's intercept column.
     sums = np.zeros((len(targets) + 1, n_vars))
-    control_xty = np.zeros((n_vars, len(design.columns)))
-    control_sumsq = np.zeros(n_vars)
+    control_xty = np.zeros((workers, n_vars, len(design.columns)))
+    control_sumsq = np.zeros((workers, n_vars))
     totals = np.zeros(n_obs)
     mito = np.zeros(n_obs)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
@@ -239,16 +248,24 @@ def residual_effects(
                 if (groups[start:start + chunk_size] >= 0).any()
             ]
             checked = False
+
+            def read_csr(start):
+                block = read_block(start, min(start + chunk_size, n_obs))
+                return block.tocsr() if sparse.issparse(block) else sparse.csr_matrix(np.asarray(block))
+
             with _create_progress_context(len(starts), _NAME, verbose, unit="chunk") as pbar:
-                for start in starts:
+                for start, block in _read_ahead(read_csr, starts):
                     end = min(start + chunk_size, n_obs)
-                    block = read_block(start, end)
-                    block = block.tocsr() if sparse.issparse(block) else sparse.csr_matrix(np.asarray(block))
                     if not checked:
                         _check_counts(block.data)
                         checked = True
+                    chunk_groups = groups[start:end]
+                    target_rows, target_bounds, control_rows, control_bounds = _segments(
+                        chunk_groups, np.diff(block.indptr), workers,
+                    )
                     _residual_effects_rows(
-                        block.indptr, block.indices, block.data, groups[start:end],
+                        block.indptr, block.indices, block.data, chunk_groups,
+                        target_rows, target_bounds, control_rows, control_bounds,
                         design.category_columns[start:end], design.continuous[start:end],
                         design.continuous_columns, design.total_column, design.mito_column,
                         design.is_mito, sums, control_xty, control_sumsq,
@@ -258,6 +275,8 @@ def residual_effects(
         finally:
             streamed.file.close()
 
+    control_xty = control_xty.sum(axis=0)
+    control_sumsq = control_sumsq.sum(axis=0)
     used = (groups >= 0) & (totals > 0)
     n_cells = np.bincount(groups[used], minlength=len(targets) + 1).astype(np.float64)
     keep = n_cells[1:] >= min_cells
@@ -283,7 +302,7 @@ def residual_effects(
         )
     rss = control_sumsq - np.einsum("pg,gp->g", coefficients, control_xty)
     residual_sd = np.sqrt(np.maximum(rss, 0.0) / df)
-    control_mean = sums[0] / n_cells[0]
+    control_mean = control_xty[:, 0] / n_cells[0]
 
     rows = 1 + np.flatnonzero(keep)
     n_target = n_cells[rows]
@@ -360,6 +379,40 @@ def residual_effects(
         )
     _messages.print_saving(verbose, _NAME, resolved_output)
     return AnnData(resolved_output)
+
+
+def _segments(groups: np.ndarray, row_nnz: np.ndarray, workers: int):
+    """Split a chunk's rows into ``workers`` segments for the kernel: the
+    perturbation rows ordered by group and cut at group boundaries, balanced
+    by non-zeros, so no two segments share a group; the control rows in
+    equal shares (each segment has its own control accumulators)."""
+    rows = np.flatnonzero(groups > 0)
+    rows = rows[np.argsort(groups[rows], kind="stable")]
+    cumulative = np.cumsum(row_nnz[rows])
+    cuts = np.full(workers - 1, rows.size, dtype=np.int64)
+    group_starts = np.flatnonzero(np.diff(groups[rows])) + 1
+    if group_starts.size:
+        # balance by non-zeros, then move each cut forward to where a group starts
+        balanced = np.searchsorted(cumulative, cumulative[-1] * np.arange(1, workers) / workers)
+        after = np.searchsorted(group_starts, balanced)
+        found = after < group_starts.size
+        cuts[found] = group_starts[after[found]]
+    target_bounds = np.concatenate([[0], cuts, [rows.size]]).astype(np.int64)
+    controls = np.flatnonzero(groups == 0)
+    control_bounds = np.linspace(0, controls.size, workers + 1).astype(np.int64)
+    return rows.astype(np.int64), target_bounds, controls.astype(np.int64), control_bounds
+
+
+def _read_ahead(read, starts):
+    """Yield ``(start, read(start))`` for each start, reading the next chunk on
+    a background thread while the caller processes the current one. The pass
+    is bound by reading, and the kernel releases the GIL, so the two overlap."""
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cx_read_ahead") as pool:
+        pending = pool.submit(read, starts[0]) if starts else None
+        for i, start in enumerate(starts):
+            block = pending.result()
+            pending = pool.submit(read, starts[i + 1]) if i + 1 < len(starts) else None
+            yield start, block
 
 
 def _dense_dataset(group: h5py.Group, name: str, data=None, shape=None) -> h5py.Dataset:
