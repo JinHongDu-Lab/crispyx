@@ -58,6 +58,7 @@ Key features
 
    api
    notebooks/batch_statistics_tutorial
+   notebooks/residual_effects_tutorial
    comparison
    faq
 

@@ -300,6 +300,33 @@ def test_write_filtered_subset_preserves_extra_slots_directly(tmp_path):
     assert out_mem.uns["some_key"] == "hello"
 
 
+@pytest.mark.parametrize("all_genes", [True, False])
+def test_write_filtered_subset_skips_unselected_chunks(tmp_path, all_genes):
+    """Rows kept only in a middle band (whole chunks unselected), from a CSR
+    source whose rows store their columns out of order."""
+    rng = np.random.default_rng(3)
+    dense = rng.poisson(0.6, size=(60, 9)).astype(np.float32)
+    matrix = sp.csr_matrix(dense)
+    for row in range(matrix.shape[0]):  # reverse each row's column order
+        lo, hi = matrix.indptr[row], matrix.indptr[row + 1]
+        matrix.indices[lo:hi] = matrix.indices[lo:hi][::-1]
+        matrix.data[lo:hi] = matrix.data[lo:hi][::-1]
+    matrix.has_sorted_indices = False
+    path = tmp_path / "unsorted.h5ad"
+    ad.AnnData(matrix, var=pd.DataFrame(index=[f"g{i}" for i in range(9)])).write(path)
+    cell_mask = np.zeros(60, dtype=bool)
+    cell_mask[23:31] = True
+    cell_mask[33] = True
+    gene_mask = np.ones(9, dtype=bool) if all_genes else np.arange(9) % 3 != 1
+
+    out_path = tmp_path / "band.h5ad"
+    write_filtered_subset(path, cell_mask=cell_mask, gene_mask=gene_mask, output_path=out_path, chunk_size=5)
+    out = ad.read_h5ad(out_path)
+    np.testing.assert_array_equal(out.X.toarray(), dense[cell_mask][:, gene_mask])
+    rows = np.split(out.X.indices, out.X.indptr[1:-1])
+    assert all(np.all(np.diff(row) > 0) for row in rows)  # anndata expects sorted rows
+
+
 def test_write_filtered_subset_subsets_varp_by_gene_mask(tmp_path):
     """varp is gene-by-gene, so it must be subset along gene_mask, not cell_mask."""
     path = _make_h5ad(

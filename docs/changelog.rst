@@ -1,6 +1,27 @@
 Changelog
 =========
 
+Version 0.1.10
+--------------
+
+*Not yet released.*
+
+* **New: ``cx.tl.residual_effects``** (also ``cx.residual_effects``), the
+  covariate-adjusted estimator of Feng et al. (2025). Each gene's
+  ``log1p(CP10k)`` expression is regressed on the covariates over the control
+  cells, and a perturbation's effect is its cells' mean residual, tested
+  against the control fit's residual spread (``null="model"``) or the spread
+  across perturbations (``null="robust"``). Covariates are ``obs`` columns
+  plus ``log_total_counts`` and ``mito_fraction``, computed from the counts.
+  One streaming pass over the raw counts; cells with a missing label are not
+  used. On 5.6 million CD4+ T cells (21.5 billion non-zeros) it runs in under
+  8 minutes on 32 cores with 11 GB of memory. New tutorial on that screen,
+  comparing the estimates with the authors' own.
+* **Faster: streaming a sparse matrix along its fast axis** slices
+  uncompressed files directly instead of through anndata (about twice as
+  fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row
+  chunks they do not keep or read rows just to count them.
+
 Version 0.1.9
 -------------
 
