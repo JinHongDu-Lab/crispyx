@@ -11,8 +11,11 @@ Version 0.1.10
   ``log1p(CP10k)`` expression is regressed on the covariates over the control
   cells, and a perturbation's effect is its cells' mean residual, tested
   against the control fit's residual spread (``null="model"``) or the spread
-  across perturbations (``null="robust"``). Covariates are ``obs`` columns
-  plus ``log_total_counts`` and ``mito_fraction``, computed from the counts.
+  across perturbations (``null="robust"``). ``covariates`` is required:
+  ``obs`` columns, plus ``log_total_counts`` and ``mito_fraction`` computed
+  from the counts. Adjust for donor, lane or batch; depth and mitochondrial
+  share are changed by many perturbations, and adjusting for them removes
+  part of the effect.
   One streaming pass over the raw counts; cells with a missing label are not
   used. On 5.6 million CD4+ T cells (21.5 billion non-zeros) it runs in under
   8 minutes on 32 cores with 11 GB of memory. New tutorial on that screen,

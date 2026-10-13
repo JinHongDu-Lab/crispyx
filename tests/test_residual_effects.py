@@ -112,7 +112,7 @@ def test_matches_dense_reference(tmp_path, fmt, chunk_size):
 
 def test_robust_null(tmp_path):
     path, counts, obs = _screen(tmp_path)
-    out = _read(cx.residual_effects(path, "perturbation", "ctrl", null="robust", min_cells=1, verbose=False))
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["log_total_counts", "mito_fraction"], null="robust", min_cells=1, verbose=False))
     _, _, z, _, _ = _reference(counts, obs, ["log_total_counts", "mito_fraction"], null="robust")
     np.testing.assert_allclose(out.layers["z_score"], z, rtol=1e-7, equal_nan=True)
     assert out.uns["null"] == "robust"
@@ -167,34 +167,34 @@ def test_missing_labels_are_not_used(tmp_path):
 def test_series_must_cover_every_cell(tmp_path):
     path, _, obs = _screen(tmp_path)
     with pytest.raises(ValueError, match="no entry"):
-        cx.residual_effects(path, obs["perturbation"].iloc[1:], "ctrl", verbose=False)
+        cx.residual_effects(path, obs["perturbation"].iloc[1:], "ctrl", covariates=["lane"], verbose=False)
 
 
 def test_rerun_reuses_and_relabel_recomputes(tmp_path, capsys):
     path, _, obs = _screen(tmp_path)
-    cx.residual_effects(path, "perturbation", "ctrl", min_cells=1, verbose=False)
-    cx.residual_effects(path, "perturbation", "ctrl", min_cells=1, verbose=True)
+    cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, verbose=False)
+    cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, verbose=True)
     assert "Loading existing result" in capsys.readouterr().out
     shuffled = pd.Series(np.random.default_rng(0).permutation(obs["perturbation"].astype(str).to_numpy()),
                          index=obs.index, name="perturbation")
-    out = _read(cx.residual_effects(path, shuffled, "ctrl", min_cells=1, verbose=True))
+    out = _read(cx.residual_effects(path, shuffled, "ctrl", covariates=["lane"], min_cells=1, verbose=True))
     assert "is not reused" in capsys.readouterr().out
     assert out.uns["crispyx"]["kind"] == "residual_effects"
 
 
 def test_min_cells_and_perturbations(tmp_path):
     path, *_ = _screen(tmp_path)
-    out = _read(cx.residual_effects(path, "perturbation", "ctrl", perturbations=["B"], min_cells=1, verbose=False))
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], perturbations=["B"], min_cells=1, verbose=False))
     assert out.obs_names.tolist() == ["B"]
     with pytest.raises(ValueError, match="no perturbation has at least"):
-        cx.residual_effects(path, "perturbation", "ctrl", min_cells=41, verbose=False)
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=41, verbose=False)
     with pytest.raises(ValueError, match="not found"):
-        cx.residual_effects(path, "perturbation", "ctrl", perturbations=["Z"], verbose=False)
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], perturbations=["Z"], verbose=False)
 
 
 def test_untested_genes_keep_effects(tmp_path):
     path, *_ = _screen(tmp_path)
-    out = _read(cx.residual_effects(path, "perturbation", "ctrl", min_cells=1, min_control_mean=3.0, verbose=False))
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, min_control_mean=3.0, verbose=False))
     tested = out.var["tested"].to_numpy()
     assert 0 < tested.sum() < len(GENES)
     assert np.isnan(out.layers["z_score"][:, ~tested]).all()
@@ -206,7 +206,7 @@ def test_refuses_normalised_input(tmp_path):
     path, counts, obs = _screen(tmp_path)
     ad.AnnData(sp.csr_matrix(np.log1p(counts)), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
     with pytest.raises(ValueError, match="raw counts"):
-        cx.residual_effects(path, "perturbation", "ctrl", verbose=False)
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], verbose=False)
 
 
 def test_level_without_controls_raises(tmp_path):
@@ -223,7 +223,7 @@ def test_computed_covariate_name_clash_raises(tmp_path):
     obs["log_total_counts"] = 1.0
     ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
     with pytest.raises(ValueError, match="computed from the counts"):
-        cx.residual_effects(path, "perturbation", "ctrl", verbose=False)
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["log_total_counts"], verbose=False)
 
 
 def test_mito_fraction_matches_scanpy(tmp_path):
@@ -241,7 +241,7 @@ def test_mito_fraction_matches_scanpy(tmp_path):
 
 def test_round_trip_through_anndata(tmp_path):
     path, *_ = _screen(tmp_path)
-    result = cx.tl.residual_effects(path, "perturbation", "ctrl", min_cells=1, verbose=False)
+    result = cx.tl.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, verbose=False)
     out = _read(result)
     assert set(out.layers) == {"z_score", "pvalue", "pvalue_adj"}
     assert {"control_mean", "residual_sd", "robust_sd", "tested"} <= set(out.var.columns)
@@ -281,3 +281,9 @@ def test_results_do_not_depend_on_n_jobs(tmp_path):
                                      min_cells=1, n_jobs=4, output_path=tmp_path / "many.h5ad", verbose=False))
     np.testing.assert_allclose(one.X, many.X, rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(one.layers["z_score"], many.layers["z_score"], rtol=1e-10, equal_nan=True)
+
+
+def test_covariates_must_be_given(tmp_path):
+    path, *_ = _screen(tmp_path)
+    with pytest.raises(TypeError, match="covariates"):
+        cx.residual_effects(path, "perturbation", "ctrl", verbose=False)

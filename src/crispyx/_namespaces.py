@@ -52,7 +52,7 @@ from .pseudobulk import (
     compute_normalized_effects,
     compute_pseudobulk_effects,
 )
-from .residual import COMPUTED_COVARIATES, ResidualNull, residual_effects
+from .residual import ResidualNull, residual_effects
 from .qc import (
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
@@ -1039,7 +1039,7 @@ class _ToolsNamespace:
         perturbation_column: str | pd.Series,
         control_label: str | None = None,
         *,
-        covariates: Sequence[str] = COMPUTED_COVARIATES,
+        covariates: Sequence[str],
         null: ResidualNull = "model",
         min_cells: int = 10,
         min_control_mean: float = 0.1,

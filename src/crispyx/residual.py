@@ -53,7 +53,7 @@ def residual_effects(
     perturbation_column: str | pd.Series,
     control_label: str | None = None,
     *,
-    covariates: Sequence[str] = COMPUTED_COVARIATES,
+    covariates: Sequence[str],
     null: ResidualNull = "model",
     min_cells: int = 10,
     min_control_mean: float = 0.1,
@@ -98,6 +98,16 @@ def residual_effects(
         Label of the control cells the model is fitted on. Inferred from common
         patterns when omitted.
     covariates
+        Required; there is no default, because the right set depends on what
+        the perturbation can change. Adjust for what describes how a cell was
+        processed -- donor, lane, batch -- which no perturbation affects. A
+        covariate the perturbation itself changes (depth, mitochondrial share,
+        cell cycle) removes part of the effect: on a genome-scale CD4+ T-cell
+        screen, adding ``log_total_counts`` and ``mito_fraction`` to donor and
+        lane nearly doubled the share of the authors' hits estimated with the
+        opposite sign (2.3% to 4.1%; see the residual-effects tutorial). Use
+        them only when the effect at equal depth is the question.
+
         Terms of the model, besides the intercept. Each is an ``obs`` column --
         one-hot coded (first level dropped) when categorical, string or boolean,
         entered as is when numeric -- or one of the two quantities computed from
