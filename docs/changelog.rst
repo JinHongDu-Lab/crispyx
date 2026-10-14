@@ -21,8 +21,13 @@ Version 0.1.10
   ``format_mismatch_policy`` and ``cx.estimate_disk_usage`` cover the
   temporary CSR copy of a CSC source. On 7.4 million CD4+ T cells (27.6
   billion non-zeros) one call takes under 2 minutes on 32 cores with the file
-  in the page cache. New tutorial on that screen: a comparison with the
-  authors' estimates, and a check on held-out donors.
+  in the page cache. New tutorial on that screen: ``residual_effects`` and
+  the authors' own model (``nb_glm_test`` on guide x donor pseudo-bulk,
+  which reproduces their estimates) against the authors' estimates, and a
+  calibration check on fake targets made of non-targeting guides.
+* **Fixed: ``nb_glm_test`` with covariates** crashed with ``TypeError``
+  (missing ``min_mu``) whenever four or more perturbations were fitted on
+  worker processes.
 * **Faster: streaming a sparse matrix along its fast axis** slices
   uncompressed files directly instead of through anndata (about twice as
   fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row

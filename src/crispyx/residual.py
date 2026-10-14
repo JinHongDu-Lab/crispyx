@@ -113,10 +113,7 @@ def residual_effects(
         Adjust for how cells were processed (donor, lane, batch), which no
         perturbation changes. Avoid what the perturbation itself can change
         (depth, mitochondrial share, cell cycle): adjusting for it removes part
-        of the effect. On the CD4+ T-cell screen of the residual-effects
-        tutorial, adding depth and mitochondrial share to donor and lane
-        raised the share of the authors' hits given the opposite sign from
-        0.6% to 1.9%.
+        of the effect.
 
         ``[]`` gives the plain difference from the controls. Interactions
         (lane x donor) and other scores are ``obs`` columns made beforehand.
