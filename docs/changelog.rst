@@ -17,13 +17,18 @@ Version 0.1.10
   share are changed by many perturbations, and adjusting for them removes
   part of the effect.
   One streaming pass over the raw counts; cells with a missing label are not
-  used. On 5.6 million CD4+ T cells (21.5 billion non-zeros) it runs in under
+  used. Collinear covariates are accepted only while every perturbation's
+  effect stays unique, and every chunk is checked for raw counts.
+  ``format_mismatch_policy`` and ``cx.estimate_disk_usage`` cover the
+  temporary CSR copy of a CSC source. On 5.6 million CD4+ T cells (21.5 billion non-zeros) it runs in under
   8 minutes on 32 cores with 11 GB of memory. New tutorial on that screen,
   comparing the estimates with the authors' own.
 * **Faster: streaming a sparse matrix along its fast axis** slices
   uncompressed files directly instead of through anndata (about twice as
   fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row
   chunks they do not keep or read rows just to count them.
+  ``iter_matrix_chunks`` takes ``selected`` (skip chunks without a selected
+  row) and ``read_ahead`` (read the next chunk on a background thread).
 
 Version 0.1.9
 -------------

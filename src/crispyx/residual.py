@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, Literal, Sequence, get_args
 
@@ -11,7 +10,6 @@ import h5py
 import numba
 import numpy as np
 import pandas as pd
-import scipy.sparse as sparse
 from scipy.special import ndtr
 
 from . import _messages
@@ -23,16 +21,20 @@ from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, sta
 from ._statistics import _adjust_pvalue_matrix
 from .data import (
     AnnData,
-    _decoded_block_reader,
-    _detect_backed_sparse_format,
+    _ensure_csr,
     _replace_on_success,
+    _validate_counts_chunk,
     calculate_optimal_chunk_size,
+    chunk_starts,
     ensure_gene_symbol_column,
+    iter_matrix_chunks,
     read_backed,
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    scratch_copy_bytes,
     stream_on_fast_axis,
+    validate_format_mismatch_policy,
 )
 
 ResidualNull = Literal["model", "robust"]
@@ -42,7 +44,8 @@ COMPUTED_COVARIATES = ("log_total_counts", "mito_fraction")
 
 #: Arguments that decide how a call runs but not what it writes.
 _OPERATIONAL_ARGS = frozenset({
-    "data", "chunk_size", "n_jobs", "memory_limit_gb", "data_name", "output_path", "verbose", "force",
+    "data", "chunk_size", "n_jobs", "memory_limit_gb", "format_mismatch_policy", "data_name",
+    "output_path", "verbose", "force",
 })
 
 _NAME = "residual_effects"
@@ -62,6 +65,7 @@ def residual_effects(
     chunk_size: int | None = None,
     n_jobs: int | None = None,
     memory_limit_gb: float | None = None,
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
     data_name: str | None = None,
     output_path: str | Path | None = None,
     verbose: int | bool = True,
@@ -88,7 +92,8 @@ def residual_effects(
     data
         Path to an h5ad file of **raw counts**, :class:`crispyx.AnnData`, or an
         ``anndata.AnnData`` opened with ``backed='r'``. The function normalises
-        (``log1p`` of counts per 10,000) itself and refuses non-integer input.
+        (``log1p`` of counts per 10,000) itself and refuses input with
+        non-integer or negative values in any chunk it reads.
     perturbation_column
         Column in ``adata.obs`` naming each cell's perturbation, or a
         ``pd.Series`` of labels indexed by ``obs_names``. Cells whose label is
@@ -120,7 +125,11 @@ def residual_effects(
         An ``obs`` column with one of these names raises instead of being used
         silently. Interactions (e.g. lane x donor) and other per-cell scores
         (cell cycle) are ``obs`` columns computed beforehand. Every level of a
-        categorical covariate must occur among the controls. ``[]`` gives the
+        categorical covariate must occur among the controls. Collinear
+        covariates are accepted as long as every reported perturbation's
+        effect stays unique -- its cells' mean design row is a combination of
+        the controls' rows; a perturbation whose effect would depend on how
+        the fit splits the collinear columns raises instead. ``[]`` gives the
         unadjusted mean difference from the controls.
     null
         Spread the z-score divides by:
@@ -156,9 +165,22 @@ def residual_effects(
         split between them); the next chunk is read meanwhile. All cores when
         omitted. Results do not depend on it.
     memory_limit_gb
-        Memory budget. The perturbations x genes accumulator must fit in it
-        three times over (accumulator, effect, robust spread), else the call
-        refuses before reading the matrix. Detected from the system when omitted.
+        Memory budget. Three perturbations x genes float64 arrays
+        (accumulator, effect, robust spread) and one genes x design-columns
+        array per thread must fit in it, else the call refuses before
+        reading the matrix. Detected from the system when omitted.
+    format_mismatch_policy
+        How to handle a source stored as CSC, whose row-(cell-)streaming here
+        is O(total_nnz) per chunk and can be ~100x slower than CSR:
+
+        * ``"auto"`` (default): measure the source's read throughput and
+          convert only when the re-reads would cost more than one conversion.
+          See :func:`crispyx.data.resolve_auto_format_mismatch_policy`.
+        * ``"warn"``: proceed but log a single actionable warning.
+        * ``"convert"``: stream from a temporary CSR copy written beside the
+          output (about the source's size in free disk), removed before
+          returning.
+        * ``"off"``: proceed silently with no warning.
     data_name
         Custom stem for the output filename.
     output_path
@@ -188,6 +210,7 @@ def residual_effects(
         raise ValueError("min_cells must be at least 1")
     if min_control_mean < 0:
         raise ValueError("min_control_mean must be non-negative")
+    validate_format_mismatch_policy(format_mismatch_policy)
     covariates = [str(c) for c in covariates]
     if len(set(covariates)) != len(covariates):
         raise ValueError(f"{_NAME}: covariates are listed more than once: {covariates}")
@@ -213,13 +236,19 @@ def residual_effects(
         )
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column).astype(str)
         design = _Design.build(backed.obs, covariates, groups, gene_symbols)
-        accumulator_bytes = (len(targets) + 1) * n_vars * 8
+        workers = max(1, min(_resolve_n_jobs(n_jobs), numba.config.NUMBA_NUM_THREADS))
+        p = len(design.columns)
+        # three perturbations x genes arrays; per thread, the controls' genes x
+        # design columns cross-products and sums of squares plus two edge rows
+        # (and one more cross-product array when the threads' are summed)
+        needed = 8 * n_vars * (3 * (len(targets) + 1) + (workers + 1) * (p + 1) + 2 * workers)
         budget = _resolve_memory_limit_bytes(memory_limit_gb)
-        if 3 * accumulator_bytes > budget:
+        if needed > budget:
             raise MemoryError(
-                f"{_NAME}: {len(targets):,} perturbations x {n_vars:,} genes need "
-                f"{3 * accumulator_bytes / 1e9:.1f} GB (three float64 copies); the budget is "
-                f"{budget / 1e9:.1f} GB. Pass fewer perturbations or raise memory_limit_gb."
+                f"{_NAME}: {len(targets):,} perturbations x {n_vars:,} genes with {p} design "
+                f"columns on {workers} thread(s) need {needed / 1e9:.1f} GB; the budget is "
+                f"{budget / 1e9:.1f} GB. Pass fewer perturbations, fewer threads (n_jobs) or "
+                "fewer covariate levels, or raise memory_limit_gb."
             )
         if chunk_size is None:
             chunk_size = calculate_optimal_chunk_size(
@@ -235,52 +264,45 @@ def residual_effects(
         f"{len(targets):,} perturbations, {int((groups == 0).sum()):,} control cells, "
         f"design: {len(design.columns)} columns",
     )
-    workers = max(1, min(_resolve_n_jobs(n_jobs), numba.config.NUMBA_NUM_THREADS))
     # Row 0 (the controls) stays zero: their sum is control_xty's intercept column.
     sums = np.zeros((len(targets) + 1, n_vars))
-    control_xty = np.zeros((workers, n_vars, len(design.columns)))
+    control_xty = np.zeros((workers, n_vars, p))
     control_sumsq = np.zeros((workers, n_vars))
+    edges = np.zeros((workers, 2, n_vars))
     totals = np.zeros(n_obs)
     mito = np.zeros(n_obs)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     with stream_on_fast_axis(
-        path, axis=0, policy="auto", fn_name=_NAME, scratch_dir=resolved_output.parent,
-        chunk_size=chunk_size, memory_limit_gb=memory_limit_gb, verbose=verbose,
+        path, axis=0, policy=format_mismatch_policy, fn_name=_NAME,
+        scratch_dir=resolved_output.parent, chunk_size=chunk_size,
+        memory_limit_gb=memory_limit_gb, verbose=verbose,
     ) as stream_path:
         streamed = read_backed(stream_path)
         try:
-            matrix = streamed.X
-            read_block = _decoded_block_reader(
-                matrix, _detect_backed_sparse_format(matrix), 0, n_obs, n_vars,
-            ) or (lambda start, end: matrix[start:end])
-            starts = [
-                start for start in range(0, n_obs, chunk_size)
-                if (groups[start:start + chunk_size] >= 0).any()
-            ]
-            checked = False
-
-            def read_csr(start):
-                block = read_block(start, min(start + chunk_size, n_obs))
-                return block.tocsr() if sparse.issparse(block) else sparse.csr_matrix(np.asarray(block))
-
-            with _create_progress_context(len(starts), _NAME, verbose, unit="chunk") as pbar:
-                for start, block in _read_ahead(read_csr, starts):
-                    end = min(start + chunk_size, n_obs)
-                    if not checked:
-                        _check_counts(block.data)
-                        checked = True
-                    chunk_groups = groups[start:end]
-                    target_rows, target_bounds, control_rows, control_bounds = _segments(
+            selected = groups >= 0
+            n_chunks = len(chunk_starts(n_obs, chunk_size, selected=selected))
+            with _create_progress_context(n_chunks, _NAME, verbose, unit="chunk") as pbar:
+                for slc, block in iter_matrix_chunks(
+                    streamed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
+                    warn_slow_axis=False, selected=selected, read_ahead=True,
+                ):
+                    block = _ensure_csr(block)
+                    _validate_counts_chunk(block, context=_NAME)
+                    chunk_groups = groups[slc]
+                    target_rows, target_bounds, edge_groups, control_rows, control_bounds = _segments(
                         chunk_groups, np.diff(block.indptr), workers,
                     )
                     _residual_effects_rows(
                         block.indptr, block.indices, block.data, chunk_groups,
-                        target_rows, target_bounds, control_rows, control_bounds,
-                        design.category_columns[start:end], design.continuous[start:end],
+                        target_rows, target_bounds, edge_groups, edges,
+                        control_rows, control_bounds,
+                        design.category_columns[slc], design.continuous[slc],
                         design.continuous_columns, design.total_column, design.mito_column,
                         design.is_mito, sums, control_xty, control_sumsq,
-                        totals[start:end], mito[start:end],
+                        totals[slc], mito[slc],
                     )
+                    for w, k in zip(*np.nonzero(edge_groups > 0)):
+                        sums[edge_groups[w, k]] += edges[w, k]
                     pbar.update(1)
         finally:
             streamed.file.close()
@@ -298,12 +320,21 @@ def residual_effects(
         )
     group_design_sums, control_xtx = design.cross_products(groups, used, totals, mito, len(targets) + 1)
     n_controls = int(n_cells[0])
-    coefficients, _, rank, _ = np.linalg.lstsq(control_xtx, control_xty.T, rcond=None)
-    if rank < len(design.columns):
+    rows = 1 + np.flatnonzero(keep)
+    n_target = n_cells[rows]
+    mean_design = group_design_sums[rows] / n_target[:, None]
+    # Least squares through the pseudo-inverse of X^T X, with the cutoff
+    # np.linalg.lstsq uses; its null space is what collinearity leaves free.
+    u, singular, vt = np.linalg.svd(control_xtx, hermitian=True)
+    independent = singular > singular[0] * p * np.finfo(np.float64).eps
+    rank = int(independent.sum())
+    coefficients = vt[independent].T @ ((u[:, independent].T @ control_xty.T) / singular[independent, None])
+    if rank < p:
+        _check_identified(mean_design, vt[~independent], design.columns, targets, keep, rank)
         _messages.vprint(
             verbose, _NAME,
-            f"the design has rank {rank} < {len(design.columns)} columns (collinear covariates); "
-            "fitted values and effects are still unique.",
+            f"the design has rank {rank} < {p} columns (collinear covariates); every "
+            "perturbation's design lies within the controls', so its effect is still unique.",
         )
     df = n_controls - rank
     if df <= 0:
@@ -314,12 +345,9 @@ def residual_effects(
     residual_sd = np.sqrt(np.maximum(rss, 0.0) / df)
     control_mean = control_xty[:, 0] / n_cells[0]
 
-    rows = 1 + np.flatnonzero(keep)
-    n_target = n_cells[rows]
     effect = sums[rows]
     del sums
     effect /= n_target[:, None]
-    mean_design = group_design_sums[rows] / n_target[:, None]
     effect -= mean_design @ coefficients
     scaled = effect * np.sqrt(n_target)[:, None]
     scaled -= np.median(scaled, axis=0)
@@ -393,36 +421,49 @@ def residual_effects(
 
 def _segments(groups: np.ndarray, row_nnz: np.ndarray, workers: int):
     """Split a chunk's rows into ``workers`` segments for the kernel: the
-    perturbation rows ordered by group and cut at group boundaries, balanced
-    by non-zeros, so no two segments share a group; the control rows in
-    equal shares (each segment has its own control accumulators)."""
+    perturbation rows ordered by group and cut where their non-zeros
+    balance, and the control rows in equal shares (each segment has its own
+    control accumulators). A group may span segments, so each segment's first
+    and last group (``edge_groups``, -1 when absent) are accumulated
+    privately; a file sorted by perturbation still keeps every thread busy."""
     rows = np.flatnonzero(groups > 0)
     rows = rows[np.argsort(groups[rows], kind="stable")]
     cumulative = np.cumsum(row_nnz[rows])
-    cuts = np.full(workers - 1, rows.size, dtype=np.int64)
-    group_starts = np.flatnonzero(np.diff(groups[rows])) + 1
-    if group_starts.size:
-        # balance by non-zeros, then move each cut forward to where a group starts
-        balanced = np.searchsorted(cumulative, cumulative[-1] * np.arange(1, workers) / workers)
-        after = np.searchsorted(group_starts, balanced)
-        found = after < group_starts.size
-        cuts[found] = group_starts[after[found]]
+    if rows.size:
+        cuts = np.searchsorted(cumulative, cumulative[-1] * np.arange(1, workers) / workers, side="right")
+    else:
+        cuts = np.zeros(workers - 1, dtype=np.int64)
     target_bounds = np.concatenate([[0], cuts, [rows.size]]).astype(np.int64)
+    lo, hi = target_bounds[:-1], target_bounds[1:]
+    filled = hi > lo
+    edge_groups = np.full((workers, 2), -1, dtype=np.int64)
+    first = groups[rows[lo[filled]]]
+    last = groups[rows[hi[filled] - 1]]
+    edge_groups[filled, 0] = first
+    edge_groups[filled, 1] = np.where(last != first, last, -1)
     controls = np.flatnonzero(groups == 0)
     control_bounds = np.linspace(0, controls.size, workers + 1).astype(np.int64)
-    return rows.astype(np.int64), target_bounds, controls.astype(np.int64), control_bounds
+    return rows.astype(np.int64), target_bounds, edge_groups, controls.astype(np.int64), control_bounds
 
 
-def _read_ahead(read, starts):
-    """Yield ``(start, read(start))`` for each start, reading the next chunk on
-    a background thread while the caller processes the current one. The pass
-    is bound by reading, and the kernel releases the GIL, so the two overlap."""
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cx_read_ahead") as pool:
-        pending = pool.submit(read, starts[0]) if starts else None
-        for i, start in enumerate(starts):
-            block = pending.result()
-            pending = pool.submit(read, starts[i + 1]) if i + 1 < len(starts) else None
-            yield start, block
+def _check_identified(mean_design, null_space, columns, targets, keep, rank) -> None:
+    """Raise when a perturbation's effect is not unique: its mean design row
+    has a component in the null space of the controls' design, so the
+    effect would depend on how the fit splits the collinear columns."""
+    scale = np.maximum(np.linalg.norm(mean_design, axis=1), 1.0)
+    free = np.linalg.norm(mean_design @ null_space.T, axis=1) > 1e-8 * scale
+    if not free.any():
+        return
+    collinear = [columns[i] for i in np.flatnonzero(np.abs(null_space).max(axis=0) > 1e-8)]
+    kept = np.flatnonzero(keep)
+    names = [targets[kept[i]] for i in np.flatnonzero(free)]
+    raise ValueError(
+        f"{_NAME}: the controls' design has rank {rank} < {len(columns)} columns; "
+        f"{collinear} are collinear among the controls but not among the cells of "
+        f"{len(names)} perturbation(s), whose effects would therefore be arbitrary: "
+        f"{names[:10]}. Drop or merge the collinear covariates, or restrict the run to "
+        "cells whose combinations occur among the controls."
+    )
 
 
 def _dense_dataset(group: h5py.Group, name: str, data=None, shape=None) -> h5py.Dataset:
@@ -501,16 +542,6 @@ def _group_codes(
     groups = np.full(values.shape[0], -1, dtype=np.int64)
     groups[labelled] = lookup[codes]
     return groups, targets
-
-
-def _check_counts(values: np.ndarray) -> None:
-    if values.size == 0:
-        return
-    if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values != np.rint(values)):
-        raise ValueError(
-            f"{_NAME} normalises raw counts itself, but X holds non-integer or negative "
-            "values (already normalised?). Pass a file, or point X at a layer, of raw counts."
-        )
 
 
 class _Design:
@@ -592,32 +623,47 @@ class _Design:
         return cls(columns, np.ascontiguousarray(category_columns), np.ascontiguousarray(continuous),
                    np.asarray(continuous_columns, dtype=np.int64), total_column, mito_column, is_mito)
 
-    def values(self, column: int, cells: np.ndarray, totals: np.ndarray, mito: np.ndarray) -> np.ndarray:
-        """Design column ``column`` for ``cells``."""
-        if column == 0:
-            return np.ones(cells.size)
-        if column == self.total_column:
-            return np.log(totals[cells])
-        if column == self.mito_column:
-            return mito[cells]
-        where = np.flatnonzero(self.continuous_columns == column)
-        if where.size:
-            return self.continuous[cells, where[0]]
-        return (self.category_columns[cells] == column).any(axis=1).astype(np.float64)
+    def rows(self, cells: np.ndarray, totals: np.ndarray, mito: np.ndarray) -> np.ndarray:
+        """The dense design rows of ``cells``."""
+        x = np.zeros((cells.size, len(self.columns)))
+        x[:, 0] = 1.0
+        x[:, self.continuous_columns] = self.continuous[cells]
+        if self.total_column >= 0:
+            x[:, self.total_column] = np.log(totals[cells])
+        if self.mito_column >= 0:
+            x[:, self.mito_column] = mito[cells]
+        codes = self.category_columns[cells]
+        hit = codes >= 0
+        x[np.nonzero(hit)[0], codes[hit]] = 1.0
+        return x
 
     def cross_products(self, groups, used, totals, mito, n_groups):
         """Per-group sums of the design rows, and the controls' ``X^T X``."""
         cells = np.flatnonzero(used)
         cell_groups = groups[cells]
         p = len(self.columns)
-        group_sums = np.empty((n_groups, p))
-        for column in range(p):
-            group_sums[:, column] = np.bincount(
-                cell_groups, weights=self.values(column, cells, totals, mito), minlength=n_groups,
-            )
+        # one bincount per numeric column, one for all the one-hot columns
+        group_sums = np.zeros((n_groups, p))
+        group_sums[:, 0] = np.bincount(cell_groups, minlength=n_groups)
+        numeric = [(c, self.continuous[cells, k]) for k, c in enumerate(self.continuous_columns)]
+        if self.total_column >= 0:
+            numeric.append((self.total_column, np.log(totals[cells])))
+        if self.mito_column >= 0:
+            numeric.append((self.mito_column, mito[cells]))
+        for column, values in numeric:
+            group_sums[:, column] = np.bincount(cell_groups, weights=values, minlength=n_groups)
+        codes = self.category_columns[cells]
+        hit = codes >= 0
+        flat = (cell_groups[:, None] * p + codes)[hit]
+        group_sums += np.bincount(flat, minlength=n_groups * p).reshape(n_groups, p)
+        # X^T X over the controls, a bounded block of dense rows at a time
         controls = cells[cell_groups == 0]
-        x = np.column_stack([self.values(column, controls, totals, mito) for column in range(p)])
-        return group_sums, x.T @ x
+        xtx = np.zeros((p, p))
+        step = max(1, (1 << 23) // p)
+        for start in range(0, controls.size, step):
+            x = self.rows(controls[start:start + step], totals, mito)
+            xtx += x.T @ x
+        return group_sums, xtx
 
 
 def _estimate_shape_for_residual_effects(
@@ -627,16 +673,28 @@ def _estimate_shape_for_residual_effects(
     control_label: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells: int = 10,
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
+    format_mismatch_policy: str = "auto",
     **_ignored,
 ) -> dict[str, float]:
+    validate_format_mismatch_policy(format_mismatch_policy)
     backed = read_backed(path)
     try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
         labels, _ = _cell_labels(backed, perturbation_column)
         labelled = labels.notna().to_numpy()
         values = labels.astype(str).to_numpy()
         control_label = resolve_control_label(values[labelled], control_label, verbose=False)
         _, targets = _group_codes(values, labelled, control_label, perturbations, min_cells, False)
-        # X and three layers, float64
-        return {"output": estimate_bytes(len(targets), backed.n_vars, 4, overhead=1.10)}
     finally:
         backed.file.close()
+    # X and three layers, float64
+    estimate = {"output": estimate_bytes(len(targets), n_vars, 4, overhead=1.10)}
+    if chunk_size is None:
+        chunk_size = calculate_optimal_chunk_size(n_obs, n_vars, available_memory_gb=memory_limit_gb)
+    # the temporary CSR copy stream_on_fast_axis may write beside the output
+    scratch = scratch_copy_bytes(path, axis=0, policy=format_mismatch_policy, chunk_size=chunk_size)
+    if scratch is not None:
+        estimate["scratch"] = scratch
+    return estimate

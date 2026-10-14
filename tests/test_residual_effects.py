@@ -243,7 +243,7 @@ def test_round_trip_through_anndata(tmp_path):
     path, *_ = _screen(tmp_path)
     result = cx.tl.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, verbose=False)
     out = _read(result)
-    assert set(out.layers) == {"z_score", "pvalue", "pvalue_adj"}
+    assert set(out.layers) - {None} == {"z_score", "pvalue", "pvalue_adj"}  # anndata >= 0.13 lists X as None
     assert {"control_mean", "residual_sd", "robust_sd", "tested"} <= set(out.var.columns)
     assert out.uns["crispyx"]["schema"] == 1
 
@@ -255,22 +255,114 @@ def test_disk_usage_estimate(tmp_path):
     assert estimate["output"].required_bytes == pytest.approx(3 * len(GENES) * 4 * 8 * 1.10)
 
 
-def test_segments_never_split_a_group():
+def test_segments_share_only_their_edge_groups():
     from crispyx.residual import _segments
 
     rng = np.random.default_rng(0)
-    groups = rng.integers(-1, 30, size=500)
-    row_nnz = rng.integers(1, 100, size=500)
-    for workers in (1, 3, 8, 64):
-        rows, bounds, controls, control_bounds = _segments(groups, row_nnz, workers)
-        assert len(bounds) == len(control_bounds) == workers + 1
-        assert np.all(np.diff(bounds) >= 0) and np.all(np.diff(control_bounds) >= 0)
-        assert sorted(rows) == sorted(np.flatnonzero(groups > 0))
-        assert sorted(controls) == sorted(np.flatnonzero(groups == 0))
-        owners = [set(groups[rows[bounds[w]:bounds[w + 1]]]) for w in range(workers)]
-        for a in range(workers):
-            for b in range(a + 1, workers):
-                assert not owners[a] & owners[b]
+    for groups in (rng.integers(-1, 30, size=500), np.repeat([0, 1, 2], [50, 400, 50])):
+        row_nnz = rng.integers(1, 100, size=groups.size)
+        for workers in (1, 3, 8, 64):
+            rows, bounds, edge_groups, controls, control_bounds = _segments(groups, row_nnz, workers)
+            assert len(bounds) == len(control_bounds) == workers + 1
+            assert np.all(np.diff(bounds) >= 0) and np.all(np.diff(control_bounds) >= 0)
+            assert sorted(rows) == sorted(np.flatnonzero(groups > 0))
+            assert sorted(controls) == sorted(np.flatnonzero(groups == 0))
+            owners = [set(groups[rows[bounds[w]:bounds[w + 1]]]) for w in range(workers)]
+            for a in range(workers):
+                for b in range(a + 1, workers):
+                    assert owners[a] & owners[b] <= set(edge_groups[a]) & set(edge_groups[b])
+
+
+def test_segments_split_a_large_group():
+    """A chunk holding one perturbation still gives every thread work."""
+    from crispyx.residual import _segments
+
+    groups = np.ones(400, dtype=np.int64)
+    _, bounds, edge_groups, _, _ = _segments(groups, np.full(400, 5), 4)
+    assert np.all(np.diff(bounds) == 100)
+    assert (edge_groups[:, 0] == 1).all() and (edge_groups[:, 1] == -1).all()
+
+
+@pytest.mark.parametrize("chunk_size", [7, 100, 1000])
+def test_sorted_by_perturbation_matches_reference(tmp_path, chunk_size):
+    """Groups larger than a chunk, split across threads."""
+    path, counts, obs = _screen(tmp_path, n_per_target=150)
+    order = np.argsort(obs["perturbation"].astype(str).to_numpy(), kind="stable")
+    counts, obs = counts[order], obs.iloc[order]
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "log_total_counts"],
+                                    min_cells=1, chunk_size=chunk_size, n_jobs=4, verbose=False))
+    _, effect, *_ = _reference(counts, obs, ["lane", "log_total_counts"])
+    np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
+
+
+def test_collinear_but_identified_runs(tmp_path):
+    """A covariate duplicated under another name: rank-deficient, but every
+    perturbation's design lies within the controls', so effects are unique."""
+    path, counts, obs = _screen(tmp_path)
+    obs["lane_copy"] = obs["lane"].astype(str)
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "lane_copy"],
+                                    min_cells=1, verbose=False))
+    _, effect, *_ = _reference(counts, obs, ["lane"])
+    np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
+
+
+def test_unidentified_effect_raises(tmp_path):
+    """Among the controls donor and lane coincide, so the fit cannot tell
+    them apart; target A's cells pair them differently, so its effect would
+    be arbitrary."""
+    path, counts, obs = _screen(tmp_path)
+    obs["lane"] = obs["lane"].astype(str)
+    control = (obs["perturbation"] == "ctrl").to_numpy()
+    lane = np.where(control, np.where(np.arange(len(obs)) % 2, "L1", "L2"), "L1")
+    donor = np.where(control, np.where(lane == "L1", "D1", "D2"), "D1")
+    donor[(obs["perturbation"] == "A").to_numpy()] = "D2"
+    obs["lane"], obs["donor"] = lane, donor
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    with pytest.raises(ValueError, match=r"arbitrary: \['A'\]"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "donor"], min_cells=1,
+                            verbose=False)
+
+
+def test_refuses_normalised_rows_after_the_first_chunk(tmp_path):
+    path, counts, obs = _screen(tmp_path)
+    mixed = counts.astype(np.float64)
+    mixed[200:] = np.log1p(mixed[200:])
+    ad.AnnData(sp.csr_matrix(mixed), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    with pytest.raises(ValueError, match="raw counts"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], chunk_size=100,
+                            verbose=False)
+
+
+def test_memory_guard_counts_per_thread_arrays(tmp_path):
+    """The per-thread cross-products exceed the budget though the
+    perturbations x genes arrays alone would fit."""
+    path, *_ = _screen(tmp_path)
+    budget_gb = 8 * len(GENES) * 3 * 4 * 1.5 / 1e9
+    with pytest.raises(MemoryError, match="thread"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "score"], min_cells=1,
+                            n_jobs=1, memory_limit_gb=budget_gb, verbose=False)
+
+
+def test_disk_usage_estimate_includes_scratch_copy(tmp_path):
+    path, *_ = _screen(tmp_path, fmt="csc")
+    kwargs = dict(perturbation_column="perturbation", control_label="ctrl", min_cells=1)
+    converting = cx.estimate_disk_usage("residual_effects", path, format_mismatch_policy="convert", **kwargs)
+    assert converting["scratch"].required_bytes > 0
+    assert "scratch" not in cx.estimate_disk_usage("residual_effects", path, format_mismatch_policy="off", **kwargs)
+
+
+def test_format_mismatch_policy_convert(tmp_path):
+    path, counts, obs = _screen(tmp_path, fmt="csc")
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1,
+                                    format_mismatch_policy="convert", verbose=False))
+    _, effect, *_ = _reference(counts, obs, ["lane"])
+    np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
+    assert not list(tmp_path.glob(".cx_*"))
+    with pytest.raises(ValueError, match="format_mismatch_policy"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"],
+                            format_mismatch_policy="never", verbose=False)
 
 
 def test_results_do_not_depend_on_n_jobs(tmp_path):

@@ -1490,6 +1490,8 @@ def _residual_effects_rows(
     groups: np.ndarray,
     target_rows: np.ndarray,
     target_bounds: np.ndarray,
+    edge_groups: np.ndarray,
+    edges: np.ndarray,
     control_rows: np.ndarray,
     control_bounds: np.ndarray,
     category_columns: np.ndarray,
@@ -1519,16 +1521,20 @@ def _residual_effects_rows(
 
     Work is split into segments run in parallel, without locks: segment
     ``w`` handles ``target_rows[target_bounds[w]:target_bounds[w + 1]]``
-    (rows ordered by group and cut at group boundaries, so no two segments
-    write the same row of ``sums``) and ``control_rows[control_bounds[w]:
-    control_bounds[w + 1]]``, into its own ``control_xty[w]`` and
-    ``control_sumsq[w]``. The controls' sum is the intercept column of
-    ``control_xty``, so they do not touch ``sums``.
+    and ``control_rows[control_bounds[w]:control_bounds[w + 1]]``, the
+    latter into its own ``control_xty[w]`` and ``control_sumsq[w]``. Target
+    rows are ordered by group, so only a segment's first and last group can
+    be shared with another segment: rows of ``edge_groups[w, k]`` go to
+    ``edges[w, k]`` (zeroed here) instead of ``sums``, for the caller to add
+    in afterwards; every other group belongs to one segment alone. The
+    controls' sum is the intercept column of ``control_xty``, so they do not
+    touch ``sums``.
     """
     n_categories = category_columns.shape[1]
     n_continuous = continuous_columns.shape[0]
     base = indptr[0]
     for w in nb.prange(target_bounds.shape[0] - 1):
+        edges[w] = 0.0
         for i in range(target_bounds[w], target_bounds[w + 1]):
             r = target_rows[i]
             total, mito_counts = _row_totals(indptr, indices, data, is_mito, r, base)
@@ -1538,8 +1544,14 @@ def _residual_effects_rows(
                 continue
             scale = 1e4 / total
             group = groups[r]
+            if group == edge_groups[w, 0]:
+                acc = edges[w, 0]
+            elif group == edge_groups[w, 1]:
+                acc = edges[w, 1]
+            else:
+                acc = sums[group]
             for j in range(indptr[r] - base, indptr[r + 1] - base):
-                sums[group, indices[j]] += math.log1p(data[j] * scale)
+                acc[indices[j]] += math.log1p(data[j] * scale)
         xty = control_xty[w]
         sumsq = control_sumsq[w]
         for i in range(control_bounds[w], control_bounds[w + 1]):

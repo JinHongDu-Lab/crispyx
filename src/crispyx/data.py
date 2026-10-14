@@ -8,6 +8,7 @@ import re as _re
 import socket as _socket
 import tempfile
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1327,6 +1328,8 @@ def iter_matrix_chunks(
     matrix: np.ndarray | sp.spmatrix | None = None,
     start_chunk: int = 0,
     warn_slow_axis: bool = True,
+    selected: np.ndarray | None = None,
+    read_ahead: bool = False,
 ) -> Iterator[tuple[slice, np.ndarray | sp.spmatrix]]:
     """Yield chunks of ``matrix`` (defaults to ``adata.X``).
 
@@ -1337,6 +1340,11 @@ def iter_matrix_chunks(
     ``warn_slow_axis=False`` suppresses the one-time logger warning about
     streaming a compressed matrix off its fast axis; callers that already
     resolved that decision through :func:`stream_on_fast_axis` pass it.
+    ``selected``, a boolean mask along ``axis``, skips (without reading) the
+    chunks that hold no selected entry; the chunks yielded are whole.
+    ``read_ahead=True`` reads the next chunk on a background thread while the
+    caller works on the current one -- worth it when that work releases the
+    GIL (a numba kernel), so reading and computing overlap.
     """
 
     if axis not in (0, 1):
@@ -1349,7 +1357,8 @@ def iter_matrix_chunks(
     n_obs, n_vars = adata.n_obs, adata.n_vars
     length = n_obs if axis == 0 else n_vars
     read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
-    for start in range(start_chunk * chunk_size, length, chunk_size):
+
+    def read(start: int) -> tuple[slice, np.ndarray | sp.spmatrix]:
         end = min(start + chunk_size, length)
         if read_block is not None:
             block = read_block(start, end)
@@ -1359,7 +1368,31 @@ def iter_matrix_chunks(
             block = matrix[:, start:end]
         if convert_to_dense:
             block = _to_dense(block)
-        yield slice(start, end), block
+        return slice(start, end), block
+
+    starts = chunk_starts(length, chunk_size, start_chunk=start_chunk, selected=selected)
+    if not read_ahead:
+        for start in starts:
+            yield read(start)
+        return
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cx_read_ahead") as pool:
+        pending = pool.submit(read, starts[0]) if starts else None
+        for i in range(len(starts)):
+            chunk = pending.result()
+            pending = pool.submit(read, starts[i + 1]) if i + 1 < len(starts) else None
+            yield chunk
+
+
+def chunk_starts(
+    length: int, chunk_size: int, *, start_chunk: int = 0, selected: np.ndarray | None = None,
+) -> list[int]:
+    """First index of each chunk :func:`iter_matrix_chunks` reads: every
+    ``chunk_size``-th from chunk ``start_chunk`` on, less those holding no
+    ``selected`` entry."""
+    starts = range(start_chunk * chunk_size, length, chunk_size)
+    if selected is None:
+        return list(starts)
+    return [start for start in starts if selected[start : start + chunk_size].any()]
 
 
 def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars: int):
@@ -1549,20 +1582,13 @@ def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
     backed = read_backed(segment.source_path)
     try:
         matrix = segment.read_matrix(backed)
-        n_obs, n_vars = backed.n_obs, backed.n_vars
-        fmt = _detect_backed_sparse_format(matrix)
-        if fmt == "csc":
-            _warn_slow_axis(fmt, 0)
-        read_block = _decoded_block_reader(matrix, fmt, 0, n_obs, n_vars) or (
-            lambda start, end: matrix[start:end]
-        )
-        all_columns = _keeps_all_columns(segment.gene_indices, n_vars)
-        for start in range(0, n_obs, chunk_size):
-            local_mask = segment.cell_mask[start : start + chunk_size]
-            if not np.any(local_mask):
-                continue
-            block = read_block(start, min(start + chunk_size, n_obs))
-            if not np.all(local_mask):
+        all_columns = _keeps_all_columns(segment.gene_indices, backed.n_vars)
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix,
+            selected=segment.cell_mask,
+        ):
+            local_mask = segment.cell_mask[slc]
+            if not local_mask.all():
                 block = block[local_mask]
             if all_columns:
                 yield block
@@ -2609,26 +2635,28 @@ def _thin_csr_chunk(indptr: np.ndarray, data: np.ndarray, target: int, seeds: np
         row[:] = rng.multivariate_hypergeometric(row, target)
 
 
-def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> None:
-    """Raise if a chunk's values don't look like non-negative integer counts.
+def _looks_like_counts(values: np.ndarray) -> bool:
+    """Whether ``values`` are all finite, non-negative integers."""
+    if values.dtype.kind in "biu":
+        return values.size == 0 or values.min() >= 0
+    return bool(
+        np.isfinite(values).all() and (values >= 0).all() and (values == np.rint(values)).all()
+    )
 
-    :func:`downsample_counts` casts ``X`` to int64 and thins it; running it
-    on already-normalized/log1p data would silently truncate fractional
-    values instead of raising, and (since normalized values are typically
-    far below any reasonable ``counts_per_cell``) mostly no-op.
+
+def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> None:
+    """Raise unless a chunk's values are non-negative integer counts.
+
+    For functions that transform raw counts themselves (thinning them,
+    normalising them): given already normalised or log-transformed data they
+    would otherwise not fail but silently return something meaningless.
     """
     values = chunk.data if sp.issparse(chunk) else np.asarray(chunk)
-    if values.size == 0:
-        return
-    if np.any(values < 0):
+    if not _looks_like_counts(values):
         raise ValueError(
-            f"{context}: X contains negative values. downsample_counts requires "
-            "non-negative integer counts, not normalized/log-transformed data."
-        )
-    if not np.all(np.isclose(values, np.round(values))):
-        raise ValueError(
-            f"{context}: X contains non-integer values. downsample_counts requires "
-            "raw integer counts -- run it before cx.pp.normalize_total_log1p, not after."
+            f"{context} needs raw counts, but X holds non-integer, negative or "
+            "non-finite values (already normalised or log-transformed?). Pass a "
+            "file, or point X at a layer, of raw integer counts."
         )
 
 
