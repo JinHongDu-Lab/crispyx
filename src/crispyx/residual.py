@@ -73,19 +73,17 @@ def residual_effects(
 ) -> AnnData:
     """Perturbation effects adjusted for covariates by a model fitted on controls.
 
-    The estimator of Feng et al. (2025, Cell Genomics): every gene's
-    ``log1p(CP10k)`` expression is regressed by ordinary least squares on the
-    covariates over the control cells only; a perturbation's effect is the mean,
-    over its cells, of observed minus predicted expression. Cell-line, donor,
-    lane, depth or mitochondrial differences between a perturbation's cells and
-    the controls are thereby removed rather than read as an effect.
+    The method of Feng et al. (2025, Cell Genomics). Each gene's
+    ``log1p(CP10k)`` expression is fitted to the covariates by least squares
+    over the control cells only; a perturbation's effect is the mean, over its
+    cells, of observed minus fitted expression. Differences in donor, lane or
+    batch between a perturbation's cells and the controls are thereby removed
+    rather than read as an effect.
 
-    Everything is computed in one streaming pass over the rows of the raw count
-    matrix, which collects per-perturbation sums of ``log1p(CP10k)``, the
-    controls' cross-products with the covariates and their sums of squares. The
-    mean residual of perturbation ``t`` is ``mean_t(y) - mean_t(x) @ B``, so no
-    per-cell residual is ever formed and memory is one perturbations x genes
-    array.
+    Everything comes from one pass over the rows of the raw counts. The mean
+    residual of perturbation ``t`` is ``mean_t(y) - mean_t(x) @ B``, so only
+    per-perturbation sums and the controls' cross-products are kept, never a
+    per-cell residual; memory is one perturbations x genes array.
 
     Parameters
     ----------
@@ -103,41 +101,36 @@ def residual_effects(
         Label of the control cells the model is fitted on. Inferred from common
         patterns when omitted.
     covariates
-        Required; there is no default, because the right set depends on what
-        the perturbation can change. Adjust for what describes how a cell was
-        processed -- donor, lane, batch -- which no perturbation affects. A
-        covariate the perturbation itself changes (depth, mitochondrial share,
-        cell cycle) removes part of the effect: on a genome-scale CD4+ T-cell
-        screen, adding ``log_total_counts`` and ``mito_fraction`` to donor and
-        lane nearly doubled the share of the authors' hits estimated with the
-        opposite sign (2.3% to 4.1%; see the residual-effects tutorial). Use
-        them only when the effect at equal depth is the question.
-
-        Terms of the model, besides the intercept. Each is an ``obs`` column --
-        one-hot coded (first level dropped) when categorical, string or boolean,
-        entered as is when numeric -- or one of the two quantities computed from
-        the counts during the pass:
+        Terms of the model besides the intercept; required, with no default.
+        Each is an ``obs`` column (one-hot coded, first level dropped, when
+        categorical, string or boolean; used as is when numeric) or one of two
+        values computed from the counts:
 
         * ``"log_total_counts"``: natural log of the cell's total counts;
         * ``"mito_fraction"``: share of the cell's counts in genes whose symbol
           starts with ``MT-``.
 
-        An ``obs`` column with one of these names raises instead of being used
-        silently. Interactions (e.g. lane x donor) and other per-cell scores
-        (cell cycle) are ``obs`` columns computed beforehand. Every level of a
-        categorical covariate must occur among the controls. Collinear
-        covariates are accepted as long as every reported perturbation's
-        effect stays unique -- its cells' mean design row is a combination of
-        the controls' rows; a perturbation whose effect would depend on how
-        the fit splits the collinear columns raises instead. ``[]`` gives the
-        unadjusted mean difference from the controls.
+        Adjust for how cells were processed (donor, lane, batch), which no
+        perturbation changes. Avoid what the perturbation itself can change
+        (depth, mitochondrial share, cell cycle): adjusting for it removes part
+        of the effect. On the CD4+ T-cell screen of the residual-effects
+        tutorial, adding depth and mitochondrial share to donor and lane
+        raised the share of the authors' hits given the opposite sign from
+        0.6% to 1.9%.
+
+        ``[]`` gives the plain difference from the controls. Interactions
+        (lane x donor) and other scores are ``obs`` columns made beforehand.
+        Every level of a categorical covariate must occur among the controls,
+        and an ``obs`` column named like a computed value raises. Collinear
+        covariates are fine unless a perturbation's effect would then depend
+        on how the fit splits them, which raises.
     null
         Spread the z-score divides by:
 
         * ``"model"`` (the paper's test): ``sigma_g / sqrt(n_t)``, with
           ``sigma_g`` the residual standard deviation of the control fit.
           Treats cells as independent; cells sharing a guide or donor are not,
-          which makes it anti-conservative.
+          so it calls too many hits.
         * ``"robust"``: ``s_g / sqrt(n_t)``, with ``s_g`` 1.4826 x the median
           absolute deviation, over perturbations, of ``effect * sqrt(n_t)``. It
           assumes most perturbations leave gene ``g`` unchanged -- true for

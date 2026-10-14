@@ -7,22 +7,22 @@ Version 0.1.10
 *Not yet released.*
 
 * **New: ``cx.tl.residual_effects``** (also ``cx.residual_effects``), the
-  covariate-adjusted estimator of Feng et al. (2025). Each gene's
-  ``log1p(CP10k)`` expression is regressed on the covariates over the control
-  cells, and a perturbation's effect is its cells' mean residual, tested
-  against the control fit's residual spread (``null="model"``) or the spread
-  across perturbations (``null="robust"``). ``covariates`` is required:
-  ``obs`` columns, plus ``log_total_counts`` and ``mito_fraction`` computed
-  from the counts. Adjust for donor, lane or batch; depth and mitochondrial
-  share are changed by many perturbations, and adjusting for them removes
-  part of the effect.
-  One streaming pass over the raw counts; cells with a missing label are not
-  used. Collinear covariates are accepted only while every perturbation's
-  effect stays unique, and every chunk is checked for raw counts.
+  covariate-adjusted effects of Feng et al. (2025). Each gene is fitted to
+  the covariates over the control cells, and a perturbation's effect is its
+  cells' mean residual. z-scores use the control fit's noise
+  (``null="model"``) or the spread across perturbations (``null="robust"``).
+  ``covariates`` is required: ``obs`` columns, plus ``log_total_counts`` and
+  ``mito_fraction`` computed from the counts. Adjust for donor, lane or
+  batch; many perturbations change depth and mitochondrial share, so
+  adjusting for those removes part of the effect.
+  One pass over the raw counts on disk; cells with a missing label are not
+  used. Every chunk is checked for raw counts, and collinear covariates raise
+  when they would make a perturbation's effect arbitrary.
   ``format_mismatch_policy`` and ``cx.estimate_disk_usage`` cover the
-  temporary CSR copy of a CSC source. On 5.6 million CD4+ T cells (21.5 billion non-zeros) it runs in under
-  8 minutes on 32 cores with 11 GB of memory. New tutorial on that screen,
-  comparing the estimates with the authors' own.
+  temporary CSR copy of a CSC source. On 7.4 million CD4+ T cells (27.6
+  billion non-zeros) one call takes under 2 minutes on 32 cores with the file
+  in the page cache. New tutorial on that screen: a comparison with the
+  authors' estimates, and a check on held-out donors.
 * **Faster: streaming a sparse matrix along its fast axis** slices
   uncompressed files directly instead of through anndata (about twice as
   fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row
