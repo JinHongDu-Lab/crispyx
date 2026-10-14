@@ -3606,6 +3606,7 @@ def nb_glm_test(
                         min_total_count=min_total_count,
                         max_iter=max_iter,
                         tol=tol,
+                        min_mu=min_mu,
                         poisson_init_iter=poisson_init_iter,
                         dispersion_method=dispersion_method,
                         global_dispersion=global_dispersion,

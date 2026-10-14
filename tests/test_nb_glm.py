@@ -185,6 +185,26 @@ def test_nb_glm_test_pipeline(tmp_path):
     assert diff_result.pvalue.shape[0] == n_genes
 
 
+def test_nb_glm_covariates_in_parallel_match_serial(tmp_path):
+    """Covariates with enough perturbations (four or more) to fit on worker processes."""
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 180, 4
+    perturbations = np.repeat(["control", "g1", "g2", "g3", "g4", "g5"], n_cells // 6)
+    covariate = rng.normal(size=n_cells)
+    mu = np.exp(0.5 + 0.3 * covariate[:, None] + 0.4 * (perturbations == "g1")[:, None]) * np.ones((1, n_genes))
+    counts = _generate_nb_counts(rng, mu.ravel(), 0.5).reshape(n_cells, n_genes)
+    adata = ad.AnnData(counts, obs=pd.DataFrame({"perturbation": perturbations, "covariate": covariate}),
+                       var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "synthetic.h5ad"
+    adata.write(path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["covariate"],
+                  min_cells_expressed=0, verbose=False)
+    serial = nb_glm_test(path, n_jobs=1, output_path=tmp_path / "serial.h5ad", **kwargs)
+    parallel = nb_glm_test(path, n_jobs=2, output_path=tmp_path / "parallel.h5ad", **kwargs)
+    assert parallel.groups == serial.groups == ["g1", "g2", "g3", "g4", "g5"]
+    np.testing.assert_allclose(parallel.statistics, serial.statistics, rtol=1e-8, equal_nan=True)
+
+
 def test_nb_glm_agrees_with_statsmodels_and_deseq2():
     if DeseqDataSet is None or DeseqStats is None:
         pytest.skip("pydeseq2 is not installed")
