@@ -73,7 +73,8 @@ def residual_effects(
 ) -> AnnData:
     """Perturbation effects adjusted for covariates by a model fitted on controls.
 
-    The method of Feng et al. (2025, Cell Genomics). Each gene's
+    The method of Feng et al. (2026, Cell Genomics,
+    doi:10.1016/j.xgen.2025.101076). Each gene's
     ``log1p(CP10k)`` expression is fitted to the covariates by least squares
     over the control cells only; a perturbation's effect is the mean, over its
     cells, of observed minus fitted expression. Differences in donor, lane or

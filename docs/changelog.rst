@@ -7,7 +7,8 @@ Version 0.1.10
 *Not yet released.*
 
 * **New: ``cx.tl.residual_effects``** (also ``cx.residual_effects``), the
-  covariate-adjusted effects of Feng et al. (2025). Each gene is fitted to
+  covariate-adjusted effects of Feng et al. (2026, `doi:10.1016/j.xgen.2025.101076
+  <https://doi.org/10.1016/j.xgen.2025.101076>`_). Each gene is fitted to
   the covariates over the control cells, and a perturbation's effect is its
   cells' mean residual. z-scores use the control fit's noise
   (``null="model"``) or the spread across perturbations (``null="robust"``).
