@@ -910,7 +910,6 @@ class _ToolsNamespace:
                 "covariates",
                 "dispersion",
                 "fit_method",
-                "share_dispersion",
                 "max_iter",
                 "tol",
                 "poisson_init_iter",

@@ -1987,6 +1987,67 @@ def estimate_dispersion_map(
         return np.exp(np.clip(best_log_alpha, log_min, log_max))
 
 
+def estimate_glm_map_dispersion(
+    design: ArrayLike,
+    counts: ArrayLike,
+    *,
+    offset: ArrayLike,
+    size_factors: ArrayLike,
+    max_iter: int = 25,
+    tol: float = 1e-6,
+    poisson_init_iter: int = 5,
+    dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
+    min_mu: float = 0.0,
+    min_total_count: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-gene MAP dispersion of an NB GLM, and the trend it is shrunk toward.
+
+    The dispersion step of DESeq2: fit the GLM to every gene (with
+    ``dispersion_method`` estimates), fit a mean-dispersion trend to those
+    estimates, then take each gene's maximum a posteriori dispersion at the
+    fitted means under a log-normal prior centred on the trend. A gene whose
+    fit did not converge is evaluated at its normalised counts, and one with
+    no finite estimate takes the trend value.
+
+    Parameters
+    ----------
+    design
+        Design matrix of shape ``(n_samples, n_features)``.
+    counts
+        Count matrix of shape ``(n_samples, n_genes)``.
+    offset
+        Log size factors, shape ``(n_samples,)``.
+    size_factors
+        Size factors, shape ``(n_samples,)``, for the normalised means.
+    max_iter, tol, poisson_init_iter, dispersion_method, min_mu, min_total_count
+        As for :func:`fit_nb_glm_batch_auto`.
+
+    Returns
+    -------
+    dispersion, trend
+        Arrays of shape ``(n_genes,)``.
+    """
+    design = np.asarray(design, dtype=np.float64)
+    Y = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    size_factors = np.asarray(size_factors, dtype=np.float64)
+    fit = fit_nb_glm_batch_auto(
+        design, Y, offset=offset, max_iter=max_iter, tol=tol,
+        poisson_init_iter=poisson_init_iter, dispersion_method=dispersion_method,
+        min_mu=min_mu, min_total_count=min_total_count,
+    )
+    normalised = Y / size_factors[:, None]
+    trend = fit_dispersion_trend(normalised.mean(axis=0), fit.dispersion)
+    mu = np.exp(np.clip(offset[:, None] + design @ fit.coef.T, -30, 30))
+    mu[:, ~fit.converged] = normalised[:, ~fit.converged]
+    dispersion = estimate_dispersion_map(
+        Y, np.maximum(mu, 1e-10), trend, max_disp=max(10.0, float(Y.shape[0])),
+    )
+    missing = ~np.isfinite(dispersion)
+    dispersion[missing] = trend[missing]
+    return dispersion, trend
+
+
 def _estimate_apeglm_prior_scale(
     mle_lfc: np.ndarray,
     se: np.ndarray,
@@ -5745,6 +5806,7 @@ def fit_nb_glm_batch_auto(
     min_mu: float = 0.0,
     min_total_count: float = 1.0,
     ridge_penalty: float = 1e-6,
+    fixed_dispersion: ArrayLike | None = None,
 ) -> NBGLMBatchResult:
     """Fit a batch NB GLM, using the structured solver when it pays.
 
@@ -5775,6 +5837,9 @@ def fit_nb_glm_batch_auto(
     offset, max_iter, tol, poisson_init_iter, dispersion_method, min_mu,
     min_total_count, ridge_penalty
         As for :class:`NBGLMBatchFitter`.
+    fixed_dispersion
+        Per-gene dispersion of shape ``(n_genes,)`` to hold fixed instead of
+        estimating it; ``dispersion_method`` is then unused.
     """
     design = np.asarray(design, dtype=np.float64)
     n_features = design.shape[1]
@@ -5792,7 +5857,7 @@ def fit_nb_glm_batch_auto(
             design, offset=offset, max_iter=max_iter, tol=tol,
             poisson_init_iter=poisson_init_iter, dispersion_method=dispersion_method,
             min_mu=min_mu, min_total_count=min_total_count, ridge_penalty=ridge_penalty,
-        ).fit_batch(counts)
+        ).fit_batch(counts, fixed_dispersion=fixed_dispersion)
 
     counts = np.asarray(
         counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
@@ -5817,7 +5882,10 @@ def fit_nb_glm_batch_auto(
         design[:, covariate_columns], design[:, group_columns], offset=offset,
         family="nb", max_iter=max_iter, tol=tol, ridge=ridge_penalty,
         min_mu=min_mu, dispersion_method=dispersion_method,
-    ).fit_batch(counts[:, valid], return_mu=False, return_dev_resid=False)
+    ).fit_batch(
+        counts[:, valid], return_mu=False, return_dev_resid=False,
+        dispersion=None if fixed_dispersion is None else np.asarray(fixed_dispersion, dtype=np.float64)[valid],
+    )
 
     n_covariates = covariate_columns.size
     coef[np.ix_(valid_indices, covariate_columns)] = result.coef[:, :n_covariates]
