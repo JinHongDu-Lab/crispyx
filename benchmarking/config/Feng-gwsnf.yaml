@@ -27,12 +27,12 @@ parallel_config:
 # result equals the full run's. Sizes keep the run inside the 24 h method
 # limit; the same size and seed as PyDESeq2 selects the same perturbations.
 scanpy_max_perturbations:
-  wilcoxon: 40
+  wilcoxon: 25
 scanpy_subset_seed: 0
 method_resource_limits:
   scanpy_de_wilcoxon:
     memory_limit: 240.0
-    time_limit: 86400  # 24 h, as for the other large datasets
+    time_limit: 259200  # 72 h: >30 min per perturbation against a 200k+-cell control
 
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
