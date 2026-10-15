@@ -29,6 +29,18 @@ Version 0.1.10
 * **Fixed: ``nb_glm_test`` with covariates** crashed with ``TypeError``
   (missing ``min_mu``) whenever four or more perturbations were fitted on
   worker processes.
+* **Faster: ``nb_glm_test`` with covariates** estimates each gene's
+  dispersion once, on the control cells with the covariates (DESeq2's MAP
+  step), and fits every comparison at that dispersion, as
+  ``dispersion_scope="global"`` (the default) already did without
+  covariates; before, the option was ignored and every comparison re-ran the
+  dispersion search. About twice as fast on the tutorial's pseudo-bulk, and
+  slightly closer to the authors' DESeq2 estimates. The dispersion is stored
+  once in ``var``. ``dispersion_scope="per_comparison"`` keeps the old fit.
+* **Fixed: ``nb_glm_test(dispersion=...)``** was accepted but never used; a
+  fixed dispersion now applies to every gene and comparison.
+* **Removed: ``nb_glm_test(share_dispersion=...)``**, which was accepted but
+  never used; ``dispersion_scope="global"`` is that option.
 * **Faster: streaming a sparse matrix along its fast axis** slices
   uncompressed files directly instead of through anndata (about twice as
   fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row
