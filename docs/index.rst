@@ -61,6 +61,7 @@ Key features
    notebooks/batch_statistics_tutorial
    notebooks/residual_effects_tutorial
    notebooks/residual_effects_feng_tutorial
+   notebooks/stratified_wilcoxon_tutorial
    comparison
    faq
 

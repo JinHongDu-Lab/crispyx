@@ -103,8 +103,11 @@ Elteren's test).
   from ``normalized_effects``. The model-based standard error treats cells as
   independent, so it is too small when cells of one guide or donor move
   together; the robust one does not assume that but is noisy with few batches.
-- **Tutorial:** Part 3 of :doc:`notebooks/residual_effects_feng_tutorial`
-  compares pooled and stratified controls.
+- **Tutorials:** :doc:`notebooks/stratified_wilcoxon_tutorial` (effects,
+  standard errors and p-values per batch on the Feng *et al.* targeted
+  screen, with a calibration check on fake targets); Part 3 of
+  :doc:`notebooks/residual_effects_feng_tutorial` compares pooled and
+  stratified controls for the Wilcoxon test alone.
 
 ``residual_effects``: effects from a control-fitted model
 ---------------------------------------------------------

@@ -14,6 +14,13 @@ Unreleased
   data is one batch, so the effect and its standard error are the plain
   two-sample ones; that path now streams through the same code, one pass
   however many perturbations there are.
+  Its per-(perturbation, batch) sums stay in memory when they fit half the
+  memory budget, and go to temporary files otherwise (they always went to
+  disk); ``perturbation_column`` and ``batch_column`` may be ``pd.Series``
+  indexed by cell, as in ``wilcoxon_test`` and ``residual_effects``. Checked
+  against the effects and standard errors Liu et al. published for the Feng
+  et al. targeted screen: they agree to float32 precision. New tutorial,
+  *Batch-corrected effects and Wilcoxon tests*, on that screen.
 * **Fixed: ``t_test`` with a one-cell group.** A perturbation (or control)
   with a single cell has no variance estimate; it was treated as zero, so
   the test used the other side's standard error alone and reported nearly
