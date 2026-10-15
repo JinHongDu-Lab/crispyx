@@ -1,6 +1,53 @@
 Changelog
 =========
 
+Version 0.1.10
+--------------
+
+*Not yet released.*
+
+* **New: ``cx.tl.residual_effects``** (also ``cx.residual_effects``), the
+  covariate-adjusted effects of Feng et al. (2026, `doi:10.1016/j.xgen.2025.101076
+  <https://doi.org/10.1016/j.xgen.2025.101076>`_). Each gene is fitted to
+  the covariates over the control cells, and a perturbation's effect is its
+  cells' mean residual. z-scores use the control fit's noise
+  (``null="model"``) or the spread across perturbations (``null="robust"``).
+  ``covariates`` is required: ``obs`` columns, plus ``log_total_counts`` and
+  ``mito_fraction`` computed from the counts. Adjust for donor, lane or
+  batch; many perturbations change depth and mitochondrial share, so
+  adjusting for those removes part of the effect.
+  One pass over the raw counts on disk; cells with a missing label are not
+  used. Every chunk is checked for raw counts, and collinear covariates raise
+  when they would make a perturbation's effect arbitrary.
+  ``format_mismatch_policy`` and ``cx.estimate_disk_usage`` cover the
+  temporary CSR copy of a CSC source. On 7.4 million CD4+ T cells (27.6
+  billion non-zeros) one call takes under 2 minutes on 32 cores with the file
+  in the page cache. New tutorial on that screen: ``residual_effects`` and
+  the authors' own model (``nb_glm_test`` on guide x donor pseudo-bulk,
+  which reproduces their estimates) against the authors' estimates, and a
+  calibration check on fake targets made of non-targeting guides.
+* **Fixed: ``nb_glm_test`` with covariates** crashed with ``TypeError``
+  (missing ``min_mu``) whenever four or more perturbations were fitted on
+  worker processes.
+* **Faster: ``nb_glm_test`` with covariates** estimates each gene's
+  dispersion once, on the control cells with the covariates (DESeq2's MAP
+  step), and fits every comparison at that dispersion, as
+  ``dispersion_scope="global"`` (the default) already did without
+  covariates; before, the option was ignored and every comparison re-ran the
+  dispersion search. About twice as fast on the tutorial's pseudo-bulk, and
+  slightly closer to the authors' DESeq2 estimates. The dispersion is stored
+  once in ``var``. ``dispersion_scope="per_comparison"`` keeps the old fit.
+* **Fixed: ``nb_glm_test(dispersion=...)``** was accepted but never used; a
+  fixed dispersion now applies to every gene and comparison.
+* **Removed: ``nb_glm_test(share_dispersion=...)``**, which was accepted but
+  never used; ``dispersion_scope="global"`` is that option.
+* **Faster: streaming a sparse matrix along its fast axis** slices
+  uncompressed files directly instead of through anndata (about twice as
+  fast), and ``write_filtered_subset`` / ``concat_h5ad`` no longer read row
+  chunks they do not keep or read rows just to count them.
+  ``iter_matrix_chunks`` takes ``selected`` (skip chunks without a selected
+  row) and ``read_ahead`` (read the next chunk on a background thread).
+
 Version 0.1.9
 -------------
 

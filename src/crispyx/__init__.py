@@ -93,6 +93,7 @@ from .qc import (
     filter_perturbations_by_cell_count,
     quality_control_summary,
 )
+from .residual import residual_effects
 from .sample import subsample
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,7 @@ __all__ = [
     "PseudobulkMethod",
     "aggregate_pseudobulk",
     "compute_normalized_effects",
+    "residual_effects",
     "compute_pseudobulk_effects",
     # Generic batch statistics
     "BatchReducer",

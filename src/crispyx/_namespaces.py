@@ -7,6 +7,7 @@ from typing import Iterable, Literal, Sequence
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 
 from ._grouping import resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
@@ -51,6 +52,7 @@ from .pseudobulk import (
     compute_normalized_effects,
     compute_pseudobulk_effects,
 )
+from .residual import ResidualNull, residual_effects
 from .qc import (
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
@@ -908,7 +910,6 @@ class _ToolsNamespace:
                 "covariates",
                 "dispersion",
                 "fit_method",
-                "share_dispersion",
                 "max_iter",
                 "tol",
                 "poisson_init_iter",
@@ -1029,6 +1030,52 @@ class _ToolsNamespace:
             profiling=profiling,
             memory_limit_gb=memory_limit_gb,
             verbose=verbose,
+        )
+
+    def residual_effects(
+        self,
+        data: str | Path | ad.AnnData,
+        perturbation_column: str | pd.Series,
+        control_label: str | None = None,
+        *,
+        covariates: Sequence[str],
+        null: ResidualNull = "model",
+        min_cells: int = 10,
+        min_control_mean: float = 0.1,
+        perturbations: Iterable[str] | None = None,
+        gene_name_column: str | None = None,
+        chunk_size: int | None = None,
+        n_jobs: int | None = None,
+        memory_limit_gb: float | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        data_name: str | None = None,
+        output_path: str | Path | None = None,
+        verbose: int | bool = True,
+        force: bool = False,
+    ) -> AnnData:
+        """Perturbation effects adjusted for covariates by a model fitted on controls.
+
+        See :func:`crispyx.residual.residual_effects` for the full parameter
+        documentation.
+        """
+        return residual_effects(
+            data,
+            perturbation_column,
+            control_label,
+            covariates=covariates,
+            null=null,
+            min_cells=min_cells,
+            min_control_mean=min_control_mean,
+            perturbations=perturbations,
+            gene_name_column=gene_name_column,
+            chunk_size=chunk_size,
+            n_jobs=n_jobs,
+            memory_limit_gb=memory_limit_gb,
+            format_mismatch_policy=format_mismatch_policy,
+            data_name=data_name,
+            output_path=output_path,
+            verbose=verbose,
+            force=force,
         )
 
     def compute_overlap(self, sets_dict, *, metric="both"):

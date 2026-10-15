@@ -115,6 +115,18 @@ rerunning when it was computed from the same input and arguments; pass
    :undoc-members:
    :show-inheritance:
 
+Covariate-adjusted effects
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`~crispyx.residual.residual_effects` fits each gene's ``log1p(CP10k)``
+expression on covariates (lane, donor, depth, mitochondrial share, ...) over
+the control cells and reports each perturbation's mean residual, in one
+streaming pass over the counts.
+
+.. automodule:: crispyx.residual
+   :members: residual_effects
+   :show-inheritance:
+
 GLM fitting
 ~~~~~~~~~~~
 

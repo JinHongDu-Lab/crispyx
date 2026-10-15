@@ -36,6 +36,7 @@ SCHEMAS = {
     "sorted": 1,
     "standardized": 1,
     "concat": 1,
+    "residual_effects": 1,
 }
 
 

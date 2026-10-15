@@ -24,6 +24,7 @@ from tqdm.auto import tqdm
 from . import _messages
 from .data import (
     AnnData,
+    _looks_like_counts,
     _detect_backed_sparse_format,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
@@ -175,8 +176,7 @@ def _check_looks_like_counts(
         values = block.data if sp.issparse(block) else np.asarray(block)
         if values.size == 0:
             continue
-        looks_like_counts = not np.any(values < 0) and np.all(np.isclose(values, np.round(values)))
-        if not looks_like_counts:
+        if not _looks_like_counts(values):
             warnings.warn(
                 "flavor='seurat_v3' expects raw count data, but non-integer or "
                 "negative values were found. Results may be unreliable.",

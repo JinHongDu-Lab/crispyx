@@ -177,12 +177,83 @@ def test_nb_glm_test_pipeline(tmp_path):
     exported = result.result_path
     assert exported.exists()
     exported_adata = ad.read_h5ad(exported)
-    assert "dispersion" in exported_adata.layers
+    # a fixed dispersion is one value per gene, stored once in var
+    np.testing.assert_allclose(exported_adata.var["dispersion"], alpha)
     assert "standard_error" in exported_adata.layers
 
     diff_result = result["g1"]
     assert diff_result.method == "nb_glm"
     assert diff_result.pvalue.shape[0] == n_genes
+
+
+def test_nb_glm_covariates_in_parallel_match_serial(tmp_path):
+    """Covariates with enough perturbations (four or more) to fit on worker processes."""
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 180, 4
+    perturbations = np.repeat(["control", "g1", "g2", "g3", "g4", "g5"], n_cells // 6)
+    covariate = rng.normal(size=n_cells)
+    mu = np.exp(0.5 + 0.3 * covariate[:, None] + 0.4 * (perturbations == "g1")[:, None]) * np.ones((1, n_genes))
+    counts = _generate_nb_counts(rng, mu.ravel(), 0.5).reshape(n_cells, n_genes)
+    adata = ad.AnnData(counts, obs=pd.DataFrame({"perturbation": perturbations, "covariate": covariate}),
+                       var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "synthetic.h5ad"
+    adata.write(path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["covariate"],
+                  min_cells_expressed=0, verbose=False)
+    serial = nb_glm_test(path, n_jobs=1, output_path=tmp_path / "serial.h5ad", **kwargs)
+    parallel = nb_glm_test(path, n_jobs=2, output_path=tmp_path / "parallel.h5ad", **kwargs)
+    assert parallel.groups == serial.groups == ["g1", "g2", "g3", "g4", "g5"]
+    np.testing.assert_allclose(parallel.statistics, serial.statistics, rtol=1e-8, equal_nan=True)
+
+
+def _covariate_screen(tmp_path, seed=11):
+    """Five perturbations, a continuous and a categorical covariate, gene-specific dispersion."""
+    rng = np.random.default_rng(seed)
+    n_cells, n_genes = 360, 30
+    perturbations = np.repeat(["control", "g1", "g2", "g3", "g4", "g5"], n_cells // 6)
+    depth = rng.normal(size=n_cells)
+    donor = rng.choice(["D1", "D2", "D3"], size=n_cells)
+    base = rng.uniform(0.5, 3.0, size=n_genes)
+    alpha = rng.uniform(0.1, 0.8, size=n_genes)
+    shift = (perturbations == "g1")[:, None] * np.where(np.arange(n_genes) < 5, 0.8, 0.0)
+    mu = np.exp(base + 0.3 * depth[:, None] + 0.2 * (donor == "D2")[:, None] + shift)
+    counts = rng.negative_binomial(1.0 / alpha, 1.0 / (1.0 + alpha * mu))
+    obs = pd.DataFrame({"perturbation": perturbations, "depth": depth, "donor": donor})
+    path = tmp_path / "covariates.h5ad"
+    ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])).write(path)
+    return path
+
+
+def test_nb_glm_global_dispersion_with_covariates(tmp_path):
+    """With covariates, dispersion_scope='global' estimates one dispersion per
+    gene on the controls and holds it fixed; its tests track per-comparison
+    estimation closely."""
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth", "donor"],
+                  min_cells_expressed=0, n_jobs=1, verbose=False)
+    shared = nb_glm_test(path, dispersion_scope="global", output_path=tmp_path / "global.h5ad", **kwargs)
+    separate = nb_glm_test(path, dispersion_scope="per_comparison", output_path=tmp_path / "per.h5ad", **kwargs)
+    shared_ad, separate_ad = ad.read_h5ad(shared.result_path), ad.read_h5ad(separate.result_path)
+    assert "dispersion" in shared_ad.var and "dispersion" not in shared_ad.layers
+    assert np.all(np.isfinite(shared_ad.var["dispersion"])) and np.all(shared_ad.var["dispersion"] > 0)
+    assert "dispersion" in separate_ad.layers
+    z_shared, z_separate = shared.statistics.ravel(), separate.statistics.ravel()
+    ok = np.isfinite(z_shared) & np.isfinite(z_separate)
+    assert np.corrcoef(z_shared[ok], z_separate[ok])[0, 1] > 0.98
+    assert np.all(np.abs(shared_ad.layers["z_score"][shared_ad.obs_names.get_loc("g1"), :5]) > 2)  # g1's shifted genes
+
+
+def test_nb_glm_fixed_dispersion_is_used(tmp_path):
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth", "donor"],
+                  min_cells_expressed=0, n_jobs=1, verbose=False)
+    low = nb_glm_test(path, dispersion=0.05, output_path=tmp_path / "low.h5ad", **kwargs)
+    high = nb_glm_test(path, dispersion=2.0, output_path=tmp_path / "high.h5ad", **kwargs)
+    low_ad, high_ad = ad.read_h5ad(low.result_path), ad.read_h5ad(high.result_path)
+    np.testing.assert_allclose(high_ad.var["dispersion"], 2.0)
+    low_se, high_se = low_ad.layers["standard_error"], high_ad.layers["standard_error"]
+    ok = np.isfinite(low_se) & np.isfinite(high_se)
+    assert ok.any() and np.all(high_se[ok] > low_se[ok])
 
 
 def test_nb_glm_agrees_with_statsmodels_and_deseq2():

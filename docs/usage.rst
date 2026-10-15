@@ -847,10 +847,12 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   ``nb_glm_test()``. This preserves large effects while shrinking 
   small/uncertain effects toward zero.
 
-* **Dispersion sharing** (``share_dispersion=True``): Estimate dispersion once 
-  using all cells (similar to PyDESeq2's approach). This provides more stable 
-  estimates when sample sizes are small or when you expect homogeneous 
-  dispersion across perturbations.
+* **Dispersion scope** (``dispersion_scope``): ``"global"`` (the default)
+  estimates each gene's dispersion once and uses it in every comparison -- from
+  all cells without covariates, and from the control cells with the covariate
+  design when ``covariates`` are given, as DESeq2 estimates dispersions once per
+  model. ``"per_comparison"`` re-estimates it for each comparison, which is
+  slower.
 
 * **Memory limit** (``memory_limit_gb``): Specify the maximum memory available
   for the analysis. For ``nb_glm_test()``, this affects chunk size calculation and
@@ -869,19 +871,11 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
 
 .. code-block:: python
 
-   # Basic NB-GLM (faster, per-perturbation dispersion)
+   # NB-GLM, one dispersion per gene shared by every comparison (the default)
    adata_de = cx.tl.rank_genes_groups(
        adata_ro,
        perturbation_column="perturbation",
        method="nb_glm",
-   )
-
-   # NB-GLM with shared dispersion
-   adata_de = cx.tl.rank_genes_groups(
-       adata_ro,
-       perturbation_column="perturbation",
-       method="nb_glm",
-       share_dispersion=True,
    )
 
 LFC shrinkage

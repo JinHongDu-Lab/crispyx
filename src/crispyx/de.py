@@ -59,6 +59,7 @@ from .glm import (
     NBGLMBatchFitter,
     ControlStatisticsCache,
     build_design_matrix,
+    estimate_glm_map_dispersion,
     fit_nb_glm_batch_auto,
     estimate_covariate_effects_streaming,
     estimate_dispersion_map,
@@ -1612,7 +1613,6 @@ def nb_glm_test(
     dispersion: float | None = None,
     dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
     dispersion_scope: Literal["global", "per_comparison"] = "global",
-    share_dispersion: bool = False,
     use_map_dispersion: bool = True,
     shrink_dispersion: bool = True,
     # ---- Optimization parameters ----
@@ -1715,7 +1715,8 @@ def nb_glm_test(
         median-of-ratios size factors without rescaling, which matches
         PyDESeq2's default behavior and can improve numerical alignment.
     dispersion
-        Fixed dispersion parameter for negative binomial. If None, estimates per gene.
+        Fixed NB dispersion used for every gene and comparison. If None, it is
+        estimated (see ``dispersion_scope``).
     dispersion_method
         Method for estimating dispersion when ``dispersion`` is None.
 
@@ -1725,18 +1726,17 @@ def nb_glm_test(
     dispersion_scope
         Scope for dispersion estimation.
 
-        - ``"global"`` (default): Precompute dispersion once using all cells (control +
-          all perturbations). This is ~10x faster for multi-perturbation datasets
-          since MAP dispersion estimation is done once instead of per-comparison.
-          Recommended when perturbation effects are expected to be small relative
-          to baseline expression (typical for CRISPR screens).
+        - ``"global"`` (default): Estimate each gene's dispersion once and use it in
+          every comparison. Without covariates it is estimated from all cells;
+          with covariates, from the control cells fitted with the covariates
+          (DESeq2's MAP step), and each comparison is then one fit at that fixed
+          dispersion. This is many times faster than per-comparison estimation and
+          suits CRISPR screens, where perturbation effects are small relative to
+          baseline expression. Per-comparison size factors keep per-comparison
+          dispersion.
         - ``"per_comparison"``: Estimate dispersion separately for each control +
           perturbation comparison. More accurate when perturbations cause large
           changes in gene expression variance, but significantly slower.
-    share_dispersion
-        If True, estimate dispersion once using all cells, then use the same
-        dispersion values for all Wald tests. If False (default), estimate
-        dispersion separately for each perturbation comparison.
     use_map_dispersion
         If True (default), use MAP dispersion estimation with mean-dispersion trend.
         If False, use MLE dispersion without trend-based shrinkage.
@@ -2089,6 +2089,7 @@ def nb_glm_test(
     beta_cov = None
     beta_intercept = None
     global_dispersion = None
+    global_dispersion_trend = None
 
     # -------------------------------------------------------------------------
     # Worker function for parallel fitting of a single perturbation group
@@ -2324,6 +2325,7 @@ def nb_glm_test(
             dispersion_method=dispersion_method,
             min_mu=min_mu,
             min_total_count=min_total_count,
+            fixed_dispersion=None if global_dispersion is None else global_dispersion[valid_mask],
         )
 
         # Extract results
@@ -3348,6 +3350,42 @@ def nb_glm_test(
         len(covariates) == 0 and
         size_factor_scope == "global"
     )
+
+    # Without the control cache (covariates, or use_control_cache=False) the
+    # global dispersion is estimated here instead: once per gene, by DESeq2's
+    # MAP step on the control cells with the covariate design, then held fixed
+    # in every comparison -- one IRLS fit per comparison instead of a
+    # dispersion search per comparison.
+    if dispersion is not None:
+        global_dispersion = np.full(n_genes, float(dispersion))
+        global_dispersion_trend = global_dispersion
+    elif (
+        not can_use_cache
+        and dispersion_scope == "global"
+        and size_factor_scope == "global"
+        and shrink_dispersion
+        and use_map_dispersion
+        and control_matrix is not None
+    ):
+        logger.info("Estimating each gene's dispersion once, on the control cells (dispersion_scope='global')...")
+        control_design, _ = build_design_matrix(
+            obs_df.iloc[control_mask],
+            covariate_columns=covariates,
+            perturbation_indicator=np.zeros(control_n),
+            intercept=True,
+        )
+        global_dispersion, global_dispersion_trend = estimate_glm_map_dispersion(
+            np.delete(control_design, 1, axis=1),  # drop the all-zero perturbation column
+            control_matrix,
+            offset=offset[control_mask],
+            size_factors=np.asarray(size_factors)[control_mask],
+            max_iter=max_iter,
+            tol=tol,
+            poisson_init_iter=poisson_init_iter,
+            dispersion_method=dispersion_method,
+            min_mu=min_mu,
+            min_total_count=min_total_count,
+        )
         
     # =====================================================================
     # Early memory check: determine if we need streaming mode
@@ -3452,8 +3490,12 @@ def nb_glm_test(
                 control_matrix = None
                 gc.collect()
             
+        # A fixed dispersion replaces the precomputed global one
+        if global_dispersion is not None:
+            control_cache.global_dispersion = global_dispersion
+            control_cache.global_dispersion_trend = global_dispersion_trend
         # Precompute global dispersion if dispersion_scope='global'
-        if dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
+        elif dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
             logger.info("Precomputing global dispersion trend (dispersion_scope='global')...")
                 
             if use_streaming_mode:
@@ -3606,6 +3648,7 @@ def nb_glm_test(
                         min_total_count=min_total_count,
                         max_iter=max_iter,
                         tol=tol,
+                        min_mu=min_mu,
                         poisson_init_iter=poisson_init_iter,
                         dispersion_method=dispersion_method,
                         global_dispersion=global_dispersion,
@@ -3759,7 +3802,10 @@ def nb_glm_test(
     # A precomputed global dispersion is one value per gene, copied into
     # every perturbation's row; store it once in var. Otherwise dispersion
     # was estimated per comparison and stays a matrix.
-    global_dispersion_fit = control_cache is not None and control_cache.global_dispersion is not None
+    if control_cache is not None and control_cache.global_dispersion is not None:
+        global_dispersion = control_cache.global_dispersion
+        global_dispersion_trend = control_cache.global_dispersion_trend
+    global_dispersion_fit = global_dispersion is not None
     if not global_dispersion_fit:
         dispersion_matrix = np.array(dispersion_memmap)
         dispersion_raw_matrix = np.array(dispersion_raw_memmap)
@@ -3773,11 +3819,9 @@ def nb_glm_test(
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=gene_symbols)
     if global_dispersion_fit:
-        var["dispersion"] = control_cache.global_dispersion
+        var["dispersion"] = global_dispersion
         var["dispersion_trend"] = (
-            control_cache.global_dispersion_trend
-            if control_cache.global_dispersion_trend is not None
-            else control_cache.global_dispersion
+            global_dispersion_trend if global_dispersion_trend is not None else global_dispersion
         )
 
     # Convert from natural log to log2 if requested (PyDESeq2/edgeR convention).
