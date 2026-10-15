@@ -17,7 +17,8 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 - **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
 - **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
 - **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation
-- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with covariates and apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Covariate-adjusted effects** – `cx.tl.residual_effects` (Feng et al., 2026) fits each gene to covariates such as donor, lane or batch on the control cells only, and takes a perturbation's effect as the mean residual of its cells. Unlike the NB GLM, which fits the covariates on counts jointly with each perturbation, the control fit is shared by every perturbation, so a perturbation's own cells cannot shift its covariate adjustment, and all perturbations come from one streaming pass. On a 1.16-million-cell screen it reproduces the published effects and significance calls in under a minute.
 - **Storage-format aware** – Gene-streaming functions (`wilcoxon_test`, `batch_process`) can convert a CSR source once to a temporary, memory-bounded CSC copy beside the output instead of re-reading the whole matrix once per gene chunk; `format_mismatch_policy="auto"` (the default) measures the source's read throughput and does so only when the re-reads would really cost more than the conversion, so a small local file is streamed as-is and a large one on a network filesystem is converted; `convert_to_csc`/`convert_to_csr` honour `memory_limit_gb` and preserve the value dtype
 - **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
@@ -62,6 +63,30 @@ crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both spee
 <p align="center">
   <img src="docs/_static/fig2.png" width="800" alt="Benchmark results across 12 CRISPR screens: (a) dataset sizes, (b) completion status by method, (c) concordance with Scanpy, (d) runtime scaling, (e) peak memory scaling">
 </p>
+
+## Running on HPC
+
+crispyx reads its data from disk instead of loading it into memory, so where the files live matters as
+much as cores or memory. Clusters usually offer several kinds of storage:
+
+- **A parallel filesystem** (Lustre, GPFS, BeeGFS): large and fast for big sequential reads, but slow for
+  small random reads.
+- **Node-local disk** (`$TMPDIR` or `/tmp` on the compute node): fast for random access, but visible to
+  one node only and usually wiped when the job ends.
+- **Home and project directories:** often small and not meant for heavy I/O.
+
+Steps that stream a file chunk by chunk, such as QC, normalisation, `residual_effects` and pseudo-bulk,
+run well on a parallel filesystem. Steps that read or write cells and genes in scattered order do not:
+sorting cells (`sort_by_perturbation`), converting between CSR and CSC, `nb_glm_test` on a file that is
+not sorted by perturbation, and streaming a matrix along the axis it is not stored by. For those, copy
+the input to node-local disk, write outputs and temporary files there too (`output_path`, `TMPDIR`),
+and copy the results back before the job ends:
+
+```bash
+cp /parallel-fs/project/screen.h5ad "$TMPDIR"/
+python analysis.py --input "$TMPDIR/screen.h5ad" --output "$TMPDIR/results"
+cp -r "$TMPDIR/results" /parallel-fs/project/
+```
 
 ## Installation
 
