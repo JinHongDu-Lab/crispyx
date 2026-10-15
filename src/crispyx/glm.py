@@ -5834,8 +5834,7 @@ def fit_nb_glm_batch_auto(
         coefficient is the quantity being estimated.  ``clip_group`` bounds
         group coefficients, which is appropriate for nuisance level effects
         and not for an effect under test.
-    offset, max_iter, tol, poisson_init_iter, dispersion_method, min_mu,
-    min_total_count, ridge_penalty
+    offset, max_iter, tol, poisson_init_iter, dispersion_method, min_mu, min_total_count, ridge_penalty
         As for :class:`NBGLMBatchFitter`.
     fixed_dispersion
         Per-gene dispersion of shape ``(n_genes,)`` to hold fixed instead of
