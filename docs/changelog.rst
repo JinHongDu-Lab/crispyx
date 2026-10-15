@@ -15,6 +15,10 @@ Unreleased
   their result. Every writer now raises ``ValueError`` instead. Subset
   writes also go to a partial file renamed on success, so an interrupted
   ``subsample`` or QC filter leaves no half-written output.
+* **Fixed: cells with a missing perturbation label** were tested as a group
+  named ``"nan"`` by ``t_test``, ``wilcoxon_test`` and ``nb_glm_test``. They
+  are now in no comparison, as in ``residual_effects``. A labels Series with
+  ``NaN`` for some cells is accepted on the same terms.
 
 Version 0.1.10
 --------------

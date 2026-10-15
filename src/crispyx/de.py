@@ -398,6 +398,16 @@ def _load_layered_de_result(
     )
 
 
+# Cells with a missing label carry this, which no real group can be named, so
+# they fall into no comparison (``str(NaN)`` would make a group named "nan").
+_UNLABELLED = "\0unlabelled"
+
+
+def _label_strings(labels: pd.Series) -> np.ndarray:
+    """Per-cell labels as strings, missing ones as ``_UNLABELLED``."""
+    return labels.astype(object).where(labels.notna(), _UNLABELLED).astype(str).to_numpy()
+
+
 def _resolve_candidates(
     labels: np.ndarray,
     control_label: str,
@@ -428,7 +438,7 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    candidates = [label for label in unique if label != control_label]
+    candidates = [label for label in unique if label not in (control_label, _UNLABELLED)]
     if not candidates:
         raise ValueError("No perturbation groups available for differential expression testing")
     return candidates
@@ -475,14 +485,13 @@ def _align_labels(labels: pd.Series, obs_names: pd.Index) -> np.ndarray:
     if not labels.index.is_unique:
         raise ValueError("The labels Series must be indexed by cell, each cell once.")
     names = pd.Index(obs_names).astype(str)
-    aligned = labels.reindex(names)
-    missing = names[aligned.isna().to_numpy()]
+    missing = names[~names.isin(labels.index)]
     if len(missing):
         raise ValueError(
             f"The labels Series has no label for {len(missing)} of {len(names)} cells "
             f"(e.g. {missing[:3].tolist()}); index it by obs_names."
         )
-    return aligned.astype(str).to_numpy()
+    return _label_strings(labels.reindex(names))
 
 
 def _de_fingerprint(
@@ -1232,7 +1241,7 @@ def t_test(
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = _label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -2030,7 +2039,7 @@ def nb_glm_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
-        labels = obs_df[perturbation_column].astype(str).to_numpy()
+        labels = _label_strings(obs_df[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -5133,7 +5142,7 @@ def wilcoxon_test(
                 f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = (
-            backed.obs[perturbation_column].astype(str).to_numpy() if given_labels is None
+            _label_strings(backed.obs[perturbation_column]) if given_labels is None
             else _align_labels(given_labels, backed.obs_names)
         )
         control_label = resolve_control_label(labels, control_label)
@@ -6022,7 +6031,7 @@ def shrink_lfc(
         # Load original dataset for streaming
         backed = read_backed(original_path)
         try:
-            labels = backed.obs[perturbation_column].astype(str).to_numpy()
+            labels = _label_strings(backed.obs[perturbation_column])
             
             # Get or compute size factors
             size_factors_global = adata.uns.get("size_factors")
@@ -6255,7 +6264,7 @@ def _estimate_shape_for_t_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = _label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6275,7 +6284,7 @@ def _estimate_shape_for_nb_glm_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = _label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6303,7 +6312,7 @@ def _estimate_shape_for_wilcoxon_test(
         labels = (
             _align_labels(perturbation_column, backed.obs_names)
             if isinstance(perturbation_column, pd.Series)
-            else backed.obs[perturbation_column].astype(str).to_numpy()
+            else _label_strings(backed.obs[perturbation_column])
         )
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
