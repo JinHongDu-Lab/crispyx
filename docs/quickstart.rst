@@ -8,11 +8,11 @@ on commodity hardware without loading the full count matrix into memory.
 The typical workflow, with the guide page for each step:
 
 1. **Load** – open a dataset on disk (:doc:`data_preparation`)
-2. **QC** – filter cells, perturbations, and genes (:doc:`qc_normalisation`)
+2. **QC** – filter cells, perturbations, and genes (:doc:`quality_control`)
 3. **Preprocess** – normalise and log-transform, streaming (:doc:`large_data`
    covers the storage formats each step prefers)
-4. **HVG selection** – pick highly variable genes (:doc:`qc_normalisation`)
-5. **Dimension reduction** – PCA and KNN graph construction (:doc:`qc_normalisation`)
+4. **HVG selection** – pick highly variable genes (:doc:`quality_control`)
+5. **Dimension reduction** – PCA and KNN graph construction (:doc:`quality_control`)
 6. **Pseudo-bulk** – aggregate per perturbation (:doc:`pseudobulk`)
 7. **Differential expression** – t-test, Wilcoxon, or NB-GLM (:doc:`differential_expression`)
 8. **Plot** – visualise results with Scanpy-style helpers (:doc:`differential_expression`)

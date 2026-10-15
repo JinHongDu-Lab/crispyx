@@ -57,7 +57,7 @@ Key features
    :caption: User guide
 
    data_preparation
-   qc_normalisation
+   quality_control
    pseudobulk
    differential_expression
    covariate_adjustment
