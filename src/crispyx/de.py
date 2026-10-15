@@ -1198,6 +1198,9 @@ def t_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -1959,6 +1962,10 @@ def nb_glm_test(
         ``dispersion_trend`` instead. ``obs["n_genes_tested"]`` counts the
         genes each perturbation was tested on, after the filters.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
+    covariates = list(covariates or [])
     call_args = dict(locals())  # for the resume fingerprint, before any other local
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
@@ -1971,8 +1978,6 @@ def nb_glm_test(
     # Validate min_mu parameter
     if min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
-
-    covariates = list(covariates or [])
 
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -5098,6 +5103,9 @@ def wilcoxon_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label = resolve_group_reference_aliases(

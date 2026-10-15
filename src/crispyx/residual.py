@@ -118,24 +118,31 @@ def residual_effects(
 
         ``[]`` gives the plain difference from the controls. Interactions
         (lane x donor) and other scores are ``obs`` columns made beforehand.
-        Every level of a categorical covariate must occur among the controls,
-        and an ``obs`` column named like a computed value raises. Collinear
+        Perturbed cells in a categorical level no control shares cannot be
+        adjusted and are left out (counted at ``verbose=1``); numeric
+        covariates must be finite in used cells, and an ``obs`` column named
+        like a computed value raises. Collinear
         covariates are fine unless a perturbation's effect would then depend
         on how the fit splits them, which raises.
     null
         Spread the z-score divides by:
 
-        * ``"model"`` (the paper's test): ``sigma_g / sqrt(n_t)``, with
-          ``sigma_g`` the residual standard deviation of the control fit.
-          Treats cells as independent; cells sharing a guide or donor are not,
-          so it calls too many hits.
-        * ``"robust"``: ``s_g / sqrt(n_t)``, with ``s_g`` 1.4826 x the median
-          absolute deviation, over perturbations, of ``effect * sqrt(n_t)``. It
-          assumes most perturbations leave gene ``g`` unchanged -- true for
-          genome-wide screens, false for a focused panel where every target is
-          active.
+        * ``"model"`` (the paper's test): ``sigma_g * sqrt(1/n_t + h_t)``,
+          with ``sigma_g`` the residual standard deviation of the control fit
+          and ``h_t = mean_t(x) (X^T X)^+ mean_t(x)^T`` the control fit's own
+          error at the perturbation's mean design, which every perturbation
+          shares. ``h_t`` is negligible with many controls (the paper's
+          ``sigma_g / sqrt(n_t)``) and keeps z calibrated with few. Treats
+          cells as independent; cells sharing a guide or donor are not, so it
+          calls too many hits.
+        * ``"robust"``: ``z = (effect * sqrt(n_t) - m_g) / s_g``, with ``m_g``
+          the median over perturbations of ``effect * sqrt(n_t)`` and ``s_g``
+          1.4826 x their median absolute deviation. It assumes most
+          perturbations leave gene ``g`` unchanged -- true for genome-wide
+          screens, false for a focused panel where every target is active.
 
-        Both spreads are written to ``var``, so either z can be recomputed.
+        ``h_t`` is written to ``obs`` (``leverage``) and ``sigma_g``, ``m_g``
+        and ``s_g`` to ``var``, so either z can be recomputed.
     min_cells
         Perturbations with fewer usable cells are left out (listed at
         ``verbose=1``).
@@ -189,11 +196,15 @@ def residual_effects(
         variables. ``X`` is the effect: the mean residual, a difference of mean
         ``log1p(CP10k)`` values (natural log) -- not a log2 fold change.
         Layers ``z_score``, ``pvalue`` (two-sided normal) and ``pvalue_adj``
-        (Benjamini-Hochberg within each perturbation). ``obs`` holds ``n_cells``
-        and ``n_genes_tested``; ``var`` holds ``control_mean``, ``residual_sd``,
-        ``robust_sd`` and ``tested``; ``uns`` records the null, the covariates
+        (Benjamini-Hochberg within each perturbation). ``obs`` holds ``n_cells``,
+        ``n_genes_tested`` and ``leverage``; ``var`` holds ``control_mean``,
+        ``residual_sd``, ``robust_center``, ``robust_sd`` and ``tested``; ``uns`` records the null, the covariates
         and the design's column names.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
+    covariates = list(covariates)
     call_args = dict(locals())  # for the result fingerprint, before any other local
     if null not in get_args(ResidualNull):
         raise ValueError(f"{_NAME}: null must be 'model' or 'robust'; received {null!r}.")
@@ -226,6 +237,7 @@ def residual_effects(
             values, labelled, control_label, perturbations, min_cells, verbose,
         )
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column).astype(str)
+        groups = _drop_cells_without_controls(backed.obs, covariates, groups, verbose)
         design = _Design.build(backed.obs, covariates, groups, gene_symbols)
         workers = max(1, min(_resolve_n_jobs(n_jobs), numba.config.NUMBA_NUM_THREADS))
         p = len(design.columns)
@@ -309,19 +321,35 @@ def residual_effects(
             f"{int((~keep).sum())} perturbation(s) have fewer than {min_cells} cells with counts "
             f"and are left out: {[targets[i] for i in np.flatnonzero(~keep)][:10]}",
         )
+    if not keep.any():
+        raise ValueError(f"{_NAME}: no perturbation has at least {min_cells} usable cells.")
     group_design_sums, control_xtx = design.cross_products(groups, used, totals, mito, len(targets) + 1)
     n_controls = int(n_cells[0])
     rows = 1 + np.flatnonzero(keep)
     n_target = n_cells[rows]
     mean_design = group_design_sums[rows] / n_target[:, None]
-    # Least squares through the pseudo-inverse of X^T X, with the cutoff
-    # np.linalg.lstsq uses; its null space is what collinearity leaves free.
-    u, singular, vt = np.linalg.svd(control_xtx, hermitian=True)
+    # Least squares through the pseudo-inverse of X^T X, after centring and
+    # scaling the non-intercept columns over the controls (X T): a covariate
+    # of large magnitude but modest spread is otherwise nearly collinear with
+    # the intercept and lost below the cutoff. The null space of X T, mapped
+    # back through T, is what collinearity leaves free.
+    transform = _standardising_transform(control_xtx)
+    # eigh, not svd(hermitian=True): the latter zeroes the eigenvector of an
+    # eigenvalue that is exactly 0, which is the null space wanted here.
+    eigenvalues, eigenvectors = np.linalg.eigh(transform.T @ control_xtx @ transform)
+    order = np.argsort(eigenvalues)[::-1]
+    singular, vt = np.maximum(eigenvalues[order], 0.0), eigenvectors[:, order].T
     independent = singular > singular[0] * p * np.finfo(np.float64).eps
     rank = int(independent.sum())
-    coefficients = vt[independent].T @ ((u[:, independent].T @ control_xty.T) / singular[independent, None])
+    basis = transform @ vt[independent].T
+    coefficients = basis @ ((basis.T @ control_xty.T) / singular[independent, None])
+    # x̄ (X^T X)^+ x̄ per perturbation: the control fit's share of the
+    # variance of its effect, which every perturbation's effect carries.
+    leverage = np.square((mean_design @ basis) / np.sqrt(singular[independent])).sum(axis=1)
     if rank < p:
-        _check_identified(mean_design, vt[~independent], design.columns, targets, keep, rank)
+        null_space = (transform @ vt[~independent].T).T
+        null_space /= np.linalg.norm(null_space, axis=1, keepdims=True)
+        _check_identified(mean_design, null_space, design.columns, targets, keep, rank)
         _messages.vprint(
             verbose, _NAME,
             f"the design has rank {rank} < {p} columns (collinear covariates); every "
@@ -340,11 +368,19 @@ def residual_effects(
     del sums
     effect /= n_target[:, None]
     effect -= mean_design @ coefficients
+    # Each null scales an effect to unit variance: "model" by the control
+    # fit's noise, counting its own error (shared by every perturbation)
+    # through the leverage; "robust" by the spread across perturbations,
+    # centred on their median, which also absorbs that shared error.
     scaled = effect * np.sqrt(n_target)[:, None]
-    scaled -= np.median(scaled, axis=0)
+    robust_center = np.median(scaled, axis=0)
+    scaled -= robust_center
     robust_sd = 1.4826 * np.median(np.abs(scaled, out=scaled), axis=0)
     del scaled
-    spread = residual_sd if null == "model" else robust_sd
+    if null == "model":
+        spread, center, unit = residual_sd, 0.0, 1.0 / np.sqrt(1.0 / n_target + leverage)
+    else:
+        spread, center, unit = robust_sd, robust_center, np.sqrt(n_target)
     tested = (control_mean > min_control_mean) & (spread > 0)
     kept_targets = [targets[i] for i in np.flatnonzero(keep)]
 
@@ -354,6 +390,7 @@ def residual_effects(
             label_name: obs_index.to_list(),
             "n_cells": n_target.astype(np.int64),
             "n_genes_tested": np.full(len(kept_targets), int(tested.sum()), dtype=np.int64),
+            "leverage": leverage,
         },
         index=obs_index,
     )
@@ -361,6 +398,7 @@ def residual_effects(
         {
             "control_mean": control_mean,
             "residual_sd": residual_sd,
+            "robust_center": robust_center,
             "robust_sd": robust_sd,
             "tested": tested,
         },
@@ -395,7 +433,7 @@ def residual_effects(
             step = max(1, (1 << 22) // max(n_vars, 1))
             for start in range(0, len(kept_targets), step):
                 stop = start + step
-                z = effect[start:stop] * np.sqrt(n_target[start:stop])[:, None] / np.where(tested, spread, np.nan)
+                z = (effect[start:stop] * unit[start:stop, None] - center) / np.where(tested, spread, np.nan)
                 pvalue = 2.0 * ndtr(-np.abs(z))
                 z_ds[start:stop] = z
                 p_ds[start:stop] = pvalue
@@ -435,6 +473,20 @@ def _segments(groups: np.ndarray, row_nnz: np.ndarray, workers: int):
     controls = np.flatnonzero(groups == 0)
     control_bounds = np.linspace(0, controls.size, workers + 1).astype(np.int64)
     return rows.astype(np.int64), target_bounds, edge_groups, controls.astype(np.int64), control_bounds
+
+
+def _standardising_transform(xtx: np.ndarray) -> np.ndarray:
+    """``T`` such that ``X T`` is the intercept followed by the other columns
+    centred and scaled to unit variance over the cells of ``X^T X``; a
+    column constant among them is centred to zero."""
+    n = xtx[0, 0]
+    mean = xtx[0, 1:] / n
+    sd = np.sqrt(np.maximum(np.diag(xtx)[1:] / n - mean ** 2, 0.0))
+    scale = np.where(sd > 0, sd, 1.0)
+    transform = np.eye(xtx.shape[0])
+    transform[0, 1:] = -mean / scale
+    transform[1:, 1:] = np.diag(1.0 / scale)
+    return transform
 
 
 def _check_identified(mean_design, null_space, columns, targets, keep, rank) -> None:
@@ -535,6 +587,32 @@ def _group_codes(
     return groups, targets
 
 
+def _drop_cells_without_controls(obs: pd.DataFrame, covariates: list[str], groups: np.ndarray,
+                                 verbose: int | bool) -> np.ndarray:
+    """``groups`` with the perturbed cells in a categorical covariate level
+    that no control shares set to unused (-1): the control fit has no
+    estimate for that level, so their residuals would be undefined. Their
+    perturbations keep their other cells."""
+    controls = groups == 0
+    uncovered = np.zeros(len(groups), dtype=bool)
+    for name in covariates:
+        if name in COMPUTED_COVARIATES or name not in obs.columns:
+            continue
+        series = obs[name]
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            continue
+        values = series.astype(str).to_numpy()
+        uncovered |= (groups > 0) & ~np.isin(values, np.unique(values[controls]))
+    if not uncovered.any():
+        return groups
+    _messages.vprint(
+        verbose, _NAME,
+        f"{int(uncovered.sum()):,} perturbed cell(s) are in a covariate level with no control "
+        "cells, which the control fit cannot adjust for, and are left out.",
+    )
+    return np.where(uncovered, -1, groups)
+
+
 class _Design:
     """The model's design: column names and what the kernel needs per cell."""
 
@@ -552,7 +630,6 @@ class _Design:
     def build(cls, obs: pd.DataFrame, covariates: list[str], groups: np.ndarray,
               gene_symbols: pd.Index) -> "_Design":
         used = groups >= 0
-        controls = groups == 0
         columns = ["intercept"]
         category_codes, continuous_values, continuous_columns = [], [], []
         total_column = mito_column = -1
@@ -585,20 +662,15 @@ class _Design:
             if series[used].isna().any():
                 raise ValueError(f"{_NAME}: covariate {name!r} has missing values in used cells.")
             if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+                values = series.to_numpy(dtype=np.float64, na_value=np.nan)
+                if not np.isfinite(values[used]).all():
+                    raise ValueError(f"{_NAME}: covariate {name!r} has infinite values in used cells.")
                 continuous_columns.append(len(columns))
-                continuous_values.append(series.to_numpy(dtype=np.float64))
+                continuous_values.append(values)
                 columns.append(name)
                 continue
             levels = pd.Index(pd.unique(series[used].astype(str))).sort_values()
             codes = levels.get_indexer(series.astype(str))
-            without_controls = [
-                level for i, level in enumerate(levels) if not (codes[controls] == i).any()
-            ]
-            if without_controls:
-                raise ValueError(
-                    f"{_NAME}: covariate {name!r} has level(s) with no control cells, whose "
-                    f"effect the control fit cannot estimate: {without_controls[:10]}"
-                )
             offset = len(columns) - 1  # level 0 is the reference and gets no column
             category_codes.append(np.where(codes > 0, codes + offset, -1))
             columns.extend(f"{name}[{level}]" for level in levels[1:])

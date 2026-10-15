@@ -77,10 +77,16 @@ def _reference(counts, obs, covariates, *, used=None, null="model", min_control_
     n = np.array([(obs["perturbation"] == t).sum() for t in targets], dtype=float)
     effect = np.vstack([residual[(obs["perturbation"] == t).to_numpy()].mean(axis=0) for t in targets])
     scaled = effect * np.sqrt(n)[:, None]
-    robust = 1.4826 * np.median(np.abs(scaled - np.median(scaled, axis=0)), axis=0)
-    spread = sd if null == "model" else robust
+    center = np.median(scaled, axis=0)
+    robust = 1.4826 * np.median(np.abs(scaled - center), axis=0)
+    mean_design = np.vstack([design[(obs["perturbation"] == t).to_numpy()].mean(axis=0) for t in targets])
+    leverage = np.einsum("tp,pq,tq->t", mean_design, np.linalg.pinv(design[control].T @ design[control]), mean_design)
+    if null == "model":
+        spread, z = sd, effect / np.sqrt(1 / n + leverage)[:, None] / sd
+    else:
+        spread, z = robust, (scaled - center) / robust
     tested = (y[control].mean(axis=0) > min_control_mean) & (spread > 0)
-    z = np.where(tested, scaled / spread, np.nan)
+    z = np.where(tested, z, np.nan)
     return targets, effect, z, sd, robust
 
 
@@ -209,13 +215,38 @@ def test_refuses_normalised_input(tmp_path):
         cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], verbose=False)
 
 
-def test_level_without_controls_raises(tmp_path):
+def test_cells_in_a_level_without_controls_are_left_out(tmp_path):
+    """A's cells all sit in a lane no control is in: A is left out, the
+    other perturbations are unaffected."""
     path, counts, obs = _screen(tmp_path)
     obs["lane"] = obs["lane"].astype(str)
     obs.loc[obs["perturbation"] == "A", "lane"] = "L9"
     ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
-    with pytest.raises(ValueError, match="L9"):
-        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], verbose=False)
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1,
+                                    verbose=False))
+    assert out.obs_names.tolist() == ["B", "C"]
+    used = (obs["perturbation"] != "A").to_numpy()
+    _, effect, *_ = _reference(counts, obs, ["lane"], used=used)
+    np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
+
+
+def test_infinite_covariate_raises(tmp_path):
+    path, counts, obs = _screen(tmp_path)
+    obs.loc[obs.index[0], "score"] = np.inf
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    with pytest.raises(ValueError, match="infinite"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["score"], verbose=False)
+
+
+def test_perturbations_from_a_generator_are_reused(tmp_path):
+    path, *_ = _screen(tmp_path)
+    run = lambda: cx.residual_effects(path, "perturbation", "ctrl", covariates=[],
+                                      perturbations=(t for t in ["A", "B"]), min_cells=1, verbose=False)
+    first = run().path
+    stamp = ad.read_h5ad(first).uns["crispyx"]["fingerprint"]
+    assert "generator" not in stamp
+    mtime = first.stat().st_mtime_ns
+    assert run().path.stat().st_mtime_ns == mtime
 
 
 def test_computed_covariate_name_clash_raises(tmp_path):
@@ -294,6 +325,36 @@ def test_sorted_by_perturbation_matches_reference(tmp_path, chunk_size):
                                     min_cells=1, chunk_size=chunk_size, n_jobs=4, verbose=False))
     _, effect, *_ = _reference(counts, obs, ["lane", "log_total_counts"])
     np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
+
+
+@pytest.mark.parametrize("null", ["model", "robust"])
+def test_z_calibrated_with_few_controls(tmp_path, null):
+    """No true effects, 50 controls against 40 targets of 200 cells: the
+    control fit's error is shared by every target and must not inflate z."""
+    rng = np.random.default_rng(3)
+    labels = ["ctrl"] * 50 + [f"T{i}" for i in range(40) for _ in range(200)]
+    lane = rng.choice(["L1", "L2"], size=len(labels))
+    base = rng.uniform(2, 20, size=len(GENES))
+    counts = rng.poisson(base[None, :] * np.where(lane == "L1", 1.0, 1.5)[:, None]).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "lane": lane}, index=[f"c{i}" for i in range(len(labels))])
+    path = tmp_path / "null.h5ad"
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    z = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], null=null,
+                                  verbose=False)).layers["z_score"]
+    assert 0.7 < np.nanvar(z) < 1.4  # 5.6 (model) and 4.6 (robust) before
+
+
+def test_large_magnitude_covariate_is_kept(tmp_path):
+    """A covariate far from zero with modest spread is nearly collinear with
+    the intercept in X^T X; it must still be fitted, as lstsq does."""
+    path, counts, obs = _screen(tmp_path)
+    obs["depth_code"] = counts.sum(axis=1) * 1000.0 + 1e7
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    out = _read(cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane", "depth_code"],
+                                    min_cells=1, verbose=False))
+    _, effect, _, sd, _ = _reference(counts, obs, ["lane", "depth_code"])
+    np.testing.assert_allclose(out.X, effect, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(out.var["residual_sd"], sd, rtol=1e-6)
 
 
 def test_collinear_but_identified_runs(tmp_path):

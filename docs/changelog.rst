@@ -19,6 +19,23 @@ Unreleased
   named ``"nan"`` by ``t_test``, ``wilcoxon_test`` and ``nb_glm_test``. They
   are now in no comparison, as in ``residual_effects``. A labels Series with
   ``NaN`` for some cells is accepted on the same terms.
+* **Fixed: ``residual_effects`` z-scores were too large with few controls.**
+  Every perturbation's effect shares the error of the control fit, which
+  neither null counted: with 50 controls against 200 cells per target, 41%
+  of null tests had p < 0.05. ``null="model"`` now divides by
+  ``sigma_g * sqrt(1/n_t + h_t)``, with ``h_t`` the control fit's leverage at
+  the perturbation's mean design (negligible with many controls, so the
+  tutorials' results are unchanged); ``null="robust"`` centres on the median
+  over perturbations. ``obs["leverage"]`` and ``var["robust_center"]`` are
+  written so either z can be recomputed.
+* **Fixed: ``residual_effects`` could drop a covariate silently.** The rank
+  cutoff ran on ``X^T X``, squaring its condition number, so a covariate of
+  large magnitude but modest spread was projected out and effects came out
+  wrong. Covariates are now centred and scaled over the controls first.
+* **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
+  level no control shares**, instead of refusing the whole run; infinite
+  numeric covariates raise. ``perturbations`` given as a generator no longer
+  prevents reuse of an existing result (also for the DE functions).
 
 Version 0.1.10
 --------------
