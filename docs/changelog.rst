@@ -56,8 +56,9 @@ Version 0.2.0
   neither null counted: with 50 controls against 200 cells per target, 41%
   of null tests had p < 0.05. ``null="model"`` now divides by
   ``sigma_g * sqrt(1/n_t + h_t)``, with ``h_t`` the control fit's leverage at
-  the perturbation's mean design (negligible with many controls, so the
-  tutorials' results are unchanged); ``null="robust"`` centres on the median
+  the perturbation's mean design (small with many controls: in the Feng et
+  al. tutorial, 10.5% of target x gene pairs are significant instead of
+  10.6%); ``null="robust"`` centres on the median
   over perturbations. ``obs["leverage"]`` and ``var["robust_center"]`` are
   written so either z can be recomputed.
 * **Fixed: ``residual_effects`` could drop a covariate silently.** The rank

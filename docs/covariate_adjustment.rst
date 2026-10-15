@@ -105,7 +105,7 @@ Elteren's test).
   without controls are not used, and a target sharing no batch with the controls
   is untested. Ranks of mostly zero counts carry less information than means: on
   the Feng et al. targeted screen it recovered 61–67% of the published hits
-  where ``residual_effects`` recovered 98–99%. The Wilcoxon result's own
+  where ``residual_effects`` recovered 97–99%. The Wilcoxon result's own
   ``logfoldchanges`` are pooled over batches; take effects and standard errors
   from ``normalized_effects``. The model-based standard error treats cells as
   independent, so it is too small when cells of one guide or donor move
@@ -145,7 +145,7 @@ The two nulls turn an effect into a z-score differently:
   a guide or a donor are not: on the genome-wide screen of the CD4+ T-cell
   tutorial it gave about 300 hits to every fake target.
 
-- **Strengths:** about a minute for every target of a 7-million-cell screen;
+- **Strengths:** about two minutes for every target of a 7-million-cell screen;
   continuous and categorical covariates; small groups, including per-line or
   per-donor effects (label cells ``target|line``).
 - **Weaknesses:** the effect is a difference of ``log1p(CP10k)``, not a log2 fold
@@ -182,10 +182,10 @@ the test accounts for variation between guides and donors.
 
 - **Strengths:** a count model with log2 fold changes and standard errors. On
   pseudo-bulk it reproduces the authors' DESeq2 estimates of the CD4+ T-cell
-  screen (median per-target r 0.997) and is the best calibrated of these methods
+  screen (median per-target r 0.999) and is the best calibrated of these methods
   on fake targets.
-- **Weaknesses:** slow: about 4 seconds per target on 32 cores on pseudo-bulk,
-  so half a day for a genome-wide screen. Pseudo-bulk needs replicate units
+- **Weaknesses:** slow: about 1.5 seconds per target on 32 cores on pseudo-bulk,
+  so about five hours for a genome-wide screen. Pseudo-bulk needs replicate units
   (several guides or donors per target); with one donor and one guide there is
   little to estimate the variation from. On single cells, cells are again
   treated as independent, and with covariates the control cells must fit in
