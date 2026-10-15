@@ -57,6 +57,7 @@ Key features
    :caption: Reference
 
    api
+   covariate_adjustment
    notebooks/batch_statistics_tutorial
    notebooks/residual_effects_tutorial
    notebooks/residual_effects_feng_tutorial
