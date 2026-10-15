@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **Fixed: ``t_test`` with a one-cell group.** A perturbation (or control)
+  with a single cell has no variance estimate; it was treated as zero, so
+  the test used the other side's standard error alone and reported nearly
+  every gene as significant. Such comparisons are now left untested (NaN),
+  as in scanpy.
+
 Version 0.1.10
 --------------
 

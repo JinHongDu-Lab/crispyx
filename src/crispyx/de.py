@@ -1072,7 +1072,10 @@ def t_test(
     backward compatibility with Scanpy-style workflows, count-like inputs are
     automatically normalized and log-transformed in streaming fashion, with a
     warning to encourage explicit preprocessing upstream.
-    
+
+    A perturbation (or control) with a single cell has no variance estimate,
+    so its comparison is left untested (``NaN``), as in scanpy.
+
     Parameters
     ----------
     data
@@ -1405,6 +1408,11 @@ def t_test(
 
         total_expr = expr_counts[idx] + expr_counts[control_idx]
         valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
+        # A one-cell side has no variance estimate; treating it as zero
+        # leaves the other side's SE alone and makes every gene look
+        # significant.  Leave such comparisons untested, as scanpy does.
+        if n_cells < 2 or control_n < 2:
+            valid[:] = False
         # Per-condition low-expression filter: drop genes that are
         # jointly low in BOTH the perturbation and control groups.
         low_both = _low_expr_in_both_mask(
