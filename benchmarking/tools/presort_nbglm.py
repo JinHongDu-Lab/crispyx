@@ -9,18 +9,27 @@ benchmark's ``crispyx_de_nb_glm`` then reuses the copy (crispyx >= 0.1.7
 reuses it only when it was made from this exact source with the same
 labels), so its runtime covers fitting only.
 
+With PRESORT_IN_MEMORY=1, crispyx's own sorted-copy writer is fed from an
+in-memory copy of the matrix (one sequential read) instead of fancy-indexing
+the backed file row by row, which on Lustre ran at ~1 GB/h for Huang-HCT116
+(~210 GB). The writer, layout and provenance are unchanged, so NB-GLM reuses
+the copy as before. Needs RAM for the whole matrix (use a 768 GB node).
+
 Usage (inside the benchmark container, from the repo root):
     python -m benchmarking.tools.presort_nbglm benchmarking/config/VCC.yaml
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 import yaml
 
+import anndata as ad
+import crispyx.data
 from crispyx.data import get_matrix_storage_format, needs_sorting_for_nbglm, sort_by_perturbation
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +38,35 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # passes them to nb_glm_test (see create_benchmark_suite).
 PERTURBATION_COLUMN = "perturbation"
 CONTROL_LABEL = "control"
+
+
+class _InMemoryMatrix:
+    """Stands in for crispyx's backed AnnData inside the sorted-copy writer."""
+
+    def __init__(self, path):
+        t0 = time.perf_counter()
+        self._adata = ad.read_h5ad(path)
+        print(f"Loaded {path} into memory ({time.perf_counter() - t0:.0f} s)", flush=True)
+        self.n_obs, self.n_vars, self.X = self._adata.n_obs, self._adata.n_vars, self._adata.X
+        self.file = self  # the writer closes backed.file when done
+
+    def close(self):
+        pass
+
+
+def _use_in_memory_sorted_writer() -> None:
+    """Make crispyx's sparse sorted-copy writer read rows from memory."""
+    write_sorted_sparse = crispyx.data._write_sorted_sparse
+
+    def writer(**kwargs):
+        read_backed = crispyx.data.read_backed
+        crispyx.data.read_backed = _InMemoryMatrix
+        try:
+            return write_sorted_sparse(**kwargs)
+        finally:
+            crispyx.data.read_backed = read_backed
+
+    crispyx.data._write_sorted_sparse = writer
 
 
 def main(config_path: str) -> None:
@@ -56,6 +94,8 @@ def main(config_path: str) -> None:
         print(f"{nbglm_input.name}: already sorted by perturbation, nothing to do")
         return
 
+    if os.environ.get("PRESORT_IN_MEMORY") == "1":
+        _use_in_memory_sorted_writer()
     t0 = time.perf_counter()
     sorted_path = sort_by_perturbation(
         nbglm_input,
