@@ -34,3 +34,12 @@ def test_t_test_leaves_one_cell_groups_untested(tmp_path, screen):
     assert np.isnan(single.pvalue).all()
     assert np.isnan(single.statistic).all()
     assert np.isfinite(result["A"].pvalue).all()
+
+
+def test_de_refuses_to_write_over_its_input(screen):
+    with pytest.raises(ValueError, match="is the input file"):
+        cx.t_test(
+            screen, perturbation_column="perturbation", control_label="ctrl",
+            output_path=screen, verbose=False,
+        )
+    assert ad.read_h5ad(screen).n_obs == 81

@@ -9,6 +9,12 @@ Unreleased
   the test used the other side's standard error alone and reported nearly
   every gene as significant. Such comparisons are now left untested (NaN),
   as in scanpy.
+* **Fixed: an ``output_path`` equal to the input file destroyed it.**
+  ``pp.subsample`` (and the QC filter) wrote the empty output skeleton over
+  the source and then failed reading it; DE functions replaced the input with
+  their result. Every writer now raises ``ValueError`` instead. Subset
+  writes also go to a partial file renamed on success, so an interrupted
+  ``subsample`` or QC filter leaves no half-written output.
 
 Version 0.1.10
 --------------

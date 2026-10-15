@@ -218,5 +218,5 @@ def test_rerun_reuses_until_an_input_changes(tmp_path, capsys):
 
 def test_output_must_not_be_an_input(tmp_path):
     paths, _, _ = _pilot(tmp_path)
-    with pytest.raises(ValueError, match="must not be one of the input files"):
+    with pytest.raises(ValueError, match="is the input file"):
         cx.pp.concat_h5ad(paths, output_path=paths[0], verbose=False)

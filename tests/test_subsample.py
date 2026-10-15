@@ -87,6 +87,32 @@ def test_unknown_groupby_column_raises(tmp_path):
         cx.pp.subsample(path, n=1, groupby="does_not_exist")
 
 
+def test_output_path_equal_to_input_raises_and_keeps_input(tmp_path):
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    before = ad.read_h5ad(path).X.toarray()
+    with pytest.raises(ValueError, match="is the input file"):
+        cx.pp.subsample(path, n=10, groupby=None, output_path=path, verbose=False)
+    np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before)
+
+
+def test_interrupted_subset_leaves_no_output(tmp_path, monkeypatch):
+    """A subset killed mid-write leaves neither the output nor a partial."""
+    import crispyx.data as data
+
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    out = tmp_path / "out.h5ad"
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(data, "_stream_write_matrix_subset", boom)
+    with pytest.raises(KeyboardInterrupt):
+        write_filtered_subset(
+            path, cell_mask=np.ones(60, bool), gene_mask=np.ones(20, bool), output_path=out,
+        )
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["data.h5ad"]
+
+
 def test_unknown_unit_column_raises(tmp_path):
     path = _make_h5ad(tmp_path, n_cells_per_group={"A": 10, "control": 10})
     with pytest.raises(KeyError):

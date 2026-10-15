@@ -704,6 +704,30 @@ def resolve_data_path(
     return result
 
 
+def _refuse_overwriting_input(inputs: Sequence[Any], output_path: str | Path) -> None:
+    """Raise ``ValueError`` when ``output_path`` is one of the input files.
+
+    Writers build their output while still reading the input, so writing over
+    it would destroy the data mid-run. Inputs that are not paths (in-memory
+    AnnData) or do not exist are ignored.
+    """
+    output = Path(output_path)
+    if not output.exists():
+        return
+    for source in inputs:
+        if not isinstance(source, (str, _os.PathLike)):
+            continue
+        try:
+            same = _os.path.samefile(source, output)
+        except OSError:
+            continue
+        if same:
+            raise ValueError(
+                f"output_path '{output}' is the input file; write to a different "
+                "path so the input is not overwritten."
+            )
+
+
 def resolve_output_path(
     input_path: str | Path,
     *,
@@ -730,7 +754,9 @@ def resolve_output_path(
         in the next major version.  Use ``output_path`` instead.
     """
     if output_path is not None:
-        return Path(output_path)
+        output_path = Path(output_path)
+        _refuse_overwriting_input([input_path], output_path)
+        return output_path
 
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
@@ -1815,8 +1841,36 @@ def write_filtered_subset(
 
     source_path = Path(source_path)
     output_path = Path(output_path)
+    _refuse_overwriting_input([source_path], output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    with _replace_on_success(output_path) as partial:
+        _write_filtered_subset(
+            source_path,
+            cell_mask=cell_mask,
+            gene_mask=gene_mask,
+            output_path=partial,
+            chunk_size=chunk_size,
+            var_assignments=var_assignments,
+            row_nnz=row_nnz,
+            total_nnz=total_nnz,
+            data_dtype=data_dtype,
+            chunk_cache=chunk_cache,
+        )
 
+
+def _write_filtered_subset(
+    source_path: Path,
+    *,
+    cell_mask: np.ndarray,
+    gene_mask: np.ndarray,
+    output_path: Path,
+    chunk_size: int,
+    var_assignments: dict[str, Sequence] | None,
+    row_nnz: np.ndarray | None,
+    total_nnz: int | None,
+    data_dtype: np.dtype | None,
+    chunk_cache: Any,
+) -> None:
     backed = read_backed(source_path)
     try:
         obs = backed.obs.iloc[cell_mask].copy()
@@ -2062,8 +2116,7 @@ def concat_h5ad(
     if shared_cells not in ("drop", "error"):
         raise ValueError(f"shared_cells must be 'drop' or 'error'; received {shared_cells!r}")
     output_path = Path(output_path)
-    if any(output_path.resolve() == source.resolve() for source in sources):
-        raise ValueError("output_path must not be one of the input files")
+    _refuse_overwriting_input(sources, output_path)
     if len({source.resolve() for source in sources}) != len(sources):
         raise ValueError("an input file is listed more than once")
 
