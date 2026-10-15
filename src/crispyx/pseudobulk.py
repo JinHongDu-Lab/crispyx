@@ -96,6 +96,13 @@ def _pair_accumulator(n_rows: int, n_genes: int, prefix: str, *, on_disk: bool) 
     return np.memmap(tmp.name, dtype=np.float64, mode="w+", shape=(max(n_rows, 1), n_genes)), tmp.name
 
 
+def _add_by_sorted_group(out: np.ndarray, groups: np.ndarray, values: np.ndarray) -> None:
+    """``np.add.at(out, groups, values)`` for ``groups`` sorted ascending, as
+    one segment sum per group: ``np.add.at`` is slow on large 2-D blocks."""
+    starts = np.flatnonzero(np.r_[True, groups[1:] != groups[:-1]])
+    out[groups[starts]] += np.add.reduceat(values, starts, axis=0)
+
+
 def _group_sums(values: np.ndarray, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Distinct ``codes``, the row sums of ``values`` for each, and their counts."""
     unique, inverse = np.unique(codes, return_inverse=True)
@@ -265,22 +272,24 @@ def _streaming_batch_corrected(
                 yield (pert_of_pair[start:end][valid], (n_pv * n_cv) / (n_pv + n_cv),
                        n_pv, n_cv, Tp, Tc, Vp, Vc)
 
+        # Pairs are sorted by perturbation, so each block's rows for one
+        # perturbation are contiguous.
         for p_idx, w, n_p, n_c, Tp, Tc, Vp, Vc in contributing_pairs():
-            np.add.at(pert_expr_num, p_idx, w[:, None] * Tp)
-            np.add.at(ctrl_expr_num, p_idx, w[:, None] * Tc)
-            np.add.at(weight_tot, p_idx, w)
+            _add_by_sorted_group(pert_expr_num, p_idx, w[:, None] * Tp)
+            _add_by_sorted_group(ctrl_expr_num, p_idx, w[:, None] * Tc)
+            _add_by_sorted_group(weight_tot, p_idx, w)
             if standard_errors:
                 # Batches with one cell on a side estimate no variance there,
                 # but still count, with n = 1, in that side's sum of w^2/n.
                 wp = np.where(n_p >= 2, w, 0.0)
                 wc = np.where(n_c >= 2, w, 0.0)
-                np.add.at(pert_var_num, p_idx, wp[:, None] * Vp)
-                np.add.at(ctrl_var_num, p_idx, wc[:, None] * Vc)
-                np.add.at(pert_var_w, p_idx, wp)
-                np.add.at(ctrl_var_w, p_idx, wc)
-                np.add.at(pert_w2n, p_idx, w * w / n_p)
-                np.add.at(ctrl_w2n, p_idx, w * w / n_c)
-                np.add.at(n_strata, p_idx, 1)
+                _add_by_sorted_group(pert_var_num, p_idx, wp[:, None] * Vp)
+                _add_by_sorted_group(ctrl_var_num, p_idx, wc[:, None] * Vc)
+                _add_by_sorted_group(pert_var_w, p_idx, wp)
+                _add_by_sorted_group(ctrl_var_w, p_idx, wc)
+                _add_by_sorted_group(pert_w2n, p_idx, w * w / n_p)
+                _add_by_sorted_group(ctrl_w2n, p_idx, w * w / n_c)
+                _add_by_sorted_group(n_strata, p_idx, np.ones(len(p_idx), dtype=np.int64))
 
         no_cells = pooled_pert_counts == 0
         if no_cells.any():
@@ -311,7 +320,7 @@ def _streaming_batch_corrected(
             # avoids the cancellation of sum w^2 d^2 - 2 E sum w^2 d + E^2 sum w^2.
             spread = np.zeros((n_candidates, n_genes), dtype=np.float64)
             for p_idx, w, _, _, Tp, Tc, _, _ in contributing_pairs():
-                np.add.at(spread, p_idx, (w * w)[:, None] * np.square(Tp - Tc - effect_matrix[p_idx]))
+                _add_by_sorted_group(spread, p_idx, (w * w)[:, None] * np.square(Tp - Tc - effect_matrix[p_idx]))
             with np.errstate(invalid="ignore", divide="ignore"):
                 correction = np.where(n_strata >= 2, n_strata / (n_strata - 1.0), np.nan)
             se_robust = np.sqrt(correction[:, None] * spread * inv_w * inv_w)
