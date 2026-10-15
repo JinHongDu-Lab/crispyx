@@ -63,6 +63,32 @@ crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both spee
   <img src="docs/_static/fig2.png" width="800" alt="Benchmark results across 12 CRISPR screens: (a) dataset sizes, (b) completion status by method, (c) concordance with Scanpy, (d) runtime scaling, (e) peak memory scaling">
 </p>
 
+## Running on HPC
+
+crispyx reads its data from disk instead of loading it into memory, so where the files live matters as
+much as cores or memory. Clusters usually offer several kinds of storage:
+
+- **A parallel filesystem** (Lustre, GPFS, BeeGFS): large and fast for big sequential reads, but slow for
+  small random reads.
+- **Node-local disk** (`$TMPDIR` or `/tmp` on the compute node): fast for random access, but visible to
+  one node only and usually wiped when the job ends.
+- **Home and project directories:** often small and not meant for heavy I/O.
+
+Steps that stream a file chunk by chunk, such as QC, normalisation, `residual_effects` and pseudo-bulk,
+run well on a parallel filesystem. Steps that read or write cells and genes in scattered order do not:
+sorting cells (`sort_by_perturbation`), converting between CSR and CSC, `nb_glm_test` on a file that is
+not sorted by perturbation, and streaming a matrix along the axis it is not stored by. For those, copy
+the input to node-local disk, write outputs and temporary files there too (`output_path`, `TMPDIR`),
+and copy the results back before the job ends:
+
+```bash
+cp /parallel-fs/project/screen.h5ad "$TMPDIR"/
+python analysis.py --input "$TMPDIR/screen.h5ad" --output "$TMPDIR/results"
+cp -r "$TMPDIR/results" /parallel-fs/project/
+```
+
+Your cluster's user guide says which storage is which, and how much node-local space a job gets.
+
 ## Installation
 
 ```bash
