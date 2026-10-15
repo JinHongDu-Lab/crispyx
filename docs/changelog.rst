@@ -25,7 +25,10 @@ Version 0.1.10
   in the page cache. New tutorial on that screen: ``residual_effects`` and
   the authors' own model (``nb_glm_test`` on guide x donor pseudo-bulk,
   which reproduces their estimates) against the authors' estimates, and a
-  calibration check on fake targets made of non-targeting guides.
+  calibration check on fake targets made of non-targeting guides. A second
+  tutorial reproduces Feng et al.'s published effects and significance calls
+  for their targeted iPSC screen (1.16 million cells), per target and per
+  target in each cell line, and compares crispyx's Wilcoxon test.
 * **Fixed: ``nb_glm_test`` with covariates** crashed with ``TypeError``
   (missing ``min_mu``) whenever four or more perturbations were fitted on
   worker processes.
