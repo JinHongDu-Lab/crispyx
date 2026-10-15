@@ -32,6 +32,29 @@ Unreleased
   cutoff ran on ``X^T X``, squaring its condition number, so a covariate of
   large magnitude but modest spread was projected out and effects came out
   wrong. Covariates are now centred and scaled over the controls first.
+* **Fixed: ``nb_glm_test`` with controls too large for memory** returned
+  all-NaN results whenever covariates, per-comparison size factors or
+  per-comparison dispersion were used: only the control cache streams the
+  controls from disk, and every other path received no control matrix. It
+  now raises ``MemoryError`` with the alternatives up front, and any
+  perturbation that fails raises a ``UserWarning`` instead of only a log line.
+* **Fixed: ``nb_glm_test``'s fallback from ``size_factor_scope="per_comparison"``**
+  on data too large to load used unit size factors (no normalisation at
+  all) rather than the global ones its message promised. It now computes
+  global size factors, warns, and records ``"global"`` in
+  ``uns["size_factor_scope"]``. The per-comparison MAP step also used the
+  global offsets instead of the comparison's.
+* **Fixed: ``nb_glm_test``'s control-cache fit** estimated its coefficients
+  at a per-comparison moments dispersion and reported their SE at the global
+  one; it now fits at the global dispersion, matching the uncached fit (log2
+  fold changes move by up to ~0.01). A fixed ``dispersion=`` with
+  ``shrink_dispersion=False`` was ignored on this path and is now used.
+* **Fixed: ``nb_glm_test`` with covariates and ``dispersion_scope="global"``**
+  gave a gene almost absent among the controls (one a perturbation switches
+  on) a huge dispersion extrapolated from the trend, costing it its test.
+  Genes with fewer than 10 control counts now have their dispersion estimated
+  within each comparison; ``layers["dispersion"]`` is written instead of
+  ``var["dispersion"]`` when any gene needs it.
 * **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
   level no control shares**, instead of refusing the whole run; infinite
   numeric covariates raise. ``perturbations`` given as a generator no longer

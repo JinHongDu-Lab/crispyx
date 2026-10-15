@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from types import SimpleNamespace
 import dataclasses
 import logging
 import os
@@ -406,6 +407,40 @@ _UNLABELLED = "\0unlabelled"
 def _label_strings(labels: pd.Series) -> np.ndarray:
     """Per-cell labels as strings, missing ones as ``_UNLABELLED``."""
     return labels.astype(object).where(labels.notna(), _UNLABELLED).astype(str).to_numpy()
+
+
+# Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
+# cannot estimate its dispersion for the shared, control-fitted value.
+_MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
+
+
+def _global_size_factors(path: Path, method: str, chunk_size: int, scale: bool) -> np.ndarray:
+    """Size factors over every cell in ``path`` by ``method``."""
+    if method == "deseq2":
+        return _deseq2_style_size_factors(path, chunk_size=chunk_size, scale=scale)
+    return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
+
+
+def _fit_at_global_dispersion(design, counts, global_dispersion, **fit_kwargs):
+    """:func:`fit_nb_glm_batch_auto` with each gene's dispersion held at
+    ``global_dispersion``; genes where it is NaN (too sparse among the
+    controls) have theirs estimated within this comparison instead."""
+    if global_dispersion is None or np.isfinite(global_dispersion).all():
+        return fit_nb_glm_batch_auto(design, counts, fixed_dispersion=global_dispersion, **fit_kwargs)
+    free = ~np.isfinite(global_dispersion)
+    n_genes, p = counts.shape[1], design.shape[1]
+    merged = SimpleNamespace(
+        coef=np.full((n_genes, p), np.nan), se=np.full((n_genes, p), np.nan),
+        converged=np.zeros(n_genes, dtype=bool), n_iter=np.zeros(n_genes, dtype=np.int64),
+        dispersion=np.full(n_genes, np.nan),
+    )
+    for columns, fixed in ((~free, global_dispersion[~free]), (free, None)):
+        if not columns.any():
+            continue
+        fit = fit_nb_glm_batch_auto(design, counts[:, columns], fixed_dispersion=fixed, **fit_kwargs)
+        for field in ("coef", "se", "converged", "n_iter", "dispersion"):
+            getattr(merged, field)[columns] = getattr(fit, field)
+    return merged
 
 
 def _resolve_candidates(
@@ -2085,19 +2120,13 @@ def nb_glm_test(
     # For per_comparison size factors, we skip the expensive global computation
     # since size factors will be recomputed per-comparison anyway.
     # We use dummy size factors here (will be overwritten per-comparison).
+    size_factors_given = size_factors is not None
     if size_factor_scope == "per_comparison" and size_factors is None:
         # Dummy size factors - will be replaced in worker
         size_factors = np.ones(n_cells_total, dtype=np.float64)
         logger.debug("Skipping global size factor computation for per_comparison mode")
     elif size_factors is None:
-        if size_factor_method == "deseq2":
-            size_factors = _deseq2_style_size_factors(
-                path, chunk_size=chunk_size, scale=scale_size_factors
-            )
-        else:  # "sparse" (default)
-            size_factors = _median_of_ratios_size_factors(
-                path, chunk_size=chunk_size, scale=scale_size_factors
-            )
+        size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
     else:
         size_factors = _validate_size_factors(
             size_factors, n_cells_total, scale=scale_size_factors
@@ -2336,9 +2365,10 @@ def nb_glm_test(
         # perturbation column are protected from the group block because the
         # perturbation coefficient is the quantity under test and must not be
         # subject to the group-coefficient clip.
-        batch_result = fit_nb_glm_batch_auto(
+        batch_result = _fit_at_global_dispersion(
             design,
             fit_matrix,
+            None if global_dispersion is None else global_dispersion[valid_mask],
             offset=subset_offset,
             protected_columns=(0, perturbation_column_index),
             max_iter=max_iter,
@@ -2347,7 +2377,6 @@ def nb_glm_test(
             dispersion_method=dispersion_method,
             min_mu=min_mu,
             min_total_count=min_total_count,
-            fixed_dispersion=None if global_dispersion is None else global_dispersion[valid_mask],
         )
 
         # Extract results
@@ -2381,9 +2410,11 @@ def nb_glm_test(
 
         # Handle dispersion
         if global_dispersion is not None:
-            result["dispersion_raw"][:] = global_dispersion
-            result["dispersion"][:] = global_dispersion
-            result["dispersion_trend"][:] = global_dispersion
+            # genes the controls could not estimate keep this comparison's
+            used = np.where(np.isfinite(global_dispersion), global_dispersion, result["dispersion_raw"])
+            result["dispersion_raw"][:] = used
+            result["dispersion"][:] = used
+            result["dispersion_trend"][:] = used
         elif shrink_dispersion:
             trend = fit_dispersion_trend(result["mean"], result["dispersion_raw"])
             result["dispersion_trend"] = trend
@@ -2405,7 +2436,7 @@ def nb_glm_test(
                 for local_idx, gene_idx in enumerate(valid_indices):
                     if batch_result.converged[local_idx]:
                         # eta = X @ beta + offset
-                        eta = design @ batch_result.coef[local_idx, :] + offset[subset_mask]
+                        eta = design @ batch_result.coef[local_idx, :] + subset_offset
                         mu[:, gene_idx] = np.exp(np.clip(eta, -30, 30))
                 
                 # For invalid genes, use normalized counts as fallback
@@ -2729,7 +2760,9 @@ def nb_glm_test(
         result["intercept"] = np.where(valid_converged_mask, batch_result.coef[:, 0], np.nan)  # Store fitted intercept
         
         # Handle dispersion shrinkage
-        if shrink_dispersion:
+        # A global dispersion in the cache is either the shrunk estimate or a
+        # fixed ``dispersion=``; the latter must apply without shrinkage too.
+        if shrink_dispersion or control_cache.global_dispersion is not None:
             # ================================================================
             # MEMORY-OPTIMIZED: Use batched computation for dispersion and SE
             # ================================================================
@@ -3145,10 +3178,21 @@ def nb_glm_test(
     can_use_frozen_control = (
         freeze_control and 
         can_use_cache_early and 
-        dispersion_scope == "global" and 
+        dispersion_scope == "global" and
         shrink_dispersion
     )
-        
+    # Only the control cache can stream the controls from disk; every other
+    # path fits them in memory and would get no control matrix at all.
+    if use_streaming_control and not (
+        can_use_cache_early and dispersion_scope == "global" and shrink_dispersion
+    ):
+        raise MemoryError(
+            f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
+            "fit the memory budget, and only covariates=None with size_factor_scope='global', "
+            "dispersion_scope='global' and shrink_dispersion=True streams them from disk. Raise "
+            "memory_limit_gb, aggregate to pseudo-bulk first (cx.pb.aggregate), or use those settings."
+        )
+
     # When frozen control is enabled but streaming was not, retroactively
     # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
     # streaming avoids that by processing chunks.  The loaded control
@@ -3408,6 +3452,15 @@ def nb_glm_test(
             min_mu=min_mu,
             min_total_count=min_total_count,
         )
+        # A gene nearly absent among the controls (one a perturbation
+        # switches on) has no dispersion the controls can estimate; the trend
+        # extrapolated to its tiny mean would swamp it. Leave it NaN so each
+        # comparison estimates it from its own cells.
+        sparse_in_controls = (
+            np.asarray(control_matrix.sum(axis=0)).ravel() < _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION
+        )
+        global_dispersion[sparse_in_controls] = np.nan
+        global_dispersion_trend[sparse_in_controls] = np.nan
         
     # =====================================================================
     # Early memory check: determine if we need streaming mode
@@ -3435,12 +3488,17 @@ def nb_glm_test(
     # Skip if streaming mode - worker will fall back to global SF
     if size_factor_scope == "per_comparison":
         if use_streaming_mode:
-            logger.warning(
-                f"Dataset too large ({estimated_matrix_gb:.1f} GB) for per-comparison "
-                f"size factors (requires loading full matrix). "
-                f"Falling back to global size factors for memory efficiency."
+            _messages.warn(
+                "nb_glm_test",
+                f"the data ({estimated_matrix_gb:.1f} GB) is too large to load for "
+                "size_factor_scope='per_comparison'; using global size factors "
+                "(recorded in uns['size_factor_scope']).",
             )
-            full_X = None  # Worker will use global SF
+            size_factor_scope = "global"
+            if not size_factors_given:  # the placeholder ones would leave counts unnormalised
+                size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
+                offset = np.log(np.clip(size_factors, 1e-8, None))
+            full_X = None
         else:
             logger.info("Using per-comparison size factors for PyDESeq2 compatibility...")
             backed = read_backed(path)
@@ -3796,7 +3854,11 @@ def nb_glm_test(
     logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
     _print_de_summary(verbose, "NB-GLM DE", len(newly_completed), n_groups, n_tested_list, n_genes)
     if newly_failed:
-        logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
+        _messages.warn(
+            "nb_glm_test",
+            f"{len(newly_failed)} perturbation(s) failed and are NaN in the result (each "
+            f"error is logged): {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}",
+        )
 
     pvalue_adj_memmap = run.arrays["pvalue_adj"]
     _adjust_pvalue_matrix(pvalue_memmap, corr_method, out=pvalue_adj_memmap)
@@ -3827,7 +3889,8 @@ def nb_glm_test(
     if control_cache is not None and control_cache.global_dispersion is not None:
         global_dispersion = control_cache.global_dispersion
         global_dispersion_trend = control_cache.global_dispersion_trend
-    global_dispersion_fit = global_dispersion is not None
+    # NaN marks genes estimated per comparison; their values are in the matrices
+    global_dispersion_fit = global_dispersion is not None and bool(np.isfinite(global_dispersion).all())
     if not global_dispersion_fit:
         dispersion_matrix = np.array(dispersion_memmap)
         dispersion_raw_matrix = np.array(dispersion_raw_memmap)
