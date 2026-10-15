@@ -318,7 +318,7 @@ class AnnData:
         """Return the lazily opened backed AnnData handle."""
 
         if self._backed is None:
-            self._backed = ad.read_h5ad(str(self.path), backed=self._mode)
+            self._backed = read_backed(self.path, mode=self._mode)
         return self._backed
 
     def close(self) -> None:
@@ -397,10 +397,44 @@ class AnnData:
             pass
 
 
-def read_backed(path: str | Path) -> ad.AnnData:
-    """Open an ``.h5ad`` file in backed mode for low-memory access."""
+def read_backed(path: str | Path, mode: Literal["r", "r+"] = "r") -> ad.AnnData:
+    """Open an ``.h5ad`` file in backed mode, its matrices left on disk.
 
-    return ad.read_h5ad(str(path), backed="r")
+    ``X`` and every layer stay on disk and are read only as they are
+    sliced; ``obs``, ``var``, ``uns``, ``obsm``, ``varm``, ``obsp``,
+    ``varp`` and ``.raw``'s ``var`` are read into memory. This is
+    ``anndata.read_h5ad(path, backed=mode)`` except for the layers, which
+    anndata reads into memory in full -- each as large as ``X``.
+
+    Close the file with ``adata.file.close()``; the layers, like ``X``,
+    cannot be read after that. ``adata.to_memory()`` loads everything.
+    """
+    path = str(path)
+    with h5py.File(path, "r") as handle:
+        if "encoding-type" not in handle.attrs:  # written by anndata < 0.7
+            return ad.read_h5ad(path, backed=mode)
+        slots = {key: read_elem(handle[key]) for key in _IN_MEMORY_SLOTS if key in handle}
+        raw = handle["raw"] if "raw" in handle else {}
+        slots["raw"] = {key: read_elem(raw[key]) for key in ("var", "varm") if key in raw}
+    adata = ad.AnnData(**slots, filename=path, filemode=mode)
+    layers = adata.file["layers"] if "layers" in adata.file._file else {}
+    for key in layers:
+        adata.layers[key] = _lazy_matrix(layers[key])
+    return adata
+
+
+# Read into memory by read_backed, as anndata's backed mode does.
+_IN_MEMORY_SLOTS = ("obs", "var", "uns", "obsm", "varm", "obsp", "varp")
+
+
+def _lazy_matrix(elem: h5py.Group | h5py.Dataset) -> Any:
+    """An h5ad matrix element left on disk: a sparse dataset for CSR/CSC, the
+    HDF5 dataset when dense; any other encoding is read into memory."""
+    if isinstance(elem, h5py.Dataset):
+        return elem
+    if _element_format(elem) in ("csr", "csc"):
+        return sparse_dataset(elem)
+    return read_elem(elem)
 
 
 # -----------------------------------------------------------------------------

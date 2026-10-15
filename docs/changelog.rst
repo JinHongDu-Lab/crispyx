@@ -67,6 +67,16 @@ Unreleased
   AnnData, which anndata fills with every layer, ``obsm`` and ``obsp``. They
   now read metadata and stream each matrix through h5py, so no layer is ever
   held in memory, as documented.
+* **Changed: ``cx.read_backed`` (and ``cx.AnnData.backed``) leave the layers
+  on disk.** ``anndata.read_h5ad(backed="r")`` keeps ``X`` on disk but reads
+  every layer into memory, each as large as ``X``; every crispyx function
+  opens its input this way, so a file with a ``counts`` layer cost that
+  layer's size in memory before any work began (124 MB held vs 3 MB on a
+  20,000 x 500 test file with two layers). Layers are now sparse datasets
+  or HDF5 datasets read as they are sliced, like ``X``; the other slots are
+  read as before, and ``to_memory()`` loads everything. A CSC layer streamed
+  by rows is now re-read per chunk, as a CSC ``X`` already was.
+  ``read_backed`` also takes ``mode="r+"``.
 * **Fixed: CSC inputs to ``concat_h5ad`` and ``write_filtered_subset``**
   (``pp.subsample``, the QC filter) were streamed by rows, re-reading the
   whole matrix for every chunk. Both take ``format_mismatch_policy``
