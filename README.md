@@ -87,8 +87,6 @@ python analysis.py --input "$TMPDIR/screen.h5ad" --output "$TMPDIR/results"
 cp -r "$TMPDIR/results" /parallel-fs/project/
 ```
 
-Your cluster's user guide says which storage is which, and how much node-local space a job gets.
-
 ## Installation
 
 ```bash
