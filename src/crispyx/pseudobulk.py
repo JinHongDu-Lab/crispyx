@@ -752,13 +752,38 @@ def _constant_covariates(
     selected = np.flatnonzero(group_codes >= 0)
     if not candidates or selected.size == 0:
         return pd.DataFrame(index=pd.RangeIndex(n_groups)), []
-    frame = obs.iloc[selected][candidates].reset_index(drop=True)
-    grouped = frame.groupby(group_codes[selected], sort=True, observed=True)
-    constant = grouped.nunique(dropna=False).le(1).all()
-    keep = [column for column in candidates if constant[column]]
-    varying = [column for column in candidates if not constant[column]]
-    first = grouped[keep].first() if keep else pd.DataFrame(index=pd.RangeIndex(n_groups))
+    # Sort the cells by profile once; a column is constant when no cell
+    # differs from the one before it within the same profile.
+    order = selected[np.argsort(group_codes[selected], kind="stable")]
+    sorted_groups = group_codes[order]
+    starts = np.r_[True, sorted_groups[1:] != sorted_groups[:-1]]
+    keep, varying = [], []
+    for column in candidates:
+        values = _comparable_values(obs[column])
+        if values is None:
+            varying.append(column)
+            continue
+        values = values[order]
+        same = values[1:] == values[:-1]
+        if values.dtype.kind == "f":
+            same |= np.isnan(values[1:]) & np.isnan(values[:-1])
+        (keep if np.all(same | starts[1:]) else varying).append(column)
+    first = obs.iloc[order[starts]][keep]
+    first.index = sorted_groups[starts]
     return first.reindex(pd.RangeIndex(n_groups)), varying
+
+
+def _comparable_values(series: pd.Series) -> np.ndarray | None:
+    """Per-cell values whose ``==`` matches equality of the originals (NaN
+    as a value of its own); ``None`` when they cannot be compared."""
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        return series.cat.codes.to_numpy()
+    if pd.api.types.is_bool_dtype(series) or pd.api.types.is_numeric_dtype(series):
+        return series.to_numpy(dtype=np.float64, na_value=np.nan)
+    try:
+        return pd.factorize(series, use_na_sentinel=False)[0]
+    except TypeError:  # unhashable values (lists, dicts) in an object column
+        return None
 
 
 def aggregate_pseudobulk(
@@ -1050,7 +1075,7 @@ def aggregate_pseudobulk(
                 backed.obs, group_codes, len(keys), exclude=[*columns, *_PROFILE_COLUMNS],
             )
             for column in covariates.columns:
-                obs[column] = covariates[column].to_numpy()
+                obs[column] = covariates[column].set_axis(obs.index)  # keeps nullable dtypes
             if varying:
                 _messages.vprint(
                     verbose, "pb.aggregate",

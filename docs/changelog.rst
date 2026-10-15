@@ -55,6 +55,13 @@ Unreleased
   Genes with fewer than 10 control counts now have their dispersion estimated
   within each comparison; ``layers["dispersion"]`` is written instead of
   ``var["dispersion"]`` when any gene needs it.
+* **Fixed: ``pb.aggregate`` with nullable covariates.** A donor-level
+  ``boolean``/``Int64`` column with missing values, as ``concat_h5ad`` makes
+  for a column only some files have, was carried over as an object array
+  anndata could not write. Dtypes are now kept. Finding the constant columns
+  no longer runs a grouped ``nunique`` over every obs column (one sort, then
+  a comparison per column), and a column of unhashable values counts as
+  varying instead of raising.
 * **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
   level no control shares**, instead of refusing the whole run; infinite
   numeric covariates raise. ``perturbations`` given as a generator no longer
