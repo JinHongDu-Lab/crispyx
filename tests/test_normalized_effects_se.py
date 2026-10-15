@@ -130,3 +130,25 @@ def test_log_mean_has_no_standard_error(tmp_path):
     path, _, _ = _screen(tmp_path, SIZES)
     out = _run(path, tmp_path, "batch", method="log_mean")
     assert "standard_error" not in out.layers and "standard_error_robust" not in out.layers
+
+
+def test_accumulators_in_memory_or_on_disk_give_the_same_result(tmp_path, monkeypatch):
+    import crispyx.pseudobulk as pseudobulk
+
+    placements = []
+    original = pseudobulk._pair_accumulator
+
+    def recording(*args, on_disk, **kwargs):
+        placements.append(on_disk)
+        return original(*args, on_disk=on_disk, **kwargs)
+
+    monkeypatch.setattr(pseudobulk, "_pair_accumulator", recording)
+    path, _, _ = _screen(tmp_path, SIZES)
+    (tmp_path / "ram").mkdir()
+    (tmp_path / "disk").mkdir()
+    in_memory = _run(path, tmp_path / "ram", "batch")
+    on_disk = _run(path, tmp_path / "disk", "batch", memory_limit_gb=1e-9, chunk_size=7)
+    assert placements == [False, False, True, True]
+    np.testing.assert_allclose(in_memory.X, on_disk.X, rtol=1e-12, atol=1e-15)
+    for layer in ("standard_error", "standard_error_robust"):
+        np.testing.assert_allclose(in_memory.layers[layer], on_disk.layers[layer], rtol=1e-12, equal_nan=True)

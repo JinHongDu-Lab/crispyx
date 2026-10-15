@@ -17,6 +17,7 @@ from . import _messages
 from ._checkpoint import _create_progress_context
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
+from ._memory import _resolve_memory_limit_bytes
 from ._grouping import _group_seed, canonical_call_args, resolve_group_reference_aliases
 from .data import (
     AnnData,
@@ -78,8 +79,11 @@ class _StratifiedEffects(NamedTuple):
     standard_error_robust: np.ndarray | None
 
 
-def _pair_memmap(n_rows: int, n_genes: int, prefix: str) -> tuple[np.memmap, str]:
-    """A zeroed ``(n_rows, n_genes)`` float64 accumulator on disk."""
+def _pair_accumulator(n_rows: int, n_genes: int, prefix: str, *, on_disk: bool) -> tuple[np.ndarray, str | None]:
+    """A zeroed ``(n_rows, n_genes)`` float64 accumulator: in memory, or in a
+    file on disk (whose name is returned, for removal)."""
+    if not on_disk:
+        return np.zeros((max(n_rows, 1), n_genes), dtype=np.float64), None
     tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".dat", delete=False)
     tmp.close()
     warn_if_disk_space_low(
@@ -111,15 +115,18 @@ def _streaming_batch_corrected(
     block_fn: Callable[[object], np.ndarray],
     transform: Callable[[np.ndarray, np.ndarray], np.ndarray],
     standard_errors: bool,
+    memory_limit_gb: float | None = None,
 ) -> _StratifiedEffects:
     """Batch-corrected effects, and optionally their standard errors, in one
     bounded-memory pass over the matrix.
 
     The per-``(perturbation, batch)`` accumulators -- the only quantities that
-    scale with the number of batches -- are spilled to disk-backed
-    ``np.memmap`` files, so peak RAM stays ``O(chunk_size x n_genes +
-    n_batches x n_genes + n_candidates x n_genes)`` however many batches there
-    are. Control per-batch accumulators are small and kept in RAM.
+    scale with the number of batches, ``pairs x genes`` each -- are kept in
+    memory when together they fit in half the memory budget, and are
+    otherwise spilled to disk-backed ``np.memmap`` files, so that peak RAM
+    stays ``O(chunk_size x n_genes + n_batches x n_genes + n_candidates x
+    n_genes)`` however many batches there are. Control per-batch accumulators
+    are small and kept in RAM.
 
     For every ``(perturbation, batch)`` pair with cells on both sides the
     within-batch effect is ``d_b = transform(pert_sum, n_p) -
@@ -173,9 +180,14 @@ def _streaming_batch_corrected(
     ctrl_counts = np.zeros(n_batches, dtype=np.int64)
     pair_counts = np.zeros(n_pairs, dtype=np.int64)
 
-    pair_sums, sums_file = _pair_memmap(n_pairs, n_genes, "cx_pb_pairsums_")
+    n_accumulators = 2 if standard_errors else 1
+    on_disk = (
+        n_accumulators * max(n_pairs, 1) * n_genes * 8 > 0.5 * _resolve_memory_limit_bytes(memory_limit_gb)
+    )
+    pair_sums, sums_file = _pair_accumulator(n_pairs, n_genes, "cx_pb_pairsums_", on_disk=on_disk)
     pair_sqsums, sqsums_file = (
-        _pair_memmap(n_pairs, n_genes, "cx_pb_pairsqsums_") if standard_errors else (None, None)
+        _pair_accumulator(n_pairs, n_genes, "cx_pb_pairsqsums_", on_disk=on_disk)
+        if standard_errors else (None, None)
     )
     try:
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
@@ -301,9 +313,9 @@ def _streaming_batch_corrected(
                 correction = np.where(n_strata >= 2, n_strata / (n_strata - 1.0), np.nan)
             se_robust = np.sqrt(correction[:, None] * spread * inv_w * inv_w)
     finally:
-        for memmap, name in ((pair_sums, sums_file), (pair_sqsums, sqsums_file)):
-            if memmap is not None:
-                memmap._mmap.close()  # type: ignore[attr-defined]
+        for accumulator, name in ((pair_sums, sums_file), (pair_sqsums, sqsums_file)):
+            if name is not None:
+                accumulator._mmap.close()  # type: ignore[attr-defined]
                 os.unlink(name)
 
     return _StratifiedEffects(
@@ -384,8 +396,11 @@ def compute_normalized_effects(
     chunk_size
         Cells streamed per chunk. Auto-selected when omitted.
     memory_limit_gb
-        Soft memory budget used to size the chunk. Only the chunk size is affected;
-        results are identical regardless.
+        Soft memory budget. It sizes the chunk, and decides whether the
+        per-(perturbation, batch) accumulators (``pairs x genes`` float64 each;
+        two with standard errors) stay in memory, which they do when they fit
+        in half of it, or go to temporary files on disk. Results are identical
+        regardless.
     data_name
         Custom stem for the output filename.
     output_path
@@ -508,6 +523,7 @@ def compute_normalized_effects(
             block_fn=_block_fn,
             transform=_transform,
             standard_errors=method == "mean_log1p",
+            memory_limit_gb=memory_limit_gb,
         )
     finally:
         backed.file.close()
