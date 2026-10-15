@@ -9,7 +9,6 @@ import logging
 import os
 import warnings
 import threading
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -53,6 +52,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    write_obs,
     _replace_on_success,
 )
 from .glm import (
@@ -686,17 +686,6 @@ def _count_tested(pvalues) -> np.ndarray:
         block = np.asarray(pvalues[start:start + step])
         counts[start:start + step] = np.isfinite(block).sum(axis=1)
     return counts
-
-
-def _replace_obs(path: Path, obs: pd.DataFrame) -> None:
-    """Replace the ``obs`` table of the h5ad at ``path`` in place. The table
-    is encoded by anndata (into a scratch file) and copied across."""
-    with tempfile.TemporaryDirectory(prefix="cx_obs_") as tmpdir:
-        donor = Path(tmpdir) / "obs.h5ad"
-        ad.AnnData(obs=obs).write(donor)
-        with h5py.File(donor, "r") as src, h5py.File(path, "r+") as dest:
-            del dest["obs"]
-            src.copy(src["obs"], dest, name="obs")
 
 
 def _wilcoxon_uns(
@@ -4431,7 +4420,7 @@ def _wilcoxon_test_streaming(
         )
     with h5py.File(work_path, "r") as hf:
         obs["n_genes_tested"] = _count_tested(hf["layers/pvalue"])
-    _replace_obs(work_path, obs)
+    write_obs(work_path, obs)
     write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()

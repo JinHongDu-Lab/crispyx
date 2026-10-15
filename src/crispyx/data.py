@@ -16,7 +16,7 @@ from typing import Any, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
 import anndata as ad
-from anndata.io import read_elem, sparse_dataset
+from anndata.io import read_elem, sparse_dataset, write_elem
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -5262,83 +5262,6 @@ def _h5_index_length(grp: "h5py.Group") -> int:
     return int(item.shape[0])
 
 
-def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
-    """Read an AnnData-encoded HDF5 group as a pandas DataFrame."""
-    _idx_raw = grp.attrs.get("_index", "_index")
-    index_key = _idx_raw.decode("utf-8") if isinstance(_idx_raw, bytes) else str(_idx_raw)
-    _col_raw = grp.attrs.get("column-order", [])
-    column_order = [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in _col_raw]
-
-    index = pd.Index(_read_h5_1d(grp[index_key]))
-
-    all_keys = [k for k in grp.keys() if k != index_key]
-    ordered_keys = [k for k in column_order if k in grp] + [
-        k for k in all_keys if k not in set(column_order)
-    ]
-
-    columns: dict[str, Any] = {}
-    for key in ordered_keys:
-        item = grp[key]
-        if isinstance(item, h5py.Group):
-            enc = str(item.attrs.get("encoding-type", ""))
-            if enc == "categorical":
-                cats = pd.Index(_read_h5_1d(item["categories"]))
-                codes = item["codes"][()].astype(np.intp)
-                ordered = bool(item.attrs.get("ordered", False))
-                columns[key] = pd.Categorical.from_codes(
-                    codes, categories=cats, ordered=ordered
-                )
-            elif "values" in item:
-                # nullable-string / nullable-integer / nullable-boolean array
-                columns[key] = _read_h5_1d(item)
-        else:
-            columns[key] = _read_h5_1d(item)
-
-    return pd.DataFrame(columns, index=index)
-
-
-def _write_dataframe_to_h5(grp: "h5py.Group", df: pd.DataFrame) -> None:
-    """Write a pandas DataFrame to an h5py Group in AnnData 0.2.0 encoding."""
-    str_dtype = h5py.string_dtype(encoding="utf-8")
-
-    grp.attrs["encoding-type"] = "dataframe"
-    grp.attrs["encoding-version"] = "0.2.0"
-    grp.attrs["_index"] = "_index"
-    grp.attrs["column-order"] = np.array(list(df.columns), dtype=object)
-
-    idx_ds = grp.create_dataset(
-        "_index", data=df.index.astype(str).to_numpy(), dtype=str_dtype
-    )
-    idx_ds.attrs["encoding-type"] = "string-array"
-    idx_ds.attrs["encoding-version"] = "0.2.0"
-
-    for col in df.columns:
-        series = df[col]
-        if isinstance(series.dtype, pd.CategoricalDtype):
-            cat_grp = grp.create_group(col)
-            cat_grp.attrs["encoding-type"] = "categorical"
-            cat_grp.attrs["encoding-version"] = "0.2.0"
-            cat_grp.attrs["ordered"] = bool(series.cat.ordered)
-            cats = series.cat.categories.astype(str).to_numpy()
-            cd = cat_grp.create_dataset("categories", data=cats, dtype=str_dtype)
-            cd.attrs["encoding-type"] = "string-array"
-            cd.attrs["encoding-version"] = "0.2.0"
-            codes = series.cat.codes.to_numpy()
-            codes_dtype = np.int8 if len(series.cat.categories) < 128 else np.int16
-            co = cat_grp.create_dataset("codes", data=codes.astype(codes_dtype))
-            co.attrs["encoding-type"] = "array"
-            co.attrs["encoding-version"] = "0.2.0"
-        elif series.dtype.kind in ("O", "U", "S"):
-            vals = series.fillna("").astype(str).to_numpy()
-            ds = grp.create_dataset(col, data=vals, dtype=str_dtype)
-            ds.attrs["encoding-type"] = "string-array"
-            ds.attrs["encoding-version"] = "0.2.0"
-        else:
-            ds = grp.create_dataset(col, data=series.to_numpy())
-            ds.attrs["encoding-type"] = "array"
-            ds.attrs["encoding-version"] = "0.2.0"
-
-
 def load_obs(path: str | Path) -> pd.DataFrame:
     """Load the obs metadata table from an h5ad file without reading X.
 
@@ -5353,9 +5276,10 @@ def load_obs(path: str | Path) -> pd.DataFrame:
         Full obs DataFrame in memory.
     """
     with h5py.File(Path(path), "r") as f:
-        if "obs" not in f:
+        name = _finish_dataframe_swap(f, "obs")
+        if name not in f:
             raise KeyError("h5ad file has no 'obs' group.")
-        return _read_dataframe_from_h5(f["obs"])
+        return read_elem(f[name])
 
 
 def load_var(path: str | Path) -> pd.DataFrame:
@@ -5372,9 +5296,10 @@ def load_var(path: str | Path) -> pd.DataFrame:
         Full var DataFrame in memory.
     """
     with h5py.File(Path(path), "r") as f:
-        if "var" not in f:
+        name = _finish_dataframe_swap(f, "var")
+        if name not in f:
             raise KeyError("h5ad file has no 'var' group.")
-        return _read_dataframe_from_h5(f["var"])
+        return read_elem(f[name])
 
 
 def write_obs(path: str | Path, df: pd.DataFrame) -> None:
@@ -5393,16 +5318,7 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     ValueError
         If the DataFrame length does not match the existing n_obs.
     """
-    path = Path(path)
-    with h5py.File(path, "r+") as f:
-        old_n = _h5_index_length(f["obs"])
-        if len(df) != old_n:
-            raise ValueError(
-                f"DataFrame has {len(df)} rows but the file has {old_n} cells."
-            )
-        del f["obs"]
-        grp = f.create_group("obs")
-        _write_dataframe_to_h5(grp, df)
+    _replace_dataframe(Path(path), "obs", df, unit="cells")
 
 
 def write_var(path: str | Path, df: pd.DataFrame) -> None:
@@ -5421,16 +5337,60 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     ValueError
         If the DataFrame length does not match the existing n_vars.
     """
-    path = Path(path)
+    _replace_dataframe(Path(path), "var", df, unit="genes")
+
+
+def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
+    """Replace the ``obs`` or ``var`` table of the h5ad at ``path`` in place.
+
+    The new table is encoded by anndata beside the old one and swapped in by
+    renames, so an interruption never leaves the file without a table under
+    ``key``; a swap cut short is finished by the next read or write (see
+    :func:`_finish_dataframe_swap`). Resumable runs rely on this: they
+    rewrite ``obs`` of a work file they may be killed in.
+    """
     with h5py.File(path, "r+") as f:
-        old_n = _h5_index_length(f["var"])
-        if len(df) != old_n:
-            raise ValueError(
-                f"DataFrame has {len(df)} rows but the file has {old_n} genes."
-            )
-        del f["var"]
-        grp = f.create_group("var")
-        _write_dataframe_to_h5(grp, df)
+        _finish_dataframe_swap(f, key)
+        n_rows = _h5_index_length(f[key])
+        if len(df) != n_rows:
+            raise ValueError(f"DataFrame has {len(df)} rows but the file has {n_rows} {unit}.")
+        new, old = f"{key}{_SWAP_NEW}", f"{key}{_SWAP_OLD}"
+        # Text columns with missing values become categoricals, as
+        # AnnData.write stores them; h5ad has no other encoding for them.
+        holder = ad.AnnData(obs=df) if key == "obs" else ad.AnnData(var=df)
+        holder.strings_to_categoricals()
+        try:
+            write_elem(f, new, getattr(holder, key))
+        except BaseException:
+            if new in f:
+                del f[new]
+            raise
+        f.move(key, old)
+        f.move(new, key)
+        del f[old]
+
+
+# Names a table takes while :func:`_replace_dataframe` swaps it.
+_SWAP_NEW, _SWAP_OLD = ".__new__", ".__old__"
+
+
+def _finish_dataframe_swap(f: h5py.File, key: str) -> str:
+    """Complete or undo a :func:`_replace_dataframe` that was interrupted,
+    and return the name holding the table. Killed between its two moves, the
+    swap left a complete new table and no ``key``: it takes ``key``'s place.
+    Anything else the swap left behind is removed. A file opened read-only
+    is left as it is, and the name of the table to read is returned."""
+    new, old = f"{key}{_SWAP_NEW}", f"{key}{_SWAP_OLD}"
+    if new not in f and old not in f:
+        return key
+    if f.file.mode == "r":
+        return key if key in f else new
+    if key not in f:
+        f.move(new, key)
+    for leftover in (new, old):
+        if leftover in f:
+            del f[leftover]
+    return key
 
 
 # =============================================================================

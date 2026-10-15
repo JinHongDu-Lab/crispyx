@@ -78,6 +78,14 @@ Unreleased
   read. Categorical columns keep their categories' order and ``ordered``
   flag when every file agrees (they were re-sorted and unordered), and
   otherwise take the categories in order of first appearance.
+* **Fixed: a run killed while rewriting ``obs`` could not be resumed.** The
+  streaming Wilcoxon test deleted its work file's ``obs`` before copying the
+  new one in; killed in between, every resume failed with ``KeyError``.
+  ``write_obs``/``write_var`` (now also used there) write the new table
+  beside the old and swap it in by renames, and the next call finishes a
+  swap that was cut short. They encode with anndata's ``write_elem``
+  instead of a hand-written encoder that turned missing text into ``""``,
+  could not store nullable columns and overflowed past 32,767 categories.
 * **Changed: raw-count checks accept float rounding noise** (``2.0000001``)
   and ``downsample_counts`` rounds such values instead of truncating them.
 * **Changed: crispyx requires anndata 0.11 or later** (``anndata.io``).
