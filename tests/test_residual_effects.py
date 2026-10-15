@@ -230,6 +230,16 @@ def test_cells_in_a_level_without_controls_are_left_out(tmp_path):
     np.testing.assert_allclose(out.X, effect, rtol=1e-8, atol=1e-10)
 
 
+def test_a_missing_covariate_in_perturbed_cells_raises_rather_than_dropping_them(tmp_path):
+    """NaN is not a level without controls: the missing metadata is reported."""
+    path, counts, obs = _screen(tmp_path)
+    obs["lane"] = obs["lane"].astype(object)
+    obs.loc[obs.index[obs["perturbation"] == "A"][:2], "lane"] = np.nan
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=GENES)).write(path)
+    with pytest.raises(ValueError, match="'lane' has missing values"):
+        cx.residual_effects(path, "perturbation", "ctrl", covariates=["lane"], min_cells=1, verbose=False)
+
+
 def test_infinite_covariate_raises(tmp_path):
     path, counts, obs = _screen(tmp_path)
     obs.loc[obs.index[0], "score"] = np.inf

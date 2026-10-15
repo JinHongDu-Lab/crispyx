@@ -79,7 +79,12 @@ SIZES = {("control", "b1"): 9, ("control", "b2"): 5, ("control", "b3"): 6,
 
 
 @pytest.mark.parametrize("batch_column", ["batch", None])
-def test_standard_errors_match_the_published_formulas(tmp_path, batch_column):
+@pytest.mark.parametrize("block_bytes", [None, 80])  # 80: two pairs of 5 genes per block
+def test_standard_errors_match_the_published_formulas(tmp_path, monkeypatch, batch_column, block_bytes):
+    if block_bytes is not None:
+        import crispyx.pseudobulk as pseudobulk
+
+        monkeypatch.setattr(pseudobulk, "_FINALISE_BLOCK_BYTES", block_bytes)
     path, counts, obs = _screen(tmp_path, SIZES)
     out = _run(path, tmp_path, batch_column, chunk_size=7)
     for target in ("KO_A", "KO_B", "KO_C"):

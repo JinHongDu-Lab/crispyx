@@ -95,6 +95,24 @@ def test_output_path_equal_to_input_raises_and_keeps_input(tmp_path):
     np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before)
 
 
+@pytest.mark.parametrize("name, writer", [
+    ("data.h5ad", lambda path: cx.pp.normalize_total_log1p(path, output_path=path, verbose=False)),
+    ("data.h5ad", lambda path: cx.pp.convert_to_csc(path, output_path=path, verbose=False)),
+    ("data.h5ad", lambda path: cx.data.sort_by_perturbation(path, perturbation_column="pert",
+                                                             control_label="control", output_path=path)),
+    # The default output name, given this data_name, is the input's own.
+    ("data_cx_log1p.h5ad", lambda path: cx.pp.normalize_total_log1p(
+        path, normalize=False, data_name="data_cx_log1p", verbose=False)),
+], ids=["normalize", "convert_to_csc", "sort_by_perturbation", "default_name"])
+def test_every_writer_refuses_to_overwrite_its_input(tmp_path, name, writer):
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    path = path.rename(path.with_name(name))
+    before = ad.read_h5ad(path).X.toarray()
+    with pytest.raises(ValueError, match="is the input file"):
+        writer(path)
+    np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before)
+
+
 def test_interrupted_subset_leaves_no_output(tmp_path, monkeypatch):
     """A subset killed mid-write leaves neither the output nor a partial."""
     import crispyx.data as data

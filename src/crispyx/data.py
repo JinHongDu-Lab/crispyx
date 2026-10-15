@@ -8,11 +8,12 @@ import re as _re
 import socket as _socket
 import tempfile
 import time as _time
+import functools
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
 import anndata as ad
@@ -336,6 +337,7 @@ class AnnData:
     def to_memory(self) -> ad.AnnData:
         """Materialise the backed AnnData into memory."""
 
+        _finish_interrupted_swaps(self.path)
         return ad.read_h5ad(str(self.path))
 
     @property
@@ -410,10 +412,12 @@ def read_backed(path: str | Path, mode: Literal["r", "r+"] = "r") -> ad.AnnData:
     cannot be read after that. ``adata.to_memory()`` loads everything.
     """
     path = str(path)
+    _finish_interrupted_swaps(path)
     with h5py.File(path, "r") as handle:
         if "encoding-type" not in handle.attrs:  # written by anndata < 0.7
             return ad.read_h5ad(path, backed=mode)
-        slots = {key: read_elem(handle[key]) for key in _IN_MEMORY_SLOTS if key in handle}
+        slots = {key: read_elem(handle[_table_name(handle, key)]) for key in _IN_MEMORY_SLOTS
+                 if _table_name(handle, key) in handle}
         raw = handle["raw"] if "raw" in handle else {}
         slots["raw"] = {key: read_elem(raw[key]) for key in ("var", "varm") if key in raw}
     adata = ad.AnnData(**slots, filename=path, filemode=mode)
@@ -700,11 +704,12 @@ class _H5Slots:
 def _read_h5ad_metadata(path: Path) -> dict:
     """``obs``, ``var`` and ``uns`` of the h5ad at ``path``, the keys of its
     other slots and whether it has ``.raw``, without loading any matrix."""
+    _finish_interrupted_swaps(path)
     with h5py.File(path, "r") as handle:
         slots = _H5Slots(handle)
         return {
-            "obs": read_elem(handle["obs"]),
-            "var": read_elem(handle["var"]),
+            "obs": read_elem(handle[_table_name(handle, "obs")]),
+            "var": read_elem(handle[_table_name(handle, "var")]),
             "uns": read_elem(handle["uns"]) if "uns" in handle else {},
             **{slot: list(getattr(slots, slot)) for slot in ("layers", "obsm", "varm", "obsp", "varp")},
             "has_raw": "raw" in handle,
@@ -819,15 +824,30 @@ def resolve_output_path(
 
     When ``output_path`` is provided it is returned directly, bypassing all
     name computation.  This lets callers enforce an exact output filename.
+    Either way, a path that is the input file itself raises ``ValueError``.
 
     .. deprecated::
         ``output_dir`` is kept for backward compatibility and will be removed
         in the next major version.  Use ``output_path`` instead.
     """
+    resolved = _compose_output_path(
+        input_path, suffix=suffix, data_name=data_name,
+        output_path=output_path, output_dir=output_dir,
+    )
+    _refuse_overwriting_input([input_path], resolved)
+    return resolved
+
+
+def _compose_output_path(
+    input_path: str | Path,
+    *,
+    suffix: str,
+    data_name: str | None,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+) -> Path:
     if output_path is not None:
-        output_path = Path(output_path)
-        _refuse_overwriting_input([input_path], output_path)
-        return output_path
+        return Path(output_path)
 
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
@@ -1671,6 +1691,10 @@ class _RowSegment:
     key: str
     cell_mask: np.ndarray
     gene_indices: np.ndarray
+    #: When set, the rows are read from the path this context yields (a
+    #: temporary CSR copy of a CSC source), entered only while this segment
+    #: streams, so one source's copy exists at a time.
+    rows_from: Callable[[], AbstractContextManager[Path]] | None = None
 
 
 @contextmanager
@@ -1688,7 +1712,8 @@ def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
     """The selected rows and columns of ``segment``, a row chunk at a time.
     Chunks without a selected row are not read, and the columns are not
     re-indexed when the segment keeps all of them in order."""
-    with _open_matrix(segment.source_path, segment.key) as matrix:
+    rows_from = segment.rows_from() if segment.rows_from is not None else nullcontext(segment.source_path)
+    with rows_from as path, _open_matrix(path, segment.key) as matrix:
         all_columns = _keeps_all_columns(segment.gene_indices, matrix.shape[1])
         for slc, block in iter_matrix_chunks(
             None, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix,
@@ -2069,18 +2094,55 @@ def _scan_rows(
     """Non-zero count and sum of each of the ``n_obs`` rows of ``path``'s
     ``X`` over ``gene_indices``, and the dtype of its stored values (``None``
     if there are none): the counting pass :func:`_stream_write_matrix_subset`
-    would make, plus enough to tell two copies of a cell from two cells."""
+    would make, plus enough to tell two copies of a cell from two cells.
+
+    A CSC ``X`` is read a block of columns at a time, which needs no
+    row-major copy: only the row index and value of each entry matter."""
+    with h5py.File(path, "r") as handle:
+        elem = handle["X"]
+        if isinstance(elem, h5py.Group) and _element_format(elem) == "csc":
+            return _scan_csc_rows(elem, n_obs, gene_indices, chunk_size)
     nnz, sums, dtype = [], [], None
     segment = _RowSegment(path, "X", np.ones(n_obs, dtype=bool), gene_indices)
     for block in _segment_blocks(segment, chunk_size):
         csr = _ensure_csr(block)
-        nnz.append(np.diff(csr.indptr))
-        sums.append(np.asarray(csr.sum(axis=1), dtype=np.float64).ravel())
+        counts = np.diff(csr.indptr)
+        nnz.append(counts)
+        sums.append(np.bincount(np.repeat(np.arange(csr.shape[0]), counts), weights=csr.data,
+                                minlength=csr.shape[0]))
         if csr.nnz:
             dtype = csr.data.dtype if dtype is None else np.result_type(dtype, csr.data.dtype)
     if not nnz:
         return np.zeros(0, dtype=np.int64), np.zeros(0), dtype
     return np.concatenate(nnz).astype(np.int64), np.concatenate(sums), dtype
+
+
+def _scan_csc_rows(
+    elem: h5py.Group, n_obs: int, gene_indices: np.ndarray, chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.dtype | None]:
+    """:func:`_scan_rows` of a CSC matrix, in column blocks of about
+    ``chunk_size`` rows' worth of entries."""
+    indptr = elem["indptr"][:].astype(np.int64)
+    n_cols = indptr.size - 1
+    selected = np.zeros(n_cols, dtype=bool)
+    selected[gene_indices] = True
+    nnz = np.zeros(n_obs, dtype=np.int64)
+    sums = np.zeros(n_obs, dtype=np.float64)
+    data_ds, indices_ds = elem["data"], elem["indices"]
+    entries_per_block = max(1, chunk_size * n_cols)
+    start = 0
+    while start < n_cols:
+        stop = int(np.searchsorted(indptr, indptr[start] + entries_per_block, side="right")) - 1
+        stop = min(max(stop, start + 1), n_cols)
+        lo, hi = int(indptr[start]), int(indptr[stop])
+        if hi > lo:
+            keep = np.repeat(selected[start:stop], np.diff(indptr[start : stop + 1]))
+            rows = indices_ds[lo:hi][keep]
+            nnz += np.bincount(rows, minlength=n_obs)
+            sums += np.bincount(rows, weights=data_ds[lo:hi][keep], minlength=n_obs)
+        start = stop
+    dtype = data_ds.dtype if nnz.any() else None
+    return nnz, sums, dtype
 
 
 def _obsm_kind(value: Any) -> str:
@@ -2329,11 +2391,20 @@ def concat_h5ad(
     for frame, mask in zip(frames, keep):
         if not mask.all():
             obs.update(frame[~mask], overwrite=False)
+    mixed = []
     for column in categorical:
-        obs[column] = obs[column].astype(_merged_categorical_dtype(
+        dtype = _merged_categorical_dtype(
             [meta["obs"][column] for meta in metas if column in meta["obs"].columns], obs[column],
-        ))
-    mixed = _stringify_mixed_columns(obs)
+        )
+        is_text = dtype.categories.map(lambda v: isinstance(v, str))
+        if is_text.any() and not is_text.all():
+            # One file's text categories beside another's numbers: h5ad
+            # cannot write mixed categories, so the column is stored as text.
+            obs[column] = obs[column].where(obs[column].isna(), obs[column].astype(str))
+            dtype = pd.CategoricalDtype(dtype.categories.astype(str).unique())
+            mixed.append(column)
+        obs[column] = obs[column].astype(dtype)
+    mixed += _stringify_mixed_columns(obs)
     if mixed:
         _messages.vprint(
             verbose, name,
@@ -2349,30 +2420,30 @@ def concat_h5ad(
 
     # ---- one pass over each X: the output's row sizes and the shared-cell check ----
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as stack:
-        # Each CSC X is streamed from a temporary CSR copy, for both passes.
-        x_paths = [
-            stack.enter_context(stream_on_fast_axis(
-                source, axis=0, policy=format_mismatch_policy, fn_name=name,
-                scratch_dir=output_path.parent, chunk_size=chunk_size, verbose=verbose,
-            ))
-            for source in sources
-        ]
-        return _concat_matrices(
-            sources, x_paths, metas, keep, pairs, gene_indices, genes, obs, fingerprint,
-            output_path=output_path, chunk_size=chunk_size, verbose=verbose, name=name,
+    # A CSC X is scanned as it is; for the write, each is streamed from a
+    # temporary CSR copy made only while its rows are written.
+    x_rows_from = [
+        functools.partial(
+            stream_on_fast_axis, source, axis=0, policy=format_mismatch_policy, fn_name=name,
+            scratch_dir=output_path.parent, chunk_size=chunk_size, verbose=verbose,
         )
+        for source in sources
+    ]
+    return _concat_matrices(
+        sources, x_rows_from, metas, keep, pairs, gene_indices, genes, obs, fingerprint,
+        output_path=output_path, chunk_size=chunk_size, verbose=verbose, name=name,
+    )
 
 
 def _concat_matrices(
-    sources, x_paths, metas, keep, pairs, gene_indices, genes, obs, fingerprint,
+    sources, x_rows_from, metas, keep, pairs, gene_indices, genes, obs, fingerprint,
     *, output_path: Path, chunk_size: int, verbose: int | bool, name: str,
 ) -> "AnnData":
     """The streaming half of :func:`concat_h5ad`: check the shared cells
     against each X, then write the output."""
     scans = [
-        _scan_rows(x_path, len(meta["obs"]), indices, chunk_size)
-        for x_path, meta, indices in zip(x_paths, metas, gene_indices)
+        _scan_rows(source, len(meta["obs"]), indices, chunk_size)
+        for source, meta, indices in zip(sources, metas, gene_indices)
     ]
     for j, i, names in pairs:
         rows_a = metas[j]["obs"].index.get_indexer(names)
@@ -2427,10 +2498,12 @@ def _concat_matrices(
     if not_carried:
         _messages.vprint(verbose, name, f"not carried over: {not_carried}")
 
-    def segments(paths, key):
+    def segments(key, rows_from=None):
         return [
-            _RowSegment(path, key, mask, indices)
-            for path, mask, indices in zip(paths, keep, gene_indices)
+            _RowSegment(source, key, mask, indices, opener)
+            for source, mask, indices, opener in zip(
+                sources, keep, gene_indices, rows_from or [None] * len(sources),
+            )
         ]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2440,13 +2513,13 @@ def _concat_matrices(
             obs=obs, var=var, obsm=obsm, uns=uns,
         ).write(partial)
         _stream_write_matrix_subset(
-            segments(x_paths, "X"), dest_group="X", n_vars=len(genes),
+            segments("X", x_rows_from), dest_group="X", n_vars=len(genes),
             output_path=partial, chunk_size=chunk_size, context=f"{name} (X)",
             row_nnz=row_nnz, total_nnz=int(row_nnz.sum()), data_dtype=data_dtype,
         )
         for key in layers:
             _stream_write_matrix_subset(
-                segments(sources, f"layers/{key}"), dest_group=f"layers/{key}",
+                segments(f"layers/{key}"), dest_group=f"layers/{key}",
                 n_vars=len(genes), output_path=partial, chunk_size=chunk_size,
                 context=f"{name} (layers/{key})",
             )
@@ -2563,6 +2636,7 @@ def normalize_total_log1p(
             source_path, suffix=suffix, output_dir=output_dir, data_name=data_name,
         )
     output_path = Path(output_path)
+    _refuse_overwriting_input([source_path], output_path)
 
     # Cell-(row-)streaming below is pathologically slow on CSC; resolve the
     # format mismatch according to policy before touching X. A temporary CSR
@@ -2835,13 +2909,17 @@ def _thin_csr_chunk(indptr: np.ndarray, data: np.ndarray, target: int, seeds: np
 
 def _looks_like_counts(values: np.ndarray) -> bool:
     """Whether ``values`` are all finite, non-negative integers, up to the
-    rounding noise a float pipeline leaves (``2.0000001``); callers round."""
+    rounding noise a float pipeline leaves (``2.0000001``); callers round.
+
+    The noise allowed is absolute -- ``1e-6``, or two units in the last place
+    of the value in its own dtype where that is larger -- so a large value
+    with a real fractional part (``612345.4``) is not taken for a count."""
     if values.dtype.kind in "biu":
         return values.size == 0 or values.min() >= 0
-    return bool(
-        np.isfinite(values).all() and (values >= 0).all()
-        and np.isclose(values, np.rint(values), rtol=1e-6, atol=1e-6).all()
-    )
+    if not (np.isfinite(values).all() and (values >= 0).all()):
+        return False
+    tolerance = np.maximum(1e-6, 2 * np.spacing(values))
+    return bool((np.abs(values - np.rint(values)) <= tolerance).all())
 
 
 def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> None:
@@ -3300,6 +3378,7 @@ def convert_to_csc(
             data_name=data_name,
         )
     output_path = Path(output_path)
+    _refuse_overwriting_input([source_path], output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     warn_if_disk_space_low(
         estimate_conversion_bytes(source_path), output_path,
@@ -3498,6 +3577,7 @@ def convert_to_csr(
             data_name=data_name,
         )
     output_path = Path(output_path)
+    _refuse_overwriting_input([source_path], output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     warn_if_disk_space_low(
         estimate_conversion_bytes(source_path), output_path,
@@ -4862,7 +4942,8 @@ def sort_by_perturbation(
         output_path = path.parent / f"{path.stem}_sorted.h5ad"
     else:
         output_path = Path(output_path)
-    
+    _refuse_overwriting_input([path], output_path)
+
     # Reuse an existing sorted copy only when it was made from this exact
     # source: a copy of an older version of the input would silently feed
     # its cells to every analysis that sorts first.
@@ -5378,9 +5459,10 @@ def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> 
     """Replace the ``obs`` or ``var`` table of the h5ad at ``path`` in place.
 
     The new table is encoded by anndata beside the old one and swapped in by
-    renames, so an interruption never leaves the file without a table under
-    ``key``; a swap cut short is finished by the next read or write (see
-    :func:`_finish_dataframe_swap`). Resumable runs rely on this: they
+    renames. HDF5 cannot rename over an existing name, so a kill between the
+    two renames leaves the new table under a temporary name; the next crispyx
+    read or write of the file finishes the swap (see
+    :func:`_finish_interrupted_swaps`), after which anndata reads it too. Resumable runs rely on this: they
     rewrite ``obs`` of a work file they may be killed in.
     """
     with h5py.File(path, "r+") as f:
@@ -5406,6 +5488,31 @@ def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> 
 
 # Names a table takes while :func:`_replace_dataframe` swaps it.
 _SWAP_NEW, _SWAP_OLD = ".__new__", ".__old__"
+
+
+def _table_name(f: h5py.File, key: str) -> str:
+    """The name ``key``'s table is under in a file opened read-only, where an
+    interrupted swap cannot be finished (see :func:`_finish_dataframe_swap`);
+    ``key`` for any slot other than ``obs`` and ``var``."""
+    return _finish_dataframe_swap(f, key) if key in ("obs", "var") else key
+
+
+def _finish_interrupted_swaps(path: str | Path) -> None:
+    """Finish any :func:`_replace_dataframe` of ``path``'s ``obs`` or ``var``
+    that was interrupted, so the file reads as an h5ad again -- also to
+    anndata. Readers call this before opening the file; a file that cannot
+    be opened for writing is left as it is, and read through
+    :func:`_table_name`."""
+    with h5py.File(path, "r") as f:
+        pending = any(f"{key}{suffix}" in f for key in ("obs", "var") for suffix in (_SWAP_NEW, _SWAP_OLD))
+    if not pending:
+        return
+    try:
+        with h5py.File(path, "r+") as f:
+            for key in ("obs", "var"):
+                _finish_dataframe_swap(f, key)
+    except OSError:
+        pass
 
 
 def _finish_dataframe_swap(f: h5py.File, key: str) -> str:

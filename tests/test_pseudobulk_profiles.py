@@ -368,6 +368,19 @@ def test_constant_covariates_treat_unhashable_values_as_varying():
     assert varying == ["tags"] and first["donor"].tolist() == ["d1", "d2"]
 
 
+def test_constant_covariates_compare_large_integers_exactly():
+    """2**53 + 1 and 2**53 are the same float64; as IDs they differ."""
+    from crispyx.pseudobulk import _constant_covariates
+
+    obs = pd.DataFrame({
+        "cell_id": np.array([2**53 + 1, 2**53, 7], dtype=np.int64),
+        "flag": pd.array([True, None, False], dtype="boolean"),
+        "score": [np.nan, np.nan, 1.0],
+    })
+    first, varying = _constant_covariates(obs, np.array([0, 0, 1]), 2, exclude=[])
+    assert varying == ["cell_id", "flag"] and np.isnan(first["score"].iloc[0])
+
+
 def test_one_grouping_column_names_profiles_by_its_value(tmp_path):
     path = _write_donor_screen(tmp_path)
     result = cx.pb.aggregate(

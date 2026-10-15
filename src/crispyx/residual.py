@@ -580,8 +580,9 @@ def _drop_cells_without_controls(obs: pd.DataFrame, covariates: list[str], group
         series = obs[name]
         if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
             continue
+        # Missing values are not a level: _Design.build reports them.
         values = series.astype(str).to_numpy()
-        uncovered |= (groups > 0) & ~np.isin(values, np.unique(values[controls]))
+        uncovered |= (groups > 0) & series.notna().to_numpy() & ~np.isin(values, np.unique(values[controls]))
     if not uncovered.any():
         return groups
     _messages.vprint(

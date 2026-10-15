@@ -227,3 +227,18 @@ def test_counts_with_float_rounding_noise_are_rounded_not_truncated(tmp_path):
     adata.write(path)
     out = cx.pp.downsample_counts(path, tmp_path / "out.h5ad", counts_per_cell=10**9, verbose=False)
     np.testing.assert_array_equal(ad.read_h5ad(out.path).X.toarray(), exact)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_large_values_with_a_fractional_part_are_not_counts(tmp_path, dtype):
+    """A relative tolerance would pass any value above ~5e5 as an integer."""
+    rng = np.random.default_rng(13)
+    n_obs, n_vars = 20, 8
+    scaled = (rng.poisson(15.0, size=(n_obs, n_vars)) * 40_000 + 0.4).astype(dtype)
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n_obs)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+    path = tmp_path / "scaled.h5ad"
+    ad.AnnData(sp.csr_matrix(scaled), obs=obs, var=var).write(path)
+
+    with pytest.raises(ValueError, match="non-integer"):
+        cx.pp.downsample_counts(path, counts_per_cell=10, output_path=tmp_path / "out.h5ad", verbose=False)

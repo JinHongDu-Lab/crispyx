@@ -66,3 +66,36 @@ def test_an_interrupted_obs_swap_is_finished_by_the_next_call(tmp_path, killed_a
     with h5py.File(path, "r") as f:
         assert not [k for k in f if "__" in k]
     assert load_obs(path)["h"].eq(2).all()
+
+
+def test_a_swap_killed_between_its_moves_is_finished_by_any_crispyx_read(tmp_path):
+    """read_backed (behind cx.AnnData) finishes the swap, after which anndata
+    reads the file too; a read-only file is read without being repaired."""
+    import os
+    import stat
+
+    from crispyx.data import read_backed
+
+    def interrupted():
+        path = _obs_file(tmp_path)
+        with h5py.File(path, "r+") as f:
+            write_elem(f, "obs.__new__", load_obs(path).assign(h=1))
+            f.move("obs", "obs.__old__")
+        return path
+
+    path = interrupted()
+    backed = read_backed(path)
+    assert "h" in backed.obs
+    backed.file.close()
+    with h5py.File(path, "r") as f:
+        assert "obs" in f and not [k for k in f if "__" in k]
+    assert "h" in ad.read_h5ad(path).obs
+
+    path = interrupted()
+    os.chmod(path, stat.S_IRUSR)
+    try:
+        backed = read_backed(path)
+        assert "h" in backed.obs
+        backed.file.close()
+    finally:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)

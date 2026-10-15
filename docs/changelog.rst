@@ -1,8 +1,10 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.2.0
+-------------
+
+*Released 2026-10-15.*
 
 * **Docs reorganised.** The usage guide is split into task pages under a new
   *User guide* section (loading and preparing data; quality control and
@@ -24,7 +26,9 @@ Unreleased
   however many perturbations there are.
   Its per-(perturbation, batch) sums stay in memory when they fit half the
   memory budget, and go to temporary files otherwise (they always went to
-  disk); ``perturbation_column`` and ``batch_column`` may be ``pd.Series``
+  disk); the results are then finished a block of perturbations at a time,
+  so nothing of the size of the output is held beside it;
+  ``perturbation_column`` and ``batch_column`` may be ``pd.Series``
   indexed by cell, as in ``wilcoxon_test`` and ``residual_effects``. Checked
   against the effects and standard errors Liu et al. published for the Feng
   et al. targeted screen: they agree to float32 precision. New tutorial,
@@ -37,7 +41,10 @@ Unreleased
 * **Fixed: an ``output_path`` equal to the input file destroyed it.**
   ``pp.subsample`` (and the QC filter) wrote the empty output skeleton over
   the source and then failed reading it; DE functions replaced the input with
-  their result. Every writer now raises ``ValueError`` instead. Subset
+  their result; ``normalize_total_log1p``, ``convert_to_csc``/``convert_to_csr``
+  and ``sort_by_perturbation`` overwrote it too. Every writer now raises
+  ``ValueError`` instead, also when a default output name (from
+  ``data_name``) is the input's. Subset
   writes also go to a partial file renamed on success, so an interrupted
   ``subsample`` or QC filter leaves no half-written output.
 * **Fixed: cells with a missing perturbation label** were tested as a group
@@ -86,7 +93,8 @@ Unreleased
   anndata could not write. Dtypes are now kept. Finding the constant columns
   no longer runs a grouped ``nunique`` over every obs column (one sort, then
   a comparison per column), and a column of unhashable values counts as
-  varying instead of raising.
+  varying instead of raising. Integer columns are compared exactly (64-bit
+  IDs above 2**53 are distinct).
 * **Fixed: ``concat_h5ad`` and subset writes loaded every layer into
   memory**, once per file for every pass: they opened each file as a backed
   AnnData, which anndata fills with every layer, ``obsm`` and ``obsp``. They
@@ -106,27 +114,35 @@ Unreleased
   (``pp.subsample``, the QC filter) were streamed by rows, re-reading the
   whole matrix for every chunk. Both take ``format_mismatch_policy``
   (default ``"auto"``) and stream a CSC ``X`` from a temporary CSR copy
-  beside the output, like the other streaming functions.
+  beside the output, like the other streaming functions. ``concat_h5ad``
+  checks the shared cells by reading a CSC ``X`` by columns, with no copy,
+  and makes each file's copy only while writing that file's cells, so the
+  scratch space needed is that of the largest file, not of all of them.
 * **Fixed: ``concat_h5ad`` with an obs column of numbers in one file and text
   in another** failed to write, after a full pass over every matrix. Such
-  columns are now stored as text, and obs is merged before any matrix is
-  read. Categorical columns keep their categories' order and ``ordered``
+  columns, categorical or not, are now stored as text, and obs is merged
+  before any matrix is read. Categorical columns keep their categories' order and ``ordered``
   flag when every file agrees (they were re-sorted and unordered), and
   otherwise take the categories in order of first appearance.
 * **Fixed: a run killed while rewriting ``obs`` could not be resumed.** The
   streaming Wilcoxon test deleted its work file's ``obs`` before copying the
   new one in; killed in between, every resume failed with ``KeyError``.
   ``write_obs``/``write_var`` (now also used there) write the new table
-  beside the old and swap it in by renames, and the next call finishes a
-  swap that was cut short. They encode with anndata's ``write_elem``
+  beside the old and swap it in by renames; a swap cut short is finished by
+  the next crispyx read or write of the file (``cx.AnnData``,
+  ``read_backed``, ``load_obs``, ...), after which anndata reads it too. They encode with anndata's ``write_elem``
   instead of a hand-written encoder that turned missing text into ``""``,
   could not store nullable columns and overflowed past 32,767 categories.
 * **Changed: raw-count checks accept float rounding noise** (``2.0000001``)
   and ``downsample_counts`` rounds such values instead of truncating them.
+  The noise allowed is absolute (``1e-6``, or two units in the last place of
+  the value's dtype), so a large value with a fractional part such as
+  ``612345.4`` is still refused.
 * **Changed: crispyx requires anndata 0.11 or later** (``anndata.io``).
 * **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
   level no control shares**, instead of refusing the whole run; infinite
-  numeric covariates raise. ``perturbations`` given as a generator no longer
+  numeric covariates raise, and so do missing ones in the cells used (a
+  missing value is not a level of its own). ``perturbations`` given as a generator no longer
   prevents reuse of an existing result (also for the DE functions).
 
 Version 0.1.10

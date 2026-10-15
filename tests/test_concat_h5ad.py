@@ -5,6 +5,7 @@ the shared cells removed by hand."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import warnings
 
@@ -98,9 +99,10 @@ def test_shared_cells_error_mode_raises(tmp_path):
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", shared_cells="error", verbose=False)
 
 
-def test_same_barcode_different_cell_raises(tmp_path):
+@pytest.mark.parametrize("matrix", [sp.csr_matrix, sp.csc_matrix])
+def test_same_barcode_different_cell_raises(tmp_path, matrix):
     paths, _, second = _pilot(tmp_path)
-    second.X = sp.csr_matrix(second.X.toarray() + np.eye(second.n_obs, second.n_vars, dtype=np.float32))
+    second.X = matrix(second.X.toarray() + np.eye(second.n_obs, second.n_vars, dtype=np.float32))
     second.write(paths[1])
     with pytest.raises(ValueError, match="with different expression"):
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
@@ -232,6 +234,17 @@ def test_a_column_with_numbers_in_one_file_and_text_in_another_is_stored_as_text
     assert got.obs["lane"].tolist() == [str(i) for i in range(first.n_obs)] + ["L6", "L7", "L8", "L9"]
 
 
+def test_a_categorical_column_with_numbers_in_another_file_is_stored_as_text(tmp_path):
+    paths, first, second = _pilot(tmp_path)
+    first.obs["lane"] = pd.Categorical(np.resize(["A", "B"], first.n_obs))
+    second.obs["lane"] = np.resize([1, 2], second.n_obs)
+    first.write(paths[0])
+    second.write(paths[1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False).path)
+    assert got.obs["lane"].cat.categories.tolist() == ["A", "B", "1", "2"]
+    assert got.obs["lane"].tolist()[first.n_obs:] == ["1", "2", "1", "2"]
+
+
 @pytest.mark.parametrize("same_categories", [True, False])
 def test_categorical_order_is_kept(tmp_path, same_categories):
     paths, first, second = _pilot(tmp_path)
@@ -251,21 +264,34 @@ def test_categorical_order_is_kept(tmp_path, same_categories):
 
 
 @pytest.mark.parametrize("policy", ["convert", "warn"])
-def test_csc_inputs(tmp_path, policy):
+def test_csc_inputs(tmp_path, monkeypatch, policy):
     """A CSC file is streamed from a CSR copy (or as is, with a warning);
     the result is the same, and no copy is left behind."""
     paths, first, second = _pilot(tmp_path)
     for path, adata in zip(paths, (first, second)):
         adata.X = sp.csc_matrix(adata.X)
         adata.write(path)
+    out = tmp_path / "out"
+    open_copies = []
+    original = cx.data.stream_on_fast_axis
+
+    @contextlib.contextmanager
+    def counting(*args, **kwargs):
+        with original(*args, **kwargs) as path:
+            open_copies.append(sum(1 for p in out.iterdir() if p.name != ".x.h5ad.partial"))
+            yield path
+
+    monkeypatch.setattr(cx.data, "stream_on_fast_axis", counting)
     context = pytest.warns(UserWarning, match="CSC") if policy == "warn" else warnings.catch_warnings()
     with context:
-        result = cx.pp.concat_h5ad(paths, output_path=tmp_path / "out" / "x.h5ad",
+        result = cx.pp.concat_h5ad(paths, output_path=out / "x.h5ad",
                                    format_mismatch_policy=policy, verbose=False)
     got = ad.read_h5ad(result.path)
     expected, _ = _expected(first, second)
     np.testing.assert_array_equal(got.X.toarray(), _dense(expected[:, got.var_names].X))
-    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["x.h5ad"]
+    assert sorted(p.name for p in out.iterdir()) == ["x.h5ad"]
+    # One temporary copy at a time, made while that file's rows are written.
+    assert open_copies == ([1, 1] if policy == "convert" else [0, 0])
 
 
 def test_no_file_is_opened_as_a_backed_anndata(tmp_path, monkeypatch):

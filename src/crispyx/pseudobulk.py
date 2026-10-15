@@ -74,12 +74,16 @@ class _StratifiedEffects(NamedTuple):
 
     effect: np.ndarray
     perturbation_profile: np.ndarray
-    control_profile_matched: np.ndarray
+    control_profile_matched: np.ndarray | None
     pooled_control_sum: np.ndarray
     pooled_control_count: int
     batch_ids: list[str]
     standard_error: np.ndarray | None
     standard_error_robust: np.ndarray | None
+
+
+#: Bytes of each per-pair temporary while finalising a block of perturbations.
+_FINALISE_BLOCK_BYTES = 256 << 20
 
 
 def _pair_accumulator(n_rows: int, n_genes: int, prefix: str, *, on_disk: bool) -> tuple[np.ndarray, str | None]:
@@ -103,14 +107,19 @@ def _add_by_sorted_group(out: np.ndarray, groups: np.ndarray, values: np.ndarray
     out[groups[starts]] += np.add.reduceat(values, starts, axis=0)
 
 
-def _group_sums(values: np.ndarray, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Distinct ``codes``, the row sums of ``values`` for each, and their counts."""
+def _group_sums(
+    values: np.ndarray, codes: np.ndarray, *, squares: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Distinct ``codes``, the row sums of ``values`` for each (and of their
+    squares, with ``squares``), and their counts: one indicator matrix serves
+    both sums."""
     unique, inverse = np.unique(codes, return_inverse=True)
     indicator = sparse.csr_matrix(
         (np.ones(codes.shape[0], dtype=np.float64), (inverse, np.arange(codes.shape[0]))),
         shape=(unique.shape[0], codes.shape[0]),
     )
-    return unique, indicator @ values, np.bincount(inverse, minlength=unique.shape[0])
+    sqsums = indicator @ np.square(values) if squares else None
+    return unique, indicator @ values, sqsums, np.bincount(inverse, minlength=unique.shape[0])
 
 
 def _streaming_batch_corrected(
@@ -125,6 +134,7 @@ def _streaming_batch_corrected(
     block_fn: Callable[[object], np.ndarray],
     transform: Callable[[np.ndarray, np.ndarray], np.ndarray],
     standard_errors: bool,
+    matched_profile: bool,
     memory_limit_gb: float | None = None,
 ) -> _StratifiedEffects:
     """Batch-corrected effects, and optionally their standard errors, in one
@@ -208,93 +218,39 @@ def _streaming_batch_corrected(
 
             # Control cells -> per-batch sums (RAM).
             if cm.any():
-                ub, sums, n = _group_sums(acc[cm], bc[cm])
+                ub, sums, sqsums, n = _group_sums(acc[cm], bc[cm], squares=standard_errors)
                 ctrl_sums[ub] += sums
                 ctrl_counts[ub] += n
                 if standard_errors:
-                    ctrl_sqsums[ub] += _group_sums(np.square(acc[cm]), bc[cm])[1]
+                    ctrl_sqsums[ub] += sqsums
 
-            # Perturbation cells -> per-(pert, batch) sums (memmap).
+            # Perturbation cells -> per-(pert, batch) sums.
             pm = pc >= 0
             if pm.any():
                 keys = pc[pm].astype(np.int64) * n_batches + bc[pm]
                 slots = np.searchsorted(uniq_pairs, keys)
-                us, sums, n = _group_sums(acc[pm], slots)
+                us, sums, sqsums, n = _group_sums(acc[pm], slots, squares=standard_errors)
                 pair_sums[us] = pair_sums[us] + sums
                 pair_counts[us] += n
                 if standard_errors:
-                    pair_sqsums[us] = pair_sqsums[us] + _group_sums(np.square(acc[pm]), slots)[1]
+                    pair_sqsums[us] = pair_sqsums[us] + sqsums
 
         pooled_ctrl_sum = ctrl_sums.sum(axis=0)
         pooled_ctrl_count = int(ctrl_counts.sum())
 
-        # Per-perturbation pooled counts (for the "no cells" guard).
-        pooled_pert_counts = np.zeros(n_candidates, dtype=np.int64)
-        np.add.at(pooled_pert_counts, pert_of_pair, pair_counts)
-
-        # Weighted numerators for the batch-corrected perturbation expression and
-        # the weight-matched control reference; with standard errors, those of
-        # the pooled within-batch variances and the sums of w^2/n per arm.
-        pert_expr_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
-        ctrl_expr_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
-        weight_tot = np.zeros(n_candidates, dtype=np.float64)
-        if standard_errors:
-            pert_var_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
-            ctrl_var_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
-            pert_var_w = np.zeros(n_candidates, dtype=np.float64)
-            ctrl_var_w = np.zeros(n_candidates, dtype=np.float64)
-            pert_w2n = np.zeros(n_candidates, dtype=np.float64)
-            ctrl_w2n = np.zeros(n_candidates, dtype=np.float64)
-            n_strata = np.zeros(n_candidates, dtype=np.int64)
-
-        n_c_pair = ctrl_counts[batch_of_pair]
-
-        def contributing_pairs():
-            """Blocks of the pairs with cells on both sides: their perturbation,
-            weight, counts and per-batch expressions (and variances)."""
-            for start in range(0, n_pairs, 4096):
-                end = min(start + 4096, n_pairs)
-                n_p = pair_counts[start:end]
-                n_c = n_c_pair[start:end]
-                valid = (n_p > 0) & (n_c > 0)
-                if not valid.any():
-                    continue
-                n_pv = n_p[valid].astype(np.float64)
-                n_cv = n_c[valid].astype(np.float64)
-                b_idx = batch_of_pair[start:end][valid]
-                Tp = transform(np.asarray(pair_sums[start:end])[valid], n_pv[:, None])
-                Tc = transform(ctrl_sums[b_idx], n_cv[:, None])
-                if standard_errors:
-                    Vp = np.maximum(np.asarray(pair_sqsums[start:end])[valid] / n_pv[:, None] - Tp * Tp, 0.0)
-                    Vc = np.maximum(ctrl_sqsums[b_idx] / n_cv[:, None] - Tc * Tc, 0.0)
-                else:
-                    Vp = Vc = None
-                yield (pert_of_pair[start:end][valid], (n_pv * n_cv) / (n_pv + n_cv),
-                       n_pv, n_cv, Tp, Tc, Vp, Vc)
-
-        # Pairs are sorted by perturbation, so each block's rows for one
-        # perturbation are contiguous.
-        for p_idx, w, n_p, n_c, Tp, Tc, Vp, Vc in contributing_pairs():
-            _add_by_sorted_group(pert_expr_num, p_idx, w[:, None] * Tp)
-            _add_by_sorted_group(ctrl_expr_num, p_idx, w[:, None] * Tc)
-            _add_by_sorted_group(weight_tot, p_idx, w)
-            if standard_errors:
-                # Batches with one cell on a side estimate no variance there,
-                # but still count, with n = 1, in that side's sum of w^2/n.
-                wp = np.where(n_p >= 2, w, 0.0)
-                wc = np.where(n_c >= 2, w, 0.0)
-                _add_by_sorted_group(pert_var_num, p_idx, wp[:, None] * Vp)
-                _add_by_sorted_group(ctrl_var_num, p_idx, wc[:, None] * Vc)
-                _add_by_sorted_group(pert_var_w, p_idx, wp)
-                _add_by_sorted_group(ctrl_var_w, p_idx, wc)
-                _add_by_sorted_group(pert_w2n, p_idx, w * w / n_p)
-                _add_by_sorted_group(ctrl_w2n, p_idx, w * w / n_c)
-                _add_by_sorted_group(n_strata, p_idx, np.ones(len(p_idx), dtype=np.int64))
-
+        pooled_pert_counts = np.bincount(pert_of_pair, weights=pair_counts, minlength=n_candidates)
         no_cells = pooled_pert_counts == 0
         if no_cells.any():
             bad = candidates[int(np.argmax(no_cells))]
             raise ValueError(f"Perturbation '{bad}' contains no cells")
+
+        # Pairs with cells on both sides contribute, with harmonic weights.
+        n_p_pair = pair_counts.astype(np.float64)
+        n_c_pair = ctrl_counts[batch_of_pair].astype(np.float64)
+        contributes = (n_p_pair > 0) & (n_c_pair > 0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            w_pair = np.where(contributes, n_p_pair * n_c_pair / (n_p_pair + n_c_pair), 0.0)
+        weight_tot = np.bincount(pert_of_pair, weights=w_pair, minlength=n_candidates)
         zero = weight_tot <= 0
         if zero.any():
             bad = candidates[int(np.argmax(zero))]
@@ -302,28 +258,79 @@ def _streaming_batch_corrected(
                 f"Perturbation '{bad}' shares no batch with the control group; "
                 "cannot compute a batch-corrected effect."
             )
-        inv_w = 1.0 / weight_tot[:, None]
-        pert_mean_corrected = pert_expr_num * inv_w
-        ctrl_mean_matched = ctrl_expr_num * inv_w
-        effect_matrix = pert_mean_corrected - ctrl_mean_matched
-        del pert_expr_num, ctrl_expr_num
 
-        se = se_robust = None
-        if standard_errors:
-            with np.errstate(invalid="ignore", divide="ignore"):
-                pooled_p = pert_var_num / pert_var_w[:, None]
-                pooled_c = ctrl_var_num / ctrl_var_w[:, None]
-            del pert_var_num, ctrl_var_num
-            se = np.sqrt((pooled_p * pert_w2n[:, None] + pooled_c * ctrl_w2n[:, None]) * inv_w * inv_w)
-            del pooled_p, pooled_c
-            # The robust SE needs E first: a second pass over the pairs, which
-            # avoids the cancellation of sum w^2 d^2 - 2 E sum w^2 d + E^2 sum w^2.
-            spread = np.zeros((n_candidates, n_genes), dtype=np.float64)
-            for p_idx, w, _, _, Tp, Tc, _, _ in contributing_pairs():
-                _add_by_sorted_group(spread, p_idx, (w * w)[:, None] * np.square(Tp - Tc - effect_matrix[p_idx]))
-            with np.errstate(invalid="ignore", divide="ignore"):
-                correction = np.where(n_strata >= 2, n_strata / (n_strata - 1.0), np.nan)
-            se_robust = np.sqrt(correction[:, None] * spread * inv_w * inv_w)
+        # Finalise a block of perturbations at a time, straight into the
+        # outputs: pairs are sorted by perturbation, so a block's pairs are
+        # one contiguous range, and no other (n_candidates, n_genes) array is
+        # ever held beside the outputs.
+        effect_matrix = np.empty((n_candidates, n_genes), dtype=np.float64)
+        pert_mean_corrected = np.empty_like(effect_matrix)
+        ctrl_mean_matched = np.empty_like(effect_matrix) if matched_profile else None
+        se = np.empty_like(effect_matrix) if standard_errors else None
+        se_robust = np.empty_like(effect_matrix) if standard_errors else None
+        pair_bounds = np.searchsorted(pert_of_pair, np.arange(n_candidates + 1))
+        rows_per_block = max(1, _FINALISE_BLOCK_BYTES // (8 * max(n_genes, 1)))
+        c0 = 0
+        while c0 < n_candidates:
+            # At least one perturbation, then as many as keep the block's
+            # pairs within rows_per_block.
+            c1 = int(np.searchsorted(pair_bounds, pair_bounds[c0] + rows_per_block, side="right")) - 1
+            c1 = min(max(c1, c0 + 1), n_candidates)
+            p0, p1 = int(pair_bounds[c0]), int(pair_bounds[c1])
+            valid = contributes[p0:p1]
+            p_idx = pert_of_pair[p0:p1][valid] - c0
+            w = w_pair[p0:p1][valid]
+            n_p = n_p_pair[p0:p1][valid]
+            n_c = n_c_pair[p0:p1][valid]
+            b_idx = batch_of_pair[p0:p1][valid]
+            Tp = transform(np.asarray(pair_sums[p0:p1])[valid], n_p[:, None])
+            Tc = transform(ctrl_sums[b_idx], n_c[:, None])
+            n_rows = c1 - c0
+            inv_w = 1.0 / weight_tot[c0:c1, None]
+
+            num = np.zeros((n_rows, n_genes), dtype=np.float64)
+            _add_by_sorted_group(num, p_idx, w[:, None] * Tp)
+            pert_mean_corrected[c0:c1] = num * inv_w
+            num[:] = 0.0
+            _add_by_sorted_group(num, p_idx, w[:, None] * Tc)
+            num *= inv_w
+            np.subtract(pert_mean_corrected[c0:c1], num, out=effect_matrix[c0:c1])
+            if matched_profile:
+                ctrl_mean_matched[c0:c1] = num
+
+            if standard_errors:
+                # Batches with one cell on a side estimate no variance there,
+                # but still count, with n = 1, in that side's sum of w^2/n.
+                wp = np.where(n_p >= 2, w, 0.0)
+                wc = np.where(n_c >= 2, w, 0.0)
+                local = np.zeros(n_rows, dtype=np.float64)
+                se_sq = np.zeros((n_rows, n_genes), dtype=np.float64)
+                for wv, n_side, T, sq in (
+                    (wp, n_p, Tp, np.asarray(pair_sqsums[p0:p1])[valid]),
+                    (wc, n_c, Tc, ctrl_sqsums[b_idx]),
+                ):
+                    var = np.maximum(sq / n_side[:, None] - T * T, 0.0)
+                    num[:] = 0.0
+                    _add_by_sorted_group(num, p_idx, wv[:, None] * var)
+                    local[:] = 0.0
+                    _add_by_sorted_group(local, p_idx, wv)
+                    w2n = np.zeros(n_rows, dtype=np.float64)
+                    _add_by_sorted_group(w2n, p_idx, w * w / n_side)
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        se_sq += num / local[:, None] * w2n[:, None]
+                se[c0:c1] = np.sqrt(se_sq * inv_w * inv_w)
+                # The robust SE from the spread of the per-batch effects
+                # about E, which avoids the cancellation of
+                # sum w^2 d^2 - 2 E sum w^2 d + E^2 sum w^2.
+                num[:] = 0.0
+                _add_by_sorted_group(
+                    num, p_idx, (w * w)[:, None] * np.square(Tp - Tc - effect_matrix[c0:c1][p_idx]),
+                )
+                n_strata = np.bincount(p_idx, minlength=n_rows)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    correction = np.where(n_strata >= 2, n_strata / (n_strata - 1.0), np.nan)
+                se_robust[c0:c1] = np.sqrt(correction[:, None] * num * inv_w * inv_w)
+            c0 = c1
     finally:
         for accumulator, name in ((pair_sums, sums_file), (pair_sqsums, sqsums_file)):
             if name is not None:
@@ -532,6 +539,7 @@ def compute_normalized_effects(
             block_fn=_block_fn,
             transform=_transform,
             standard_errors=method == "mean_log1p",
+            matched_profile=use_batch,
             memory_limit_gb=memory_limit_gb,
         )
     finally:
@@ -658,8 +666,6 @@ def _constant_covariates(
             continue
         values = values[order]
         same = values[1:] == values[:-1]
-        if values.dtype.kind == "f":
-            same |= np.isnan(values[1:]) & np.isnan(values[:-1])
         (keep if np.all(same | starts[1:]) else varying).append(column)
     first = obs.iloc[order[starts]][keep]
     first.index = sorted_groups[starts]
@@ -671,8 +677,8 @@ def _comparable_values(series: pd.Series) -> np.ndarray | None:
     as a value of its own); ``None`` when they cannot be compared."""
     if isinstance(series.dtype, pd.CategoricalDtype):
         return series.cat.codes.to_numpy()
-    if pd.api.types.is_bool_dtype(series) or pd.api.types.is_numeric_dtype(series):
-        return series.to_numpy(dtype=np.float64, na_value=np.nan)
+    # Codes, not the values cast to float: int64 IDs above 2**53 would
+    # collide as floats.
     try:
         return pd.factorize(series, use_na_sentinel=False)[0]
     except TypeError:  # unhashable values (lists, dicts) in an object column
@@ -1345,8 +1351,14 @@ def _estimate_shape_for_normalized_effects(
     with_se = method == "mean_log1p"
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
+        # Read labels and batches as compute_normalized_effects does: either
+        # may be an obs column or a pd.Series indexed by cell.
+        label_series, _ = cell_labels(backed.obs, perturbation_column)
+        if batch_column is not None:
+            batch_series, _ = cell_labels(backed.obs, batch_column)
+            label_series = label_series.where(batch_series.notna())
+        labels = label_strings(label_series)
+        control_label = resolve_control_label(labels[label_series.notna().to_numpy()], control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
         n_outputs = (3 if batch_column is not None else 2) + (2 if with_se else 0)
@@ -1355,7 +1367,7 @@ def _estimate_shape_for_normalized_effects(
                 "tempdir": estimate_bytes(max(len(candidates), 1), n_genes, 2 if with_se else 1),
                 "output": estimate_bytes(len(candidates), n_genes, n_outputs, overhead=1.10),
             }
-        batch_labels = backed.obs[batch_column].astype(str).to_numpy()
+        batch_labels = batch_series.astype(str).to_numpy()
         pert_code = pd.Index(candidates).get_indexer(pd.Index(labels))
         batch_code, batch_uniques = pd.factorize(batch_labels, sort=False)
         n_batches = len(batch_uniques)
