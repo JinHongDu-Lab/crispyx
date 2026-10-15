@@ -4,6 +4,14 @@ Changelog
 Unreleased
 ----------
 
+* **Docs reorganised.** The usage guide is split into task pages under a new
+  *User guide* section (loading and preparing data; quality control and
+  dimension reduction; pseudo-bulk and effect sizes; differential expression;
+  covariate adjustment; custom batch statistics; working with large data), and
+  a *Quick start* page opens *Getting started*. The covariate-adjustment
+  tutorials are listed under the page comparing the approaches, retitled after
+  the method each one illustrates; *Reference* keeps the API, the comparison
+  with other tools and the FAQ. ``usage.html`` no longer exists.
 * **New: standard errors from ``pb.normalized_effects``** for
   ``method="mean_log1p"``, after Liu et al. (2026,
   `doi:10.64898/2026.10.05.756839 <https://doi.org/10.64898/2026.10.05.756839>`_):

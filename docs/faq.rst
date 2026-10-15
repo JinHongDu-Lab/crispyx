@@ -1,5 +1,5 @@
-FAQ & Troubleshooting
-=====================
+FAQ and troubleshooting
+=======================
 
 Common issues
 -------------
@@ -20,7 +20,7 @@ Set ``memory_limit_gb`` to match your available RAM:
 
 For very large datasets, consider:
 
-* Converting to CSC before Wilcoxon or ``batch_process`` (see :doc:`usage`).
+* Converting to CSC before Wilcoxon or ``batch_process`` (see :doc:`large_data`).
 * Converting to CSR before NB-GLM.
 * Using ``freeze_control=True`` for datasets with >100K control cells.
 

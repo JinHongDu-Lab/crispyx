@@ -27,43 +27,50 @@ At a glance
 
 .. list-table::
    :header-rows: 1
-   :widths: 22 18 20 20 20
+   :widths: 20 15 18 17 12 18
 
    * - Approach
      - Adjusts for
      - Effect
      - Significance
      - Speed
+     - Tutorial
    * - Stratified effect + Wilcoxon
      - one categorical column
      - difference of mean ``log1p(CP10k)``, with standard errors
      - rank test within strata
      - fast
+     - :doc:`batch-corrected <notebooks/stratified_wilcoxon_tutorial>`
    * - ``residual_effects``, ``null="robust"``
      - any covariates
      - mean residual, ``log1p(CP10k)``
      - spread across targets
      - fastest (one pass)
+     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
    * - ``residual_effects``, ``null="model"``
      - any covariates
      - mean residual, ``log1p(CP10k)``
      - control fit's noise
      - fastest (one pass)
+     - :doc:`targeted <notebooks/residual_effects_feng_tutorial>`
    * - NB-GLM on pseudo-bulk
      - any covariates, replicates
      - log2 fold change
      - Wald test, replicate units
      - slow
+     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
    * - NB-GLM on single cells
      - any covariates
      - log2 fold change
      - Wald test, cells as units
      - slowest
+     - —
    * - ``cx.pb.effects`` per batch
      - one categorical column
      - difference on the input's scale
      - none
      - fast
+     - —
 
 Stratified effects and the batch-corrected Wilcoxon test
 --------------------------------------------------------
@@ -217,3 +224,15 @@ Which to use
 - **Effects within each donor, line or batch:** ``residual_effects`` with
   ``target|batch`` labels, or ``cx.pb.effects`` with ``aggregate_batches=False``.
 - **Confounding you did not record:** causarray.
+
+Tutorials
+---------
+
+Each approach above on a real screen, with its calibration checked:
+
+.. toctree::
+   :maxdepth: 1
+
+   notebooks/stratified_wilcoxon_tutorial
+   notebooks/residual_effects_feng_tutorial
+   notebooks/residual_effects_tutorial

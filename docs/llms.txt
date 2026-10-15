@@ -58,7 +58,9 @@ Benchmarked across 12 public CRISPR screen datasets (21K–1.97M cells):
 - PyPI: https://pypi.org/project/crispyx
 - Documentation: https://crispyx.readthedocs.io
 - Installation: https://crispyx.readthedocs.io/en/latest/installation.html
-- Tutorial: https://crispyx.readthedocs.io/en/latest/crispyx_tutorial.html
+- Quick start: https://crispyx.readthedocs.io/en/latest/quickstart.html
+- Tutorial: https://crispyx.readthedocs.io/en/latest/notebooks/crispyx_tutorial.html
+- Covariate adjustment (batches, donors, lines): https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html
+- Working with large data (formats, memory, disk, resume): https://crispyx.readthedocs.io/en/latest/large_data.html
 - API reference: https://crispyx.readthedocs.io/en/latest/api.html
-- Benchmarks: https://crispyx.readthedocs.io/en/latest/benchmarking.html
 - Comparison: https://crispyx.readthedocs.io/en/latest/comparison.html
