@@ -482,3 +482,10 @@ def test_in_memory_anndata_is_rejected_with_the_fix(tmp_path):
         assert resolve_data_path(backed) == path
     finally:
         backed.file.close()
+
+
+def test_chunk_starts_rejects_a_mask_of_the_wrong_length():
+    from crispyx.data import chunk_starts
+
+    with pytest.raises(ValueError, match="selected has 5 entries for an axis of 10"):
+        chunk_starts(10, 3, selected=np.ones(5, dtype=bool))

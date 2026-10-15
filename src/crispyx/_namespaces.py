@@ -386,6 +386,7 @@ class _PreprocessingNamespace:
         shared_cells: Literal["drop", "error"] = "drop",
         label: str | None = None,
         chunk_size: int = 4096,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
         verbose: int | bool = True,
         force: bool = False,
     ) -> AnnData:
@@ -400,6 +401,7 @@ class _PreprocessingNamespace:
             shared_cells=shared_cells,
             label=label,
             chunk_size=chunk_size,
+            format_mismatch_policy=format_mismatch_policy,
             verbose=verbose,
             force=force,
         )

@@ -62,6 +62,25 @@ Unreleased
   no longer runs a grouped ``nunique`` over every obs column (one sort, then
   a comparison per column), and a column of unhashable values counts as
   varying instead of raising.
+* **Fixed: ``concat_h5ad`` and subset writes loaded every layer into
+  memory**, once per file for every pass: they opened each file as a backed
+  AnnData, which anndata fills with every layer, ``obsm`` and ``obsp``. They
+  now read metadata and stream each matrix through h5py, so no layer is ever
+  held in memory, as documented.
+* **Fixed: CSC inputs to ``concat_h5ad`` and ``write_filtered_subset``**
+  (``pp.subsample``, the QC filter) were streamed by rows, re-reading the
+  whole matrix for every chunk. Both take ``format_mismatch_policy``
+  (default ``"auto"``) and stream a CSC ``X`` from a temporary CSR copy
+  beside the output, like the other streaming functions.
+* **Fixed: ``concat_h5ad`` with an obs column of numbers in one file and text
+  in another** failed to write, after a full pass over every matrix. Such
+  columns are now stored as text, and obs is merged before any matrix is
+  read. Categorical columns keep their categories' order and ``ordered``
+  flag when every file agrees (they were re-sorted and unordered), and
+  otherwise take the categories in order of first appearance.
+* **Changed: raw-count checks accept float rounding noise** (``2.0000001``)
+  and ``downsample_counts`` rounds such values instead of truncating them.
+* **Changed: crispyx requires anndata 0.11 or later** (``anndata.io``).
 * **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
   level no control shares**, instead of refusing the whole run; infinite
   numeric covariates raise. ``perturbations`` given as a generator no longer

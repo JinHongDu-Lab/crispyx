@@ -113,6 +113,25 @@ def test_interrupted_subset_leaves_no_output(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["data.h5ad"]
 
 
+def test_csc_source_is_subset_from_a_csr_copy(tmp_path):
+    """Row-streaming CSC re-reads the whole matrix per chunk; the subset is
+    written from a temporary CSR copy instead, removed afterwards."""
+    path = _make_h5ad(tmp_path / "src", n_cells_per_group={"A": 30, "control": 30}, with_extra_slots=True)
+    adata = ad.read_h5ad(path)
+    adata.X = sp.csc_matrix(adata.X)
+    adata.write(path)
+    cell_mask = np.arange(60) % 3 == 0
+    gene_mask = np.arange(20) % 2 == 0
+    out = tmp_path / "out" / "subset.h5ad"
+    write_filtered_subset(path, cell_mask=cell_mask, gene_mask=gene_mask, output_path=out,
+                          chunk_size=7, format_mismatch_policy="convert")
+    got = ad.read_h5ad(out)
+    np.testing.assert_array_equal(got.X.toarray(), adata.X.toarray()[cell_mask][:, gene_mask])
+    np.testing.assert_array_equal(got.layers["counts2"].toarray(),
+                                  np.asarray(adata.layers["counts2"])[cell_mask][:, gene_mask])
+    assert sorted(p.name for p in out.parent.iterdir()) == ["subset.h5ad"]
+
+
 def test_unknown_unit_column_raises(tmp_path):
     path = _make_h5ad(tmp_path, n_cells_per_group={"A": 10, "control": 10})
     with pytest.raises(KeyError):
