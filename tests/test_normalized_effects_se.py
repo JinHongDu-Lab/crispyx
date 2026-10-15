@@ -126,6 +126,30 @@ def test_a_side_with_only_single_cell_batches_has_no_model_standard_error(tmp_pa
     assert np.isfinite(out.layers["standard_error_robust"]).all()
 
 
+def test_labels_and_strata_can_be_series(tmp_path):
+    """Series give the result the same obs columns give; cells with a missing
+    label are not used."""
+    path, counts, obs = _screen(tmp_path, SIZES)
+    (tmp_path / "a").mkdir()
+    from_columns = _run(path, tmp_path / "a", "batch")
+    labels = obs["perturbation"].rename("target")
+    result = cx.pb.normalized_effects(path, perturbation_column=labels[::-1], control_label="control",
+                                      batch_column=obs["batch"].rename("stratum"),
+                                      output_path=tmp_path / "series.h5ad", verbose=False)
+    from_series = ad.read_h5ad(result.path)
+    result.close()
+    np.testing.assert_allclose(from_series.X, from_columns.X, rtol=1e-12)
+    assert "target" in from_series.obs and from_series.uns["batch_column"] == "stratum"
+
+    gaps = labels.copy()
+    gaps.iloc[:3] = np.nan  # three control cells of b1 left out
+    dropped = cx.pb.normalized_effects(path, perturbation_column=gaps, control_label="control",
+                                       batch_column="batch", output_path=tmp_path / "gaps.h5ad", verbose=False)
+    effect, _, _ = _reference(counts[3:], obs.iloc[3:], "KO_A", "batch")
+    np.testing.assert_allclose(ad.read_h5ad(dropped.path)[["KO_A"]].X[0], effect, rtol=1e-10, atol=1e-12)
+    dropped.close()
+
+
 def test_log_mean_has_no_standard_error(tmp_path):
     path, _, _ = _screen(tmp_path, SIZES)
     out = _run(path, tmp_path, "batch", method="log_mean")

@@ -172,7 +172,7 @@ def test_missing_labels_are_not_used(tmp_path):
 
 def test_series_must_cover_every_cell(tmp_path):
     path, _, obs = _screen(tmp_path)
-    with pytest.raises(ValueError, match="no entry"):
+    with pytest.raises(ValueError, match="no label for"):
         cx.residual_effects(path, obs["perturbation"].iloc[1:], "ctrl", covariates=["lane"], verbose=False)
 
 

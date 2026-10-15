@@ -13,6 +13,7 @@ import pandas as pd
 from scipy.special import ndtr
 
 from . import _messages
+from ._grouping import cell_labels
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._kernels import _residual_effects_rows
@@ -229,7 +230,7 @@ def residual_effects(
     backed = read_backed(path)
     try:
         n_obs, n_vars = backed.n_obs, backed.n_vars
-        labels, label_name = _cell_labels(backed, perturbation_column)
+        labels, label_name = cell_labels(backed.obs, perturbation_column)
         labelled = labels.notna().to_numpy()
         values = labels.astype(str).to_numpy()
         control_label = resolve_control_label(values[labelled], control_label, verbose=verbose)
@@ -520,28 +521,6 @@ def _dense_dataset(group: h5py.Group, name: str, data=None, shape=None) -> h5py.
     return ds
 
 
-def _cell_labels(backed: ad.AnnData, perturbation_column: str | pd.Series) -> tuple[pd.Series, str]:
-    """Each cell's label in ``obs_names`` order (NaN = not used), and its name."""
-    names = pd.Index(backed.obs_names).astype(str)
-    if isinstance(perturbation_column, pd.Series):
-        labels = perturbation_column.set_axis(perturbation_column.index.astype(str))
-        if not labels.index.is_unique:
-            raise ValueError("The labels Series must be indexed by cell, each cell once.")
-        absent = names[~names.isin(labels.index)]
-        if len(absent):
-            raise ValueError(
-                f"The labels Series has no entry for {len(absent)} of {len(names)} cells "
-                f"(e.g. {absent[:3].tolist()}); index it by obs_names, with NaN for cells to leave out."
-            )
-        return labels.reindex(names), str(perturbation_column.name or "perturbation")
-    if perturbation_column not in backed.obs.columns:
-        raise KeyError(
-            f"Column '{perturbation_column}' was not found in adata.obs. "
-            f"Available columns: {list(backed.obs.columns)}"
-        )
-    return backed.obs[perturbation_column].set_axis(names), str(perturbation_column)
-
-
 def _group_codes(
     values: np.ndarray,
     labelled: np.ndarray,
@@ -745,7 +724,7 @@ def _estimate_shape_for_residual_effects(
     backed = read_backed(path)
     try:
         n_obs, n_vars = backed.n_obs, backed.n_vars
-        labels, _ = _cell_labels(backed, perturbation_column)
+        labels, _ = cell_labels(backed.obs, perturbation_column)
         labelled = labels.notna().to_numpy()
         values = labels.astype(str).to_numpy()
         control_label = resolve_control_label(values[labelled], control_label, verbose=False)

@@ -18,7 +18,10 @@ from ._checkpoint import _create_progress_context
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._memory import _resolve_memory_limit_bytes
-from ._grouping import _group_seed, canonical_call_args, resolve_group_reference_aliases
+from ._grouping import (
+    UNLABELLED, _group_seed, canonical_call_args, cell_labels, label_strings,
+    resolve_group_reference_aliases,
+)
 from .data import (
     AnnData,
     calculate_optimal_chunk_size,
@@ -56,7 +59,7 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    return [label for label in unique if label != control_label]
+    return [label for label in unique if label not in (control_label, UNLABELLED)]
 
 
 def _densify_block(block) -> np.ndarray:
@@ -327,7 +330,7 @@ def _streaming_batch_corrected(
 def compute_normalized_effects(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    perturbation_column: str | None = None,
+    perturbation_column: str | pd.Series | None = None,
     groupby: str | None = None,
     control_label: str | None = None,
     reference: str | None = None,
@@ -335,7 +338,7 @@ def compute_normalized_effects(
     baseline_count: float = 1.0,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
-    batch_column: str | None = None,
+    batch_column: str | pd.Series | None = None,
     chunk_size: int | None = None,
     memory_limit_gb: float | None = None,
     data_name: str | None = None,
@@ -358,7 +361,9 @@ def compute_normalized_effects(
     data
         Path to an h5ad file, or a backed AnnData object.
     perturbation_column
-        Column in ``adata.obs`` identifying perturbation groups.
+        Column in ``adata.obs`` identifying perturbation groups, or a
+        ``pd.Series`` of labels indexed by ``obs_names`` (nothing is written to
+        the file). Cells whose label is missing are not used.
     groupby
         Scanpy-compatible alias for ``perturbation_column``.
     control_label
@@ -385,8 +390,10 @@ def compute_normalized_effects(
         Subset of perturbation labels to score. All non-reference groups when
         omitted.
     batch_column
-        Column in ``adata.obs`` identifying each cell's batch. When given, effects
-        are computed within each batch and combined with harmonic target/reference
+        Column in ``adata.obs`` identifying each cell's batch, or a ``pd.Series``
+        indexed by ``obs_names`` (cells with a missing batch are not used). Combine
+        several columns into one beforehand (e.g. lane and cell line). When given,
+        effects are computed within each batch and combined with harmonic target/reference
         cell-count weights, ``w_b = n_tb * n_rb / (n_tb + n_rb)``: the estimate of a
         regression with one intercept per batch and one perturbation coefficient,
         which removes batch-driven confounding. Batches without reference cells
@@ -492,24 +499,17 @@ def compute_normalized_effects(
             )
             _messages.vprint(verbose, log_name, f"chunk_size={chunk_size} (auto)")
         gene_symbols = pd.Index(ensure_gene_symbol_column(backed, gene_name_column)).astype(str)
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                f"Perturbation column '{perturbation_column}' was not found in "
-                f"adata.obs. Available columns: {list(backed.obs.columns)}"
-            )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
-        n_genes = backed.n_vars
-        candidates = _resolve_candidates(labels, control_label, perturbations)
+        label_series, label_name = cell_labels(backed.obs, perturbation_column)
         if use_batch:
-            if batch_column not in backed.obs.columns:
-                raise KeyError(
-                    f"Batch column '{batch_column}' was not found in adata.obs. "
-                    f"Available columns: {list(backed.obs.columns)}"
-                )
-            batch_labels = backed.obs[batch_column].astype(str).to_numpy()
+            batch_series, batch_name = cell_labels(backed.obs, batch_column)
+            label_series = label_series.where(batch_series.notna())  # no batch: not used
+            batch_labels = batch_series.astype(str).to_numpy()
         else:
             batch_labels = np.zeros(backed.n_obs, dtype=np.int8)  # one batch
+        labels = label_strings(label_series)
+        control_label = resolve_control_label(labels[label_series.notna().to_numpy()], control_label)
+        n_genes = backed.n_vars
+        candidates = _resolve_candidates(labels, control_label, perturbations)
         if not (labels == control_label).any():
             raise ValueError("Control group contains no cells")
         result = _streaming_batch_corrected(
@@ -538,7 +538,7 @@ def compute_normalized_effects(
     )
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = (
-        pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+        pd.DataFrame({label_name: obs_index.to_list()}, index=obs_index)
         if candidates else pd.DataFrame(index=obs_index)
     )
     adata = ad.AnnData(
@@ -556,7 +556,7 @@ def compute_normalized_effects(
             adata.layers["standard_error"] = result.standard_error
             adata.layers["standard_error_robust"] = result.standard_error_robust
     if use_batch:
-        adata.uns["batch_column"] = str(batch_column)
+        adata.uns["batch_column"] = batch_name
         adata.uns["batch_ids"] = np.asarray(result.batch_ids, dtype=object)
     _disk_estimate = warn_if_disk_space_low(
         estimate_bytes(max(len(candidates), 1), n_genes, 1 + len(adata.layers), overhead=1.10),

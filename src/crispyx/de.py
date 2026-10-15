@@ -91,7 +91,7 @@ from ._checkpoint import (
 from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import canonical_call_args, resolve_group_reference_aliases
+from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
@@ -399,16 +399,6 @@ def _load_layered_de_result(
     )
 
 
-# Cells with a missing label carry this, which no real group can be named, so
-# they fall into no comparison (``str(NaN)`` would make a group named "nan").
-_UNLABELLED = "\0unlabelled"
-
-
-def _label_strings(labels: pd.Series) -> np.ndarray:
-    """Per-cell labels as strings, missing ones as ``_UNLABELLED``."""
-    return labels.astype(object).where(labels.notna(), _UNLABELLED).astype(str).to_numpy()
-
-
 # Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
 # cannot estimate its dispersion for the shared, control-fitted value.
 _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
@@ -473,7 +463,7 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    candidates = [label for label in unique if label not in (control_label, _UNLABELLED)]
+    candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
     if not candidates:
         raise ValueError("No perturbation groups available for differential expression testing")
     return candidates
@@ -512,21 +502,6 @@ _OPERATIONAL_ARGS = frozenset({
     "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
     "cell_chunk_size", "chunk_size", "irls_batch_size",
 })
-
-
-def _align_labels(labels: pd.Series, obs_names: pd.Index) -> np.ndarray:
-    """Per-cell labels given as a Series, in ``obs_names`` order."""
-    labels = labels.set_axis(labels.index.astype(str))
-    if not labels.index.is_unique:
-        raise ValueError("The labels Series must be indexed by cell, each cell once.")
-    names = pd.Index(obs_names).astype(str)
-    missing = names[~names.isin(labels.index)]
-    if len(missing):
-        raise ValueError(
-            f"The labels Series has no label for {len(missing)} of {len(names)} cells "
-            f"(e.g. {missing[:3].tolist()}); index it by obs_names."
-        )
-    return _label_strings(labels.reindex(names))
 
 
 def _de_fingerprint(
@@ -1268,7 +1243,7 @@ def t_test(
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
-        labels = _label_strings(backed.obs[perturbation_column])
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -2068,7 +2043,7 @@ def nb_glm_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
-        labels = _label_strings(obs_df[perturbation_column])
+        labels = label_strings(obs_df[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -5202,8 +5177,8 @@ def wilcoxon_test(
                 f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = (
-            _label_strings(backed.obs[perturbation_column]) if given_labels is None
-            else _align_labels(given_labels, backed.obs_names)
+            label_strings(backed.obs[perturbation_column]) if given_labels is None
+            else label_strings(cell_labels(backed.obs, given_labels)[0])
         )
         control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
@@ -6091,7 +6066,7 @@ def shrink_lfc(
         # Load original dataset for streaming
         backed = read_backed(original_path)
         try:
-            labels = _label_strings(backed.obs[perturbation_column])
+            labels = label_strings(backed.obs[perturbation_column])
             
             # Get or compute size factors
             size_factors_global = adata.uns.get("size_factors")
@@ -6324,7 +6299,7 @@ def _estimate_shape_for_t_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = _label_strings(backed.obs[perturbation_column])
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6344,7 +6319,7 @@ def _estimate_shape_for_nb_glm_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = _label_strings(backed.obs[perturbation_column])
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6370,9 +6345,9 @@ def _estimate_shape_for_wilcoxon_test(
     backed = read_backed(path)
     try:
         labels = (
-            _align_labels(perturbation_column, backed.obs_names)
+            label_strings(cell_labels(backed.obs, perturbation_column)[0])
             if isinstance(perturbation_column, pd.Series)
-            else _label_strings(backed.obs[perturbation_column])
+            else label_strings(backed.obs[perturbation_column])
         )
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
