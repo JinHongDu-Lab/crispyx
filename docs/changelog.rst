@@ -4,6 +4,16 @@ Changelog
 Unreleased
 ----------
 
+* **New: standard errors from ``pb.normalized_effects``** for
+  ``method="mean_log1p"``, after Liu et al. (2026,
+  `doi:10.64898/2026.10.05.756839 <https://doi.org/10.64898/2026.10.05.756839>`_):
+  ``layers["standard_error"]`` (cells independent within a batch, one
+  within-batch variance per arm pooled over batches with two or more cells)
+  and ``layers["standard_error_robust"]`` (from the spread of the per-batch
+  effects; NaN with fewer than two batches). Without ``batch_column`` the
+  data is one batch, so the effect and its standard error are the plain
+  two-sample ones; that path now streams through the same code, one pass
+  however many perturbations there are.
 * **Fixed: ``t_test`` with a one-cell group.** A perturbation (or control)
   with a single cell has no variance estimate; it was treated as zero, so
   the test used the other side's standard error alone and reported nearly

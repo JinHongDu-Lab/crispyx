@@ -36,7 +36,7 @@ At a glance
      - Speed
    * - Stratified effect + Wilcoxon
      - one categorical column
-     - difference of mean ``log1p(CP10k)``
+     - difference of mean ``log1p(CP10k)``, with standard errors
      - rank test within strata
      - fast
    * - ``residual_effects``, ``null="robust"``
@@ -69,10 +69,15 @@ Stratified effects and the batch-corrected Wilcoxon test
 --------------------------------------------------------
 
 Each batch is compared with its own controls, and the per-batch results are
-combined. ``cx.pb.normalized_effects(..., method="mean_log1p", batch_column=...)``
+combined, as in Liu *et al.* (2026, *bioRxiv*,
+`doi:10.64898/2026.10.05.756839 <https://doi.org/10.64898/2026.10.05.756839>`_).
+``cx.pb.normalized_effects(..., method="mean_log1p", batch_column=...)``
 gives the effect: the difference of mean ``log1p(CP10k)`` within each batch,
 combined with weights ``n_t n_c / (n_t + n_c)``, the estimate of a regression
-with one intercept per batch and one perturbation coefficient.
+with one intercept per batch and one perturbation coefficient. It also writes
+two standard errors: ``layers["standard_error"]`` assumes independent cells and
+one within-batch variance per arm, and ``layers["standard_error_robust"]`` is
+taken from the spread of the per-batch effects (it needs two batches or more).
 ``cx.wilcoxon_test(..., batch_column=...)`` gives the p-values: cells are ranked
 within each batch and the Mann-Whitney statistics are summed across batches (van
 Elteren's test).
@@ -94,8 +99,10 @@ Elteren's test).
   is untested. Ranks of mostly zero counts carry less information than means: on
   the Feng et al. targeted screen it recovered 61–67% of the published hits
   where ``residual_effects`` recovered 98–99%. The Wilcoxon result's own
-  ``logfoldchanges`` are pooled over batches; take effects from
-  ``normalized_effects``.
+  ``logfoldchanges`` are pooled over batches; take effects and standard errors
+  from ``normalized_effects``. The model-based standard error treats cells as
+  independent, so it is too small when cells of one guide or donor move
+  together; the robust one does not assume that but is noisy with few batches.
 - **Tutorial:** Part 3 of :doc:`notebooks/residual_effects_feng_tutorial`
   compares pooled and stratified controls.
 

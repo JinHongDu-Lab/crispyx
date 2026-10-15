@@ -84,13 +84,13 @@ class TestEstimateDiskUsage:
         )
         assert {"tempdir", "output"} <= result.keys()
 
-    def test_no_batch_column_omits_tempdir(self, tmp_path):
+    def test_no_batch_column_still_counts_the_accumulators(self, tmp_path):
+        """Without batches the data is one batch, streamed the same way."""
         path = _make_normalised_h5ad(tmp_path)
         result = estimate_disk_usage(
             "compute_normalized_effects", path, perturbation_column="perturbation",
         )
-        assert "tempdir" not in result
-        assert "output" in result
+        assert {"tempdir", "output"} <= result.keys()
 
     def test_unregistered_function_raises_with_supported_list(self, tmp_path):
         path = _make_normalised_h5ad(tmp_path)

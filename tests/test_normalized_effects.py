@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import warnings
 from pathlib import Path
 
@@ -196,13 +195,6 @@ def test_argument_guards(tmp_path):
             path, groupby="perturbation", reference="control",
             control_label="control", **common,
         )
-
-
-def test_layout_is_not_public_api():
-    """The output-naming switch is an implementation detail of the aliases."""
-    parameters = inspect.signature(cx.compute_normalized_effects).parameters
-    assert "layout" not in parameters
-    assert "_layout" not in parameters
 
 
 def test_effects_warns_on_raw_counts_but_normalized_effects_does_not(tmp_path):

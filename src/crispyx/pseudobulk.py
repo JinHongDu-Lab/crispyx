@@ -6,7 +6,7 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Sequence, get_args
+from typing import Callable, Iterable, Literal, NamedTuple, Sequence, get_args
 
 import anndata as ad
 import numpy as np
@@ -45,18 +45,6 @@ def _check_method(method: str, allowed, fn_name: str, hint: str = "") -> None:
         options = " or ".join(repr(m) for m in get_args(allowed))
         raise ValueError(f"{fn_name}: method must be {options}; received {method!r}.{hint}")
 
-# Output naming for compute_normalized_effects. "modern" is the only layout in
-# use; the dict is keyed for symmetry with other per-method naming tables.
-_NORMALIZED_LAYOUTS = {
-    "modern": {
-        "profile_layer": "perturbation_profile",
-        "matched_layer": "control_profile_matched",
-        "reference_uns": "control_profile",
-        "suffix": "normalized_effects",
-        "log_name": "pb.normalized_effects",
-    },
-}
-
 
 def _resolve_candidates(
     labels: np.ndarray,
@@ -77,6 +65,40 @@ def _densify_block(block) -> np.ndarray:
     return np.asarray(block, dtype=np.float64)
 
 
+class _StratifiedEffects(NamedTuple):
+    """What :func:`_streaming_batch_corrected` returns; rows follow ``candidates``."""
+
+    effect: np.ndarray
+    perturbation_profile: np.ndarray
+    control_profile_matched: np.ndarray
+    pooled_control_sum: np.ndarray
+    pooled_control_count: int
+    batch_ids: list[str]
+    standard_error: np.ndarray | None
+    standard_error_robust: np.ndarray | None
+
+
+def _pair_memmap(n_rows: int, n_genes: int, prefix: str) -> tuple[np.memmap, str]:
+    """A zeroed ``(n_rows, n_genes)`` float64 accumulator on disk."""
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".dat", delete=False)
+    tmp.close()
+    warn_if_disk_space_low(
+        estimate_bytes(max(n_rows, 1), n_genes), tmp.name,
+        context="pb batch-corrected accumulator",
+    )
+    return np.memmap(tmp.name, dtype=np.float64, mode="w+", shape=(max(n_rows, 1), n_genes)), tmp.name
+
+
+def _group_sums(values: np.ndarray, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Distinct ``codes``, the row sums of ``values`` for each, and their counts."""
+    unique, inverse = np.unique(codes, return_inverse=True)
+    indicator = sparse.csr_matrix(
+        (np.ones(codes.shape[0], dtype=np.float64), (inverse, np.arange(codes.shape[0]))),
+        shape=(unique.shape[0], codes.shape[0]),
+    )
+    return unique, indicator @ values, np.bincount(inverse, minlength=unique.shape[0])
+
+
 def _streaming_batch_corrected(
     backed,
     *,
@@ -88,68 +110,38 @@ def _streaming_batch_corrected(
     chunk_size: int,
     block_fn: Callable[[object], np.ndarray],
     transform: Callable[[np.ndarray, np.ndarray], np.ndarray],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, list[str]]:
-    """Compute batch-corrected effects in a single, bounded-memory pass.
+    standard_errors: bool,
+) -> _StratifiedEffects:
+    """Batch-corrected effects, and optionally their standard errors, in one
+    bounded-memory pass over the matrix.
 
-    The per-``(perturbation, batch)`` sum accumulator -- the only quantity that
-    scales with the number of batches -- is spilled to a disk-backed
-    ``np.memmap`` so peak RAM stays ``O(chunk_size x n_genes + n_batches x
-    n_genes + n_candidates x n_genes)`` regardless of the number of gem-groups.
-    Control per-batch sums (``n_batches x n_genes``) are small and kept in RAM.
+    The per-``(perturbation, batch)`` accumulators -- the only quantities that
+    scale with the number of batches -- are spilled to disk-backed
+    ``np.memmap`` files, so peak RAM stays ``O(chunk_size x n_genes +
+    n_batches x n_genes + n_candidates x n_genes)`` however many batches there
+    are. Control per-batch accumulators are small and kept in RAM.
 
-    For every ``(perturbation, batch)`` pair the within-batch effect is
-    ``transform(pert_sum, n_pert) - transform(ctrl_sum, n_ctrl)``.  Pairs whose
-    batch contains no control cells carry no contrast and are skipped.  The
-    remaining within-batch effects are averaged per perturbation with
-    harmonic-count weights ``w_b = n_pert_b * n_ctrl_b / (n_pert_b + n_ctrl_b)``.
+    For every ``(perturbation, batch)`` pair with cells on both sides the
+    within-batch effect is ``d_b = transform(pert_sum, n_p) -
+    transform(ctrl_sum, n_c)``; batches without control cells carry no
+    contrast and are skipped. The effect is ``E = sum_b w_b d_b / W`` with
+    harmonic-count weights ``w_b = n_p n_c / (n_p + n_c)`` and ``W = sum_b
+    w_b``: the estimate of a regression with one intercept per batch and one
+    perturbation coefficient. Data without batches is one batch.
 
-    Parameters
-    ----------
-    backed
-        Open, disk-backed AnnData handle to stream chunks from.  It must remain
-        open for the duration of the call (chunks are read lazily).
-    labels
-        Per-cell perturbation labels, shape ``(n_obs,)``.
-    batch_labels
-        Per-cell batch (e.g. gem-group) labels, shape ``(n_obs,)``.  Factorised
-        internally into contiguous integer codes.
-    candidates
-        Ordered list of perturbation labels to score (control excluded).  Row
-        ``i`` of every returned matrix corresponds to ``candidates[i]``.
-    control_label
-        Label identifying the control group in ``labels``.
-    n_genes
-        Number of genes (columns) in the expression matrix.
-    chunk_size
-        Number of cells streamed per chunk.
-    block_fn
-        Maps a raw chunk to the dense per-cell accumuland (e.g. ``log1p`` of the
-        normalised counts for average-log expression, or the normalised counts
-        for pseudo-bulk).  Must return a ``(chunk_rows, n_genes)`` array.
-    transform
-        Maps ``(summed_accumuland, n_cells)`` to the per-batch expression used
-        in the effect, where ``n_cells`` is broadcast as a column vector
-        (shape ``(k, 1)``).  For average-log expression this is ``S / n``; for
-        pseudo-bulk it is ``log1p(baseline_count * S / n)``.
+    With ``standard_errors`` (``transform`` must then be the mean, ``S / n``),
+    two standard errors of ``E`` follow Liu et al. (2026,
+    doi:10.64898/2026.10.05.756839):
 
-    Returns
-    -------
-    effect_matrix : ndarray, shape (n_candidates, n_genes)
-        Batch-corrected effect (harmonic-count weighted average of within-batch
-        differences).  Equals ``pert_mean_corrected - ctrl_mean_matched``.
-    pert_mean_corrected : ndarray, shape (n_candidates, n_genes)
-        Batch-corrected per-perturbation expression: the harmonic-count weighted
-        average of the within-batch perturbation expressions ``T_{p,b}``.
-    ctrl_mean_matched : ndarray, shape (n_candidates, n_genes)
-        Per-perturbation weight-matched control reference: the harmonic-count
-        weighted average of the within-batch control expressions ``T_{c,b}``
-        using each perturbation's own batch weights.
-    pooled_ctrl_sum : ndarray, shape (n_genes,)
-        Pooled control sum of the accumuland (for a global pooled reference).
-    pooled_ctrl_count : int
-        Pooled control cell count.
-    batch_ids : list[str]
-        Batch labels encountered, in first-appearance order.
+    * model-based: cells independent within a batch and one within-batch
+      variance per arm, the ``w_b``-weighted mean of the batches' population
+      variances over batches with at least two cells on that side
+      (``s2_p``, ``s2_c``);
+      ``SE^2 = (s2_p sum_b w_b^2 / n_p + s2_c sum_b w_b^2 / n_c) / W^2``.
+      NaN when no batch has two cells on a side.
+    * robust: from the spread of the per-batch effects, with no shared
+      variance; ``SE^2 = B / (B - 1) sum_b w_b^2 (d_b - E)^2 / W^2`` over the
+      ``B`` contributing batches. NaN when ``B < 2``.
 
     Raises
     ------
@@ -177,16 +169,14 @@ def _streaming_batch_corrected(
 
     # Accumulators: control in RAM (small), pair sums on disk (memmap).
     ctrl_sums = np.zeros((n_batches, n_genes), dtype=np.float64)
+    ctrl_sqsums = np.zeros((n_batches, n_genes), dtype=np.float64) if standard_errors else None
     ctrl_counts = np.zeros(n_batches, dtype=np.int64)
     pair_counts = np.zeros(n_pairs, dtype=np.int64)
 
-    tmp = tempfile.NamedTemporaryFile(prefix="cx_pb_pairsums_", suffix=".dat", delete=False)
-    tmp.close()
-    warn_if_disk_space_low(
-        estimate_bytes(max(n_pairs, 1), n_genes), tmp.name,
-        context="pb batch-corrected accumulator",
+    pair_sums, sums_file = _pair_memmap(n_pairs, n_genes, "cx_pb_pairsums_")
+    pair_sqsums, sqsums_file = (
+        _pair_memmap(n_pairs, n_genes, "cx_pb_pairsqsums_") if standard_errors else (None, None)
     )
-    pair_sums = np.memmap(tmp.name, dtype=np.float64, mode="w+", shape=(max(n_pairs, 1), n_genes))
     try:
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
             acc = block_fn(block)
@@ -196,29 +186,22 @@ def _streaming_batch_corrected(
 
             # Control cells -> per-batch sums (RAM).
             if cm.any():
-                sub = acc[cm]
-                cb = bc[cm]
-                ub, inv = np.unique(cb, return_inverse=True)
-                indicator = sparse.csr_matrix(
-                    (np.ones(cb.shape[0], dtype=np.float64), (inv, np.arange(cb.shape[0]))),
-                    shape=(ub.shape[0], cb.shape[0]),
-                )
-                ctrl_sums[ub] += indicator @ sub
-                ctrl_counts[ub] += np.bincount(inv, minlength=ub.shape[0]).astype(np.int64)
+                ub, sums, n = _group_sums(acc[cm], bc[cm])
+                ctrl_sums[ub] += sums
+                ctrl_counts[ub] += n
+                if standard_errors:
+                    ctrl_sqsums[ub] += _group_sums(np.square(acc[cm]), bc[cm])[1]
 
             # Perturbation cells -> per-(pert, batch) sums (memmap).
             pm = pc >= 0
             if pm.any():
-                sub = acc[pm]
                 keys = pc[pm].astype(np.int64) * n_batches + bc[pm]
                 slots = np.searchsorted(uniq_pairs, keys)
-                us, inv = np.unique(slots, return_inverse=True)
-                indicator = sparse.csr_matrix(
-                    (np.ones(keys.shape[0], dtype=np.float64), (inv, np.arange(keys.shape[0]))),
-                    shape=(us.shape[0], keys.shape[0]),
-                )
-                pair_sums[us] = pair_sums[us] + (indicator @ sub)
-                pair_counts[us] += np.bincount(inv, minlength=us.shape[0]).astype(np.int64)
+                us, sums, n = _group_sums(acc[pm], slots)
+                pair_sums[us] = pair_sums[us] + sums
+                pair_counts[us] += n
+                if standard_errors:
+                    pair_sqsums[us] = pair_sqsums[us] + _group_sums(np.square(acc[pm]), slots)[1]
 
         pooled_ctrl_sum = ctrl_sums.sum(axis=0)
         pooled_ctrl_count = int(ctrl_counts.sum())
@@ -228,338 +211,105 @@ def _streaming_batch_corrected(
         np.add.at(pooled_pert_counts, pert_of_pair, pair_counts)
 
         # Weighted numerators for the batch-corrected perturbation expression and
-        # the weight-matched control reference.
+        # the weight-matched control reference; with standard errors, those of
+        # the pooled within-batch variances and the sums of w^2/n per arm.
         pert_expr_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
         ctrl_expr_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
         weight_tot = np.zeros(n_candidates, dtype=np.float64)
+        if standard_errors:
+            pert_var_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
+            ctrl_var_num = np.zeros((n_candidates, n_genes), dtype=np.float64)
+            pert_var_w = np.zeros(n_candidates, dtype=np.float64)
+            ctrl_var_w = np.zeros(n_candidates, dtype=np.float64)
+            pert_w2n = np.zeros(n_candidates, dtype=np.float64)
+            ctrl_w2n = np.zeros(n_candidates, dtype=np.float64)
+            n_strata = np.zeros(n_candidates, dtype=np.int64)
 
         n_c_pair = ctrl_counts[batch_of_pair]
-        pair_block = 4096
-        for start in range(0, n_pairs, pair_block):
-            end = min(start + pair_block, n_pairs)
-            # Only pairs whose batch also contains control cells carry a contrast.
-            n_p = pair_counts[start:end]
-            n_c = n_c_pair[start:end]
-            valid = (n_p > 0) & (n_c > 0)
-            if not valid.any():
-                continue
-            Sp = np.asarray(pair_sums[start:end])[valid]
-            n_pv = n_p[valid].astype(np.float64)
-            n_cv = n_c[valid].astype(np.float64)
-            p_idx = pert_of_pair[start:end][valid]
-            b_idx = batch_of_pair[start:end][valid]
-            w = (n_pv * n_cv) / (n_pv + n_cv)
-            Tp = transform(Sp, n_pv[:, None])
-            Tc = transform(ctrl_sums[b_idx], n_cv[:, None])
+
+        def contributing_pairs():
+            """Blocks of the pairs with cells on both sides: their perturbation,
+            weight, counts and per-batch expressions (and variances)."""
+            for start in range(0, n_pairs, 4096):
+                end = min(start + 4096, n_pairs)
+                n_p = pair_counts[start:end]
+                n_c = n_c_pair[start:end]
+                valid = (n_p > 0) & (n_c > 0)
+                if not valid.any():
+                    continue
+                n_pv = n_p[valid].astype(np.float64)
+                n_cv = n_c[valid].astype(np.float64)
+                b_idx = batch_of_pair[start:end][valid]
+                Tp = transform(np.asarray(pair_sums[start:end])[valid], n_pv[:, None])
+                Tc = transform(ctrl_sums[b_idx], n_cv[:, None])
+                if standard_errors:
+                    Vp = np.maximum(np.asarray(pair_sqsums[start:end])[valid] / n_pv[:, None] - Tp * Tp, 0.0)
+                    Vc = np.maximum(ctrl_sqsums[b_idx] / n_cv[:, None] - Tc * Tc, 0.0)
+                else:
+                    Vp = Vc = None
+                yield (pert_of_pair[start:end][valid], (n_pv * n_cv) / (n_pv + n_cv),
+                       n_pv, n_cv, Tp, Tc, Vp, Vc)
+
+        for p_idx, w, n_p, n_c, Tp, Tc, Vp, Vc in contributing_pairs():
             np.add.at(pert_expr_num, p_idx, w[:, None] * Tp)
             np.add.at(ctrl_expr_num, p_idx, w[:, None] * Tc)
             np.add.at(weight_tot, p_idx, w)
+            if standard_errors:
+                # Batches with one cell on a side estimate no variance there,
+                # but still count, with n = 1, in that side's sum of w^2/n.
+                wp = np.where(n_p >= 2, w, 0.0)
+                wc = np.where(n_c >= 2, w, 0.0)
+                np.add.at(pert_var_num, p_idx, wp[:, None] * Vp)
+                np.add.at(ctrl_var_num, p_idx, wc[:, None] * Vc)
+                np.add.at(pert_var_w, p_idx, wp)
+                np.add.at(ctrl_var_w, p_idx, wc)
+                np.add.at(pert_w2n, p_idx, w * w / n_p)
+                np.add.at(ctrl_w2n, p_idx, w * w / n_c)
+                np.add.at(n_strata, p_idx, 1)
+
+        no_cells = pooled_pert_counts == 0
+        if no_cells.any():
+            bad = candidates[int(np.argmax(no_cells))]
+            raise ValueError(f"Perturbation '{bad}' contains no cells")
+        zero = weight_tot <= 0
+        if zero.any():
+            bad = candidates[int(np.argmax(zero))]
+            raise ValueError(
+                f"Perturbation '{bad}' shares no batch with the control group; "
+                "cannot compute a batch-corrected effect."
+            )
+        inv_w = 1.0 / weight_tot[:, None]
+        pert_mean_corrected = pert_expr_num * inv_w
+        ctrl_mean_matched = ctrl_expr_num * inv_w
+        effect_matrix = pert_mean_corrected - ctrl_mean_matched
+        del pert_expr_num, ctrl_expr_num
+
+        se = se_robust = None
+        if standard_errors:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                pooled_p = pert_var_num / pert_var_w[:, None]
+                pooled_c = ctrl_var_num / ctrl_var_w[:, None]
+            del pert_var_num, ctrl_var_num
+            se = np.sqrt((pooled_p * pert_w2n[:, None] + pooled_c * ctrl_w2n[:, None]) * inv_w * inv_w)
+            del pooled_p, pooled_c
+            # The robust SE needs E first: a second pass over the pairs, which
+            # avoids the cancellation of sum w^2 d^2 - 2 E sum w^2 d + E^2 sum w^2.
+            spread = np.zeros((n_candidates, n_genes), dtype=np.float64)
+            for p_idx, w, _, _, Tp, Tc, _, _ in contributing_pairs():
+                np.add.at(spread, p_idx, (w * w)[:, None] * np.square(Tp - Tc - effect_matrix[p_idx]))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                correction = np.where(n_strata >= 2, n_strata / (n_strata - 1.0), np.nan)
+            se_robust = np.sqrt(correction[:, None] * spread * inv_w * inv_w)
     finally:
-        pair_sums._mmap.close()  # type: ignore[attr-defined]
-        os.unlink(tmp.name)
+        for memmap, name in ((pair_sums, sums_file), (pair_sqsums, sqsums_file)):
+            if memmap is not None:
+                memmap._mmap.close()  # type: ignore[attr-defined]
+                os.unlink(name)
 
-    no_cells = pooled_pert_counts == 0
-    if no_cells.any():
-        bad = candidates[int(np.argmax(no_cells))]
-        raise ValueError(f"Perturbation '{bad}' contains no cells")
-    zero = weight_tot <= 0
-    if zero.any():
-        bad = candidates[int(np.argmax(zero))]
-        raise ValueError(
-            f"Perturbation '{bad}' shares no batch with the control group; "
-            "cannot compute a batch-corrected effect."
-        )
-    inv_w = 1.0 / weight_tot[:, None]
-    pert_mean_corrected = pert_expr_num * inv_w
-    ctrl_mean_matched = ctrl_expr_num * inv_w
-    effect_matrix = pert_mean_corrected - ctrl_mean_matched
-    return (
-        effect_matrix,
-        pert_mean_corrected,
-        ctrl_mean_matched,
-        pooled_ctrl_sum,
-        pooled_ctrl_count,
-        batch_ids,
+    return _StratifiedEffects(
+        effect_matrix, pert_mean_corrected, ctrl_mean_matched,
+        pooled_ctrl_sum, pooled_ctrl_count, batch_ids, se, se_robust,
     )
-
-
-def _normalized_effects_impl(
-    data: str | Path | AnnData | ad.AnnData,
-    *,
-    layout: str,
-    perturbation_column: str | None = None,
-    groupby: str | None = None,
-    control_label: str | None = None,
-    reference: str | None = None,
-    method: NormalizedEffectMethod = "mean_log1p",
-    baseline_count: float = 1.0,
-    gene_name_column: str | None = None,
-    perturbations: Iterable[str] | None = None,
-    batch_column: str | None = None,
-    chunk_size: int | None = None,
-    memory_limit_gb: float | None = None,
-    data_name: str | None = None,
-    output_path: str | Path | None = None,
-    output_dir: str | Path | None = None,
-    verbose: int | bool = True,
-) -> AnnData:
-    """Shared implementation. ``layout`` picks the output naming scheme.
-
-    This is the one-command path from a cell-level ``.h5ad`` to an effect size: it
-    normalises each cell's counts, aggregates per perturbation, and subtracts the
-    reference, in a single streaming pass over the matrix.
-
-    Unlike :func:`compute_pseudobulk_effects`, which works on whatever scale its
-    input already carries, this function **normalises library size itself**. Do not
-    pre-normalise the input as well.
-
-    Parameters
-    ----------
-    data
-        Path to an h5ad file, or a backed AnnData object.
-    perturbation_column
-        Column in ``adata.obs`` identifying perturbation groups.
-    groupby
-        Scanpy-compatible alias for ``perturbation_column``.
-    control_label
-        Label of the reference group. Inferred from common patterns when omitted.
-    reference
-        Scanpy-compatible alias for ``control_label``.
-    method
-        Which scale the averaging happens on. Both normalise library size first:
-
-        * ``"mean_log1p"`` averages per-cell ``log1p`` values (mean of logs).
-        * ``"log_mean"`` averages normalised counts, then takes
-          ``log1p(baseline_count * mean)`` (log of mean).
-
-        These are different estimators, not different spellings: averaging before
-        or after the log gives different answers whenever expression varies within
-        a group. ``"sum"`` is not accepted here; it belongs to
-        :func:`aggregate_pseudobulk`.
-    baseline_count
-        Scaling applied inside the log for ``method="log_mean"``. Ignored by
-        ``"mean_log1p"``. Must be positive.
-    gene_name_column
-        Column in ``adata.var`` with gene symbols. Uses ``var_names`` when omitted.
-    perturbations
-        Subset of perturbation labels to score. All non-reference groups when
-        omitted.
-    batch_column
-        Column in ``adata.obs`` identifying each cell's batch. When given, effects
-        are computed within each batch and combined with harmonic target/reference
-        cell-count weights, ``w_b = n_tb * n_rb / (n_tb + n_rb)``, which removes
-        batch-driven confounding. Batches without reference cells support no
-        contrast and are skipped. When omitted, a single pooled effect is computed.
-        There is no flag to disable the correction: supplying the column is the
-        request for it.
-    chunk_size
-        Cells streamed per chunk. Auto-selected when omitted.
-    memory_limit_gb
-        Soft memory budget used to size the chunk. Only the chunk size is affected;
-        results are identical regardless.
-    data_name
-        Custom stem for the output filename.
-    output_path
-        Exact output h5ad path. Takes precedence over ``output_dir`` / ``data_name``.
-    output_dir
-        Deprecated output directory override; use ``output_path``.
-    verbose
-        ``1`` / ``True`` prints a summary line.
-
-    Returns
-    -------
-    AnnData
-        On-disk result with perturbations in observations and the effect in ``X``.
-        ``layers['perturbation_profile']`` holds the per-perturbation profile and
-        ``uns['control_profile']`` the pooled reference profile. With
-        ``batch_column``, ``X`` is the batch-corrected effect,
-        ``layers['perturbation_profile']`` its batch-corrected profile, and
-        ``layers['control_profile_matched']`` the weight-matched reference, so that
-        ``X == perturbation_profile - control_profile_matched`` exactly.
-        ``uns['batch_column']`` and ``uns['batch_ids']`` record the stratification.
-
-    See Also
-    --------
-    compute_pseudobulk_effects : contrast on the input's own scale; also accepts a
-        saved :func:`aggregate_pseudobulk` artifact.
-    aggregate_pseudobulk : absolute profiles rather than a contrast.
-    """
-    perturbation_column, control_label = resolve_group_reference_aliases(
-        perturbation_column=perturbation_column,
-        groupby=groupby,
-        control_label=control_label,
-        reference=reference,
-        fn_name="compute_normalized_effects",
-    )
-    _check_method(
-        method, NormalizedEffectMethod, "compute_normalized_effects",
-        " Use aggregate_pseudobulk for method='sum'.",
-    )
-    if baseline_count <= 0:
-        raise ValueError("baseline_count must be positive")
-    naming = _NORMALIZED_LAYOUTS[layout]
-    log_name = naming["log_name"]
-
-    # The two methods differ only in where the log is applied.
-    if method == "mean_log1p":
-        def _per_cell(values: np.ndarray) -> np.ndarray:
-            return np.log1p(values)
-
-        def _finalise(mean: np.ndarray) -> np.ndarray:
-            return mean
-    else:
-        def _per_cell(values: np.ndarray) -> np.ndarray:
-            return values
-
-        def _finalise(mean: np.ndarray) -> np.ndarray:
-            return np.log1p(baseline_count * mean)
-
-    path = resolve_data_path(data)
-    _messages.print_reading(verbose, log_name, path)
-    backed = read_backed(path)
-    use_batch = batch_column is not None
-    effect_matrix_np = np.empty((0, 0), dtype=np.float64)
-    pert_corrected = np.empty((0, 0), dtype=np.float64)
-    ctrl_matched = np.empty((0, 0), dtype=np.float64)
-    pooled_ctrl_sum = np.empty(0, dtype=np.float64)
-    pooled_ctrl_count = 0
-    sums: dict[str, np.ndarray] = {}
-    counts: dict[str, int] = {}
-    try:
-        if chunk_size is None:
-            chunk_size = calculate_optimal_chunk_size(
-                backed.n_obs, backed.n_vars, available_memory_gb=memory_limit_gb,
-            )
-            _messages.vprint(verbose, log_name, f"chunk_size={chunk_size} (auto)")
-        gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                f"Perturbation column '{perturbation_column}' was not found in "
-                f"adata.obs. Available columns: {list(backed.obs.columns)}"
-            )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
-        n_genes = backed.n_vars
-        candidates = _resolve_candidates(labels, control_label, perturbations)
-        batch_ids: list[str] = []
-        if use_batch:
-            if batch_column not in backed.obs.columns:
-                raise KeyError(
-                    f"Batch column '{batch_column}' was not found in adata.obs. "
-                    f"Available columns: {list(backed.obs.columns)}"
-                )
-            batch_labels = backed.obs[batch_column].astype(str).to_numpy()
-
-            def _block_fn(block) -> np.ndarray:
-                normalised, _ = normalize_total_block(block)
-                return _per_cell(_densify_block(normalised))
-
-            def _transform(agg: np.ndarray, n: np.ndarray) -> np.ndarray:
-                return _finalise(agg / n)
-
-            (
-                effect_matrix_np,
-                pert_corrected,
-                ctrl_matched,
-                pooled_ctrl_sum,
-                pooled_ctrl_count,
-                batch_ids,
-            ) = _streaming_batch_corrected(
-                backed,
-                labels=labels,
-                batch_labels=batch_labels,
-                candidates=candidates,
-                control_label=control_label,
-                n_genes=n_genes,
-                chunk_size=chunk_size,
-                block_fn=_block_fn,
-                transform=_transform,
-            )
-        else:
-            groups = [control_label] + candidates
-            sums = {label: np.zeros(n_genes, dtype=np.float64) for label in groups}
-            counts = {label: 0 for label in groups}
-            for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
-                slice_labels = labels[slc]
-                normalised_block, _ = normalize_total_block(block)
-                accumuland = _per_cell(normalised_block)
-                for label in groups:
-                    mask = slice_labels == label
-                    if not np.any(mask):
-                        continue
-                    sums[label] += accumuland[mask].sum(axis=0)
-                    counts[label] += int(mask.sum())
-    finally:
-        backed.file.close()
-
-    matched_profile = None
-    if use_batch:
-        if pooled_ctrl_count == 0:
-            raise ValueError("Control group contains no cells")
-        control_profile = _finalise(pooled_ctrl_sum / pooled_ctrl_count)
-        pert_profiles = list(pert_corrected)
-        matched_profile = ctrl_matched
-        effect_matrix = list(effect_matrix_np)
-    else:
-        if counts[control_label] == 0:
-            raise ValueError("Control group contains no cells")
-        control_profile = _finalise(sums[control_label] / counts[control_label])
-        effect_matrix = []
-        pert_profiles = []
-        for label in candidates:
-            if counts[label] == 0:
-                raise ValueError(f"Perturbation '{label}' contains no cells")
-            profile = _finalise(sums[label] / counts[label])
-            pert_profiles.append(profile)
-            effect_matrix.append(profile - control_profile)
-
-    resolved_output = resolve_output_path(
-        path,
-        suffix=naming["suffix"],
-        output_dir=output_dir,
-        data_name=data_name,
-        output_path=output_path,
-    )
-    if not effect_matrix:
-        adata = ad.AnnData(
-            np.zeros((0, gene_symbols.shape[0])),
-            obs=pd.DataFrame(index=pd.Index([], name="perturbation")),
-            var=pd.DataFrame(index=gene_symbols),
-        )
-        adata.uns[naming["reference_uns"]] = control_profile
-        adata.uns["method"] = str(method)
-        if method == "log_mean":
-            adata.uns["baseline_count"] = float(baseline_count)
-        _messages.vprint(verbose, log_name, f"0 perturbations × {gene_symbols.shape[0]} genes")
-        _messages.print_saving(verbose, log_name, resolved_output)
-        adata.write(resolved_output)
-        return AnnData(resolved_output)
-
-    gene_symbols = pd.Index(gene_symbols).astype(str)
-    obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    adata = ad.AnnData(
-        np.vstack(effect_matrix), obs=obs, var=pd.DataFrame(index=gene_symbols)
-    )
-    adata.layers[naming["profile_layer"]] = np.vstack(pert_profiles)
-    adata.uns[naming["reference_uns"]] = control_profile
-    adata.uns["method"] = str(method)
-    if method == "log_mean":
-        adata.uns["baseline_count"] = float(baseline_count)
-    if use_batch:
-        adata.layers[naming["matched_layer"]] = np.asarray(matched_profile)
-        adata.uns["batch_column"] = str(batch_column)
-        adata.uns["batch_ids"] = np.asarray(batch_ids, dtype=object)
-    n_layers = 3 if use_batch else 2  # X + profile_layer (+ matched_layer if batch-corrected)
-    _disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(len(candidates), n_genes, n_layers, overhead=1.10), resolved_output,
-        context=log_name,
-    )
-    _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
-    _messages.vprint(verbose, log_name, f"{len(candidates)} perturbations × {len(gene_symbols)} genes")
-    _messages.print_saving(verbose, log_name, resolved_output)
-    adata.write(resolved_output)
-    return AnnData(resolved_output)
 
 
 def compute_normalized_effects(
@@ -584,8 +334,8 @@ def compute_normalized_effects(
     """Compute library-size-normalised target-minus-reference effects from cells.
 
     This is the one-command path from a cell-level ``.h5ad`` to an effect size: it
-    normalises each cell's counts, aggregates per perturbation, and subtracts the
-    reference, in a single streaming pass over the matrix.
+    normalises each cell's counts to 10,000, aggregates per perturbation, and
+    subtracts the reference, in a single streaming pass over the matrix.
 
     Unlike :func:`compute_pseudobulk_effects`, which works on whatever scale its
     input already carries, this function **normalises library size itself**. Do not
@@ -625,11 +375,12 @@ def compute_normalized_effects(
     batch_column
         Column in ``adata.obs`` identifying each cell's batch. When given, effects
         are computed within each batch and combined with harmonic target/reference
-        cell-count weights, ``w_b = n_tb * n_rb / (n_tb + n_rb)``, which removes
-        batch-driven confounding. Batches without reference cells support no
-        contrast and are skipped. When omitted, a single pooled effect is computed.
-        There is no flag to disable the correction: supplying the column is the
-        request for it.
+        cell-count weights, ``w_b = n_tb * n_rb / (n_tb + n_rb)``: the estimate of a
+        regression with one intercept per batch and one perturbation coefficient,
+        which removes batch-driven confounding. Batches without reference cells
+        support no contrast and are skipped. When omitted, a single pooled effect
+        is computed. There is no flag to disable the correction: supplying the
+        column is the request for it.
     chunk_size
         Cells streamed per chunk. Auto-selected when omitted.
     memory_limit_gb
@@ -658,31 +409,148 @@ def compute_normalized_effects(
         ``uns['batch_column']`` and ``uns['batch_ids']`` record the stratification.
         ``method="log_mean"`` additionally records ``uns['baseline_count']``.
 
+        ``method="mean_log1p"`` also writes two standard errors of the effect
+        (Liu et al., 2026, doi:10.64898/2026.10.05.756839), treating data without
+        ``batch_column`` as one batch:
+
+        * ``layers['standard_error']``: cells independent within a batch, with one
+          within-batch variance per arm pooled over the batches with at least two
+          cells on that side (``w_b``-weighted population variances);
+          ``SE^2 = (s2_t sum_b w_b^2 / n_tb + s2_r sum_b w_b^2 / n_rb) / W^2``,
+          ``W = sum_b w_b``. Without batches this is ``sqrt(v_t / n_t + v_r / n_r)``.
+          NaN when no batch has two cells on a side.
+        * ``layers['standard_error_robust']``: from the spread of the per-batch
+          effects ``d_b`` around the effect ``E``, with no shared variance;
+          ``SE^2 = B / (B - 1) sum_b w_b^2 (d_b - E)^2 / W^2`` over the ``B``
+          contributing batches. NaN with fewer than two.
+
     See Also
     --------
     compute_pseudobulk_effects : contrast on the input's own scale; also accepts a
         saved :func:`aggregate_pseudobulk` artifact.
     aggregate_pseudobulk : absolute profiles rather than a contrast.
     """
-    return _normalized_effects_impl(
-        data,
-        layout="modern",
+    log_name = "pb.normalized_effects"
+    perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
         groupby=groupby,
         control_label=control_label,
         reference=reference,
-        method=method,
-        baseline_count=baseline_count,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        batch_column=batch_column,
-        chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb,
+        fn_name="compute_normalized_effects",
+    )
+    _check_method(
+        method, NormalizedEffectMethod, "compute_normalized_effects",
+        " Use aggregate_pseudobulk for method='sum'.",
+    )
+    if baseline_count <= 0:
+        raise ValueError("baseline_count must be positive")
+
+    # The two methods differ only in where the log is applied.
+    if method == "mean_log1p":
+        def _per_cell(values: np.ndarray) -> np.ndarray:
+            return np.log1p(values)
+
+        def _finalise(mean: np.ndarray) -> np.ndarray:
+            return mean
+    else:
+        def _per_cell(values: np.ndarray) -> np.ndarray:
+            return values
+
+        def _finalise(mean: np.ndarray) -> np.ndarray:
+            return np.log1p(baseline_count * mean)
+
+    def _block_fn(block) -> np.ndarray:
+        normalised, _ = normalize_total_block(block)
+        return _per_cell(_densify_block(normalised))
+
+    def _transform(agg: np.ndarray, n: np.ndarray) -> np.ndarray:
+        return _finalise(agg / n)
+
+    path = resolve_data_path(data)
+    _messages.print_reading(verbose, log_name, path)
+    backed = read_backed(path)
+    use_batch = batch_column is not None
+    try:
+        if chunk_size is None:
+            chunk_size = calculate_optimal_chunk_size(
+                backed.n_obs, backed.n_vars, available_memory_gb=memory_limit_gb,
+            )
+            _messages.vprint(verbose, log_name, f"chunk_size={chunk_size} (auto)")
+        gene_symbols = pd.Index(ensure_gene_symbol_column(backed, gene_name_column)).astype(str)
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in "
+                f"adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
+        n_genes = backed.n_vars
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        if use_batch:
+            if batch_column not in backed.obs.columns:
+                raise KeyError(
+                    f"Batch column '{batch_column}' was not found in adata.obs. "
+                    f"Available columns: {list(backed.obs.columns)}"
+                )
+            batch_labels = backed.obs[batch_column].astype(str).to_numpy()
+        else:
+            batch_labels = np.zeros(backed.n_obs, dtype=np.int8)  # one batch
+        if not (labels == control_label).any():
+            raise ValueError("Control group contains no cells")
+        result = _streaming_batch_corrected(
+            backed,
+            labels=labels,
+            batch_labels=batch_labels,
+            candidates=candidates,
+            control_label=control_label,
+            n_genes=n_genes,
+            chunk_size=chunk_size,
+            block_fn=_block_fn,
+            transform=_transform,
+            standard_errors=method == "mean_log1p",
+        )
+    finally:
+        backed.file.close()
+
+    control_profile = _finalise(result.pooled_control_sum / result.pooled_control_count)
+    resolved_output = resolve_output_path(
+        path,
+        suffix="normalized_effects",
+        output_dir=output_dir,
         data_name=data_name,
         output_path=output_path,
-        output_dir=output_dir,
-        verbose=verbose,
     )
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = (
+        pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+        if candidates else pd.DataFrame(index=obs_index)
+    )
+    adata = ad.AnnData(
+        result.effect.reshape(len(candidates), n_genes), obs=obs, var=pd.DataFrame(index=gene_symbols),
+    )
+    adata.uns["control_profile"] = control_profile
+    adata.uns["method"] = str(method)
+    if method == "log_mean":
+        adata.uns["baseline_count"] = float(baseline_count)
+    if candidates:
+        adata.layers["perturbation_profile"] = result.perturbation_profile
+        if use_batch:
+            adata.layers["control_profile_matched"] = result.control_profile_matched
+        if result.standard_error is not None:
+            adata.layers["standard_error"] = result.standard_error
+            adata.layers["standard_error_robust"] = result.standard_error_robust
+    if use_batch:
+        adata.uns["batch_column"] = str(batch_column)
+        adata.uns["batch_ids"] = np.asarray(result.batch_ids, dtype=object)
+    _disk_estimate = warn_if_disk_space_low(
+        estimate_bytes(max(len(candidates), 1), n_genes, 1 + len(adata.layers), overhead=1.10),
+        resolved_output, context=log_name,
+    )
+    _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
+    _messages.vprint(verbose, log_name, f"{len(candidates)} perturbations × {n_genes} genes")
+    _messages.print_saving(verbose, log_name, resolved_output)
+    adata.write(resolved_output)
+    return AnnData(resolved_output)
 
 
 def _normalise_groupby(groupby: str | Sequence[str]) -> list[str]:
@@ -1437,6 +1305,7 @@ def _estimate_shape_for_normalized_effects(
     reference: str | None = None,
     batch_column: str | None = None,
     perturbations: Iterable[str] | None = None,
+    method: NormalizedEffectMethod = "mean_log1p",
     **_ignored,
 ) -> dict[str, float]:
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -1446,14 +1315,21 @@ def _estimate_shape_for_normalized_effects(
         reference=reference,
         fn_name="compute_normalized_effects",
     )
+    # mean_log1p adds two standard-error layers, and a sum-of-squares
+    # accumulator beside the per-(perturbation, batch) sums.
+    with_se = method == "mean_log1p"
     backed = read_backed(path)
     try:
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
+        n_outputs = (3 if batch_column is not None else 2) + (2 if with_se else 0)
         if batch_column is None:
-            return {"output": estimate_bytes(len(candidates), n_genes, 2, overhead=1.10)}
+            return {
+                "tempdir": estimate_bytes(max(len(candidates), 1), n_genes, 2 if with_se else 1),
+                "output": estimate_bytes(len(candidates), n_genes, n_outputs, overhead=1.10),
+            }
         batch_labels = backed.obs[batch_column].astype(str).to_numpy()
         pert_code = pd.Index(candidates).get_indexer(pd.Index(labels))
         batch_code, batch_uniques = pd.factorize(batch_labels, sort=False)
@@ -1462,8 +1338,8 @@ def _estimate_shape_for_normalized_effects(
         pair_key_all = pert_code[cand_cell].astype(np.int64) * n_batches + batch_code[cand_cell]
         n_pairs = int(np.unique(pair_key_all).shape[0]) if cand_cell.any() else 0
         return {
-            "tempdir": estimate_bytes(max(n_pairs, 1), n_genes),
-            "output": estimate_bytes(len(candidates), n_genes, 3, overhead=1.10),
+            "tempdir": estimate_bytes(max(n_pairs, 1), n_genes, 2 if with_se else 1),
+            "output": estimate_bytes(len(candidates), n_genes, n_outputs, overhead=1.10),
         }
     finally:
         backed.file.close()
