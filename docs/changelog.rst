@@ -4,7 +4,7 @@ Changelog
 Version 0.1.10
 --------------
 
-*Not yet released.*
+*Released 2026-10-15.*
 
 * **New: ``cx.tl.residual_effects``** (also ``cx.residual_effects``), the
   covariate-adjusted effects of Feng et al. (2026, `doi:10.1016/j.xgen.2025.101076
