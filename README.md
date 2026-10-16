@@ -5,6 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/project/crispyx)
 [![Tests](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jinhongdu-lab/crispyx/actions/workflows/tests.yml)
+[![Documentation](https://readthedocs.org/projects/crispyx/badge/?version=latest)](https://crispyx.readthedocs.io/en/latest/)
 
 ## Motivation
 
@@ -12,21 +13,27 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 
 **crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix.
 
-## Features
+**Documentation:** [crispyx.readthedocs.io](https://crispyx.readthedocs.io/en/latest/) — [installation](https://crispyx.readthedocs.io/en/latest/installation.html), [quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), [tutorials](https://crispyx.readthedocs.io/en/latest/notebooks/crispyx_tutorial.html) and [API reference](https://crispyx.readthedocs.io/en/latest/api.html).
 
-- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
-- **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
-- **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation
-- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with covariates and apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
-- **Covariate-adjusted effects** – `cx.tl.residual_effects` (Feng et al., 2026) fits each gene to covariates such as donor, lane or batch on the control cells only, and takes a perturbation's effect as the mean residual of its cells. Unlike the NB GLM, which fits the covariates on counts jointly with each perturbation, the control fit is shared by every perturbation, so a perturbation's own cells cannot shift its covariate adjustment, and all perturbations come from one streaming pass. On a 1.16-million-cell screen it reproduces the published effects and significance calls in under a minute.
-- **Storage-format aware** – Gene-streaming functions (`wilcoxon_test`, `batch_process`) can convert a CSR source once to a temporary, memory-bounded CSC copy beside the output instead of re-reading the whole matrix once per gene chunk; `format_mismatch_policy="auto"` (the default) measures the source's read throughput and does so only when the re-reads would really cost more than the conversion, so a small local file is streamed as-is and a large one on a network filesystem is converted; `convert_to_csc`/`convert_to_csr` honour `memory_limit_gb` and preserve the value dtype
-- **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
-- **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
-- **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
-- **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`
-- **Disk-aware** – Estimates and warns about scratch-disk usage before large writes or CSC/CSR conversions, and `cx.estimate_disk_usage(...)` answers "how much disk will this need?" up front; the memory savings above assume the machine has enough free disk for streaming intermediates and output files
+## Installation
 
-## Quick Start
+```bash
+pip install crispyx
+```
+
+For development (editable install with all extras):
+
+```bash
+git clone https://github.com/jinhongdu-lab/crispyx.git
+cd crispyx
+pip install -e ".[test,benchmark,docs]"
+```
+
+crispyx supports Python 3.10–3.12 and is compatible with recent releases of the
+scientific stack, including `anndata >= 0.13` and `pandas >= 3.0` (where string
+metadata is stored on disk using the nullable-string encoding).
+
+## Quick start
 
 ```python
 import crispyx as cx
@@ -54,7 +61,21 @@ print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
 ```
 
-For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](docs/quickstart.rst), which links each step's guide page, and the [tutorial notebook](docs/notebooks/crispyx_tutorial.ipynb). [Covariate adjustment](docs/covariate_adjustment.rst) compares the ways to adjust for batches, donors and lines.
+For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), which links each step's guide page, and the [tutorial](https://crispyx.readthedocs.io/en/latest/notebooks/crispyx_tutorial.html). [Covariate adjustment](https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html) compares the ways to adjust for batches, donors and lines.
+
+## Features
+
+- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
+- **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
+- **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation
+- **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with covariates and apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups
+- **Covariate-adjusted effects** – `cx.tl.residual_effects` (Feng et al., 2026) fits each gene to covariates such as donor, lane or batch on the control cells only, and takes a perturbation's effect as the mean residual of its cells. Unlike the NB GLM, which fits the covariates on counts jointly with each perturbation, the control fit is shared by every perturbation, so a perturbation's own cells cannot shift its covariate adjustment, and all perturbations come from one streaming pass. On a 1.16-million-cell screen it reproduces the published effects and significance calls in under a minute.
+- **Storage-format aware** – Gene-streaming functions (`wilcoxon_test`, `batch_process`) can convert a CSR source once to a temporary, memory-bounded CSC copy beside the output instead of re-reading the whole matrix once per gene chunk; `format_mismatch_policy="auto"` (the default) measures the source's read throughput and does so only when the re-reads would really cost more than the conversion, so a small local file is streamed as-is and a large one on a network filesystem is converted; `convert_to_csc`/`convert_to_csr` honour `memory_limit_gb` and preserve the value dtype
+- **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
+- **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
+- **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
+- **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`
+- **Disk-aware** – Estimates and warns about scratch-disk usage before large writes or CSC/CSR conversions, and `cx.estimate_disk_usage(...)` answers "how much disk will this need?" up front; the memory savings above assume the machine has enough free disk for streaming intermediates and output files
 
 ## Performance
 
@@ -88,24 +109,6 @@ python analysis.py --input "$TMPDIR/screen.h5ad" --output "$TMPDIR/results"
 cp -r "$TMPDIR/results" /parallel-fs/project/
 ```
 
-## Installation
-
-```bash
-pip install crispyx
-```
-
-For development (editable install with all extras):
-
-```bash
-git clone https://github.com/jinhongdu-lab/crispyx.git
-cd crispyx
-pip install -e ".[test,benchmark,docs]"
-```
-
-crispyx supports Python 3.10–3.12 and is compatible with recent releases of the
-scientific stack, including `anndata >= 0.13` and `pandas >= 3.0` (where string
-metadata is stored on disk using the nullable-string encoding).
-
 ## Testing
 
 ```bash
@@ -113,6 +116,8 @@ pytest
 ```
 
 ## Documentation
+
+The documentation is hosted at [crispyx.readthedocs.io](https://crispyx.readthedocs.io/en/latest/). To build it locally:
 
 ```bash
 sphinx-build docs docs/_build
