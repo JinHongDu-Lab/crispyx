@@ -1,6 +1,48 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **Differential expression stays inside ``memory_limit_gb``.** ``t_test``,
+  ``nb_glm_test``, ``wilcoxon_test`` and ``shrink_lfc`` no longer hold, or map,
+  a perturbations × genes result: each perturbation's row (or gene chunk's
+  columns) is written into the result file as it is computed, a file
+  allocated up front beside the output that becomes the output when the run
+  finishes. Each checkpoint writes its pages back and evicts them, so they
+  are not charged to a SLURM job's memory. Results are bit-identical to
+  0.2.0's.
+* **Changed: ``RankGenesGroupsResult`` reads its result file.** Its matrices
+  are read on access (``result.pvalues[i]`` reads one row,
+  ``np.asarray(result.pvalues)`` the matrix, ``order`` is computed per row),
+  so returning a result no longer costs the result's size in memory, and
+  ``result["KO1"]`` works however large the result is (the lazy result
+  ``wilcoxon_test`` returned for large outputs raised ``IndexError`` there).
+  A later call that rewrites the same ``output_path`` changes what an earlier
+  result object reads. ``u_statistics`` is ``None`` outside ``wilcoxon_test``
+  (it was a matrix of zeros), and so is Scanpy's ``u_stat`` for ``t_test``
+  and ``nb_glm_test``; ``t_test``'s Scanpy ``order`` now ranks untested genes
+  last, like the other methods.
+* **Removed: ``wilcoxon_test``'s group-batch streaming path.** With the
+  results on disk, the single-pass path's memory is one gene chunk, whose
+  width now accounts for every perturbation's results.
+* **Faster, smaller ``nb_glm_test`` workers.** Each comparison's worker gets
+  its own rows rather than every cell's label (pickled once per comparison,
+  ~3.4 million strings on Huang-HCT116), checks that every perturbation has
+  cells in one pass instead of one per perturbation, and results are written
+  as they finish rather than in submission order. joblib's shared arrays are
+  written to the run's directory, not ``/dev/shm``, where they could not be
+  reclaimed. Requires ``joblib>=1.4``. ``uns["pvalue_correction"]`` is now
+  recorded, as for the other methods.
+* **QC's row-streaming cache is plain files beside the output**
+  (``cache_mode="disk"``, was ``"memmap"`` in ``$TMPDIR``), read and written
+  sequentially and evicted every GB, as are the outputs of the subset,
+  concatenation, sort, normalisation and downsampling writers.
+* **One memory budget.** ``quality_control_summary``, ``nb_glm_test``'s
+  worker and dense-matrix sizing and ``shrink_lfc``'s worker count read
+  ``memory_limit_gb`` capped by the cgroup's headroom (the memory available
+  when ``None``), instead of each detecting memory its own way.
+
 Version 0.2.0
 -------------
 

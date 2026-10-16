@@ -364,7 +364,7 @@ class ResumableRun:
         self.progress = {k: v for k, v in checkpoint.items() if k != "fingerprint"} if self.resumed else {}
         if not self.resumed:
             self.discard()
-            self.directory.mkdir(parents=True)
+            self.directory.mkdir(parents=True, exist_ok=True)
             scaffold(self.work_path)
         self.file = h5py.File(self.work_path, "r+")
 

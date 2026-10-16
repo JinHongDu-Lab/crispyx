@@ -83,9 +83,13 @@ streaming is used unconditionally. DESeq2-style size factors
 (``size_factor_method="deseq2"``) also stream automatically when the
 intermediate counts array would exceed 4 GB, computing geometric means
 and per-cell median ratios in chunks. After each streaming phase,
-``drop_file_cache()`` evicts file data from the kernel page cache so that
-cgroup-limited environments (e.g. SLURM) do not count cached pages toward
-the memory limit.
+``drop_file_cache()`` writes back and evicts file data from the kernel page
+cache so that cgroup-limited environments (e.g. SLURM) do not count cached
+pages toward the memory limit. Files that are written -- a DE result as it is
+filled, QC's chunk cache and its filtered output, sorted and converted copies
+-- are synced and evicted the same way every gigabyte or checkpoint, since
+dirty pages on a network filesystem are written back slowly and stay charged
+to the job until they are.
 
 .. note::
 
@@ -100,12 +104,12 @@ Disk space
 
 crispyx's memory savings come from streaming, but several operations trade
 RAM for **disk**: the per-``(perturbation, batch)`` accumulator described
-above, the partial result arrays of ``cx.tl.t_test`` /
-``cx.tl.wilcoxon_test`` / ``cx.tl.nb_glm_test``, and whole-file CSR↔CSC
-conversions. The DE functions keep their partial results beside the output
-(in a hidden ``.<output name>.resume`` directory, removed on success) rather
-than in ``$TMPDIR``, so an interrupted run can continue with ``resume=True``;
-their ``"output"`` estimate covers those arrays plus the final file.
+above, the result file of ``cx.tl.t_test`` / ``cx.tl.wilcoxon_test`` /
+``cx.tl.nb_glm_test`` as it is filled, QC's chunk cache, and whole-file
+CSR↔CSC conversions. The DE functions fill their result file beside the output
+(in a hidden ``.<output name>.resume`` directory, moved to the output on
+success) rather than in ``$TMPDIR``, so an interrupted run can continue with
+``resume=True``; their ``"output"`` estimate covers that file.
 ``cx.tl.batch_process`` writes results directly into its output file as each
 gene chunk finishes, so its ``"output"`` estimate likewise accounts for the
 full footprint (see ``resume`` below for what that also enables). crispyx warns
@@ -269,9 +273,9 @@ Coverage added beyond the basic Reading/Saving/Done triad:
    * - Progress bars (``tqdm``, degrade to a no-op without it)
      - CSC/CSR conversion, ``cx.pb.aggregate``, ``cx.tl.batch_process``, QC
        streaming passes, plus the pre-existing DE loops
-   * - Auto-picked chunk size / streaming-vs-single-pass strategy
+   * - Auto-picked chunk size / strategy
      - Every function that calls ``calculate_optimal_chunk_size`` (and
-       siblings) or ``_should_use_streaming`` internally
+       siblings) internally
    * - Disk-usage confirmation alongside the unconditional warning
      - Every ``warn_if_disk_space_low`` call site with a ``verbose``
        parameter in scope
