@@ -38,26 +38,6 @@ from ._disk import (
 logger = logging.getLogger(__name__)
 
 
-def drop_file_cache(path: str | Path) -> None:
-    """Advise the kernel to drop page cache for *path* (Linux only).
-
-    On cgroup-limited systems (SLURM), page-cache pages count toward the
-    memory limit.  Calling this after a streaming read prevents the cached
-    file data from consuming the cgroup budget.
-
-    The call is a no-op on non-Linux platforms or when the file cannot be
-    opened.
-    """
-    try:
-        fd = _os.open(str(path), _os.O_RDONLY)
-        try:
-            _os.posix_fadvise(fd, 0, 0, _os.POSIX_FADV_DONTNEED)
-        finally:
-            _os.close(fd)
-    except (OSError, AttributeError):
-        pass
-
-
 from numba import njit, prange
 
 # Numba-accelerated helpers for dense→CSR conversion (60x faster than scipy)
@@ -4097,23 +4077,25 @@ def calculate_wilcoxon_chunk_size(
     n_obs: int,
     n_vars: int,
     *,
+    n_groups: int = 0,
     available_memory_gb: float | None = None,
     min_chunk: int = 32,
     max_chunk: int = 4096,
 ) -> int:
     """Calculate optimal gene chunk size for Wilcoxon rank-sum tests.
 
-    Unlike :func:`calculate_optimal_gene_chunk_size`, this function has **no
-    n_groups cap**.  Wilcoxon writes all output arrays (effect, pvalue, z-score,
-    etc.) to on-disk memory-mapped files immediately, so peak RAM per chunk is
-    independent of the number of perturbation groups.  The only effective cap is
-    a per-chunk transient-memory budget:
+    One gene chunk is held in memory at a time: the chunk's cells, densified,
+    and every group's results for its genes, which are written to the result
+    file before the next chunk is read. Per gene of the chunk that is
 
-        transient ≈ chunk_size × (n_obs × 4  +  n_ctrl × 8  +  n_pert × 4)
-                  ≈ chunk_size × n_obs × 12 bytes
+        transient ≈ n_obs × 12  +  n_groups × 128 bytes
 
-    The budget is set to 15 % of ``available_memory_gb`` so that a single chunk
-    never exceeds ~1/7th of the node RAM.
+    (dense float32 block + ctrl float64 presort + pert float32 stack; about
+    sixteen per-group float64 result and work arrays). The budget is 15 % of
+    ``available_memory_gb``, so a single chunk never exceeds ~1/7th of it.
+
+    Unlike :func:`calculate_optimal_gene_chunk_size`, there is no separate
+    ``n_groups`` cap: the group term above is what the groups cost.
 
     Parameters
     ----------
@@ -4121,6 +4103,9 @@ def calculate_wilcoxon_chunk_size(
         Number of cells in the dataset.
     n_vars
         Number of genes in the dataset (used only for logging).
+    n_groups
+        Number of perturbations tested (0 when the caller holds no per-group
+        results per chunk).
     available_memory_gb
         Available memory in GB.  When *None*, detected via :mod:`psutil`.
         On HPC nodes, pass the SLURM ``--mem`` value so the cap reflects the
@@ -4128,9 +4113,9 @@ def calculate_wilcoxon_chunk_size(
     min_chunk
         Floor for the returned chunk size (default 32).
     max_chunk
-        Ceiling for the returned chunk size (default 4096).  The cell-budget
-        cap is applied *before* this ceiling, so ``max_chunk`` is only active
-        for small/sparse datasets where the cell cap would be very large.
+        Ceiling for the returned chunk size (default 4096).  The memory cap
+        is applied *before* this ceiling, so ``max_chunk`` is only active for
+        small/sparse datasets where the memory cap would be very large.
 
     Returns
     -------
@@ -4156,12 +4141,9 @@ def calculate_wilcoxon_chunk_size(
             )
             available_memory_gb = 16.0
 
-    # Per-chunk transient memory budget: 15% of available RAM.
-    # transient ≈ chunk_size × n_obs × 12 bytes
-    # (dense float32 block + ctrl float64 presort + pert float32 stack).
     _PER_CHUNK_BUDGET_FRACTION = 0.15
     per_chunk_budget = available_memory_gb * _PER_CHUNK_BUDGET_FRACTION * 1e9
-    per_chunk_bytes_per_gene = n_obs * 12
+    per_chunk_bytes_per_gene = n_obs * 12 + n_groups * 128
     cell_cap = max(min_chunk, int(per_chunk_budget / per_chunk_bytes_per_gene))
 
     chunk_size = max(min_chunk, min(cell_cap, max_chunk))

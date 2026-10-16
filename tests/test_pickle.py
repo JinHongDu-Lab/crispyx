@@ -63,7 +63,7 @@ def test_rank_genes_groups_result_round_trip(tmp_path):
     np.testing.assert_array_equal(restored.pvalues, result.pvalues)
     np.testing.assert_array_equal(restored.logfoldchanges, result.logfoldchanges)
     assert restored.result is None
-    assert restored._group_cache == {}
+    assert restored.result_path == result.result_path
     # Dict-style access still works on the restored object.
     item = restored["KO1"]
     assert item.perturbation == "KO1"

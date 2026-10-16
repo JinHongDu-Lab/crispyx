@@ -2054,11 +2054,11 @@ def _estimate_apeglm_prior_scale(
     init_scale: float = 1.0,
 ) -> float:
     """Estimate apeGLM prior scale parameter using PyDESeq2's adaptive method.
-    
+
     This implements the prior variance estimation from PyDESeq2's `fit_prior_var`
     function, which finds the scale parameter that balances the data likelihood
     with the Cauchy prior.
-    
+
     Parameters
     ----------
     mle_lfc
@@ -2067,32 +2067,48 @@ def _estimate_apeglm_prior_scale(
         Standard errors of the MLE estimates.
     init_scale
         Initial guess for the scale parameter.
-    
+
     Returns
     -------
     float
         Estimated prior scale parameter for the Cauchy prior.
     """
-    mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
-    if not np.any(mask):
+    return _apeglm_prior_scale_from_blocks(lambda: [(mle_lfc, se)], init_scale)
+
+
+def _apeglm_prior_scale_from_blocks(blocks, init_scale: float = 1.0) -> float:
+    """:func:`_estimate_apeglm_prior_scale` over ``(mle_lfc, se)`` pieces:
+    ``blocks()`` yields them afresh for each evaluation of the objective, so
+    a result too large to hold can be read a block at a time. With one block
+    the sums, and so the scale, are exactly those of the whole arrays."""
+
+    def pieces():
+        for mle_lfc, se in blocks():
+            mle_lfc, se = np.asarray(mle_lfc), np.asarray(se)
+            mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
+            if np.any(mask):
+                yield mle_lfc[mask] ** 2, se[mask] ** 2
+
+    if next(pieces(), None) is None:
         return init_scale
-    
-    S = mle_lfc[mask] ** 2
-    D = se[mask] ** 2
-    
+
     def objective(a: float) -> float:
         """Objective function: find a such that weighted mean of (S-D) equals a."""
-        coeff = 1.0 / (2.0 * (a + D) ** 2)
-        return float(((S - D) * coeff).sum() / coeff.sum() - a)
-    
+        numerator = denominator = 0.0
+        for S, D in pieces():
+            coeff = 1.0 / (2.0 * (a + D) ** 2)
+            numerator += ((S - D) * coeff).sum()
+            denominator += coeff.sum()
+        return float(numerator / denominator - a)
+
     # Match PyDESeq2's _fit_prior_var exactly:
     # - If objective(min_var) < 0, return min_var (maximum shrinkage)
     # - Otherwise, find root in [min_var, max_var]
     min_var, max_var = 1e-6, 400.0
-    
+
     try:
         f_min = objective(min_var)
-        
+
         if f_min < 0:
             # No root exists above min_var, use min_var (max shrinkage)
             # This is the PyDESeq2 behavior when Var(LFC) < median(SE^2)
@@ -2103,7 +2119,7 @@ def _estimate_apeglm_prior_scale(
     except Exception:
         # Fallback: use min_var for maximum shrinkage
         scale_sq = min_var
-    
+
     # PyDESeq2: prior_scale = min(sqrt(prior_var), 1.0)
     # No minimum floor on prior_scale - allow aggressive shrinkage
     return min(np.sqrt(scale_sq), 1.0)

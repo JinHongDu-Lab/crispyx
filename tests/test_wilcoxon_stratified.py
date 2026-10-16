@@ -345,6 +345,8 @@ class TestStratifiedCacheSafety:
             force=True,
             **_NO_FILTER,
         )
+        # A result reads its file, which the stratified run replaces.
+        pooled_statistics = np.asarray(pooled.statistics)
         strat = wilcoxon_test(
             path,
             perturbation_column="perturbation",
@@ -355,7 +357,7 @@ class TestStratifiedCacheSafety:
         )
 
         assert strat.result_path == pooled.result_path == out
-        assert not np.allclose(pooled.statistics, strat.statistics, equal_nan=True)
+        assert not np.allclose(pooled_statistics, strat.statistics, equal_nan=True)
         with h5py.File(out, "r") as hf:
             assert hf["uns/batch_column"][()].decode() == "batch"
             assert bool(hf["uns/stratified"][()]) is True

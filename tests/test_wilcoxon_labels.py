@@ -69,13 +69,14 @@ def test_each_shuffle_is_its_own_result(tmp_path, screen, capsys):
     first = pd.Series(rng.permutation(obs["perturbation"].to_numpy()), index=obs.index)
     second = pd.Series(rng.permutation(obs["perturbation"].to_numpy()), index=obs.index)
 
-    a = cx.wilcoxon_test(path, perturbation_column=first, **common)
+    # A result reads its file, which the third call replaces: keep the values.
+    a_pvalues = np.asarray(cx.wilcoxon_test(path, perturbation_column=first, **common).pvalues)
     capsys.readouterr()
     cx.wilcoxon_test(path, perturbation_column=first.copy(), **common)
     assert "Loading existing result" in capsys.readouterr().out
     b = cx.wilcoxon_test(path, perturbation_column=second, **common)
     assert "argument 'perturbation_column' differs" in capsys.readouterr().out
-    assert not np.allclose(a.pvalues, b.pvalues, equal_nan=True)
+    assert not np.allclose(a_pvalues, b.pvalues, equal_nan=True)
 
 
 def test_series_missing_cells_raises(tmp_path, screen):

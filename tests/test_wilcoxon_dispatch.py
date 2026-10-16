@@ -1,12 +1,12 @@
-"""Wilcoxon kernels, the standard vs streaming paths, and the result file helpers.
+"""Wilcoxon kernels, gene chunking, and the result file.
 
 Covers:
 - _presort_control_nonzeros and the presorted kernel against scipy's ranks
-- Standard (memmap) and streaming (group-batch) paths giving the same result
-- _write_wilcoxon_result_h5ad / _build_result_from_h5ad
+- The result not depending on the gene chunk width (set by the memory budget)
+- The result file's layout, and the result read back from it
 - Agreement with Scanpy on dense and mixed dense/sparse genes
 
-The memory-based dispatch heuristics are tested in ``test_memory_dispatch.py``.
+The memory-based chunk sizing is tested in ``test_memory_dispatch.py``.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from crispyx._kernels import (
     _presort_control_nonzeros,
     _wilcoxon_batch_perts_presorted_numba,
 )
-from crispyx.de import _build_result_from_h5ad, _write_wilcoxon_result_h5ad, wilcoxon_test
+from crispyx.de import wilcoxon_test
 
 ADAMSON_PATH = Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad"
 
@@ -49,12 +49,12 @@ def _labels(n_ctrl: int, n_perts: int, cells_per_pert: int) -> list[str]:
     return ["control"] * n_ctrl + [f"p{i}" for i in range(n_perts) for _ in range(cells_per_pert)]
 
 
-def _assert_paths_agree(standard, streaming):
-    assert standard.groups == streaming.groups
+def _assert_results_agree(wide, narrow):
+    assert wide.groups == narrow.groups
     for field in _RESULT_FIELDS:
         np.testing.assert_allclose(
-            np.asarray(getattr(streaming, field)), np.asarray(getattr(standard, field)),
-            atol=1e-10, err_msg=f"{field} differs between the standard and streaming paths",
+            np.asarray(getattr(narrow, field)), np.asarray(getattr(wide, field)),
+            atol=1e-10, err_msg=f"{field} depends on the gene chunk width",
         )
 
 
@@ -155,116 +155,76 @@ def test_presorted_kernel_matches_scipy_ranks(n_ctrl, n_pert, n_genes, sparsity,
 
 
 # ---------------------------------------------------------------------------
-# Standard vs streaming
+# Gene chunk width
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n_ctrl, n_perts", [(50, 10), (500, 5), (2000, 5)])
-def test_streaming_matches_standard_on_synthetic_data(tmp_path, n_ctrl, n_perts):
+def test_result_does_not_depend_on_the_chunk_width(tmp_path, n_ctrl, n_perts):
     rng = np.random.default_rng(n_ctrl)
     n_cells = n_ctrl + n_perts * 10
     data = (rng.random((n_cells, 64)) < 0.3) * rng.exponential(2, (n_cells, 64))
     path = _write_log_normalised(tmp_path / "data.h5ad", data, _labels(n_ctrl, n_perts, 10))
     kw = dict(perturbation_column="perturbation", verbose=False)
-    standard = wilcoxon_test(path, output_path=tmp_path / "std.h5ad", memory_limit_gb=128, **kw)
-    streaming = wilcoxon_test(path, output_path=tmp_path / "stream.h5ad", memory_limit_gb=1e-7, **kw)
-    _assert_paths_agree(standard, streaming)
+    wide = wilcoxon_test(path, output_path=tmp_path / "wide.h5ad", **kw)
+    narrow = wilcoxon_test(path, output_path=tmp_path / "narrow.h5ad", chunk_size=7, **kw)
+    _assert_results_agree(wide, narrow)
 
 
 @pytest.mark.skipif(not ADAMSON_PATH.exists(), reason="data/Adamson_subset.h5ad not found")
-def test_streaming_matches_standard_on_real_data(tmp_path):
-    """Real sparsity and tie structure; 2,000 genes keep the streaming run short."""
+def test_result_does_not_depend_on_the_chunk_width_on_real_data(tmp_path):
+    """Real sparsity and tie structure; 2,000 genes keep the narrow run short."""
     adata = ad.read_h5ad(ADAMSON_PATH)[:, :2000].copy()
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
     path = tmp_path / "adamson_norm.h5ad"
     adata.write(path)
     kw = dict(perturbation_column="perturbation", control_label="control", verbose=False)
-    standard = wilcoxon_test(path, output_path=tmp_path / "std.h5ad", memory_limit_gb=128, **kw)
-    streaming = wilcoxon_test(path, output_path=tmp_path / "stream.h5ad", memory_limit_gb=1e-7, **kw)
-    _assert_paths_agree(standard, streaming)
+    wide = wilcoxon_test(path, output_path=tmp_path / "wide.h5ad", **kw)
+    narrow = wilcoxon_test(path, output_path=tmp_path / "narrow.h5ad", chunk_size=64, **kw)
+    _assert_results_agree(wide, narrow)
 
 
 # ---------------------------------------------------------------------------
-# Result file helpers
+# Result file
 # ---------------------------------------------------------------------------
 
-def _result_arrays(n_groups: int, n_genes: int, seed: int = 0) -> dict:
-    rng = np.random.default_rng(seed)
-    return dict(
-        auc_matrix=rng.random((n_groups, n_genes)),
-        z_matrix=rng.standard_normal((n_groups, n_genes)),
-        pvalue_matrix=rng.random((n_groups, n_genes)),
-        pvalue_adj_matrix=rng.random((n_groups, n_genes)),
-        lfc_matrix=rng.standard_normal((n_groups, n_genes)),
-        u_matrix=rng.random((n_groups, n_genes)) * 1000,
-        pts_matrix=rng.random((n_groups, n_genes)).astype(np.float32),
-        pts_rest=rng.random(n_genes).astype(np.float32),
+def _small_result(tmp_path: Path, **kw):
+    rng = np.random.default_rng(1)
+    data = (rng.random((90, 24)) < 0.4) * rng.exponential(2, (90, 24))
+    path = _write_log_normalised(tmp_path / "data.h5ad", data, _labels(30, 6, 10))
+    return wilcoxon_test(
+        path, perturbation_column="perturbation", control_label="control", verbose=False,
+        output_path=tmp_path / "result.h5ad", min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0, **kw,
     )
 
 
-def _write_result(path: Path, n_groups: int = 4, n_genes: int = 16, **overrides) -> tuple[dict, dict]:
-    meta = dict(
-        candidates=[f"p{i}" for i in range(n_groups)],
-        gene_symbols=pd.Index([f"g{i}" for i in range(n_genes)]),
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        tie_correct=True,
-        corr_method="benjamini-hochberg",
-    )
-    meta.update(overrides)
-    arrays = _result_arrays(n_groups, n_genes)
-    _write_wilcoxon_result_h5ad(path, **meta, **arrays)
-    return meta, arrays
+def test_result_layout(tmp_path):
+    result = _small_result(tmp_path, tie_correct=False, corr_method="bonferroni")
+    with h5py.File(result.result_path, "r") as hf:
+        assert sorted(hf["layers"]) == ["logfoldchanges", "pts", "pvalue", "pvalue_adj", "u_statistic", "z_score"]
+        assert hf["X"].shape == (6, 24) and hf["X"].dtype == np.float64
+        assert hf["layers/pts"].dtype == np.float32
+    stored = ad.read_h5ad(result.result_path)
+    assert stored.obs_names.tolist() == [f"p{i}" for i in range(6)]
+    assert stored.var["pts_rest"].dtype == np.float32 and (stored.var["pts_rest"] > 0).all()
+    assert stored.uns["method"] == "wilcoxon"
+    assert not stored.uns["tie_correct"]
+    assert stored.uns["pvalue_correction"] == "bonferroni"
+    assert not stored.uns["stratified"]
+    assert (stored.obs["n_genes_tested"] == np.isfinite(stored.layers["pvalue"]).sum(axis=1)).all()
 
 
-def test_write_result_layout(tmp_path):
-    out = tmp_path / "result.h5ad"
-    meta, arrs = _write_result(out, tie_correct=False, corr_method="bonferroni")
-    with h5py.File(out, "r") as hf:
-        np.testing.assert_allclose(hf["X"][:], arrs["auc_matrix"])
-        for layer, key in [
-            ("z_score", "z_matrix"), ("pvalue", "pvalue_matrix"), ("pvalue_adj", "pvalue_adj_matrix"),
-            ("logfoldchanges", "lfc_matrix"), ("u_statistic", "u_matrix"), ("pts", "pts_matrix"),
-        ]:
-            np.testing.assert_allclose(hf[f"layers/{layer}"][:], arrs[key], err_msg=layer)
-        assert "pts_rest" not in hf["layers"]
-    result = ad.read_h5ad(out)
-    np.testing.assert_array_equal(result.var["pts_rest"].to_numpy(), arrs["pts_rest"])
-    assert result.obs_names.tolist() == meta["candidates"]
-    assert result.var_names.tolist() == list(meta["gene_symbols"])
-    assert result.uns["method"] == "wilcoxon"
-    assert not result.uns["tie_correct"]
-    assert result.uns["pvalue_correction"] == "bonferroni"
-    assert not result.uns["stratified"]
-
-
-def test_build_result_reads_the_file_back(tmp_path):
-    out = tmp_path / "result.h5ad"
-    meta, arrs = _write_result(out, n_groups=6, n_genes=24)
-    result = _build_result_from_h5ad(out, **meta, memory_limit_gb=128.0)
-    assert list(result.groups) == meta["candidates"]
-    assert list(result.genes) == list(meta["gene_symbols"])
-    np.testing.assert_allclose(result.statistics, arrs["z_matrix"])
-    np.testing.assert_allclose(result.auc, arrs["auc_matrix"])
-    np.testing.assert_allclose(result.pvalues, arrs["pvalue_matrix"])
-    np.testing.assert_allclose(result.logfoldchanges, arrs["lfc_matrix"])
-    np.testing.assert_array_equal(result.pts_rest, np.broadcast_to(arrs["pts_rest"], result.pts.shape))
-    np.testing.assert_array_equal(result.order, np.argsort(-np.abs(arrs["z_matrix"]), axis=1, kind="mergesort"))
-
-
-def test_build_result_is_lazy_when_memory_is_short(tmp_path, monkeypatch):
-    """With too little physical memory the arrays stay on disk."""
-    import sys
-    import types
-
-    fake_psutil = types.ModuleType("psutil")
-    fake_psutil.virtual_memory = lambda: types.SimpleNamespace(available=100)
-    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
-    out = tmp_path / "result.h5ad"
-    meta, _ = _write_result(out)
-    result = _build_result_from_h5ad(out, **meta, memory_limit_gb=None)
-    assert result.statistics.size == 0
-    assert result.result is not None  # the AnnData handle is still set
+def test_result_reads_the_file_back(tmp_path):
+    result = _small_result(tmp_path)
+    stored = ad.read_h5ad(result.result_path)
+    z = stored.layers["z_score"]
+    np.testing.assert_array_equal(np.asarray(result.statistics), z)
+    np.testing.assert_array_equal(np.asarray(result.auc), stored.X)
+    np.testing.assert_array_equal(np.asarray(result.u_statistics), stored.layers["u_statistic"])
+    np.testing.assert_array_equal(result.pvalues[3], stored.layers["pvalue"][3])
+    np.testing.assert_array_equal(result.pts_rest, np.broadcast_to(stored.var["pts_rest"], z.shape))
+    np.testing.assert_array_equal(np.asarray(result.order), np.argsort(-np.abs(z), axis=1, kind="mergesort"))
+    np.testing.assert_array_equal(result["p2"].auc, stored.X[2])
 
 
 # ---------------------------------------------------------------------------
