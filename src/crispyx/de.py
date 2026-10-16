@@ -111,7 +111,6 @@ from ._statistics import (
 )
 from ._memory import (
     _estimate_max_workers,
-    _get_available_memory_mb,
 )
 
 logger = logging.getLogger(__name__)
@@ -4826,7 +4825,7 @@ def _apeglm_worker_count(
             n_cells,
             1,
             memory_per_worker_mb=per_worker_mb,
-            memory_limit_mb=None if memory_limit_gb is None else memory_limit_gb * 1e3,
+            memory_limit_gb=memory_limit_gb,
         ),
     )
 

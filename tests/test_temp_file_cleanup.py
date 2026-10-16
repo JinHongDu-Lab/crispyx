@@ -29,9 +29,8 @@ def _write_counts(path: Path, *, n_cells: int = 60, n_genes: int = 12) -> Path:
 
 def test_qc_gene_filter_cache_is_removed_when_filling_it_fails(tmp_path, monkeypatch):
     path = _write_counts(tmp_path / "counts.h5ad")
-    cache_root = tmp_path / "tmpdir"
+    cache_root = tmp_path / "out"  # the cache goes beside the output
     cache_root.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(cache_root))
 
     def boom(*args, **kwargs):
         raise RuntimeError("injected")
@@ -43,11 +42,11 @@ def test_qc_gene_filter_cache_is_removed_when_filling_it_fails(tmp_path, monkeyp
             min_cells=1,
             cell_mask=np.ones(60, dtype=bool),
             gene_cell_counts=np.full(12, 10),
-            output_path=tmp_path / "out.h5ad",
-            cache_mode="memmap",
+            output_path=cache_root / "out.h5ad",
+            cache_mode="disk",
             verbose=False,
         )
-    assert not list(cache_root.glob("crispyx_qc_cache_*"))
+    assert not list(cache_root.iterdir())
 
 
 def test_sort_metadata_temp_file_is_removed_on_failure(tmp_path, monkeypatch):

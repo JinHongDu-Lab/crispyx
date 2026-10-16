@@ -53,12 +53,26 @@ def drop_file_cache(path: str | Path) -> None:
         pass
 
 
-def _get_available_memory_mb() -> float:
-    """Get available system memory in MB, with fallback."""
-    try:
-        return _detected_available_bytes() / 1e6
-    except ImportError:
-        return 8000.0  # 8 GB default fallback
+class _EvictEvery:
+    """Count the bytes a streaming pass moves through some files and, every
+    ``nbytes`` of them, :func:`drop_file_cache` each file, so a pass over
+    hundreds of GB keeps about ``nbytes`` of their pages resident rather
+    than all of them.
+
+    Call it with the size of each block read or written.
+    """
+
+    def __init__(self, *paths: str | Path, nbytes: int = 1 << 30) -> None:
+        self.paths = paths
+        self.nbytes = nbytes
+        self._pending = 0
+
+    def __call__(self, moved: int) -> None:
+        self._pending += int(moved)
+        if self._pending >= self.nbytes:
+            for path in self.paths:
+                drop_file_cache(path)
+            self._pending = 0
 
 
 def _estimate_dense_memory_gb(n_cells: int, n_genes: int, n_copies: int = 3) -> float:
@@ -120,14 +134,15 @@ def _estimate_max_workers(
     n_samples: int,
     n_genes: int,
     memory_per_worker_mb: float | None = None,
-    available_mb: float | None = None,
-    memory_limit_mb: float | None = None,
+    memory_limit_gb: float | None = None,
 ) -> int:
     """Estimate maximum number of parallel workers based on memory constraints.
-    
+
     Limits worker count to prevent OOM from multiple workers each allocating
-    large work arrays.
-    
+    large work arrays: as many workers as fit 80% of the budget
+    (:func:`_resolve_memory_limit_bytes`), and no more than the CPUs this
+    process may use.
+
     Parameters
     ----------
     n_samples
@@ -136,39 +151,21 @@ def _estimate_max_workers(
         Total number of genes.
     memory_per_worker_mb
         Estimated memory per worker in MB. If None, calculated from data size.
-    available_mb
-        Available memory in MB. If None, uses 80% of system memory.
-    memory_limit_mb
-        Optional explicit memory limit in MB (e.g., from config). If provided,
-        the effective memory budget is min(available_mb, memory_limit_mb).
-        
+    memory_limit_gb
+        Explicit memory budget in GB; ``None`` uses the memory available.
+
     Returns
     -------
     int
         Recommended maximum number of workers.
     """
-    if available_mb is None:
-        # Try to get system memory, default to 8 GB if unavailable
-        try:
-            available_mb = _detected_available_bytes() / 1e6 * 0.8
-        except ImportError:
-            available_mb = 8000.0  # 8 GB default
-    
-    # Apply explicit memory limit if provided
-    if memory_limit_mb is not None:
-        effective_mb = min(available_mb, memory_limit_mb * 0.8)  # 80% of limit
-    else:
-        effective_mb = available_mb
-    
+    effective_mb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e6 * 0.8
     if memory_per_worker_mb is None:
         # Estimate: 4 work arrays + Y subset + overhead
         n_work_arrays = 5
         memory_per_worker_mb = n_samples * n_genes * 8 * n_work_arrays / 1e6
-    
     max_workers = max(1, int(effective_mb / memory_per_worker_mb))
-    cpu_count = os.cpu_count() or 4
-    
-    return min(max_workers, cpu_count)
+    return min(max_workers, _resolve_n_jobs(None))
 
 
 #: cgroup v1 files report an "unlimited" ceiling as a sentinel near 2**63

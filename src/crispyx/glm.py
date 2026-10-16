@@ -47,7 +47,7 @@ from ._irls import (
     schur_variances,
 )
 from ._memory import (
-    _get_available_memory_mb,
+    _resolve_memory_limit_bytes,
     _estimate_dense_memory_gb,
     _estimate_gene_batch_size_fitter,
 )
@@ -673,12 +673,7 @@ def precompute_global_dispersion(
     estimated_memory_gb = _estimate_dense_memory_gb(n_cells, n_genes, n_copies=3)
     
     # Compute effective memory budget
-    available_memory_gb = _get_available_memory_mb() / 1000.0
-    if memory_limit_gb is not None:
-        effective_limit_gb = min(available_memory_gb, memory_limit_gb)
-    else:
-        effective_limit_gb = available_memory_gb
-    
+    effective_limit_gb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e9
     memory_budget_gb = max_dense_fraction * effective_limit_gb
     
     # Check if we need streaming mode

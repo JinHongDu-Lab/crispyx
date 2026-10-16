@@ -47,8 +47,8 @@ def _make_uneven_screen(path: Path, fmt: str, seed: int = 0) -> Path:
 
 _STRATEGIES = {
     "column": lambda path, out, **kw: _qc_column_oriented(path, output_path=out, chunk_size=7, **kw),
-    "row-memmap-delta": lambda path, out, **kw: _qc_row_oriented(
-        path, output_path=out, chunk_size=7, cache_mode="memmap", delta_threshold=1e9, **kw),
+    "row-disk-delta": lambda path, out, **kw: _qc_row_oriented(
+        path, output_path=out, chunk_size=7, cache_mode="disk", delta_threshold=1e9, **kw),
     "row-memory-recompute": lambda path, out, **kw: _qc_row_oriented(
         path, output_path=out, chunk_size=7, cache_mode="memory", delta_threshold=0.0, **kw),
     "row-no-cache": lambda path, out, **kw: _qc_row_oriented(

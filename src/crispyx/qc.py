@@ -17,7 +17,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _detected_available_bytes
+from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
@@ -135,61 +135,54 @@ class _ChunkCache:
         return len(self._chunks)
 
 
-class _MemmapChunkCache:
-    """Memory-mapped chunk cache for QC streaming.
-    
-    Uses numpy memmap to store CSR chunks on disk with memory-mapped access,
-    reducing RAM usage while maintaining fast access through OS page caching.
-    Similar to the approach used in crispyx.glm for large streaming operations.
-    
+class _DiskChunkCache:
+    """On-disk cache for CSR chunk data during QC streaming.
+
+    Chunks are appended to two flat files (values and column indices) in a
+    hidden directory beside the output, then read back one chunk at a time
+    for the write phase. The files are written and read with plain I/O, not
+    mapped, and every GB of traffic their pages are written back and
+    evicted (:class:`~crispyx._memory._EvictEvery`), so
+    the cache -- as large as the kept cells' matrix -- never accumulates in
+    the page cache a cgroup-limited job is charged for.
+
     Parameters
     ----------
     output_path
-        Base path for output file. Cache files created in a temp directory.
+        Path of the QC output; the cache directory is created beside it.
     estimated_nnz
-        Estimated total non-zeros for pre-allocation.
+        Estimated total non-zeros, for the low-disk-space warning.
     data_dtype
         Data type for values array.
     """
-    
+
     def __init__(
-        self, 
+        self,
         output_path: Path | str,
         estimated_nnz: int,
         data_dtype: np.dtype = np.float32,
     ) -> None:
         self.output_path = Path(output_path)
-        self._estimated_nnz = estimated_nnz
-        self._data_dtype = data_dtype
-        
-        # Create temp directory for memmap files
-        self._cache_dir = Path(tempfile.mkdtemp(prefix="crispyx_qc_cache_"))
+        self._data_dtype = np.dtype(data_dtype)
+        self._cache_dir = Path(tempfile.mkdtemp(
+            prefix=f".{self.output_path.name}.qc_cache_", dir=self.output_path.parent,
+        ))
         warn_if_disk_space_low(
-            estimate_bytes(estimated_nnz, itemsize=np.dtype(data_dtype).itemsize)
+            estimate_bytes(estimated_nnz, itemsize=self._data_dtype.itemsize)
             + estimate_bytes(estimated_nnz, itemsize=4),
             self._cache_dir,
-            context="qc memmap chunk cache",
+            context="qc chunk cache",
         )
-
-        # Pre-allocate memory-mapped arrays
-        self._data_mmap = np.memmap(
-            self._cache_dir / "data.mmap",
-            dtype=data_dtype,
-            mode='w+',
-            shape=(estimated_nnz,),
-        )
-        self._indices_mmap = np.memmap(
-            self._cache_dir / "indices.mmap",
-            dtype=np.int32,
-            mode='w+',
-            shape=(estimated_nnz,),
-        )
-        
+        self._data_path = self._cache_dir / "data.bin"
+        self._indices_path = self._cache_dir / "indices.bin"
+        self._data_file = open(self._data_path, "wb")
+        self._indices_file = open(self._indices_path, "wb")
         # Track chunk boundaries: list of (start, end, indptr_diff)
         self._chunk_info: list[tuple[int, int, np.ndarray]] = []
         self._current_offset = 0
         self._n_cols: int = 0
-    
+        self._evict = _EvictEvery(self._data_path, self._indices_path)
+
     def write_chunk(
         self,
         chunk_idx: int,
@@ -198,116 +191,71 @@ class _MemmapChunkCache:
         indptr_diff: np.ndarray,
         n_cols: int,
     ) -> None:
-        """Write CSR chunk data to memory-mapped files."""
-        nnz = len(data)
-        if nnz == 0:
-            # Store empty chunk info
-            self._chunk_info.append((self._current_offset, self._current_offset, indptr_diff.copy()))
-            self._n_cols = n_cols
-            return
-            
+        """Append CSR chunk data to the cache files."""
         start = self._current_offset
-        end = start + nnz
-        
-        # Check if we need to expand the memmap (shouldn't happen with good estimate)
-        if end > self._estimated_nnz:
-            logger.warning(
-                "Memmap cache overflow: estimated %d nnz but need %d. "
-                "Expanding cache (may be slower).",
-                self._estimated_nnz, end
-            )
-            self._expand_memmaps(end)
-        
-        # Write to memmap (data stays on disk, not in RAM)
-        self._data_mmap[start:end] = data
-        self._indices_mmap[start:end] = indices
-        
+        end = start + len(data)
+        np.ascontiguousarray(data, dtype=self._data_dtype).tofile(self._data_file)
+        np.ascontiguousarray(indices, dtype=np.int32).tofile(self._indices_file)
         # Store chunk metadata (indptr_diff is small, keep in memory)
         self._chunk_info.append((start, end, indptr_diff.copy()))
         self._current_offset = end
         self._n_cols = n_cols
-    
-    def _expand_memmaps(self, new_size: int) -> None:
-        """Expand memory-mapped arrays to accommodate more data."""
-        # Add 20% buffer to avoid repeated expansions
-        new_size = int(new_size * 1.2)
-        
-        # Create new larger memmaps
-        new_data_path = self._cache_dir / "data_expanded.mmap"
-        new_indices_path = self._cache_dir / "indices_expanded.mmap"
-        
-        new_data = np.memmap(new_data_path, dtype=self._data_dtype, mode='w+', shape=(new_size,))
-        new_indices = np.memmap(new_indices_path, dtype=np.int32, mode='w+', shape=(new_size,))
-        
-        # Copy existing data
-        new_data[:self._current_offset] = self._data_mmap[:self._current_offset]
-        new_indices[:self._current_offset] = self._indices_mmap[:self._current_offset]
-        
-        # Close and delete old memmaps
-        del self._data_mmap
-        del self._indices_mmap
-        (self._cache_dir / "data.mmap").unlink(missing_ok=True)
-        (self._cache_dir / "indices.mmap").unlink(missing_ok=True)
-        
-        # Rename new files
-        new_data_path.rename(self._cache_dir / "data.mmap")
-        new_indices_path.rename(self._cache_dir / "indices.mmap")
-        
-        # Update references
-        self._data_mmap = new_data
-        self._indices_mmap = new_indices
-        self._estimated_nnz = new_size
-    
+        self._evict(len(data) * (self._data_dtype.itemsize + 4))
+
     def iter_filtered_chunks(
         self,
         gene_indices: np.ndarray,
         data_dtype: np.dtype,
     ) -> Iterable[tuple[np.ndarray, np.ndarray, int]]:
         """Iterate cached chunks, filtering genes on-the-fly.
-        
+
         Parameters
         ----------
         gene_indices
             Indices of genes to keep.
         data_dtype
             Target dtype for data array.
-            
+
         Yields
         ------
         tuple
             (filtered_data, filtered_indices, n_cells_in_chunk)
         """
+        for handle in (self._data_file, self._indices_file):
+            handle.close()
+        self._data_file = self._indices_file = None
+        drop_file_cache(self._data_path)
+        drop_file_cache(self._indices_path)
         # Build gene index remapping
         remap = np.full(self._n_cols, -1, dtype=np.int32)
         remap[gene_indices] = np.arange(len(gene_indices), dtype=np.int32)
-        
-        for start, end, indptr_diff in self._chunk_info:
-            n_cells = len(indptr_diff)
-            
-            if start == end:
-                # Empty chunk
-                yield np.array([], dtype=data_dtype), np.array([], dtype=np.int32), n_cells
-                continue
-            
-            # Read from memmap (OS handles paging efficiently)
-            data = np.array(self._data_mmap[start:end])  # Copy to regular array
-            indices = np.array(self._indices_mmap[start:end])
-            
-            # Filter genes
-            new_indices = remap[indices]
-            keep_mask = new_indices >= 0
-            
-            yield data[keep_mask].astype(data_dtype, copy=False), new_indices[keep_mask], n_cells
-    
+
+        itemsize = self._data_dtype.itemsize
+        with open(self._data_path, "rb") as data_file, open(self._indices_path, "rb") as indices_file:
+            for start, end, indptr_diff in self._chunk_info:
+                n_cells = len(indptr_diff)
+                count = end - start
+                if count == 0:
+                    yield np.array([], dtype=data_dtype), np.array([], dtype=np.int32), n_cells
+                    continue
+                data = np.fromfile(data_file, dtype=self._data_dtype, count=count, offset=0)
+                indices = np.fromfile(indices_file, dtype=np.int32, count=count, offset=0)
+                self._evict(count * (itemsize + 4))
+
+                # Filter genes
+                new_indices = remap[indices]
+                keep_mask = new_indices >= 0
+
+                yield data[keep_mask].astype(data_dtype, copy=False), new_indices[keep_mask], n_cells
+
     def cleanup(self) -> None:
-        """Delete memory-mapped files and cache directory."""
-        # Close memmap references
-        del self._data_mmap
-        del self._indices_mmap
-        
-        # Remove cache directory
+        """Delete the cache files and their directory."""
+        for handle in (self._data_file, self._indices_file):
+            if handle is not None:
+                handle.close()
+        self._data_file = self._indices_file = None
         shutil.rmtree(self._cache_dir, ignore_errors=True)
-    
+
     @property
     def chunk_count(self) -> int:
         """Number of chunks cached."""
@@ -589,8 +537,8 @@ def filter_genes_by_cell_count(
     return mask
 
 
-# Type alias for chunk cache (either in-memory or memmap)
-_ChunkCacheType = Union[_ChunkCache, _MemmapChunkCache, None]
+# Type alias for chunk cache (in memory or on disk)
+_ChunkCacheType = Union[_ChunkCache, _DiskChunkCache, None]
 
 
 @dataclass
@@ -602,7 +550,7 @@ class _GeneFilterResult:
     row_nnz: np.ndarray
     total_nnz: int
     data_dtype: np.dtype
-    chunk_cache: _ChunkCacheType = None  # Optional cache for write phase (memory or memmap)
+    chunk_cache: _ChunkCacheType = None  # Optional cache for write phase (memory or disk)
 
 
 def _compute_gene_count_delta(
@@ -667,7 +615,7 @@ def _filter_genes_with_cache(
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
     output_path: Path | None = None,
-    cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+    cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
     verbose: int | bool = True,
 ) -> _GeneFilterResult:
     """Compute gene mask and cache CSR data in a single matrix pass.
@@ -698,9 +646,9 @@ def _filter_genes_with_cache(
     output_path
         Path for output file. Required if cache_mode is not 'none'.
     cache_mode
-        Cache strategy: 'memory' (fast, high RAM), 'memmap' (low RAM, disk-based),
-        or 'none' (no caching, requires re-reading source during write).
-        Default is 'memmap' for better memory efficiency.
+        Cache strategy: 'memory' (fast, high RAM), 'disk' (low RAM, a file
+        beside the output), or 'none' (no caching, requires re-reading source
+        during write). Default is 'disk' for better memory efficiency.
         
     Returns
     -------
@@ -712,8 +660,7 @@ def _filter_genes_with_cache(
     gene_mask = gene_cell_counts >= min_cells
     gene_indices = np.flatnonzero(gene_mask)
     
-    # Estimate nnz for memmap pre-allocation (from file size heuristic)
-    # This is a rough estimate; memmap will expand if needed
+    # Estimate nnz for the disk cache's space check (from file size heuristic)
     backed = read_backed(path)
     try:
         ensure_gene_symbol_column(backed, gene_name_column)
@@ -747,8 +694,8 @@ def _filter_genes_with_cache(
     if output_path is not None and cache_mode != 'none':
         if cache_mode == 'memory':
             chunk_cache = _ChunkCache(output_path)
-        elif cache_mode == 'memmap':
-            # Detect data dtype from file for memmap pre-allocation
+        elif cache_mode == 'disk':
+            # Detect data dtype from file for the cache
             backed = read_backed(path)
             try:
                 if sp.issparse(backed.X):
@@ -757,7 +704,7 @@ def _filter_genes_with_cache(
                     data_dtype_hint = backed.X.dtype
             finally:
                 backed.file.close()
-            chunk_cache = _MemmapChunkCache(output_path, estimated_nnz, data_dtype_hint)
+            chunk_cache = _DiskChunkCache(output_path, estimated_nnz, data_dtype_hint)
     
     backed = read_backed(path)
     try:
@@ -1240,7 +1187,7 @@ def _qc_row_oriented(
     gene_name_column: str | None,
     chunk_size: int,
     output_path: Path,
-    cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+    cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
     delta_threshold: float = 0.3,
     verbose: int | bool = True,
 ) -> QualityControlResult:
@@ -1270,9 +1217,9 @@ def _qc_row_oriented(
     output_path
         Path for output h5ad file.
     cache_mode
-        Cache strategy: 'memory' (fast, high RAM), 'memmap' (low RAM, disk-based),
-        or 'none' (no caching, requires re-reading source during write).
-        Default is 'memmap' for better memory efficiency.
+        Cache strategy: 'memory' (fast, high RAM), 'disk' (low RAM, a file
+        beside the output), or 'none' (no caching, requires re-reading source
+        during write). Default is 'disk' for better memory efficiency.
     delta_threshold
         Threshold for delta adjustment.
         
@@ -1694,7 +1641,7 @@ def quality_control_summary(
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-    cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+    cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
     delta_threshold: float = 0.3,
     force_streaming: bool = False,
     verbose: int | bool = True,
@@ -1740,9 +1687,9 @@ def quality_control_summary(
         next major version.
     cache_mode
         Cache strategy for row-oriented streaming: 'memory' (fast, high RAM),
-        'memmap' (low RAM, disk-based), or 'none' (no caching, requires
-        re-reading source during write). Default is 'memmap' for better
-        memory efficiency.
+        'disk' (low RAM, a file beside the output), or 'none' (no caching,
+        requires re-reading source during write). Default is 'disk' for
+        better memory efficiency.
     delta_threshold
         Threshold for delta adjustment in row-oriented streaming.
         Default 0.3 (30%).
@@ -1777,12 +1724,9 @@ def quality_control_summary(
     storage_format = get_matrix_storage_format(path)
     file_size_gb = path.stat().st_size / 1e9
     
-    # Determine available memory
-    if memory_limit_gb is None:
-        try:
-            memory_limit_gb = _detected_available_bytes() / 1e9 * 0.5  # Use 50% of available
-        except ImportError:
-            memory_limit_gb = 8.0
+    # The memory this call may use: memory_limit_gb, capped by what the
+    # process's cgroup will still grant (detected when None).
+    budget_gb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e9
     
     # Estimate memory needed for in-memory processing.
     # For dense arrays, the compressed file size can be much smaller than the
@@ -1808,7 +1752,7 @@ def quality_control_summary(
     _chunk_size_auto = chunk_size is None
     if chunk_size is None:
         chunk_size = calculate_optimal_chunk_size(
-            n_obs, n_vars, available_memory_gb=memory_limit_gb
+            n_obs, n_vars, available_memory_gb=budget_gb
         )
 
     # Handle output_dir=None and output_path=None: return masks only without writing output
@@ -1854,7 +1798,7 @@ def quality_control_summary(
     # high memory_limit_gb (e.g., 500 GB auto-detected on 1 TB HPC nodes).
     # On a 128 GB node this allows in-memory QC for files up to ~12.5 GB
     # (estimated_memory = file_size × 4 < 50 GB → file < 12.5 GB).
-    _in_memory_threshold_gb = min(memory_limit_gb * 0.6, 50.0)
+    _in_memory_threshold_gb = min(budget_gb * 0.6, 50.0)
     _chunk_note = f", chunk_size={chunk_size} (auto)" if _chunk_size_auto else ""
     if not force_streaming and estimated_memory_gb < _in_memory_threshold_gb:
         # Option A: In-memory for small datasets

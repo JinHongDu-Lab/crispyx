@@ -23,7 +23,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
+from ._memory import _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
 from ._disk import (
@@ -1825,6 +1825,7 @@ def _stream_write_matrix_subset(
         data_buffer: list[np.ndarray] = []
         indices_buffer: list[np.ndarray] = []
         buffer_nnz = 0
+        evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
 
         def flush() -> None:
             nonlocal offset, data_buffer, indices_buffer, buffer_nnz
@@ -1832,6 +1833,7 @@ def _stream_write_matrix_subset(
                 data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
                 indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
                 offset += buffer_nnz
+                evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
             data_buffer, indices_buffer, buffer_nnz = [], [], 0
 
         def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
@@ -2789,6 +2791,7 @@ def _normalize_total_log1p_impl(
         backed = read_backed(stream_path)
         try:
             offset = 0
+            evict = _EvictEvery(output_path, stream_path)
             for slc, block in iter_matrix_chunks(
                 backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
                 warn_slow_axis=False,
@@ -2828,6 +2831,7 @@ def _normalize_total_log1p_impl(
                     data_ds[offset : offset + nnz] = processed_data
                     indices_ds[offset : offset + nnz] = csr.indices.astype(idx_dtype)
                     offset += nnz
+                    evict(nnz * 8)
         finally:
             backed.file.close()
 
@@ -3065,6 +3069,7 @@ def downsample_counts(
             try:
                 offset = 0
                 row_offset = 0
+                evict = _EvictEvery(output_path, source_path)
                 n_chunks = (n_obs + chunk_size - 1) // chunk_size
                 with _create_progress_context(n_chunks, "pp.downsample_counts", verbose, unit="chunk") as pbar:
                     for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
@@ -3091,6 +3096,7 @@ def downsample_counts(
                             data_ds[offset : offset + nnz] = kept_data
                             indices_ds[offset : offset + nnz] = kept_indices
                             offset += nnz
+                            evict(nnz * 8)
                         row_offset += n_rows
                         pbar.update(1)
             finally:
@@ -5191,6 +5197,7 @@ def _write_sorted_sparse(
 
             nnz_written = 0
             ds_indptr[0] = 0
+            evict = _EvictEvery(output_path, source_path)
 
             for start in range(0, n_cells, chunk_size):
                 end = min(start + chunk_size, n_cells)
@@ -5218,6 +5225,7 @@ def _write_sorted_sparse(
                     ds_indices.resize((new_total,))
                     ds_data[nnz_written:new_total] = csr.data
                     ds_indices[nnz_written:new_total] = csr.indices
+                    evict(chunk_nnz * (csr.data.itemsize + 4))
 
                 # Write indptr for this chunk (int64 to avoid overflow
                 # when cumulative nnz exceeds INT32_MAX ≈ 2.1 billion)
