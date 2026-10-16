@@ -21,6 +21,13 @@ resource_limits:
 parallel_config:
   n_cores: 32  # 128 GB, 32 cores for all datasets
 
+# crispyx NB-GLM's parallel workers exceeded a 140 GB job on this dataset
+# (3.4M+ cells); give it 240 GB so it completes. The 128 GB budget stays
+# for every other method.
+method_resource_limits:
+  crispyx_de_nb_glm:
+    memory_limit: 240.0
+
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
 adaptive_qc_mode: conservative  # or 'aggressive'
