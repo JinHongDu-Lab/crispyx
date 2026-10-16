@@ -4738,9 +4738,14 @@ class NBGLMBatchFitter:
         beta = np.zeros((n_features, n_valid), dtype=np.float64)
         beta[0, :] = control_cache.beta_intercept[valid_mask]
         
-        # Use cached control dispersion as starting point
-        alpha = control_cache.control_dispersion[valid_mask].copy()
-        
+        # A global dispersion (shrunk or fixed) is held throughout, so the
+        # coefficients are the MLE at the dispersion the SE is reported at;
+        # otherwise start from the controls' and update by moments.
+        fixed_alpha = control_cache.global_dispersion is not None
+        alpha = (
+            control_cache.global_dispersion if fixed_alpha else control_cache.control_dispersion
+        )[valid_mask].copy()
+
         # Precompute offsets
         offset_control = control_cache.control_offset[:, None]
         offset_pert = perturbation_offset[:, None]
@@ -4829,22 +4834,23 @@ class NBGLMBatchFitter:
             gene_n_iter[~gene_converged] = iteration
             
             beta = beta_new
-            
-            # Update dispersion (method of moments)
-            resid_control = Y_control_valid - mu_control
-            resid_pert = Y_pert_valid - mu_pert
-            
-            numerator = (
-                np.sum((resid_control ** 2 - Y_control_valid) / np.maximum(mu_control ** 2, EPS), axis=0)
-                + np.sum((resid_pert ** 2 - Y_pert_valid) / np.maximum(mu_pert ** 2, EPS), axis=0)
-            )
-            dof = max(n_total - n_features, 1)
-            alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-            alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-            
+
+            if not fixed_alpha:
+                # Update dispersion (method of moments)
+                resid_control = Y_control_valid - mu_control
+                resid_pert = Y_pert_valid - mu_pert
+
+                numerator = (
+                    np.sum((resid_control ** 2 - Y_control_valid) / np.maximum(mu_control ** 2, EPS), axis=0)
+                    + np.sum((resid_pert ** 2 - Y_pert_valid) / np.maximum(mu_pert ** 2, EPS), axis=0)
+                )
+                dof = max(n_total - n_features, 1)
+                alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
+                alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
+
             if np.all(gene_converged):
                 break
-        
+
         # Compute final standard errors using sandwich estimator (PyDESeq2 style)
         # SE = sqrt(c' @ H @ M @ H @ c) where:
         #   M = XᵀWX (unregularized Fisher information)

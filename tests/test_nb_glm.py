@@ -243,10 +243,84 @@ def test_nb_glm_global_dispersion_with_covariates(tmp_path):
     assert np.all(np.abs(shared_ad.layers["z_score"][shared_ad.obs_names.get_loc("g1"), :5]) > 2)  # g1's shifted genes
 
 
-def test_nb_glm_fixed_dispersion_is_used(tmp_path):
+def test_nb_glm_global_dispersion_leaves_genes_sparse_in_controls_to_each_comparison(tmp_path):
+    """A gene with 3 counts among the controls, switched on in g1: the
+    controls cannot estimate its dispersion, so g1's comparison does, and it
+    keeps the significance per-comparison estimation gives it."""
+    rng = np.random.default_rng(3)
+    perturbations = np.repeat(["control", "g1", "g2", "g3", "g4", "g5"], 100)
+    depth = rng.normal(size=600)
+    mu = np.exp(rng.uniform(0.5, 2.5, size=20) + 0.3 * depth[:, None])
+    counts = rng.negative_binomial(5, 5 / (5 + mu)).astype(np.float32)
+    counts[:, 0] = 0
+    counts[:3, 0] = 1
+    g1 = perturbations == "g1"
+    counts[g1, 0] = rng.negative_binomial(5, 5 / 5.5, size=g1.sum())
+    obs = pd.DataFrame({"perturbation": perturbations, "depth": depth}, index=[f"c{i}" for i in range(600)])
+    path = tmp_path / "induced.h5ad"
+    ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(20)])).write(path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth"],
+                  n_jobs=1, verbose=False)
+    shared = ad.read_h5ad(nb_glm_test(path, output_path=tmp_path / "g.h5ad", **kwargs).result_path)
+    separate = ad.read_h5ad(nb_glm_test(path, dispersion_scope="per_comparison",
+                                        output_path=tmp_path / "p.h5ad", **kwargs).result_path)
+    row = shared.obs_names.get_loc("g1")
+    np.testing.assert_allclose(shared.layers["dispersion"][row, 0], separate.layers["dispersion_raw"][row, 0],
+                               rtol=1e-6)
+    # 0.28 at the controls' dispersion of 29.7; 0.003 per comparison, whose
+    # MAP step shrinks the raw estimate used here toward the trend
+    assert shared.layers["pvalue"][row, 0] < 0.01
+    assert np.ptp(shared.layers["dispersion"][:, 1:], axis=0).max() == 0  # the rest stay shared
+
+
+def test_per_comparison_size_factors_fall_back_to_global_ones_on_large_data(tmp_path):
+    """Too large to load, per-comparison size factors become global ones
+    (not the unit placeholders), with a warning and the scope recorded."""
     path = _covariate_screen(tmp_path)
-    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth", "donor"],
-                  min_cells_expressed=0, n_jobs=1, verbose=False)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth"],
+                  dispersion_scope="per_comparison", n_jobs=1, verbose=False)
+    # 360 cells x 30 genes: the controls (x4) fit in 70 kB, the whole matrix does not
+    budget = dict(memory_limit_gb=70e-6, max_dense_fraction=1.0)
+    with pytest.warns(UserWarning, match="too large to load"):
+        fallback = nb_glm_test(path, size_factor_scope="per_comparison",
+                               output_path=tmp_path / "fallback.h5ad", **budget, **kwargs)
+    reference = nb_glm_test(path, size_factor_scope="global", output_path=tmp_path / "global.h5ad", **kwargs)
+    fallback_ad = ad.read_h5ad(fallback.result_path)
+    assert fallback_ad.uns["size_factor_scope"] == "global"
+    assert np.isfinite(fallback.statistics).mean() > 0.9
+    np.testing.assert_allclose(fallback.statistics, reference.statistics, rtol=1e-6, equal_nan=True)
+
+
+def test_control_cache_fits_at_the_global_dispersion(tmp_path):
+    """The cached fit's coefficients are the MLE at the dispersion its SE is
+    reported at: they match the uncached fit at that same fixed dispersion."""
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", dispersion=0.3,
+                  n_jobs=1, verbose=False, freeze_control=False)
+    cached = nb_glm_test(path, output_path=tmp_path / "cached.h5ad", **kwargs)
+    uncached = nb_glm_test(path, use_control_cache=False, output_path=tmp_path / "plain.h5ad", **kwargs)
+    np.testing.assert_allclose(cached.logfoldchanges, uncached.logfoldchanges, atol=1e-5, equal_nan=True)
+    np.testing.assert_allclose(cached.statistics, uncached.statistics, rtol=1e-4, equal_nan=True)
+
+
+@pytest.mark.parametrize("covariates", [["depth"], []])
+def test_controls_too_large_for_memory_raise_unless_the_cache_streams_them(tmp_path, covariates):
+    """Only the control cache streams the controls; any other setup used to
+    return all-NaN results with the errors only logged."""
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=covariates,
+                  dispersion_scope="per_comparison", memory_limit_gb=1e-6, n_jobs=1, verbose=False,
+                  output_path=tmp_path / "out.h5ad")
+    with pytest.raises(MemoryError, match="pseudo-bulk"):
+        nb_glm_test(path, **kwargs)
+
+
+@pytest.mark.parametrize("covariates", [["depth", "donor"], []], ids=["covariates", "control_cache"])
+@pytest.mark.parametrize("shrink_dispersion", [True, False])
+def test_nb_glm_fixed_dispersion_is_used(tmp_path, covariates, shrink_dispersion):
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=covariates,
+                  min_cells_expressed=0, n_jobs=1, verbose=False, shrink_dispersion=shrink_dispersion)
     low = nb_glm_test(path, dispersion=0.05, output_path=tmp_path / "low.h5ad", **kwargs)
     high = nb_glm_test(path, dispersion=2.0, output_path=tmp_path / "high.h5ad", **kwargs)
     low_ad, high_ad = ad.read_h5ad(low.result_path), ad.read_h5ad(high.result_path)
@@ -1407,12 +1481,13 @@ def test_per_comparison_size_factors_agree_with_global_for_a_single_comparison(t
 
 
 def test_per_comparison_dispersion_scope(tmp_path):
-    """Per-comparison method-of-moments dispersion keeps the coefficients and
-    gives valid Wald tests that still find the planted effects."""
+    """Per-comparison method-of-moments dispersion gives nearly the same
+    coefficients (each scope fits at its own dispersion) and valid Wald
+    tests that still find the planted effects."""
     path, _ = _dense_screen(tmp_path / "two.h5ad", ["ctrl"] * 150 + ["KO1"] * 75 + ["KO2"] * 75)
     global_scope = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW)
     per_comparison = nb_glm_test(path, output_path=tmp_path / "per.h5ad", dispersion_scope="per_comparison", **_NB_KW)
-    np.testing.assert_allclose(per_comparison.logfoldchanges, global_scope.logfoldchanges, rtol=1e-8)
+    np.testing.assert_allclose(per_comparison.logfoldchanges, global_scope.logfoldchanges, atol=0.01)
     assert np.isfinite(per_comparison.pvalues).all()
     assert (per_comparison.pvalues[:, :8] < 1e-6).all()
     assert ad.read_h5ad(per_comparison.result_path).uns["dispersion_scope"] == "per_comparison"

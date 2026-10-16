@@ -124,7 +124,8 @@ def test_memory_limit_with_batch_correction(tmp_path):
 
 
 def test_warns_when_disk_space_low_for_batch_corrected_accumulator(tmp_path, monkeypatch):
-    """The batch-corrected accumulator warns on a near-full disk but still completes."""
+    """The batch-corrected accumulator, spilled to disk when it does not fit
+    the memory budget, warns on a near-full disk but still completes."""
     import shutil
     import types
 
@@ -150,6 +151,7 @@ def test_warns_when_disk_space_low_for_batch_corrected_accumulator(tmp_path, mon
     with pytest.warns(UserWarning, match="pb batch-corrected accumulator"):
         result = compute_normalized_effects(
             path, perturbation_column="perturbation", control_label="ctrl",
-            batch_column="batch", output_path=tmp_path / "out.h5ad",
+            batch_column="batch", output_path=tmp_path / "out.h5ad", memory_limit_gb=1e-9,
+            chunk_size=8,
         ).to_memory()
     assert result.shape[0] == 1

@@ -340,6 +340,47 @@ def test_profiles_are_named_by_group_and_keep_donor_covariates(tmp_path, capsys)
     assert table.loc["d1", "L2/3 IT"] == 6 and table.loc["d2", "L4 IT"] == 3
 
 
+def test_nullable_and_missing_covariates_are_carried_over(tmp_path):
+    """Donor-level columns with missing values (as concat_h5ad makes for a
+    column only some files have) keep their dtype; NaN counts as a value."""
+    path = _write_donor_screen(tmp_path)
+    adata = ad.read_h5ad(path)
+    is_d1 = (adata.obs["donor"] == "d1").to_numpy()
+    adata.obs["flag"] = pd.array(np.where(is_d1, True, None), dtype="boolean")
+    adata.obs["age"] = pd.array(np.where(is_d1, 70, None), dtype="Int64")
+    adata.obs["score"] = np.where(is_d1, 0.5, np.nan)
+    adata.write(path)
+    result = cx.pb.aggregate(path, groupby="donor", method="sum", min_cells=1,
+                             output_path=tmp_path / "pb.h5ad", verbose=False)
+    obs = result.backed.obs.copy()
+    result.close()
+    assert obs["flag"].dtype == "boolean" and obs["flag"].tolist() == [True, pd.NA]
+    assert obs["age"].dtype == "Int64" and obs["age"].tolist() == [70, pd.NA]
+    assert obs["score"].iloc[0] == 0.5 and np.isnan(obs["score"].iloc[1])
+    assert "pct_mito" not in obs
+
+
+def test_constant_covariates_treat_unhashable_values_as_varying():
+    from crispyx.pseudobulk import _constant_covariates
+
+    obs = pd.DataFrame({"tags": [["a"], ["a"], ["b"]], "donor": ["d1", "d1", "d2"]})
+    first, varying = _constant_covariates(obs, np.array([0, 0, 1]), 2, exclude=[])
+    assert varying == ["tags"] and first["donor"].tolist() == ["d1", "d2"]
+
+
+def test_constant_covariates_compare_large_integers_exactly():
+    """2**53 + 1 and 2**53 are the same float64; as IDs they differ."""
+    from crispyx.pseudobulk import _constant_covariates
+
+    obs = pd.DataFrame({
+        "cell_id": np.array([2**53 + 1, 2**53, 7], dtype=np.int64),
+        "flag": pd.array([True, None, False], dtype="boolean"),
+        "score": [np.nan, np.nan, 1.0],
+    })
+    first, varying = _constant_covariates(obs, np.array([0, 0, 1]), 2, exclude=[])
+    assert varying == ["cell_id", "flag"] and np.isnan(first["score"].iloc[0])
+
+
 def test_one_grouping_column_names_profiles_by_its_value(tmp_path):
     path = _write_donor_screen(tmp_path)
     result = cx.pb.aggregate(

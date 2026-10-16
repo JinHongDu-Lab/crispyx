@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import gc
+from types import SimpleNamespace
 import dataclasses
 import logging
 import os
 import warnings
 import threading
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -52,6 +52,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    write_obs,
     _replace_on_success,
 )
 from .glm import (
@@ -90,7 +91,7 @@ from ._checkpoint import (
 from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import canonical_call_args, resolve_group_reference_aliases
+from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
 from ._memory import _detected_available_bytes, _resolve_n_jobs, _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
@@ -398,6 +399,40 @@ def _load_layered_de_result(
     )
 
 
+# Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
+# cannot estimate its dispersion for the shared, control-fitted value.
+_MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
+
+
+def _global_size_factors(path: Path, method: str, chunk_size: int, scale: bool) -> np.ndarray:
+    """Size factors over every cell in ``path`` by ``method``."""
+    if method == "deseq2":
+        return _deseq2_style_size_factors(path, chunk_size=chunk_size, scale=scale)
+    return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
+
+
+def _fit_at_global_dispersion(design, counts, global_dispersion, **fit_kwargs):
+    """:func:`fit_nb_glm_batch_auto` with each gene's dispersion held at
+    ``global_dispersion``; genes where it is NaN (too sparse among the
+    controls) have theirs estimated within this comparison instead."""
+    if global_dispersion is None or np.isfinite(global_dispersion).all():
+        return fit_nb_glm_batch_auto(design, counts, fixed_dispersion=global_dispersion, **fit_kwargs)
+    free = ~np.isfinite(global_dispersion)
+    n_genes, p = counts.shape[1], design.shape[1]
+    merged = SimpleNamespace(
+        coef=np.full((n_genes, p), np.nan), se=np.full((n_genes, p), np.nan),
+        converged=np.zeros(n_genes, dtype=bool), n_iter=np.zeros(n_genes, dtype=np.int64),
+        dispersion=np.full(n_genes, np.nan),
+    )
+    for columns, fixed in ((~free, global_dispersion[~free]), (free, None)):
+        if not columns.any():
+            continue
+        fit = fit_nb_glm_batch_auto(design, counts[:, columns], fixed_dispersion=fixed, **fit_kwargs)
+        for field in ("coef", "se", "converged", "n_iter", "dispersion"):
+            getattr(merged, field)[columns] = getattr(fit, field)
+    return merged
+
+
 def _resolve_candidates(
     labels: np.ndarray,
     control_label: str,
@@ -428,7 +463,7 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    candidates = [label for label in unique if label != control_label]
+    candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
     if not candidates:
         raise ValueError("No perturbation groups available for differential expression testing")
     return candidates
@@ -467,22 +502,6 @@ _OPERATIONAL_ARGS = frozenset({
     "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
     "cell_chunk_size", "chunk_size", "irls_batch_size",
 })
-
-
-def _align_labels(labels: pd.Series, obs_names: pd.Index) -> np.ndarray:
-    """Per-cell labels given as a Series, in ``obs_names`` order."""
-    labels = labels.set_axis(labels.index.astype(str))
-    if not labels.index.is_unique:
-        raise ValueError("The labels Series must be indexed by cell, each cell once.")
-    names = pd.Index(obs_names).astype(str)
-    aligned = labels.reindex(names)
-    missing = names[aligned.isna().to_numpy()]
-    if len(missing):
-        raise ValueError(
-            f"The labels Series has no label for {len(missing)} of {len(names)} cells "
-            f"(e.g. {missing[:3].tolist()}); index it by obs_names."
-        )
-    return aligned.astype(str).to_numpy()
 
 
 def _de_fingerprint(
@@ -642,17 +661,6 @@ def _count_tested(pvalues) -> np.ndarray:
         block = np.asarray(pvalues[start:start + step])
         counts[start:start + step] = np.isfinite(block).sum(axis=1)
     return counts
-
-
-def _replace_obs(path: Path, obs: pd.DataFrame) -> None:
-    """Replace the ``obs`` table of the h5ad at ``path`` in place. The table
-    is encoded by anndata (into a scratch file) and copied across."""
-    with tempfile.TemporaryDirectory(prefix="cx_obs_") as tmpdir:
-        donor = Path(tmpdir) / "obs.h5ad"
-        ad.AnnData(obs=obs).write(donor)
-        with h5py.File(donor, "r") as src, h5py.File(path, "r+") as dest:
-            del dest["obs"]
-            src.copy(src["obs"], dest, name="obs")
 
 
 def _wilcoxon_uns(
@@ -1072,7 +1080,10 @@ def t_test(
     backward compatibility with Scanpy-style workflows, count-like inputs are
     automatically normalized and log-transformed in streaming fashion, with a
     warning to encourage explicit preprocessing upstream.
-    
+
+    A perturbation (or control) with a single cell has no variance estimate,
+    so its comparison is left untested (``NaN``), as in scanpy.
+
     Parameters
     ----------
     data
@@ -1186,6 +1197,9 @@ def t_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -1229,7 +1243,7 @@ def t_test(
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -1405,6 +1419,11 @@ def t_test(
 
         total_expr = expr_counts[idx] + expr_counts[control_idx]
         valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
+        # A one-cell side has no variance estimate; treating it as zero
+        # leaves the other side's SE alone and makes every gene look
+        # significant.  Leave such comparisons untested, as scanpy does.
+        if n_cells < 2 or control_n < 2:
+            valid[:] = False
         # Per-condition low-expression filter: drop genes that are
         # jointly low in BOTH the perturbation and control groups.
         low_both = _low_expr_in_both_mask(
@@ -1942,6 +1961,10 @@ def nb_glm_test(
         ``dispersion_trend`` instead. ``obs["n_genes_tested"]`` counts the
         genes each perturbation was tested on, after the filters.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
+    covariates = list(covariates or [])
     call_args = dict(locals())  # for the resume fingerprint, before any other local
     perturbation_column, control_label = resolve_group_reference_aliases(
         perturbation_column=perturbation_column,
@@ -1954,8 +1977,6 @@ def nb_glm_test(
     # Validate min_mu parameter
     if min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
-
-    covariates = list(covariates or [])
 
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -2022,7 +2043,7 @@ def nb_glm_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
-        labels = obs_df[perturbation_column].astype(str).to_numpy()
+        labels = label_strings(obs_df[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
@@ -2063,19 +2084,13 @@ def nb_glm_test(
     # For per_comparison size factors, we skip the expensive global computation
     # since size factors will be recomputed per-comparison anyway.
     # We use dummy size factors here (will be overwritten per-comparison).
+    size_factors_given = size_factors is not None
     if size_factor_scope == "per_comparison" and size_factors is None:
         # Dummy size factors - will be replaced in worker
         size_factors = np.ones(n_cells_total, dtype=np.float64)
         logger.debug("Skipping global size factor computation for per_comparison mode")
     elif size_factors is None:
-        if size_factor_method == "deseq2":
-            size_factors = _deseq2_style_size_factors(
-                path, chunk_size=chunk_size, scale=scale_size_factors
-            )
-        else:  # "sparse" (default)
-            size_factors = _median_of_ratios_size_factors(
-                path, chunk_size=chunk_size, scale=scale_size_factors
-            )
+        size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
     else:
         size_factors = _validate_size_factors(
             size_factors, n_cells_total, scale=scale_size_factors
@@ -2314,9 +2329,10 @@ def nb_glm_test(
         # perturbation column are protected from the group block because the
         # perturbation coefficient is the quantity under test and must not be
         # subject to the group-coefficient clip.
-        batch_result = fit_nb_glm_batch_auto(
+        batch_result = _fit_at_global_dispersion(
             design,
             fit_matrix,
+            None if global_dispersion is None else global_dispersion[valid_mask],
             offset=subset_offset,
             protected_columns=(0, perturbation_column_index),
             max_iter=max_iter,
@@ -2325,7 +2341,6 @@ def nb_glm_test(
             dispersion_method=dispersion_method,
             min_mu=min_mu,
             min_total_count=min_total_count,
-            fixed_dispersion=None if global_dispersion is None else global_dispersion[valid_mask],
         )
 
         # Extract results
@@ -2359,9 +2374,11 @@ def nb_glm_test(
 
         # Handle dispersion
         if global_dispersion is not None:
-            result["dispersion_raw"][:] = global_dispersion
-            result["dispersion"][:] = global_dispersion
-            result["dispersion_trend"][:] = global_dispersion
+            # genes the controls could not estimate keep this comparison's
+            used = np.where(np.isfinite(global_dispersion), global_dispersion, result["dispersion_raw"])
+            result["dispersion_raw"][:] = used
+            result["dispersion"][:] = used
+            result["dispersion_trend"][:] = used
         elif shrink_dispersion:
             trend = fit_dispersion_trend(result["mean"], result["dispersion_raw"])
             result["dispersion_trend"] = trend
@@ -2383,7 +2400,7 @@ def nb_glm_test(
                 for local_idx, gene_idx in enumerate(valid_indices):
                     if batch_result.converged[local_idx]:
                         # eta = X @ beta + offset
-                        eta = design @ batch_result.coef[local_idx, :] + offset[subset_mask]
+                        eta = design @ batch_result.coef[local_idx, :] + subset_offset
                         mu[:, gene_idx] = np.exp(np.clip(eta, -30, 30))
                 
                 # For invalid genes, use normalized counts as fallback
@@ -2707,7 +2724,9 @@ def nb_glm_test(
         result["intercept"] = np.where(valid_converged_mask, batch_result.coef[:, 0], np.nan)  # Store fitted intercept
         
         # Handle dispersion shrinkage
-        if shrink_dispersion:
+        # A global dispersion in the cache is either the shrunk estimate or a
+        # fixed ``dispersion=``; the latter must apply without shrinkage too.
+        if shrink_dispersion or control_cache.global_dispersion is not None:
             # ================================================================
             # MEMORY-OPTIMIZED: Use batched computation for dispersion and SE
             # ================================================================
@@ -3123,10 +3142,21 @@ def nb_glm_test(
     can_use_frozen_control = (
         freeze_control and 
         can_use_cache_early and 
-        dispersion_scope == "global" and 
+        dispersion_scope == "global" and
         shrink_dispersion
     )
-        
+    # Only the control cache can stream the controls from disk; every other
+    # path fits them in memory and would get no control matrix at all.
+    if use_streaming_control and not (
+        can_use_cache_early and dispersion_scope == "global" and shrink_dispersion
+    ):
+        raise MemoryError(
+            f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
+            "fit the memory budget, and only covariates=None with size_factor_scope='global', "
+            "dispersion_scope='global' and shrink_dispersion=True streams them from disk. Raise "
+            "memory_limit_gb, aggregate to pseudo-bulk first (cx.pb.aggregate), or use those settings."
+        )
+
     # When frozen control is enabled but streaming was not, retroactively
     # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
     # streaming avoids that by processing chunks.  The loaded control
@@ -3386,6 +3416,15 @@ def nb_glm_test(
             min_mu=min_mu,
             min_total_count=min_total_count,
         )
+        # A gene nearly absent among the controls (one a perturbation
+        # switches on) has no dispersion the controls can estimate; the trend
+        # extrapolated to its tiny mean would swamp it. Leave it NaN so each
+        # comparison estimates it from its own cells.
+        sparse_in_controls = (
+            np.asarray(control_matrix.sum(axis=0)).ravel() < _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION
+        )
+        global_dispersion[sparse_in_controls] = np.nan
+        global_dispersion_trend[sparse_in_controls] = np.nan
         
     # =====================================================================
     # Early memory check: determine if we need streaming mode
@@ -3413,12 +3452,17 @@ def nb_glm_test(
     # Skip if streaming mode - worker will fall back to global SF
     if size_factor_scope == "per_comparison":
         if use_streaming_mode:
-            logger.warning(
-                f"Dataset too large ({estimated_matrix_gb:.1f} GB) for per-comparison "
-                f"size factors (requires loading full matrix). "
-                f"Falling back to global size factors for memory efficiency."
+            _messages.warn(
+                "nb_glm_test",
+                f"the data ({estimated_matrix_gb:.1f} GB) is too large to load for "
+                "size_factor_scope='per_comparison'; using global size factors "
+                "(recorded in uns['size_factor_scope']).",
             )
-            full_X = None  # Worker will use global SF
+            size_factor_scope = "global"
+            if not size_factors_given:  # the placeholder ones would leave counts unnormalised
+                size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
+                offset = np.log(np.clip(size_factors, 1e-8, None))
+            full_X = None
         else:
             logger.info("Using per-comparison size factors for PyDESeq2 compatibility...")
             backed = read_backed(path)
@@ -3774,7 +3818,11 @@ def nb_glm_test(
     logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
     _print_de_summary(verbose, "NB-GLM DE", len(newly_completed), n_groups, n_tested_list, n_genes)
     if newly_failed:
-        logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
+        _messages.warn(
+            "nb_glm_test",
+            f"{len(newly_failed)} perturbation(s) failed and are NaN in the result (each "
+            f"error is logged): {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}",
+        )
 
     pvalue_adj_memmap = run.arrays["pvalue_adj"]
     _adjust_pvalue_matrix(pvalue_memmap, corr_method, out=pvalue_adj_memmap)
@@ -3805,7 +3853,8 @@ def nb_glm_test(
     if control_cache is not None and control_cache.global_dispersion is not None:
         global_dispersion = control_cache.global_dispersion
         global_dispersion_trend = control_cache.global_dispersion_trend
-    global_dispersion_fit = global_dispersion is not None
+    # NaN marks genes estimated per comparison; their values are in the matrices
+    global_dispersion_fit = global_dispersion is not None and bool(np.isfinite(global_dispersion).all())
     if not global_dispersion_fit:
         dispersion_matrix = np.array(dispersion_memmap)
         dispersion_raw_matrix = np.array(dispersion_raw_memmap)
@@ -4346,7 +4395,7 @@ def _wilcoxon_test_streaming(
         )
     with h5py.File(work_path, "r") as hf:
         obs["n_genes_tested"] = _count_tested(hf["layers/pvalue"])
-    _replace_obs(work_path, obs)
+    write_obs(work_path, obs)
     write_stamp(work_path, stamp("de_result", fingerprint))
     os.replace(work_path, output_path)
     run.discard()
@@ -5081,6 +5130,9 @@ def wilcoxon_test(
     has ``pts = 0`` beside a high ``pts_rest``, an undetectable gene has both
     near zero.
     """
+    # A one-shot iterable would be fingerprinted by its repr and then used up.
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
     call_args = dict(locals())  # for the resume fingerprint, before any other local
 
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -5125,8 +5177,8 @@ def wilcoxon_test(
                 f"Batch column '{batch_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = (
-            backed.obs[perturbation_column].astype(str).to_numpy() if given_labels is None
-            else _align_labels(given_labels, backed.obs_names)
+            label_strings(backed.obs[perturbation_column]) if given_labels is None
+            else label_strings(cell_labels(backed.obs, given_labels)[0])
         )
         control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
@@ -6014,7 +6066,7 @@ def shrink_lfc(
         # Load original dataset for streaming
         backed = read_backed(original_path)
         try:
-            labels = backed.obs[perturbation_column].astype(str).to_numpy()
+            labels = label_strings(backed.obs[perturbation_column])
             
             # Get or compute size factors
             size_factors_global = adata.uns.get("size_factors")
@@ -6247,7 +6299,7 @@ def _estimate_shape_for_t_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6267,7 +6319,7 @@ def _estimate_shape_for_nb_glm_test(
 ) -> dict[str, float]:
     backed = read_backed(path)
     try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        labels = label_strings(backed.obs[perturbation_column])
         control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
@@ -6293,9 +6345,9 @@ def _estimate_shape_for_wilcoxon_test(
     backed = read_backed(path)
     try:
         labels = (
-            _align_labels(perturbation_column, backed.obs_names)
+            label_strings(cell_labels(backed.obs, perturbation_column)[0])
             if isinstance(perturbation_column, pd.Series)
-            else backed.obs[perturbation_column].astype(str).to_numpy()
+            else label_strings(backed.obs[perturbation_column])
         )
         control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)

@@ -87,6 +87,69 @@ def test_unknown_groupby_column_raises(tmp_path):
         cx.pp.subsample(path, n=1, groupby="does_not_exist")
 
 
+def test_output_path_equal_to_input_raises_and_keeps_input(tmp_path):
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    before = ad.read_h5ad(path).X.toarray()
+    with pytest.raises(ValueError, match="is the input file"):
+        cx.pp.subsample(path, n=10, groupby=None, output_path=path, verbose=False)
+    np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before)
+
+
+@pytest.mark.parametrize("name, writer", [
+    ("data.h5ad", lambda path: cx.pp.normalize_total_log1p(path, output_path=path, verbose=False)),
+    ("data.h5ad", lambda path: cx.pp.convert_to_csc(path, output_path=path, verbose=False)),
+    ("data.h5ad", lambda path: cx.data.sort_by_perturbation(path, perturbation_column="pert",
+                                                             control_label="control", output_path=path)),
+    # The default output name, given this data_name, is the input's own.
+    ("data_cx_log1p.h5ad", lambda path: cx.pp.normalize_total_log1p(
+        path, normalize=False, data_name="data_cx_log1p", verbose=False)),
+], ids=["normalize", "convert_to_csc", "sort_by_perturbation", "default_name"])
+def test_every_writer_refuses_to_overwrite_its_input(tmp_path, name, writer):
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    path = path.rename(path.with_name(name))
+    before = ad.read_h5ad(path).X.toarray()
+    with pytest.raises(ValueError, match="is the input file"):
+        writer(path)
+    np.testing.assert_array_equal(ad.read_h5ad(path).X.toarray(), before)
+
+
+def test_interrupted_subset_leaves_no_output(tmp_path, monkeypatch):
+    """A subset killed mid-write leaves neither the output nor a partial."""
+    import crispyx.data as data
+
+    path = _make_h5ad(tmp_path, n_cells_per_group={"A": 30, "control": 30})
+    out = tmp_path / "out.h5ad"
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(data, "_stream_write_matrix_subset", boom)
+    with pytest.raises(KeyboardInterrupt):
+        write_filtered_subset(
+            path, cell_mask=np.ones(60, bool), gene_mask=np.ones(20, bool), output_path=out,
+        )
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["data.h5ad"]
+
+
+def test_csc_source_is_subset_from_a_csr_copy(tmp_path):
+    """Row-streaming CSC re-reads the whole matrix per chunk; the subset is
+    written from a temporary CSR copy instead, removed afterwards."""
+    path = _make_h5ad(tmp_path / "src", n_cells_per_group={"A": 30, "control": 30}, with_extra_slots=True)
+    adata = ad.read_h5ad(path)
+    adata.X = sp.csc_matrix(adata.X)
+    adata.write(path)
+    cell_mask = np.arange(60) % 3 == 0
+    gene_mask = np.arange(20) % 2 == 0
+    out = tmp_path / "out" / "subset.h5ad"
+    write_filtered_subset(path, cell_mask=cell_mask, gene_mask=gene_mask, output_path=out,
+                          chunk_size=7, format_mismatch_policy="convert")
+    got = ad.read_h5ad(out)
+    np.testing.assert_array_equal(got.X.toarray(), adata.X.toarray()[cell_mask][:, gene_mask])
+    np.testing.assert_array_equal(got.layers["counts2"].toarray(),
+                                  np.asarray(adata.layers["counts2"])[cell_mask][:, gene_mask])
+    assert sorted(p.name for p in out.parent.iterdir()) == ["subset.h5ad"]
+
+
 def test_unknown_unit_column_raises(tmp_path):
     path = _make_h5ad(tmp_path, n_cells_per_group={"A": 10, "control": 10})
     with pytest.raises(KeyError):

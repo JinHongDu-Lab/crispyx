@@ -1,4 +1,4 @@
-API Reference
+API reference
 =============
 
 crispyx exposes a Scanpy-style API through four namespace singletons:
@@ -66,7 +66,7 @@ streaming write's disk footprint looks large relative to free space. To
 check usage *before* committing to a run, call ``estimate_disk_usage`` with
 the function you intend to run, its input file, and the same keyword
 arguments you plan to pass. Also available as ``cx.tl.estimate_disk_usage``
-(see the Tools namespace above). See :ref:`disk-space` in the usage guide
+(see the Tools namespace above). See :ref:`disk-space`
 for the full explanation and a worked example.
 
 .. autofunction:: crispyx.estimate_disk_usage
@@ -108,7 +108,7 @@ Differential expression
 
 All three DE functions reload an existing output ``.h5ad`` instead of
 rerunning when it was computed from the same input and arguments; pass
-``force=True`` to recompute.  See :ref:`auto-reload` in the usage guide.
+``force=True`` to recompute.  See :ref:`auto-reload`.
 
 .. automodule:: crispyx.de
    :members:

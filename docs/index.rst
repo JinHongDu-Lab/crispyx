@@ -21,7 +21,7 @@ control, normalisation, pseudo-bulk aggregation, and differential expression all
 run without materialising the full matrix — even the largest screens can be
 processed with modest resources. These memory savings assume sufficient free
 disk space for streaming intermediates and the final output file; see
-:ref:`disk-space` in the usage guide for what to expect and how to estimate
+:ref:`disk-space` for what to expect and how to estimate
 usage before running.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
@@ -46,20 +46,29 @@ Key features
 
 .. toctree::
    :maxdepth: 2
-   :caption: Getting Started
+   :caption: Getting started
 
    installation
-   usage
+   quickstart
    notebooks/crispyx_tutorial
+
+.. toctree::
+   :maxdepth: 2
+   :caption: User guide
+
+   data_preparation
+   quality_control
+   pseudobulk
+   differential_expression
+   covariate_adjustment
+   notebooks/batch_statistics_tutorial
+   large_data
 
 .. toctree::
    :maxdepth: 2
    :caption: Reference
 
    api
-   notebooks/batch_statistics_tutorial
-   notebooks/residual_effects_tutorial
-   notebooks/residual_effects_feng_tutorial
    comparison
    faq
 

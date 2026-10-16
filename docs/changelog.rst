@@ -1,6 +1,151 @@
 Changelog
 =========
 
+Version 0.2.0
+-------------
+
+*Released 2026-10-15.*
+
+* **Docs reorganised.** The usage guide is split into task pages under a new
+  *User guide* section (loading and preparing data; quality control and
+  dimension reduction; pseudo-bulk and effect sizes; differential expression;
+  covariate adjustment; custom batch statistics; working with large data), and
+  a *Quick start* page opens *Getting started*. The covariate-adjustment
+  tutorials are listed under the page comparing the approaches, retitled after
+  the method each one illustrates; *Reference* keeps the API, the comparison
+  with other tools and the FAQ. ``usage.html`` no longer exists.
+* **New: standard errors from ``pb.normalized_effects``** for
+  ``method="mean_log1p"``, after Liu et al. (2026,
+  `doi:10.64898/2026.10.05.756839 <https://doi.org/10.64898/2026.10.05.756839>`_):
+  ``layers["standard_error"]`` (cells independent within a batch, one
+  within-batch variance per arm pooled over batches with two or more cells)
+  and ``layers["standard_error_robust"]`` (from the spread of the per-batch
+  effects; NaN with fewer than two batches). Without ``batch_column`` the
+  data is one batch, so the effect and its standard error are the plain
+  two-sample ones; that path now streams through the same code, one pass
+  however many perturbations there are.
+  Its per-(perturbation, batch) sums stay in memory when they fit half the
+  memory budget, and go to temporary files otherwise (they always went to
+  disk); the results are then finished a block of perturbations at a time,
+  so nothing of the size of the output is held beside it;
+  ``perturbation_column`` and ``batch_column`` may be ``pd.Series``
+  indexed by cell, as in ``wilcoxon_test`` and ``residual_effects``. Checked
+  against the effects and standard errors Liu et al. published for the Feng
+  et al. targeted screen: they agree to float32 precision. New tutorial,
+  *Batch-corrected effects and Wilcoxon tests*, on that screen.
+* **Fixed: ``t_test`` with a one-cell group.** A perturbation (or control)
+  with a single cell has no variance estimate; it was treated as zero, so
+  the test used the other side's standard error alone and reported nearly
+  every gene as significant. Such comparisons are now left untested (NaN),
+  as in scanpy.
+* **Fixed: an ``output_path`` equal to the input file destroyed it.**
+  ``pp.subsample`` (and the QC filter) wrote the empty output skeleton over
+  the source and then failed reading it; DE functions replaced the input with
+  their result; ``normalize_total_log1p``, ``convert_to_csc``/``convert_to_csr``
+  and ``sort_by_perturbation`` overwrote it too. Every writer now raises
+  ``ValueError`` instead, also when a default output name (from
+  ``data_name``) is the input's. Subset
+  writes also go to a partial file renamed on success, so an interrupted
+  ``subsample`` or QC filter leaves no half-written output.
+* **Fixed: cells with a missing perturbation label** were tested as a group
+  named ``"nan"`` by ``t_test``, ``wilcoxon_test`` and ``nb_glm_test``. They
+  are now in no comparison, as in ``residual_effects``. A labels Series with
+  ``NaN`` for some cells is accepted on the same terms.
+* **Fixed: ``residual_effects`` z-scores were too large with few controls.**
+  Every perturbation's effect shares the error of the control fit, which
+  neither null counted: with 50 controls against 200 cells per target, 41%
+  of null tests had p < 0.05. ``null="model"`` now divides by
+  ``sigma_g * sqrt(1/n_t + h_t)``, with ``h_t`` the control fit's leverage at
+  the perturbation's mean design (small with many controls: in the Feng et
+  al. tutorial, 10.5% of target x gene pairs are significant instead of
+  10.6%); ``null="robust"`` centres on the median
+  over perturbations. ``obs["leverage"]`` and ``var["robust_center"]`` are
+  written so either z can be recomputed.
+* **Fixed: ``residual_effects`` could drop a covariate silently.** The rank
+  cutoff ran on ``X^T X``, squaring its condition number, so a covariate of
+  large magnitude but modest spread was projected out and effects came out
+  wrong. Covariates are now centred and scaled over the controls first.
+* **Fixed: ``nb_glm_test`` with controls too large for memory** returned
+  all-NaN results whenever covariates, per-comparison size factors or
+  per-comparison dispersion were used: only the control cache streams the
+  controls from disk, and every other path received no control matrix. It
+  now raises ``MemoryError`` with the alternatives up front, and any
+  perturbation that fails raises a ``UserWarning`` instead of only a log line.
+* **Fixed: ``nb_glm_test``'s fallback from ``size_factor_scope="per_comparison"``**
+  on data too large to load used unit size factors (no normalisation at
+  all) rather than the global ones its message promised. It now computes
+  global size factors, warns, and records ``"global"`` in
+  ``uns["size_factor_scope"]``. The per-comparison MAP step also used the
+  global offsets instead of the comparison's.
+* **Fixed: ``nb_glm_test``'s control-cache fit** estimated its coefficients
+  at a per-comparison moments dispersion and reported their SE at the global
+  one; it now fits at the global dispersion, matching the uncached fit (log2
+  fold changes move by up to ~0.01). A fixed ``dispersion=`` with
+  ``shrink_dispersion=False`` was ignored on this path and is now used.
+* **Fixed: ``nb_glm_test`` with covariates and ``dispersion_scope="global"``**
+  gave a gene almost absent among the controls (one a perturbation switches
+  on) a huge dispersion extrapolated from the trend, costing it its test.
+  Genes with fewer than 10 control counts now have their dispersion estimated
+  within each comparison; ``layers["dispersion"]`` is written instead of
+  ``var["dispersion"]`` when any gene needs it.
+* **Fixed: ``pb.aggregate`` with nullable covariates.** A donor-level
+  ``boolean``/``Int64`` column with missing values, as ``concat_h5ad`` makes
+  for a column only some files have, was carried over as an object array
+  anndata could not write. Dtypes are now kept. Finding the constant columns
+  no longer runs a grouped ``nunique`` over every obs column (one sort, then
+  a comparison per column), and a column of unhashable values counts as
+  varying instead of raising. Integer columns are compared exactly (64-bit
+  IDs above 2**53 are distinct).
+* **Fixed: ``concat_h5ad`` and subset writes loaded every layer into
+  memory**, once per file for every pass: they opened each file as a backed
+  AnnData, which anndata fills with every layer, ``obsm`` and ``obsp``. They
+  now read metadata and stream each matrix through h5py, so no layer is ever
+  held in memory, as documented.
+* **Changed: ``cx.read_backed`` (and ``cx.AnnData.backed``) leave the layers
+  on disk.** ``anndata.read_h5ad(backed="r")`` keeps ``X`` on disk but reads
+  every layer into memory, each as large as ``X``; every crispyx function
+  opens its input this way, so a file with a ``counts`` layer cost that
+  layer's size in memory before any work began (124 MB held vs 3 MB on a
+  20,000 x 500 test file with two layers). Layers are now sparse datasets
+  or HDF5 datasets read as they are sliced, like ``X``; the other slots are
+  read as before, and ``to_memory()`` loads everything. A CSC layer streamed
+  by rows is now re-read per chunk, as a CSC ``X`` already was.
+  ``read_backed`` also takes ``mode="r+"``.
+* **Fixed: CSC inputs to ``concat_h5ad`` and ``write_filtered_subset``**
+  (``pp.subsample``, the QC filter) were streamed by rows, re-reading the
+  whole matrix for every chunk. Both take ``format_mismatch_policy``
+  (default ``"auto"``) and stream a CSC ``X`` from a temporary CSR copy
+  beside the output, like the other streaming functions. ``concat_h5ad``
+  checks the shared cells by reading a CSC ``X`` by columns, with no copy,
+  and makes each file's copy only while writing that file's cells, so the
+  scratch space needed is that of the largest file, not of all of them.
+* **Fixed: ``concat_h5ad`` with an obs column of numbers in one file and text
+  in another** failed to write, after a full pass over every matrix. Such
+  columns, categorical or not, are now stored as text, and obs is merged
+  before any matrix is read. Categorical columns keep their categories' order and ``ordered``
+  flag when every file agrees (they were re-sorted and unordered), and
+  otherwise take the categories in order of first appearance.
+* **Fixed: a run killed while rewriting ``obs`` could not be resumed.** The
+  streaming Wilcoxon test deleted its work file's ``obs`` before copying the
+  new one in; killed in between, every resume failed with ``KeyError``.
+  ``write_obs``/``write_var`` (now also used there) write the new table
+  beside the old and swap it in by renames; a swap cut short is finished by
+  the next crispyx read or write of the file (``cx.AnnData``,
+  ``read_backed``, ``load_obs``, ...), after which anndata reads it too. They encode with anndata's ``write_elem``
+  instead of a hand-written encoder that turned missing text into ``""``,
+  could not store nullable columns and overflowed past 32,767 categories.
+* **Changed: raw-count checks accept float rounding noise** (``2.0000001``)
+  and ``downsample_counts`` rounds such values instead of truncating them.
+  The noise allowed is absolute (``1e-6``, or two units in the last place of
+  the value's dtype), so a large value with a fractional part such as
+  ``612345.4`` is still refused.
+* **Changed: crispyx requires anndata 0.11 or later** (``anndata.io``).
+* **Changed: ``residual_effects`` leaves out perturbed cells in a covariate
+  level no control shares**, instead of refusing the whole run; infinite
+  numeric covariates raise, and so do missing ones in the cells used (a
+  missing value is not a level of its own). ``perturbations`` given as a generator no longer
+  prevents reuse of an existing result (also for the DE functions).
+
 Version 0.1.10
 --------------
 
