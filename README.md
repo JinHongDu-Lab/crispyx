@@ -109,20 +109,6 @@ python analysis.py --input "$TMPDIR/screen.h5ad" --output "$TMPDIR/results"
 cp -r "$TMPDIR/results" /parallel-fs/project/
 ```
 
-## Testing
-
-```bash
-pytest
-```
-
-## Documentation
-
-The documentation is hosted at [crispyx.readthedocs.io](https://crispyx.readthedocs.io/en/latest/). To build it locally:
-
-```bash
-sphinx-build docs docs/_build
-```
-
 ## Acknowledgements
 
 crispyx builds on the foundational work of [Scanpy](https://scanpy.readthedocs.io/) (Wolf *et al.*, 2018), [Pertpy](https://pertpy.readthedocs.io/), [PyDESeq2](https://pydeseq2.readthedocs.io/) (Muzellec *et al.*, 2023), and [AnnData](https://anndata.readthedocs.io/) (Virshup *et al.*, 2024). We gratefully acknowledge these projects for establishing the single-cell analysis ecosystem in Python; crispyx extends their APIs and algorithmic designs to enable memory-efficient, streaming computation for large-scale CRISPR screen datasets. `residual_effects` implements the covariate-adjusted effect estimator of Feng *et al.* (2026, [doi:10.1016/j.xgen.2025.101076](https://doi.org/10.1016/j.xgen.2025.101076)).
