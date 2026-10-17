@@ -9,8 +9,8 @@ Unreleased
   a perturbations × genes result: each perturbation's row (or gene chunk's
   columns) is written into the result file as it is computed, a file
   allocated up front beside the output that becomes the output when the run
-  finishes. Each checkpoint writes its pages back and evicts them, so they
-  are not charged to a SLURM job's memory. Results are bit-identical to
+  finishes. Each checkpoint evicts its pages, so they are not charged to a
+  SLURM job's memory. Results are bit-identical to
   0.2.0's.
 * **Changed: ``RankGenesGroupsResult`` reads its result file.** Its matrices
   are read on access (``result.pvalues[i]`` reads one row,
@@ -34,10 +34,17 @@ Unreleased
   written to the run's directory, not ``/dev/shm``, where they could not be
   reclaimed. Requires ``joblib>=1.4``. ``uns["pvalue_correction"]`` is now
   recorded, as for the other methods.
-* **QC's row-streaming cache is plain files beside the output**
-  (``cache_mode="disk"``, was ``"memmap"`` in ``$TMPDIR``), read and written
-  sequentially and evicted every GB, as are the outputs of the subset,
-  concatenation, sort, normalisation and downsampling writers.
+* **QC's row-streaming cache is plain files** (``cache_mode="disk"``, was
+  ``"memmap"``) in ``$TMPDIR``, read and written sequentially and evicted
+  every GB, as are the outputs of the subset, concatenation, sort,
+  normalisation and downsampling writers.
+* **Fixed: QC read its whole output back into memory** to look up one
+  ``obs`` column (a lazy ``obs``/``var``/``uns`` accessor materialised the
+  AnnData, ``X`` included): 151 GB for Huang-HCT116, where QC peaked at
+  134 GB and was killed on HEK293T after writing its output. The accessors
+  now read only their element, and ``perturbation_keep`` counts labels once
+  instead of comparing every label against every cell (8 min on
+  Replogle-GW-k562).
 * **``standardize_dataset`` no longer copies the dataset.** Only the
   metadata changes, so only the metadata is written: the standardized
   file's ``X``, layers and ``raw.X`` are HDF5 external links into the

@@ -318,10 +318,10 @@ class ResumableRun:
     grow with the result.
 
     The checkpoint JSON records the call's :func:`run_fingerprint` plus
-    caller-defined progress. :meth:`save` writes the file's pending data to
-    disk and evicts its pages before writing the checkpoint, so everything a
-    checkpoint lists as done is on disk and none of it stays charged to the
-    process's memory.
+    caller-defined progress. :meth:`save` hands the file's pending data to the
+    operating system and evicts its pages before writing the checkpoint, so
+    everything a checkpoint lists as done survives the process being killed
+    and little of it stays charged to the process's memory.
 
     A run resumes only when ``resume`` is set, the checkpoint's fingerprint
     matches this call (:func:`fingerprint_difference`), and the work file

@@ -140,17 +140,18 @@ class _DiskChunkCache:
     """On-disk cache for CSR chunk data during QC streaming.
 
     Chunks are appended to two flat files (values and column indices) in a
-    hidden directory beside the output, then read back one chunk at a time
-    for the write phase. The files are written and read with plain I/O, not
-    mapped, and every GB of traffic their pages are written back and
-    evicted (:class:`~crispyx._memory._EvictEvery`), so
+    directory under ``$TMPDIR`` -- node-local disk on a cluster, where a
+    network filesystem read the cache back 1.75x slower end to end -- then
+    read back one chunk at a time for the write phase. The files are written
+    and read with plain I/O, not mapped, and every GB of traffic their pages
+    are evicted (:class:`~crispyx._memory._EvictEvery`), so
     the cache -- as large as the kept cells' matrix -- never accumulates in
     the page cache a cgroup-limited job is charged for.
 
     Parameters
     ----------
     output_path
-        Path of the QC output; the cache directory is created beside it.
+        Path of the QC output.
     estimated_nnz
         Estimated total non-zeros, for the low-disk-space warning.
     data_dtype
@@ -165,9 +166,7 @@ class _DiskChunkCache:
     ) -> None:
         self.output_path = Path(output_path)
         self._data_dtype = np.dtype(data_dtype)
-        self._cache_dir = Path(tempfile.mkdtemp(
-            prefix=f".{self.output_path.name}.qc_cache_", dir=self.output_path.parent,
-        ))
+        self._cache_dir = Path(tempfile.mkdtemp(prefix="crispyx_qc_cache_"))
         warn_if_disk_space_low(
             estimate_bytes(estimated_nnz, itemsize=self._data_dtype.itemsize)
             + estimate_bytes(estimated_nnz, itemsize=4),
@@ -1162,8 +1161,9 @@ def _qc_column_oriented(
     
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)
+    filtered_counts = filtered_labels.value_counts()
     perturbation_keep = {
-        label: (label == control_label) or (filtered_labels[filtered_labels == label].shape[0] >= min_cells_per_perturbation)
+        label: (label == control_label) or (filtered_counts[label] >= min_cells_per_perturbation)
         for label in filtered_labels.unique()
     }
     
@@ -1349,8 +1349,9 @@ def _qc_row_oriented(
 
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)
+    filtered_counts = filtered_labels.value_counts()
     perturbation_keep = {
-        label: (label == control_label) or (filtered_labels[filtered_labels == label].shape[0] >= min_cells_per_perturbation)
+        label: (label == control_label) or (filtered_counts[label] >= min_cells_per_perturbation)
         for label in filtered_labels.unique()
     }
 

@@ -137,6 +137,14 @@ def _element_format(elem: h5py.Group | h5py.Dataset) -> str:
 _MISSING = object()
 
 
+def _read_h5ad_element(path: Path, key: str):
+    """One element (``obs``, ``var``, ``uns/<key>``) of the h5ad at ``path``,
+    decoded by anndata, without reading anything else."""
+    _finish_interrupted_swaps(path)
+    with h5py.File(path, "r") as handle:
+        return read_elem(handle[key])
+
+
 class _LazyFrameAccessor:
     """Provide a read-friendly view over ``obs``/``var`` tables with ``.load``."""
 
@@ -147,7 +155,9 @@ class _LazyFrameAccessor:
 
     def load(self) -> pd.DataFrame:
         if self._cache is None:
-            loaded = getattr(self._parent.to_memory(), self._attr)
+            # Only this table: materialising the AnnData would read X too
+            # (a 151 GB QC output, to look up one obs column).
+            loaded = _read_h5ad_element(self._parent.path, self._attr)
             if isinstance(loaded, pd.DataFrame):
                 loaded = loaded.copy()
             else:
@@ -205,7 +215,7 @@ class _LazyUnsEntry:
 
     def load(self) -> Any:
         if self._cache is _MISSING:
-            self._cache = self._parent.to_memory().uns[self._key]
+            self._cache = _read_h5ad_element(self._parent.path, f"uns/{self._key}")
         return self._cache
 
     def preview(self, n: int = 5) -> Any:

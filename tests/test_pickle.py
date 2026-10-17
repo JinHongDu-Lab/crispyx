@@ -89,3 +89,18 @@ def test_differential_expression_result_round_trip():
     np.testing.assert_array_equal(restored.auc, der.auc)
     np.testing.assert_array_equal(restored.pvalue_adj, der.pvalue_adj)
     assert restored.result is None
+
+
+def test_lazy_obs_and_uns_read_only_their_element(tmp_path, monkeypatch):
+    """Looking up obs/var/uns must not materialise X (QC read a 151 GB
+    output back to read one obs column)."""
+    path = _make_h5ad(tmp_path)
+    ad.AnnData(obs=pd.DataFrame(index=[]))  # anndata imported
+    wrapper = AnnData(path)
+
+    def refuse(self):
+        raise AssertionError("materialised the whole AnnData")
+
+    monkeypatch.setattr(AnnData, "to_memory", refuse)
+    assert wrapper.obs["perturbation"].value_counts().to_dict() == {"ctrl": 40, "KO1": 30}
+    assert len(wrapper.var) == 20

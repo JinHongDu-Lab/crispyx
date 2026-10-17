@@ -83,13 +83,11 @@ streaming is used unconditionally. DESeq2-style size factors
 (``size_factor_method="deseq2"``) also stream automatically when the
 intermediate counts array would exceed 4 GB, computing geometric means
 and per-cell median ratios in chunks. After each streaming phase,
-``drop_file_cache()`` writes back and evicts file data from the kernel page
-cache so that cgroup-limited environments (e.g. SLURM) do not count cached
-pages toward the memory limit. Files that are written -- a DE result as it is
+``drop_file_cache()`` evicts file data from the kernel page cache so that
+cgroup-limited environments (e.g. SLURM) do not count cached pages toward the
+memory limit. Streaming reads, and files being written -- a DE result as it is
 filled, QC's chunk cache and its filtered output, sorted and converted copies
--- are synced and evicted the same way every gigabyte or checkpoint, since
-dirty pages on a network filesystem are written back slowly and stay charged
-to the job until they are.
+-- are evicted the same way every gigabyte or checkpoint.
 
 .. note::
 

@@ -28,15 +28,15 @@ def _resolve_n_jobs(n_jobs: int | None) -> int:
 
 
 def drop_file_cache(path: str | Path) -> None:
-    """Write back and evict *path*'s pages from the kernel page cache (Linux only).
+    """Evict *path*'s clean pages from the kernel page cache (Linux only).
 
     On cgroup-limited systems (SLURM), page-cache pages count toward the
-    memory limit, and dirty ones -- written but not yet on disk -- cannot be
-    reclaimed until written back, which a network filesystem does slowly.
-    Calling this after a streaming read, or after a block of writes, keeps
-    the file's pages out of the cgroup budget. ``posix_fadvise`` drops only
-    clean pages, so the file is synced first; for a file that was only read
-    that costs nothing.
+    memory limit. Calling this after a streaming read, or after a block of
+    writes, keeps the file's pages out of the cgroup budget. Pages still
+    dirty are left for the kernel to write back, and a later call drops
+    them; the file is not synced, which would stall each call on a network
+    filesystem (~0.8 s a call on Lustre) for no gain in correctness: a
+    killed process's writes are in the page cache either way.
 
     The call is a no-op on non-Linux platforms or when the file cannot be
     opened.
@@ -46,7 +46,6 @@ def drop_file_cache(path: str | Path) -> None:
     try:
         fd = os.open(str(path), os.O_RDONLY)
         try:
-            os.fdatasync(fd)
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         finally:
             os.close(fd)
