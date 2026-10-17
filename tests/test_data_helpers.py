@@ -72,6 +72,21 @@ def test_resolve_control_label_infers_ctrl(caplog):
     assert "Inferred control label" in caplog.text
 
 
+@pytest.mark.parametrize("labels", [
+    ["Non-Targeting", "CTRL", "KO"],  # Huang et al.: CTRL is the chymotrypsin-like gene
+    ["control", "non-targeting", "KO"],
+    ["NTC", "CTRL", "KNTC1"],  # Nourreddine et al.
+])
+def test_resolve_control_label_refuses_to_choose_between_controls(labels):
+    with pytest.raises(ValueError, match="Several perturbation labels look like a control"):
+        resolve_control_label(labels * 3, None)
+    assert resolve_control_label(labels, labels[0]) == labels[0]
+
+
+def test_resolve_control_label_infers_ntc_but_not_genes_containing_it():
+    assert resolve_control_label(["NTC", "KNTC1", "NTC", "NT5C"], None, verbose=False) == "NTC"
+
+
 def test_resolve_control_label_prints_by_default(capsys):
     """verbose defaults to True: the inferred label should be visible on
     stdout without the caller configuring logging (unlike the logger.info

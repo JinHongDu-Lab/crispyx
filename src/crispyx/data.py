@@ -907,37 +907,49 @@ def resolve_control_label(
     *,
     verbose: int | bool = True,
 ) -> str:
-    """Return an explicit control label, inferring one when necessary."""
+    """Return an explicit control label, inferring one when necessary.
+
+    A label is inferred only when exactly one label looks like a control
+    (``ctrl``, ``control``, ``non-target``..., or exactly ``NTC``, in any
+    case). When several do,
+    the choice is not crispyx's to make -- in Huang et al.'s screens
+    ``CTRL`` is the chymotrypsin-like gene, knocked down like any other,
+    beside the ``Non-Targeting`` controls -- so it raises and asks for
+    ``control_label``.
+    """
 
     if control_label is not None:
         return str(control_label)
 
-    index = pd.Index(labels).astype(str)
+    index = pd.Index(pd.unique(pd.Index(labels).astype(str)))
     if index.empty:
         raise ValueError(
             "Cannot infer control label because no perturbation labels were provided."
         )
+    terms = ("ctrl", "control", "nontarget", "non-target", "non_target")
+    # Matched whole only: as a substring "ntc" is in gene symbols (KNTC1).
+    exact_terms = ("ntc",)
     lower = index.str.lower()
+    looks_like_control = np.array([
+        text in exact_terms
+        or any(term in text for term in terms)
+        or ("non" in text and "target" in text)
+        for text in lower
+    ], dtype=bool)
+    matches = [str(label) for label in index[looks_like_control]]
 
-    exact_terms = {"ctrl", "control", "nontarget", "non-target", "non_target"}
-    substring_terms = ("ctrl", "control", "nontarget", "non-target", "non_target")
-
-    def _select(predicate) -> str | None:
-        for label, lowered in zip(index, lower):
-            if predicate(lowered):
-                return str(label)
-        return None
-
-    candidate = _select(lambda text: text in exact_terms)
-    if candidate is None:
-        candidate = _select(lambda text: any(term in text for term in substring_terms))
-    if candidate is None:
-        candidate = _select(lambda text: ("non" in text) and ("target" in text))
-
-    if candidate is None:
+    if not matches:
         raise ValueError(
             "Unable to infer control label automatically. Please provide 'control_label' explicitly."
         )
+    if len(matches) > 1:
+        shown = ", ".join(repr(m) for m in matches[:10]) + (", ..." if len(matches) > 10 else "")
+        raise ValueError(
+            f"Several perturbation labels look like a control ({shown}); pass "
+            "control_label to say which one is. A label such as 'CTRL' can also be a "
+            "gene that was perturbed."
+        )
+    candidate = matches[0]
 
     if verbose:
         logger.info("Inferred control label '%s' from perturbation labels.", candidate)
