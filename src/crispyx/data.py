@@ -1454,6 +1454,10 @@ def iter_matrix_chunks(
     ``read_ahead=True`` reads the next chunk on a background thread while the
     caller works on the current one -- worth it when that work releases the
     GIL (a numba kernel), so reading and computing overlap.
+
+    A backed file's pages are evicted from the page cache every GB read
+    (:class:`~crispyx._memory._EvictEvery`), so a pass over a file larger
+    than the job's memory does not fill its cgroup with cache.
     """
 
     if axis not in (0, 1):
@@ -1466,6 +1470,11 @@ def iter_matrix_chunks(
     n_obs, n_vars = matrix.shape
     length = n_obs if axis == 0 else n_vars
     read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
+    # The file the matrix's bytes are in -- through an external link, the
+    # source of a standardized file -- not the file the AnnData was opened as.
+    node = getattr(matrix, "group", matrix)
+    source = getattr(getattr(node, "file", None), "filename", None)
+    evict = _EvictEvery(source) if source is not None else None
 
     def read(start: int) -> tuple[slice, np.ndarray | sp.spmatrix]:
         end = min(start + chunk_size, length)
@@ -1475,6 +1484,8 @@ def iter_matrix_chunks(
             block = matrix[start:end]
         else:
             block = matrix[:, start:end]
+        if evict is not None:
+            evict(block.data.nbytes + block.indices.nbytes if sp.issparse(block) else np.asarray(block).nbytes)
         if convert_to_dense:
             block = _to_dense(block)
         return slice(start, end), block
@@ -4521,13 +4532,18 @@ def standardize_dataset(
 ) -> Path:
     """Standardize dataset column names and control labels with caching.
     
-    Creates a standardized copy of the dataset with:
+    Creates a standardized version of the dataset with:
     - perturbation_column renamed to 'perturbation'
     - control labels standardized to 'control'
     - gene_name_column set as var.index if specified
-    
-    This function uses a streaming approach to avoid loading the X matrix
-    into memory, making it suitable for very large datasets (>1M cells).
+
+    Only the metadata changes, so only the metadata is written: the
+    standardized file's ``X``, layers and ``raw.X`` are HDF5 external links
+    into ``dataset_path`` (named relative to the cache directory), which
+    anndata and crispyx read transparently. It therefore costs megabytes, not
+    a copy of the counts, and needs ``dataset_path`` to stay where it is;
+    a changed source is detected by the cache's fingerprint and
+    re-standardized.
     
     Standardized files are cached in {output_dir}/.cache/ and reused
     unless force=True.
@@ -4564,7 +4580,6 @@ def standardize_dataset(
     ... )
     """
     import datetime
-    import shutil
     
     dataset_path = Path(dataset_path)
     output_dir = Path(output_dir)
@@ -4652,28 +4667,53 @@ def standardize_dataset(
         uns_dict["standardization_metadata"] = {}
     uns_dict["standardization_metadata"].update(metadata)
     
-    # Copy h5ad file at filesystem level (streaming - no memory load)
-    logger.info(f"  - Copying dataset (streaming, no X matrix load)...")
+    # Only the metadata changes: the matrices are linked, not copied.
+    logger.info("  - Writing standardized metadata, linking the source's matrices...")
     with _replace_on_success(standardized_path) as partial:
-        shutil.copy2(dataset_path, partial)
-
-        # Modify obs/var/uns in-place using h5py
-        logger.info(f"  - Updating metadata in copied file...")
-        with h5py.File(partial, 'r+') as f:
-            # Update obs - need to rewrite the obs group
-            # Read current obs structure and update
-            _update_h5ad_dataframe(f, 'obs', obs_df)
-
-            # Update var - need to rewrite the var group
-            _update_h5ad_dataframe(f, 'var', var_df)
-
-            # Update uns - handle the standardization_metadata key
-            _update_h5ad_uns(f, 'uns', uns_dict)
+        _write_linked_h5ad(dataset_path, partial, obs=obs_df, var=var_df, uns=uns_dict)
         write_stamp(partial, stamp("standardized", fingerprint))
     
     logger.info(f"Saved standardized dataset: {standardized_path}")
     
     return standardized_path
+
+
+def _write_linked_h5ad(source: Path, dest: Path, *, obs: pd.DataFrame, var: pd.DataFrame, uns: dict) -> None:
+    """Write an h5ad at ``dest`` with its own ``obs``, ``var`` and ``uns`` whose
+    matrices -- ``X``, each layer, and ``raw/X`` -- are HDF5 external links
+    into ``source``.
+
+    Relabelling a dataset then costs its metadata, not a copy of its counts
+    (hundreds of GB for a genome-wide screen, and a copy that a network
+    filesystem has been seen to return short without raising). The links
+    name ``source`` relative to ``dest``'s directory, which is where HDF5
+    resolves them, so the pair can move together. Everything else is copied:
+    a later write into the file -- a new layer, an ``obsm`` entry -- lands
+    in ``dest``, never in ``source``. anndata and h5py read the links
+    transparently; the file stays readable while ``source`` is where the link
+    says.
+    """
+    ad.AnnData(obs=obs, var=var, uns=uns).write(dest)
+    target = _os.path.relpath(_os.path.abspath(source), _os.path.abspath(Path(dest).parent))
+    with h5py.File(source, "r") as src, h5py.File(dest, "r+") as out:
+        for key in src:
+            if key in ("obs", "var", "uns"):
+                continue
+            if key in out:
+                del out[key]
+            if key == "X":
+                out["X"] = h5py.ExternalLink(target, "/X")
+            elif key in ("layers", "raw"):
+                group = out.create_group(key)
+                for name, value in src[key].attrs.items():
+                    group.attrs[name] = value
+                for name in src[key]:
+                    if key == "layers" or name == "X":
+                        group[name] = h5py.ExternalLink(target, f"/{key}/{name}")
+                    else:
+                        src.copy(src[key][name], group, name)
+            else:
+                src.copy(src[key], out, key)
 
 
 def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame) -> None:
@@ -4735,41 +4775,6 @@ def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame)
             str_vals = col_data.astype(str).values
             grp.create_dataset(col, data=str_vals.astype('O'),
                                dtype=h5py.special_dtype(vlen=str))
-
-
-def _update_h5ad_uns(h5file: h5py.File, group_name: str, uns_dict: dict) -> None:
-    """Update uns dict in an h5ad file in-place.
-    
-    Only updates the standardization_metadata key to avoid breaking other uns data.
-    """
-    if group_name not in h5file:
-        h5file.create_group(group_name)
-    
-    grp = h5file[group_name]
-    
-    # Only update standardization_metadata to be safe
-    key = 'standardization_metadata'
-    if key in uns_dict:
-        if key in grp:
-            del grp[key]
-        
-        # Store as a group with string datasets for each subkey
-        meta_grp = grp.create_group(key)
-        meta_grp.attrs['encoding-type'] = 'dict'
-        meta_grp.attrs['encoding-version'] = '0.1.0'
-        
-        for subkey, subval in uns_dict[key].items():
-            if isinstance(subval, dict):
-                # Nested dict - store as JSON string
-                import json
-                meta_grp.create_dataset(subkey, data=json.dumps(subval),
-                                        dtype=h5py.special_dtype(vlen=str))
-            elif isinstance(subval, str):
-                meta_grp.create_dataset(subkey, data=subval,
-                                        dtype=h5py.special_dtype(vlen=str))
-            else:
-                meta_grp.create_dataset(subkey, data=str(subval),
-                                        dtype=h5py.special_dtype(vlen=str))
 
 
 def needs_sorting_for_nbglm(

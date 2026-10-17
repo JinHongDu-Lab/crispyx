@@ -38,6 +38,25 @@ Unreleased
   (``cache_mode="disk"``, was ``"memmap"`` in ``$TMPDIR``), read and written
   sequentially and evicted every GB, as are the outputs of the subset,
   concatenation, sort, normalisation and downsampling writers.
+* **``standardize_dataset`` no longer copies the dataset.** Only the
+  metadata changes, so only the metadata is written: the standardized
+  file's ``X``, layers and ``raw.X`` are HDF5 external links into the
+  source (relative to the cache directory), read transparently by anndata
+  and crispyx. Standardizing a 350 GB screen on Lustre took ~12 hours of
+  copying, and the copy had come back short without raising three times;
+  it is now seconds. The source must stay where it is.
+* **Fixed: control inference picked a gene.** A control label is inferred
+  only when exactly one label looks like one; several (Huang et al.'s
+  ``Non-Targeting`` beside the chymotrypsin-like gene ``CTRL``) raise and ask
+  for ``control_label``. An exact ``NTC`` now counts as control-like.
+* **Streaming reads evict as they go.** ``iter_matrix_chunks`` drops the
+  pages it has read from the page cache every GB, so one pass over a file
+  larger than the job no longer fills its cgroup with cache (QC on
+  Huang-HCT116: 117 GB of it).
+* **When the cgroup limit is not visible** (a job inside a container),
+  the memory budget falls back to Slurm's ``SLURM_MEM_PER_NODE`` /
+  ``SLURM_MEM_PER_CPU``, and asks for ``memory_limit_gb`` when under Slurm
+  without either.
 * **One memory budget.** ``quality_control_summary``, ``nb_glm_test``'s
   worker and dense-matrix sizing and ``shrink_lfc``'s worker count read
   ``memory_limit_gb`` capped by the cgroup's headroom (the memory available
