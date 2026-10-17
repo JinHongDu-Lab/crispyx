@@ -21,6 +21,7 @@ from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
+    h5ad_data_bytes,
     AnnData,
     _ensure_csr,
     calculate_optimal_chunk_size,
@@ -1722,7 +1723,8 @@ def quality_control_summary(
     
     # Detect storage format and file size
     storage_format = get_matrix_storage_format(path)
-    file_size_gb = path.stat().st_size / 1e9
+    # The data's size, not the file's: a standardized file links its matrix.
+    file_size_gb = h5ad_data_bytes(path) / 1e9
     
     # The memory this call may use: memory_limit_gb, capped by what the
     # process's cgroup will still grant (detected when None).

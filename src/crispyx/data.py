@@ -4678,6 +4678,36 @@ def standardize_dataset(
     return standardized_path
 
 
+def h5ad_data_bytes(path: str | Path) -> int:
+    """Bytes the data of the h5ad at ``path`` occupies on disk, counting
+    datasets reached through external links -- for a file written by
+    :func:`standardize_dataset`, its source's matrices. The file's own size
+    is only its metadata then, and sizing work from it underestimates by
+    the whole matrix."""
+    total = 0
+
+    def add(_name: str, obj) -> None:
+        nonlocal total
+        if isinstance(obj, h5py.Dataset):
+            total += obj.id.get_storage_size()
+
+    with h5py.File(path, "r") as handle:
+        for key in handle:
+            node = handle[key]  # follows an external link
+            if isinstance(node, h5py.Dataset):
+                add(key, node)
+            else:
+                node.visititems(add)
+                for name in node:  # links one level down (layers/<name>, raw/X)
+                    if isinstance(node.get(name, getlink=True), h5py.ExternalLink):
+                        target = node[name]
+                        if isinstance(target, h5py.Dataset):
+                            add(name, target)
+                        else:
+                            target.visititems(add)
+    return total
+
+
 def _write_linked_h5ad(source: Path, dest: Path, *, obs: pd.DataFrame, var: pd.DataFrame, uns: dict) -> None:
     """Write an h5ad at ``dest`` with its own ``obs``, ``var`` and ``uns`` whose
     matrices -- ``X``, each layer, and ``raw/X`` -- are HDF5 external links
@@ -5038,7 +5068,7 @@ def sort_by_perturbation(
     # Create output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     warn_if_disk_space_low(
-        1.1 * float(path.stat().st_size), output_path,
+        1.1 * float(h5ad_data_bytes(path)), output_path,
         context="sort_by_perturbation",
     )
 

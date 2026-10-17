@@ -73,3 +73,30 @@ def test_writes_into_the_standardized_file_never_reach_the_source(raw, tmp_path)
         f["obsm"].create_dataset("X_umap", data=np.zeros((60, 2)))
         f["layers"].create_dataset("extra", data=np.zeros(3))
     assert path.read_bytes() == before
+
+
+def test_data_bytes_count_the_linked_matrix(raw, tmp_path):
+    from crispyx.data import h5ad_data_bytes
+
+    path, _ = raw
+    std = _standardize(path, tmp_path / "results")
+    with h5py.File(path, "r") as f:
+        x_bytes = sum(f["X"][k].id.get_storage_size() for k in f["X"])
+    assert h5ad_data_bytes(std) >= x_bytes
+
+
+def test_qc_on_a_standardized_file_sizes_from_the_linked_matrix(raw, tmp_path, monkeypatch, capsys):
+    """QC's in-memory/streaming choice uses the data's size, not the
+    metadata file's (a 4.5M-cell screen was loaded whole and OOM-killed)."""
+    from crispyx import qc
+    from crispyx import data as cxd
+
+    path, _ = raw
+    std = _standardize(path, tmp_path / "results")
+    seen = []
+    real = cxd.h5ad_data_bytes
+    monkeypatch.setattr(qc, "h5ad_data_bytes", lambda p: seen.append(real(p)) or seen[-1])
+    qc.quality_control_summary(std, perturbation_column="perturbation", control_label="control",
+                               min_genes=1, min_cells_per_perturbation=1, min_cells_per_gene=1,
+                               output_path=tmp_path / "qc.h5ad", verbose=False)
+    assert seen and seen[0] >= h5py.File(path, "r")["X/data"].id.get_storage_size()
