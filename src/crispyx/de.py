@@ -76,6 +76,7 @@ from .glm import (
     shrink_lfc_apeglm_from_stats,
     _estimate_apeglm_prior_scale,
     _apeglm_prior_scale_from_blocks,
+    _FROZEN_WORK_BYTES,
 )
 from ._kernels import (
     _presort_control_nonzeros,
@@ -2819,6 +2820,11 @@ def nb_glm_test(
     # Compute group size statistics without loading the full matrix
     # Use numpy unique with counts since labels is a numpy array
     unique_labels, label_counts = np.unique(labels, return_counts=True)
+    with h5py.File(path, "r") as handle:
+        x_node = handle["X"]
+        nnz_per_cell = (
+            x_node["data"].shape[0] / max(n_cells_total, 1) if isinstance(x_node, h5py.Group) else n_genes
+        )
     group_sizes = dict(zip(unique_labels, label_counts))
     pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
     max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
@@ -3266,8 +3272,9 @@ def nb_glm_test(
         # Frozen stats (W_sum, Wz_sum, ...) and cache metadata, n_genes each,
         # and the size factors.
         serialized_args_mb = (n_genes * 8 * 11 + n_groups * 50 + n_cells_total * 8) * 2.0 / 1e6
-        # Work arrays: mu, W, z for the perturbation's cells only.
-        work_arrays_mb = use_group_size * n_genes * 8 * 5 / 1e6
+        # Work arrays: mu, W, z for the perturbation's cells only, a block of
+        # genes at a time (at most _FROZEN_WORK_BYTES however large the group).
+        work_arrays_mb = min(use_group_size * n_genes * 8 * 5, _FROZEN_WORK_BYTES) / 1e6
         # The worker's result row (~12 fields of n_genes).
         result_arrays_mb = n_genes * 8 * 12 / 1e6
         python_overhead_mb = 500
@@ -3289,8 +3296,13 @@ def nb_glm_test(
         per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
 
     # The parent holds one copy of the control matrix plus its own arrays.
+    # The largest perturbation is sized on its own rather than by the p95
+    # group above: its worker holds its counts (float64 CSR, and a
+    # normalised copy) however many cells it has -- a 165k-cell
+    # non-targeting group fitted as a perturbation is ~20 GB of them.
     control_matrix_mb = control_n * n_genes * 8 / 1e6
-    base_memory_mb = control_matrix_mb + 1000
+    largest_group_mb = max_group_size * nnz_per_cell * 12 * 2 / 1e6
+    base_memory_mb = control_matrix_mb + largest_group_mb + 1000
     available_mb = budget_gb * 1000
     # Reserve 20% headroom for safety
     usable_mb = available_mb * 0.8

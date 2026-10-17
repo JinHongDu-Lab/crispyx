@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from pathlib import Path
 
 import joblib
@@ -306,13 +307,63 @@ def _cgroup_available_bytes() -> float | None:
     return headroom
 
 
+def _slurm_allocation_bytes() -> float | None:
+    """The memory Slurm allocated this job on this node, from the variables
+    it exports to the job (``--mem`` as ``SLURM_MEM_PER_NODE``, ``--mem-per-cpu``
+    as ``SLURM_MEM_PER_CPU`` times ``SLURM_CPUS_ON_NODE``, both in MB), or
+    ``None`` outside a Slurm job or when neither is set."""
+    env = os.environ
+    if "SLURM_JOB_ID" not in env:
+        return None
+    try:
+        if env.get("SLURM_MEM_PER_NODE"):
+            return float(env["SLURM_MEM_PER_NODE"]) * 2**20
+        if env.get("SLURM_MEM_PER_CPU") and env.get("SLURM_CPUS_ON_NODE"):
+            return float(env["SLURM_MEM_PER_CPU"]) * float(env["SLURM_CPUS_ON_NODE"]) * 2**20
+    except ValueError:
+        pass
+    return None
+
+
+_warned_unknown_slurm_limit = False
+
+
+def _granted_bytes() -> float | None:
+    """The most memory this process's job will grant it, when that is known.
+
+    The cgroup's headroom when its limit is visible
+    (:func:`_cgroup_available_bytes`). Some clusters give a job a cgroup
+    namespace whose limit the job cannot see from inside; Slurm's own
+    record of the allocation (:func:`_slurm_allocation_bytes`) stands in
+    then. In a Slurm job where neither is available the allocation is
+    unknown: crispyx warns once and asks for ``memory_limit_gb``, since
+    sizing from the host's memory is how a run outgrows its job.
+    """
+    global _warned_unknown_slurm_limit
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        return cgroup_available
+    allocation = _slurm_allocation_bytes()
+    if allocation is None and "SLURM_JOB_ID" in os.environ and not _warned_unknown_slurm_limit:
+        _warned_unknown_slurm_limit = True
+        warnings.warn(
+            "crispyx: running in Slurm job "
+            f"{os.environ['SLURM_JOB_ID']} but cannot see its memory limit (no cgroup "
+            "limit is visible and SLURM_MEM_PER_NODE / SLURM_MEM_PER_CPU are unset); "
+            "pass memory_limit_gb set to the job's --mem so crispyx does not size "
+            "itself from the whole node's memory.",
+            stacklevel=3,
+        )
+    return allocation
+
+
 def _detected_available_bytes() -> float:
     """Memory this process may actually use, in bytes.
 
-    ``psutil.virtual_memory().available`` capped by what the cgroup will still
-    grant. Every crispyx auto-sizing path routes its host-memory reading
-    through here so that none of them can budget from memory the job's cgroup
-    will not hand out.
+    ``psutil.virtual_memory().available`` capped by what the job will grant
+    (:func:`_granted_bytes`). Every crispyx auto-sizing path routes its
+    host-memory reading through here so that none of them can budget from
+    memory the job will not hand out.
 
     Raises
     ------
@@ -322,9 +373,9 @@ def _detected_available_bytes() -> float:
     """
     import psutil
     available = float(psutil.virtual_memory().available)
-    cgroup_available = _cgroup_available_bytes()
-    if cgroup_available is not None:
-        available = min(available, cgroup_available)
+    granted = _granted_bytes()
+    if granted is not None:
+        available = min(available, granted)
     return available
 
 
@@ -333,9 +384,9 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
 
     If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
     the system with ``psutil`` and fall back to 64 GB. Either way the result
-    is capped by what the process's cgroup will still grant when there is
-    one, so a budget can never exceed what the job may actually allocate --
-    see :func:`_cgroup_available_bytes`.
+    is capped by what the job will grant when that is known, so a budget can
+    never exceed what the job may actually allocate -- see
+    :func:`_granted_bytes`.
 
     Parameters
     ----------
@@ -347,15 +398,13 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     float
         Memory budget in bytes.
     """
-    if memory_limit_gb is not None:
-        budget = memory_limit_gb * 1e9
-    else:
+    if memory_limit_gb is None:
         try:
             return _detected_available_bytes()
         except ImportError:
             return 64 * 1e9  # conservative default
-
-    cgroup_available = _cgroup_available_bytes()
-    if cgroup_available is not None:
-        budget = min(budget, cgroup_available)
+    budget = memory_limit_gb * 1e9
+    granted = _granted_bytes()
+    if granted is not None:
+        budget = min(budget, granted)
     return budget
