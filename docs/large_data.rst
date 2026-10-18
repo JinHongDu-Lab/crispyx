@@ -87,7 +87,11 @@ and per-cell median ratios in chunks. After each streaming phase,
 cgroup-limited environments (e.g. SLURM) do not count cached pages toward the
 memory limit. Streaming reads, and files being written -- a DE result as it is
 filled, QC's chunk cache and its filtered output, sorted and converted copies
--- are evicted the same way every gigabyte or checkpoint.
+-- are evicted the same way every gigabyte or checkpoint. This happens only
+when page cache counts against a limit: a cgroup memory limit is visible, or
+the process runs in a Slurm job. On a personal machine the kernel manages
+the cache on its own and nothing is evicted, so a second pass over a file
+still reads from memory.
 
 .. note::
 

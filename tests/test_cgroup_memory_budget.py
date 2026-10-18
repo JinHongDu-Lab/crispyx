@@ -282,3 +282,30 @@ def test_unknown_slurm_allocation_asks_for_memory_limit_gb(no_slurm):
 def test_outside_slurm_nothing_is_granted_or_warned(no_slurm, recwarn):
     assert _memory._granted_bytes() is None
     assert not recwarn
+
+
+@pytest.mark.parametrize(
+    "cgroup_limit, slurm, charged",
+    [(None, False, False), (float(64 * GIB), False, True), (None, True, True)],
+    ids=["personal-machine", "cgroup-limit", "slurm-job"],
+)
+def test_page_cache_is_evicted_only_under_a_memory_limit(no_slurm, tmp_path, cgroup_limit, slurm, charged):
+    """On a machine without a memory limit the kernel manages page cache on
+    its own; evicting would only make a second read of the file slower."""
+    import os
+
+    no_slurm.setattr(_memory, "_cgroup_available_bytes", lambda: cgroup_limit)
+    if slurm:
+        no_slurm.setenv("SLURM_JOB_ID", "42")
+        no_slurm.setenv("SLURM_MEM_PER_NODE", "1024")
+    _memory._page_cache_is_charged.cache_clear()
+    calls = []
+    no_slurm.setattr(os, "posix_fadvise", lambda *args: calls.append(args), raising=False)
+    no_slurm.setattr(os, "POSIX_FADV_DONTNEED", 4, raising=False)
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"x" * 10)
+    try:
+        _memory.drop_file_cache(path)
+    finally:
+        _memory._page_cache_is_charged.cache_clear()
+    assert bool(calls) is charged

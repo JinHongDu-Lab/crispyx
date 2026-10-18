@@ -9,13 +9,14 @@ Unreleased
   a perturbations × genes result: each perturbation's row (or gene chunk's
   columns) is written into the result file as it is computed, a file
   allocated up front beside the output that becomes the output when the run
-  finishes. Each checkpoint evicts its pages, so they are not charged to a
-  SLURM job's memory. Results are bit-identical to
+  finishes. Under a memory limit, each checkpoint evicts its pages, so they
+  are not charged to a SLURM job's memory. Results are bit-identical to
   0.2.0's.
-* **Changed: ``RankGenesGroupsResult`` reads its result file.** Its matrices
-  are read on access (``result.pvalues[i]`` reads one row,
+* **Changed: ``RankGenesGroupsResult`` reads its result file.** A matrix
+  within 1% of the memory budget is read once and kept (as fast as before);
+  a larger one is read on access (``result.pvalues[i]`` reads one row,
   ``np.asarray(result.pvalues)`` the matrix, ``order`` is computed per row),
-  so returning a result no longer costs the result's size in memory, and
+  so returning a large result no longer costs its size in memory, and
   ``result["KO1"]`` works however large the result is (the lazy result
   ``wilcoxon_test`` returned for large outputs raised ``IndexError`` there).
   A later call that rewrites the same ``output_path`` changes what an earlier
@@ -30,9 +31,7 @@ Unreleased
   its own rows rather than every cell's label (pickled once per comparison,
   ~3.4 million strings on Huang-HCT116), checks that every perturbation has
   cells in one pass instead of one per perturbation, and results are written
-  as they finish rather than in submission order. joblib's shared arrays are
-  written to the run's directory, not ``/dev/shm``, where they could not be
-  reclaimed. Requires ``joblib>=1.4``. ``uns["pvalue_correction"]`` is now
+  as they finish rather than in submission order. Requires ``joblib>=1.4``. ``uns["pvalue_correction"]`` is now
   recorded, as for the other methods.
 * **QC's row-streaming cache is plain files** (``cache_mode="disk"``, was
   ``"memmap"``) in ``$TMPDIR``, read and written sequentially and evicted
@@ -56,10 +55,12 @@ Unreleased
   only when exactly one label looks like one; several (Huang et al.'s
   ``Non-Targeting`` beside the chymotrypsin-like gene ``CTRL``) raise and ask
   for ``control_label``. An exact ``NTC`` now counts as control-like.
-* **Streaming reads evict as they go.** ``iter_matrix_chunks`` drops the
-  pages it has read from the page cache every GB, so one pass over a file
-  larger than the job no longer fills its cgroup with cache (QC on
-  Huang-HCT116: 117 GB of it).
+* **Streaming reads evict as they go, under a memory limit.**
+  ``iter_matrix_chunks`` drops the pages it has read from the page cache every
+  GB, so one pass over a file larger than the job no longer fills its cgroup
+  with cache (QC on Huang-HCT116: 117 GB of it). Like every eviction in
+  crispyx, it happens only when a cgroup memory limit is visible or the
+  process runs in a Slurm job; elsewhere the kernel keeps the cache.
 * **When the cgroup limit is not visible** (a job inside a container),
   the memory budget falls back to Slurm's ``SLURM_MEM_PER_NODE`` /
   ``SLURM_MEM_PER_CPU``, and asks for ``memory_limit_gb`` when under Slurm

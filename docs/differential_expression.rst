@@ -218,13 +218,16 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   your SLURM ``--mem`` value (e.g., ``memory_limit_gb=128``).
 
 * **Results are read from the output file.** The returned
-  ``RankGenesGroupsResult`` reads its matrices on access:
-  ``result.pvalues[i]`` and ``result["KO1"]`` read one perturbation's row,
-  ``np.asarray(result.pvalues)`` (or any other whole-matrix use) reads the
-  matrix, and ``result.order`` is computed for the rows read. Because it reads
-  the file, a later call that rewrites the same ``output_path`` changes what an
-  earlier result object returns; copy the values (``np.asarray``) first if you
-  need both.
+  ``RankGenesGroupsResult`` reads its matrices from the file: a matrix within
+  1% of the memory budget (any result on a personal machine, short of a
+  genome-wide screen) is read once and kept in memory; a larger one is read on
+  access, so ``result.pvalues[i]`` and ``result["KO1"]`` cost one
+  perturbation's row however large the result is, and
+  ``np.asarray(result.pvalues)`` reads the matrix. ``result.order`` is
+  computed for the rows read. A result holds no open handle on its file, and it
+  follows the file at its path: a later call that rewrites the same
+  ``output_path`` changes what an earlier result object returns; copy the
+  values (``np.asarray``) first if you need both.
 
 * **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
   ``uns["rank_genes_groups"]`` structure for interoperability with 

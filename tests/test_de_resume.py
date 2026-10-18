@@ -341,3 +341,31 @@ def test_checkpoint_interval(n_perturbations, requested, expected):
     from crispyx._checkpoint import _get_checkpoint_interval
 
     assert _get_checkpoint_interval(n_perturbations, requested) == expected
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["small-in-memory", "large-from-file"])
+def test_result_reads_a_replaced_output_afresh(screen, tmp_path, monkeypatch, in_memory):
+    """Whether a result keeps its matrices in memory (small) or reads the
+    file per access (large), it reports the file now at its path."""
+    monkeypatch.setattr(de, "_IN_MEMORY_LAYER_FRACTION", 1.0 if in_memory else 0.0)
+    out = tmp_path / "result.h5ad"
+    first = _run("t_test", screen, out)
+    before = first.pvalues[0]
+    _run("t_test", screen, out, perturbations=["P3", "P4"])  # rewrites out, another row 0
+    second = de.RankGenesGroupsResult(out)
+    with h5py.File(out, "r") as f:
+        np.testing.assert_array_equal(second.pvalues[0], f["layers/pvalue"][0])
+        np.testing.assert_array_equal(first.pvalues[0], f["layers/pvalue"][0])
+    assert not np.array_equal(before, first.pvalues[0], equal_nan=True)
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["small-in-memory", "large-from-file"])
+def test_a_used_result_leaves_its_file_writable(screen, tmp_path, monkeypatch, in_memory):
+    """A result holds no handle on its file between reads, so the file can
+    be opened for writing (HDF5 refuses while the process holds it open)."""
+    monkeypatch.setattr(de, "_IN_MEMORY_LAYER_FRACTION", 1.0 if in_memory else 0.0)
+    out = tmp_path / "result.h5ad"
+    result = _run("t_test", screen, out)
+    _ = result.pvalues[0], result[result.groups[1]].statistic, np.asarray(result.order)
+    with h5py.File(out, "r+") as f:
+        f["uns"].attrs["note"] = "edited"

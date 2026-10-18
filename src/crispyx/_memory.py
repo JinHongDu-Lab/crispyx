@@ -6,6 +6,7 @@ determining optimal batch sizes for parallel processing.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import warnings
@@ -27,21 +28,36 @@ def _resolve_n_jobs(n_jobs: int | None) -> int:
     return min(joblib.effective_n_jobs(-1 if n_jobs is None else n_jobs), cpus)
 
 
-def drop_file_cache(path: str | Path) -> None:
-    """Evict *path*'s clean pages from the kernel page cache (Linux only).
+@functools.lru_cache(maxsize=None)
+def _page_cache_is_charged() -> bool:
+    """Whether this process's page cache counts against a memory limit: a
+    cgroup memory limit is visible, or it runs in a Slurm job (whose limit
+    a container may hide). Fixed for the life of the process.
 
-    On cgroup-limited systems (SLURM), page-cache pages count toward the
-    memory limit. Calling this after a streaming read, or after a block of
-    writes, keeps the file's pages out of the cgroup budget. Pages still
-    dirty are left for the kernel to write back, and a later call drops
-    them; the file is not synced, which would stall each call on a network
-    filesystem (~0.8 s a call on Lustre) for no gain in correctness: a
-    killed process's writes are in the page cache either way.
-
-    The call is a no-op on non-Linux platforms or when the file cannot be
-    opened.
+    Without such a limit -- a laptop, a workstation, an unconstrained
+    container -- the kernel reclaims page cache on its own and keeping it
+    is free, so nothing is evicted (a second pass over the same file then
+    reads from cache).
     """
-    if not hasattr(os, "posix_fadvise"):
+    return _cgroup_available_bytes() is not None or "SLURM_JOB_ID" in os.environ
+
+
+def drop_file_cache(path: str | Path) -> None:
+    """Evict *path*'s clean pages from the kernel page cache, when page cache
+    counts against a memory limit (:func:`_page_cache_is_charged`).
+
+    Under a cgroup limit (SLURM, Kubernetes), page-cache pages count toward
+    it. Calling this after a streaming read, or after a block of writes,
+    keeps the file's pages out of the job's budget. Pages still dirty are
+    left for the kernel to write back, and a later call drops them; the file
+    is not synced, which would stall each call on a network filesystem
+    (~0.8 s a call on Lustre) for no gain in correctness: a killed process's
+    writes are in the page cache either way.
+
+    A no-op without such a limit, on platforms without ``posix_fadvise``
+    (macOS, Windows), or when the file cannot be opened.
+    """
+    if not hasattr(os, "posix_fadvise") or not _page_cache_is_charged():
         return
     try:
         fd = os.open(str(path), os.O_RDONLY)

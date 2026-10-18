@@ -146,13 +146,22 @@ def _is_row_key(key) -> bool:
     )
 
 
-class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
-    """One ``(n_groups, n_genes)`` matrix of a DE result file, read on access.
+#: A result matrix this small a share of the memory budget is read into
+#: memory on first use and indexed there (as fast as the arrays results used
+#: to hold); a larger one is read from the file a block of rows at a time.
+_IN_MEMORY_LAYER_FRACTION = 0.01
 
-    Indexing by rows or slices reads only what it selects, so
-    ``result.pvalues[i]`` costs one row however large the result is; any
-    other use (``np.asarray``, arithmetic, fancy indexing) reads the whole
-    matrix, as an explicit request for all of it.
+
+class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
+    """One ``(n_groups, n_genes)`` matrix of a DE result file.
+
+    A matrix within :data:`_IN_MEMORY_LAYER_FRACTION` of the memory budget
+    -- any result on a personal machine, short of a genome-wide screen --
+    is read whole on first use and kept, re-read if the file is replaced.
+    A larger one is read on access: indexing by rows or slices reads only
+    what it selects, so ``result.pvalues[i]`` costs one row however large
+    the result is; any other use (``np.asarray``, arithmetic, fancy
+    indexing) reads the whole matrix, as an explicit request for all of it.
     """
 
     def __init__(self, path: Path, key: str) -> None:
@@ -161,6 +170,10 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
         with h5py.File(self.path, "r") as handle:
             self.shape = tuple(handle[key].shape)
             self.dtype = handle[key].dtype
+        nbytes = int(np.prod(self.shape)) * self.dtype.itemsize
+        self._in_memory = nbytes <= _IN_MEMORY_LAYER_FRACTION * _resolve_memory_limit_bytes(None)
+        self._values: np.ndarray | None = None
+        self._identity: tuple | None = None
 
     ndim = property(lambda self: len(self.shape))
     size = property(lambda self: int(np.prod(self.shape)))
@@ -168,7 +181,23 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
     def __len__(self) -> int:
         return self.shape[0]
 
+    def _loaded(self) -> np.ndarray | None:
+        """The whole matrix, when it is small enough to keep: read once and
+        again only if the file has been replaced or rewritten since."""
+        if not self._in_memory:
+            return None
+        stat = os.stat(self.path)
+        identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        if self._values is None or identity != self._identity:
+            with h5py.File(self.path, "r") as handle:
+                self._values = handle[self.key][()]
+            self._identity = identity
+        return self._values
+
     def __getitem__(self, key) -> np.ndarray:
+        values = self._loaded()
+        if values is not None:
+            return values[key].copy() if isinstance(values[key], np.ndarray) else values[key]
         with h5py.File(self.path, "r") as handle:
             dataset = handle[self.key]
             if _is_row_key(key):
@@ -176,8 +205,12 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
             return dataset[()][key]
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
-        with h5py.File(self.path, "r") as handle:
-            values = handle[self.key][()]
+        values = self._loaded()
+        if values is not None:
+            values = values.copy()
+        else:
+            with h5py.File(self.path, "r") as handle:
+                values = handle[self.key][()]
         return values if dtype is None else values.astype(dtype, copy=False)
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
@@ -209,13 +242,13 @@ class _RankOrder(_ResultLayer):
     def __init__(self, statistics: _ResultLayer) -> None:
         self.path, self.key = statistics.path, statistics.key
         self.shape, self.dtype = statistics.shape, np.dtype(np.intp)
+        self._statistics = statistics
 
     def __getitem__(self, key) -> np.ndarray:
         rows, columns = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
         if not _is_row_key(rows):
             return np.asarray(self)[key]
-        with h5py.File(self.path, "r") as handle:
-            order = _rank_order(handle[self.key][rows])
+        order = _rank_order(self._statistics[rows])
         return order[(Ellipsis, *columns)] if columns else order
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -3261,8 +3294,7 @@ def nb_glm_test(
     # Each loky worker is a process of its own. Its arguments are pickled
     # per task, except numeric arrays over 1 MB (the control matrix, size
     # factors, a control cache's vectors), which joblib writes once to its
-    # temp folder -- placed in this run's directory, so they are page cache
-    # the kernel can reclaim, not /dev/shm -- and every worker maps.
+    # temp folder and every worker maps.
     #
     # What each worker allocates during execution:
     # 1. group_matrix (loaded from disk, small: ~200 cells × n_genes)
@@ -3406,7 +3438,6 @@ def nb_glm_test(
                     # Each row is written as soon as it is fitted, rather than
                     # held until every earlier one is.
                     return_as="generator_unordered",
-                    temp_folder=run.directory,
                 )(
                     delayed(_fit_perturbation_worker_cached)(
                         group_idx=candidate_to_idx[label],
@@ -3441,7 +3472,6 @@ def nb_glm_test(
                     backend="loky",
                     prefer="processes",
                     return_as="generator_unordered",
-                    temp_folder=run.directory,
                 )(
                     delayed(_fit_perturbation_worker)(
                         group_idx=candidate_to_idx[label],

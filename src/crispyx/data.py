@@ -12,7 +12,7 @@ import functools
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
@@ -4727,14 +4727,20 @@ def _write_linked_h5ad(source: Path, dest: Path, *, obs: pd.DataFrame, var: pd.D
     (hundreds of GB for a genome-wide screen, and a copy that a network
     filesystem has been seen to return short without raising). The links
     name ``source`` relative to ``dest``'s directory, which is where HDF5
-    resolves them, so the pair can move together. Everything else is copied:
+    resolves them, so the pair can move together (an absolute path when no
+    relative one exists, across Windows drives). Everything else is copied:
     a later write into the file -- a new layer, an ``obsm`` entry -- lands
     in ``dest``, never in ``source``. anndata and h5py read the links
     transparently; the file stays readable while ``source`` is where the link
     says.
     """
     ad.AnnData(obs=obs, var=var, uns=uns).write(dest)
-    target = _os.path.relpath(_os.path.abspath(source), _os.path.abspath(Path(dest).parent))
+    try:
+        target = _os.path.relpath(_os.path.abspath(source), _os.path.abspath(Path(dest).parent))
+    except ValueError:  # different drives on Windows: no relative path exists
+        target = _os.path.abspath(source)
+    # HDF5 accepts '/' on every platform, so the file reads the same anywhere.
+    target = PurePath(target).as_posix()
     with h5py.File(source, "r") as src, h5py.File(dest, "r+") as out:
         for key in src:
             if key in ("obs", "var", "uns"):
