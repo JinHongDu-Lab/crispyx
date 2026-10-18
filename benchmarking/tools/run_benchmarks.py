@@ -548,14 +548,97 @@ def run_wilcoxon_with_csc(
     timing breakdown (``csc_conversion_seconds``, ``wilcoxon_seconds``,
     ``was_already_csc``) as extra benchmark columns.
     """
+    import os
+    import shutil
     import time
 
     # Step 1: Ensure CSC format (cheap no-op when already CSC or cached).
+    # With CSC_SCRATCH=local the conversion (and Wilcoxon's reads of its
+    # output) run on node-local disk instead of beside the output: the
+    # conversion re-reads its source once per column band, which crawls on a
+    # network filesystem (~7 h for Huang-HCT116 on Lustre). Any staging copy
+    # is inside the timed conversion step.
     t_csc_start = time.perf_counter()
-    csc_result = run_preprocess_csc(input_path, csc_path, chunk_size=csc_chunk_size)
-    csc_seconds = time.perf_counter() - t_csc_start
-    was_already_csc = csc_result.get("was_already_csc", False)
-    data_path = Path(csc_result["result_path"])
+    scratch_dir = None
+    csc_scratch = "beside-output"
+    if os.environ.get("CSC_SCRATCH") == "local":
+        scratch_dir, input_path, csc_path, csc_scratch = _local_csc_scratch(input_path, csc_path)
+    try:
+        csc_result = run_preprocess_csc(input_path, csc_path, chunk_size=csc_chunk_size)
+        csc_seconds = time.perf_counter() - t_csc_start
+        was_already_csc = csc_result.get("was_already_csc", False)
+        data_path = Path(csc_result["result_path"])
+        return _run_wilcoxon_on_csc(
+            data_path, csc_seconds, was_already_csc, csc_scratch,
+            perturbation_column=perturbation_column, control_label=control_label,
+            output_dir=output_dir, gene_name_column=gene_name_column,
+            data_name=data_name, n_jobs=n_jobs, memory_limit_gb=memory_limit_gb,
+        )
+    finally:
+        if scratch_dir is not None:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _local_csc_scratch(input_path: Path, csc_path: Path):
+    """Pick where the CSC conversion runs on node-local disk ($TMPDIR).
+
+    Returns ``(scratch_dir, source, csc_target, layout)``. The source is
+    copied too when source and CSC copy both fit; otherwise only the CSC
+    copy goes local; if even that does not fit, nothing changes.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    from crispyx.data import get_matrix_storage_format
+
+    if get_matrix_storage_format(input_path) == "csc":
+        return None, input_path, csc_path, "already-csc"
+    base = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    source_bytes = input_path.stat().st_size
+    free = shutil.disk_usage(base).free
+    # The CSC copy holds the same non-zeros as the CSR source.
+    if free < 1.1 * source_bytes:
+        print(f"  CSC_SCRATCH=local: {base} has {free / 1e9:.0f} GB free, "
+              f"need {1.1 * source_bytes / 1e9:.0f} GB; converting beside the output")
+        return None, input_path, csc_path, "beside-output"
+    scratch_dir = Path(tempfile.mkdtemp(prefix="cx_csc_", dir=base))
+    local_csc = scratch_dir / csc_path.name
+    if free >= 2.2 * source_bytes:
+        local_source = scratch_dir / input_path.name
+        _copy_verified(input_path, local_source)
+        print(f"  CSC_SCRATCH=local: source and CSC copy on {scratch_dir}")
+        return scratch_dir, local_source, local_csc, "local-source+csc"
+    print(f"  CSC_SCRATCH=local: CSC copy on {scratch_dir} (source stays in place)")
+    return scratch_dir, input_path, local_csc, "local-csc"
+
+
+def _copy_verified(source: Path, target: Path, chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    """Chunked copy that raises instead of leaving a short file."""
+    expected = source.stat().st_size
+    with open(source, "rb") as fin, open(target, "wb") as fout:
+        while chunk := fin.read(chunk_bytes):
+            fout.write(chunk)
+    if target.stat().st_size != expected:
+        raise OSError(f"Short copy of {source}: {target.stat().st_size} of {expected} bytes")
+
+
+def _run_wilcoxon_on_csc(
+    data_path: Path,
+    csc_seconds: float,
+    was_already_csc: bool,
+    csc_scratch: str,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    gene_name_column: str | None,
+    data_name: str,
+    n_jobs: int | None,
+    memory_limit_gb: float | None,
+) -> Dict[str, Any]:
+    """Step 2 of :func:`run_wilcoxon_with_csc`: Wilcoxon on the CSC file."""
+    import time
 
     # Step 2: Run Wilcoxon on the CSC file.
     # chunk_size=None: wilcoxon_test auto-calculates gene chunk size via
@@ -587,6 +670,7 @@ def run_wilcoxon_with_csc(
         "csc_conversion_seconds": 0.0 if was_already_csc else csc_seconds,
         "wilcoxon_seconds": de_seconds,
         "was_already_csc": was_already_csc,
+        "csc_scratch": csc_scratch,
     }
 
 
@@ -3661,6 +3745,8 @@ def _summarise_wilcoxon_csc(result: Any, context: Dict[str, Any]) -> Dict[str, A
     if de_secs is not None:
         summary["wilcoxon_seconds"] = round(de_secs, 3)
     summary["was_already_csc"] = was_already_csc
+    if result.get("csc_scratch"):
+        summary["csc_scratch"] = result["csc_scratch"]
 
     return summary
 

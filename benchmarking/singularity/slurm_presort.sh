@@ -35,6 +35,15 @@ BINDS="--bind $PROJECT_ROOT:/workspace:rw"
 if [ "${STAGE_LOCAL:-0}" = 1 ]; then
     D="${CONFIG_FILE%.yaml}"
     SRC="$(readlink -f "$PROJECT_ROOT/benchmarking/results/$D/.cache/standardized_$D.h5ad")"
+    # crispyx >= 0.2 writes a small standardized file whose matrices are HDF5
+    # external links to the raw file (config dataset_path, repo-relative);
+    # stage that raw file instead -- it is what the sort reads.
+    if [ "$(stat -c %s "$SRC")" -lt 2000000000 ]; then
+        RAW="$(sed -n 's/^dataset_path: *"\{0,1\}\([^"# ]*\).*/\1/p' "$PROJECT_ROOT/benchmarking/config/$CONFIG_FILE")"
+        case "$RAW" in /*) ;; *) RAW="$PROJECT_ROOT/$RAW" ;; esac
+        SRC="$(readlink -f "$RAW")"
+        echo "Standardized file links its matrix; staging the raw file $SRC"
+    fi
     LOCAL="${TMPDIR:-/tmp}/$(basename "$SRC")"
     NEED=$(stat -c %s "$SRC")
     AVAIL=$(df --output=avail -B1 "$(dirname "$LOCAL")" | tail -1)
