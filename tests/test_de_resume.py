@@ -369,3 +369,37 @@ def test_a_used_result_leaves_its_file_writable(screen, tmp_path, monkeypatch, i
     _ = result.pvalues[0], result[result.groups[1]].statistic, np.asarray(result.order)
     with h5py.File(out, "r+") as f:
         f["uns"].attrs["note"] = "edited"
+
+
+@pytest.mark.parametrize("method", ["wilcoxon", "wilcoxon_stratified"])
+def test_wilcoxon_layout_follows_eviction_and_values_do_not(screen, tmp_path, monkeypatch, method):
+    """Where pages are evicted (a memory-limited job), the result is chunked
+    in column blocks matching the gene-chunk writes; elsewhere it stays
+    contiguous. The values are the same bit for bit, and a chunked run
+    resumes like a contiguous one."""
+    reference = tmp_path / "contiguous.h5ad"
+    monkeypatch.setattr(de, "_page_cache_is_charged", lambda: False)
+    _run(method, screen, reference)
+    with h5py.File(reference, "r") as f:
+        assert f["X"].chunks is None
+
+    monkeypatch.setattr(de, "_page_cache_is_charged", lambda: True)
+    monkeypatch.setattr(de, "_COLUMN_BLOCK_CHUNK_BYTES", 25 * 8 * 4)  # 4 rows x 25 genes
+    out = tmp_path / "chunked.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out)
+    runs = _record_runs(monkeypatch)
+    _run(method, screen, out, resume=True)
+    assert runs[-1].resumed
+    with h5py.File(out, "r") as f:
+        assert f["X"].chunks == (4, 25) and f["layers/pvalue"].chunks == (4, 25)
+    _assert_same_result(reference, out)
+
+
+def test_row_blocks_cover_whole_chunk_bands():
+    blocks = list(de._row_blocks(1000, 1 << 18, chunk_rows=7))  # 16 rows a block before rounding
+    assert all(b.start % 7 == 0 for b in blocks)
+    assert blocks[0].stop - blocks[0].start == 14
+    assert blocks[-1].stop == 1000 and sum(b.stop - b.start for b in blocks) == 1000

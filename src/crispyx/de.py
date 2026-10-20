@@ -95,7 +95,7 @@ from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
-from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
+from ._memory import _page_cache_is_charged, _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -254,9 +254,10 @@ class _RankOrder(_ResultLayer):
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         n_rows, n_genes = self.shape
         out = np.empty(self.shape, dtype=np.intp)
-        step = max(1, _BLOCK_ELEMENTS // max(n_genes, 1))
-        for start in range(0, n_rows, step):
-            out[start:start + step] = self[start:start + step]
+        with h5py.File(self.path, "r") as handle:
+            chunk_rows = _chunk_rows(handle[self.key])
+        for sl in _row_blocks(n_rows, n_genes, chunk_rows):
+            out[sl] = self[sl]
         return out if dtype is None else out.astype(dtype, copy=False)
 
 
@@ -645,6 +646,23 @@ def _wilcoxon_disk_bytes(n_groups: int, n_genes: int) -> float:
     return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
 
 
+class _PhaseTimer:
+    """Wall time spent in each phase of a loop, for a one-line summary:
+    ``lap(phase)`` charges the time since the previous lap to ``phase``."""
+
+    def __init__(self) -> None:
+        self.totals: dict[str, float] = {}
+        self._last = time.perf_counter()
+
+    def lap(self, phase: str) -> None:
+        now = time.perf_counter()
+        self.totals[phase] = self.totals.get(phase, 0.0) + now - self._last
+        self._last = now
+
+    def summary(self) -> str:
+        return ", ".join(f"{phase} {seconds:.1f} s" for phase, seconds in self.totals.items())
+
+
 def _release_chunk_memory() -> None:
     """Force Python and glibc to return freed memory to the OS.
 
@@ -668,12 +686,23 @@ def _release_chunk_memory() -> None:
 _BLOCK_ELEMENTS = 1 << 22
 
 
-def _row_blocks(n_rows: int, n_genes: int):
+def _row_blocks(n_rows: int, n_genes: int, chunk_rows: int | None = None):
     """Slices covering ``n_rows`` rows of ``n_genes`` columns, about
-    :data:`_BLOCK_ELEMENTS` elements each."""
+    :data:`_BLOCK_ELEMENTS` elements each. With ``chunk_rows`` (the rows of
+    an HDF5 chunk), each slice is whole bands of chunks, so no chunk is read
+    twice."""
     step = max(1, _BLOCK_ELEMENTS // max(n_genes, 1))
+    if chunk_rows:
+        step = max(1, round(step / chunk_rows)) * chunk_rows
     for start in range(0, n_rows, step):
         yield slice(start, min(start + step, n_rows))
+
+
+def _chunk_rows(dataset) -> int | None:
+    """Rows in one HDF5 chunk of ``dataset`` (``None`` when contiguous or
+    not an HDF5 dataset)."""
+    chunks = getattr(dataset, "chunks", None)
+    return chunks[0] if chunks else None
 
 
 def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
@@ -684,16 +713,45 @@ def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
     return ds
 
 
-def _create_unfilled_array(group: h5py.Group, name: str, shape: tuple[int, ...], dtype) -> h5py.Dataset:
-    """A contiguous anndata dense array whose storage is allocated now but
-    never filled: creating it writes nothing (on disk it is a sparse hole
-    until written), and the file's layout is final from the start, so
-    filling it later only writes data -- a kill mid-write leaves a readable
-    file. Unwritten elements read as zero."""
+def _create_unfilled_array(
+    group: h5py.Group, name: str, shape: tuple[int, ...], dtype, chunks: tuple[int, ...] | None = None,
+) -> h5py.Dataset:
+    """An anndata dense array whose storage is allocated now but never
+    filled: creating it writes nothing (on disk it is a sparse hole until
+    written), and the file's layout is final from the start, so filling it
+    later only writes data -- a kill mid-write leaves a readable file.
+    Unwritten elements read as zero. Contiguous, or in HDF5 ``chunks``
+    (every chunk allocated up front, so the layout is still final)."""
     dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
     dcpl.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
     dcpl.set_fill_time(h5py.h5d.FILL_TIME_NEVER)
+    if chunks is not None:
+        dcpl.set_chunk(tuple(int(c) for c in chunks))
     return _create_array(group, name, shape=shape, dtype=dtype, dcpl=dcpl)
+
+
+#: Bytes in one HDF5 chunk of a Wilcoxon result written in column blocks.
+_COLUMN_BLOCK_CHUNK_BYTES = 1 << 20
+
+
+def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[int, int] | None:
+    """HDF5 chunk shape for a result written one gene chunk (a block of
+    ``chunk_size`` columns) at a time, or ``None`` for a contiguous layout.
+
+    A gene chunk of a row-major contiguous dataset is one small write per
+    group row, each straddling partial pages; when the run evicts the file
+    between chunks (its page cache counts against a memory limit, as on a
+    Slurm node), the kernel must read every such page back before writing
+    it -- 22x slower per chunk on Lustre than on local disk. Chunks of
+    ``(rows, chunk_size)`` turn each gene chunk into whole ~1 MiB writes.
+    Without eviction the pages stay cached and the contiguous layout costs
+    nothing to write, while keeping row reads cheap, so it is kept.
+    """
+    if not _page_cache_is_charged():
+        return None
+    width = max(1, min(int(chunk_size), n_genes))
+    rows = max(1, min(n_groups, _COLUMN_BLOCK_CHUNK_BYTES // (width * 8)))
+    return rows, width
 
 
 def _resumable_result(
@@ -707,11 +765,12 @@ def _resumable_result(
     uns: dict,
     x_dtype,
     layers: dict[str, "np.typing.DTypeLike"],
+    chunks: tuple[int, int] | None = None,
 ) -> ResumableRun:
     """The :class:`ResumableRun` of a DE result: an h5ad with ``obs``,
     ``var`` and ``uns`` and an unfilled ``X`` plus ``layers``, one row per
     ``obs`` row and one column per ``var`` row, filled in place as the run
-    computes them."""
+    computes them; contiguous, or in HDF5 ``chunks``."""
     shape = (len(obs), len(var))
     datasets = {"X": (shape, x_dtype), **{f"layers/{name}": (shape, dtype) for name, dtype in layers.items()}}
 
@@ -719,7 +778,7 @@ def _resumable_result(
         ad.AnnData(obs=obs, var=var, uns=uns).write(path)
         with h5py.File(path, "r+") as handle:
             for key, (shape_, dtype) in datasets.items():
-                _create_unfilled_array(handle, key, shape_, dtype)
+                _create_unfilled_array(handle, key, shape_, dtype, chunks)
 
     return ResumableRun(
         output_path, checkpoint_path, fingerprint=fingerprint, resume=resume,
@@ -731,7 +790,7 @@ def _adjust_pvalues_in_file(handle: h5py.File, corr_method: str) -> None:
     """Fill ``layers/pvalue_adj`` from ``layers/pvalue``, a block of rows at
     a time (the correction is per row)."""
     pvalues, adjusted = handle["layers/pvalue"], handle["layers/pvalue_adj"]
-    for sl in _row_blocks(*pvalues.shape):
+    for sl in _row_blocks(*pvalues.shape, _chunk_rows(pvalues)):
         adjusted[sl] = _adjust_pvalue_matrix(pvalues[sl], corr_method)
 
 
@@ -775,7 +834,7 @@ def _count_tested(pvalues) -> np.ndarray:
     a large result is never held whole."""
     n_rows, n_genes = pvalues.shape
     counts = np.empty(n_rows, dtype=np.int64)
-    for sl in _row_blocks(n_rows, n_genes):
+    for sl in _row_blocks(n_rows, n_genes, _chunk_rows(pvalues)):
         counts[sl] = np.isfinite(np.asarray(pvalues[sl])).sum(axis=1)
     return counts
 
@@ -836,7 +895,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
             del uns["rank_genes_groups"]
         rgg = uns.create_group("rank_genes_groups")
         full = rgg.create_group("full")
-        for sl in _row_blocks(n_groups, n_genes):
+        for sl in _row_blocks(n_groups, n_genes, _chunk_rows(handle["X"])):
             block = {name: handle[key][sl] for name, key in fields.items() if key is not None}
             block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
             block["order"] = _rank_order(block["scores"])
@@ -3669,11 +3728,13 @@ def _wilcoxon_resumable_result(
     corr_method: str,
     resume: bool,
     fingerprint: dict,
+    chunk_size: int,
     batch_column: str | None = None,
 ) -> ResumableRun:
     """The result file a Wilcoxon run fills one gene chunk at a time: the
     AUC in ``X``, the test's layers, and the control arm's detection rate as
-    ``var["pts_rest"]``."""
+    ``var["pts_rest"]``. Laid out in column blocks when the run evicts its
+    pages (:func:`_column_block_chunks`)."""
     var = pd.DataFrame(
         {"pts_rest": np.zeros(len(gene_symbols), dtype=np.float32)},
         index=pd.Index(gene_symbols).astype(str),
@@ -3690,6 +3751,7 @@ def _wilcoxon_resumable_result(
             "z_score": np.float64, "pvalue": np.float64, "pvalue_adj": np.float64,
             "logfoldchanges": np.float64, "u_statistic": np.float64, "pts": np.float32,
         },
+        chunks=_column_block_chunks(len(candidates), len(gene_symbols), chunk_size),
     )
 
 
@@ -3757,6 +3819,7 @@ def _wilcoxon_test_stratified(
         perturbation_column=perturbation_column, control_label=control_label,
         tie_correct=tie_correct, corr_method=corr_method, resume=resume,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="stratified", chunk_size=int(chunk_size)),
+        chunk_size=chunk_size,
         batch_column=batch_column,
     )
     last_completed_chunk = run.progress.get("last_gene_chunk", -1)
@@ -3898,10 +3961,12 @@ def _wilcoxon_test_stratified(
             n_gene_chunks, "Wilcoxon DE stratified (gene chunks)", verbose,
             initial=current_chunk,
         ) as pbar:
+            timer = _PhaseTimer()
             for slc, block in iter_matrix_chunks(
                 backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
                 start_chunk=current_chunk, warn_slow_axis=False,
             ):
+                timer.lap("read")
                 if not dtype_checked:
                     if not sp.issparse(block):
                         raise ValueError(
@@ -4083,6 +4148,7 @@ def _wilcoxon_test_stratified(
                     chunk_p[invalid_arr] = np.nan
                     chunk_effect[invalid_arr] = np.nan
 
+                timer.lap("compute")
                 _write_wilcoxon_chunk(
                     run.file, slc, auc=chunk_effect, u=chunk_u, z=chunk_z, p=chunk_p,
                     lfc=chunk_lfc, pts=chunk_pts, pts_rest=control_pts,
@@ -4104,8 +4170,14 @@ def _wilcoxon_test_stratified(
                 if n_chunks_processed % eff_checkpoint_interval == 0:
                     _save_wilcoxon_checkpoint(current_chunk)
                 current_chunk += 1
+                timer.lap("write")
 
             _save_wilcoxon_checkpoint(current_chunk - 1)
+            timer.lap("write")
+            _messages.vprint(
+                verbose, "wilcoxon_test",
+                f"{n_chunks_processed} gene chunks: {timer.summary()}",
+            )
             logger.info(f"Completed {n_chunks_processed} gene chunks (stratified)")
             if int(verbose) >= 1:
                 # Untested pairs are NaN in every test column; counting
@@ -4559,6 +4631,7 @@ def _wilcoxon_test_standard(
         perturbation_column=perturbation_column, control_label=control_label,
         tie_correct=tie_correct, corr_method=corr_method, resume=resume,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="standard", chunk_size=int(chunk_size)),
+        chunk_size=chunk_size,
     )
     last_completed_chunk = run.progress.get("last_gene_chunk", -1)
     if run.resumed:
@@ -4615,10 +4688,12 @@ def _wilcoxon_test_standard(
             n_gene_chunks, "Wilcoxon DE (gene chunks)", verbose,
             initial=current_chunk,
         ) as pbar:
+            timer = _PhaseTimer()
             for slc, block in iter_matrix_chunks(
                 backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
                 start_chunk=current_chunk, warn_slow_axis=False,
             ):
+                timer.lap("read")
                 if not dtype_checked:
                     if not sp.issparse(block):
                         raise ValueError(
@@ -4795,6 +4870,7 @@ def _wilcoxon_test_standard(
                     chunk_effect[invalid_arr] = np.nan
 
                 # 13. Write the chunk's columns into the result file
+                timer.lap("compute")
                 _write_wilcoxon_chunk(
                     run.file, slc, auc=chunk_effect, u=chunk_u, z=chunk_z, p=chunk_p,
                     lfc=chunk_lfc, pts=chunk_pts, pts_rest=control_pts,
@@ -4818,9 +4894,15 @@ def _wilcoxon_test_standard(
                 if n_chunks_processed % eff_checkpoint_interval == 0:
                     _save_wilcoxon_checkpoint(current_chunk)
                 current_chunk += 1
+                timer.lap("write")
                 
             # Final checkpoint
             _save_wilcoxon_checkpoint(current_chunk - 1)
+            timer.lap("write")
+            _messages.vprint(
+                verbose, "wilcoxon_test",
+                f"{n_chunks_processed} gene chunks: {timer.summary()}",
+            )
             logger.info(f"Completed {n_chunks_processed} gene chunks")
             if int(verbose) >= 1:
                 # Untested pairs are NaN in every test column; counting them
