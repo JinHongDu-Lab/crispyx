@@ -10,7 +10,14 @@ control_label: "Non-Targeting"  # Explicit: 'CTRL' (the chymotrypsin-like gene, 
 gene_name_column: null  # Uses var.index
 
 # Quality control parameters - set to null to use adaptive calculation
-qc_params: null  # Will be calculated adaptively based on data distribution
+# Fixed to the values the adaptive (conservative) calculation gives for this
+# dataset (cached in .benchmark_cache/config.json): the adaptive scan reads the
+# whole 232 GB matrix from Lustre twice per job, before any timed method.
+qc_params:
+  min_genes: 50
+  min_cells_per_perturbation: 50
+  min_cells_per_gene: 5
+  chunk_size: 4096
 
 # Resource limits - Tier 3 (large datasets)
 resource_limits:
