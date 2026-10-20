@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.1.2"
+version = "0.2.0"
 description = "Memory-efficient streaming analysis of large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -34,13 +34,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "anndata>=0.9",
+    "anndata>=0.11",
     "numpy>=1.23",
     "numba>=0.59",
     "pandas>=1.5",
     "scipy>=1.10",
     "h5py>=3.0",
-    "joblib>=1.0",
+    "joblib>=1.4",
     "scikit-learn>=1.0",
     "scikit-misc>=0.1.4",
     "scanpy>=1.9.2",
@@ -55,6 +55,7 @@ test = [
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
+    "psutil>=5.9",
 ]
 benchmark = [
     "pertpy>=0.4",

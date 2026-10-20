@@ -7,7 +7,9 @@ from typing import Iterable, Literal, Sequence
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 
+from ._grouping import resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
@@ -15,17 +17,13 @@ from .data import (
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
+    concat_h5ad,
     downsample_counts,
-    ensure_gene_symbol_column,
     normalize_total_log1p,
-    read_backed,
-    resolve_control_label,
     resolve_data_path,
-    resolve_output_path,
 )
 from .de import (
     RankGenesGroupsResult,
-    _adjust_pvalue_matrix,
     nb_glm_test,
     shrink_lfc,
     t_test,
@@ -54,6 +52,7 @@ from .pseudobulk import (
     compute_normalized_effects,
     compute_pseudobulk_effects,
 )
+from .residual import ResidualNull, residual_effects
 from .qc import (
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
@@ -61,119 +60,6 @@ from .qc import (
     quality_control_summary,
 )
 from .sample import subsample
-
-
-# ---------------------------------------------------------------------------
-# Helpers used only by _ToolsNamespace
-# ---------------------------------------------------------------------------
-
-def _infer_control_label(
-    path: Path,
-    perturbation_column: str,
-    control_label: str | None,
-) -> str:
-    if control_label is not None:
-        return str(control_label)
-    backed = read_backed(path)
-    try:
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                "Perturbation column '%s' was not found in adata.obs. Available columns: %s"
-                % (perturbation_column, list(backed.obs.columns))
-            )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-    finally:
-        backed.file.close()
-    return resolve_control_label(labels, None)
-
-
-def _t_test_results_to_rank_genes(
-    path: Path,
-    results,
-    *,
-    gene_name_column: str | None,
-    perturbation_column: str,
-    control_label: str,
-    corr_method: str,
-    output_dir: str | Path | None,
-    data_name: str | None,
-) -> RankGenesGroupsResult:
-    groups = list(results.keys())
-    if groups:
-        first = results[groups[0]]
-        genes = first.genes
-        effect_matrix = np.vstack([results[group].effect_size for group in groups])
-        statistic_matrix = np.vstack([results[group].statistic for group in groups])
-        pvalue_matrix = np.vstack([results[group].pvalue for group in groups])
-        result_view = first.result
-    else:
-        backed = read_backed(path)
-        try:
-            if gene_name_column is None:
-                genes = backed.var_names.astype(str)
-            else:
-                genes = ensure_gene_symbol_column(backed, gene_name_column)
-        finally:
-            backed.file.close()
-        effect_matrix = np.zeros((0, genes.size), dtype=float)
-        statistic_matrix = np.zeros_like(effect_matrix)
-        pvalue_matrix = np.ones_like(effect_matrix)
-        result_path = resolve_output_path(
-            path,
-            suffix="t_test_de",
-            output_dir=output_dir,
-            data_name=data_name,
-        )
-        result_view = AnnData(result_path)
-
-    if corr_method not in {"benjamini-hochberg", "bonferroni"}:
-        raise ValueError(
-            "corr_method must be 'benjamini-hochberg' or 'bonferroni' for t-tests"
-        )
-
-    pvalue_adj = (
-        _adjust_pvalue_matrix(pvalue_matrix, corr_method)
-        if pvalue_matrix.size
-        else np.zeros_like(pvalue_matrix)
-    )
-    order = (
-        np.argsort(-np.abs(statistic_matrix), axis=1, kind="mergesort")
-        if statistic_matrix.size
-        else np.zeros(statistic_matrix.shape, dtype=int)
-    )
-    zeros = np.zeros_like(statistic_matrix)
-
-    result = RankGenesGroupsResult(
-        genes=genes,
-        groups=groups,
-        statistics=statistic_matrix,
-        pvalues=pvalue_matrix,
-        pvalues_adj=pvalue_adj,
-        logfoldchanges=effect_matrix,
-        effect_size=effect_matrix,
-        u_statistics=zeros,
-        pts=zeros,
-        pts_rest=zeros,
-        order=order,
-        groupby=perturbation_column,
-        method="t_test",
-        control_label=control_label,
-        tie_correct=False,
-        pvalue_correction=corr_method,
-        result=result_view,
-    )
-    if result.result is not None:
-        memory = result.result.to_memory()
-        memory.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-        memory.uns["genes"] = genes.to_numpy()
-        memory.uns["method"] = "t_test"
-        memory.uns["control_label"] = control_label
-        memory.uns["tie_correct"] = False
-        memory.uns["pvalue_correction"] = corr_method
-        memory.write(result.result.path)
-        result.result.close()
-        result.result = AnnData(result.result.path)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +201,8 @@ class _PreprocessingNamespace:
         data: str | Path | ad.AnnData,
         *,
         output_path: str | Path | None = None,
-        chunk_size: int = 4096,
+        chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -329,7 +216,11 @@ class _PreprocessingNamespace:
         output_path
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
-            Rows per streaming chunk.  Default 4096.
+            Rows per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); larger
+            matrices are converted in several column bands. Default: detected
+            via psutil. On HPC nodes, pass the SLURM ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -346,6 +237,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
@@ -357,6 +249,7 @@ class _PreprocessingNamespace:
         *,
         output_path: str | Path | None = None,
         chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         verbose: int | bool = True,
@@ -371,6 +264,11 @@ class _PreprocessingNamespace:
             Explicit output path.  If None, derived from output_dir/data_name.
         chunk_size
             Rows (or columns for CSC source) per streaming chunk.  Default auto.
+        memory_limit_gb
+            Memory budget in GB for the output buffers (half of it); a CSC
+            source is converted in several row bands when it does not fit.
+            Default: detected via psutil. On HPC nodes, pass the SLURM
+            ``--mem`` value.
         output_dir
             Output directory.  Defaults to input file's directory.
         data_name
@@ -387,6 +285,7 @@ class _PreprocessingNamespace:
             data,
             output_path=output_path,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
@@ -403,7 +302,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 4096,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
-        format_mismatch_policy: str = "warn",
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
         verbose: int | bool = True,
     ) -> AnnData:
         """Stream normalize and/or log-transform an h5ad file.
@@ -427,9 +326,10 @@ class _PreprocessingNamespace:
         data_name
             Custom output name suffix.
         format_mismatch_policy
-            How to handle a CSC source (slow for cell-streaming): 'warn'
-            (default), 'convert' (transparently stream via a temporary CSR
-            copy), or 'off'.
+            How to handle a CSC source (slow for cell-streaming): 'auto'
+            (default; convert only when measurement says the repeated reads
+            cost more than one conversion), 'convert' (always stream via a
+            temporary CSR copy), 'warn', or 'off'.
         verbose
             Print progress.
 
@@ -476,6 +376,34 @@ class _PreprocessingNamespace:
             data_name=data_name,
             random_state=random_state,
             verbose=verbose,
+        )
+
+    def concat_h5ad(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        output_path: str | Path,
+        shared_cells: Literal["drop", "error"] = "drop",
+        label: str | None = None,
+        chunk_size: int = 4096,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        verbose: int | bool = True,
+        force: bool = False,
+    ) -> AnnData:
+        """Concatenate h5ad files along cells on disk, dropping shared cells.
+
+        See :func:`crispyx.data.concat_h5ad` for the full parameter
+        documentation.
+        """
+        return concat_h5ad(
+            paths,
+            output_path=output_path,
+            shared_cells=shared_cells,
+            label=label,
+            chunk_size=chunk_size,
+            format_mismatch_policy=format_mismatch_policy,
+            verbose=verbose,
+            force=force,
         )
 
     def highly_variable_genes(
@@ -646,7 +574,7 @@ class _PseudobulkNamespace:
         data: str | Path | ad.AnnData,
         *,
         groupby: str | Sequence[str],
-        method: PseudobulkMethod = "mean_log1p",
+        method: PseudobulkMethod,
         layer: str | None = None,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
@@ -857,6 +785,9 @@ class _ToolsNamespace:
         verbose: int | bool = True,
         memory_limit_gb: float | None = None,
         force: bool = False,
+        resume: bool = False,
+        checkpoint_interval: int | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
     ) -> AnnData:
         """Compute a streaming gene-wise statistic within biological batches.
 
@@ -889,6 +820,9 @@ class _ToolsNamespace:
             verbose=verbose,
             memory_limit_gb=memory_limit_gb,
             force=force,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
+            format_mismatch_policy=format_mismatch_policy,
         )
 
     def rank_genes_groups(
@@ -911,25 +845,13 @@ class _ToolsNamespace:
         force: bool = False,
         **kwargs,
     ) -> RankGenesGroupsResult:
-        # Resolve groupby / reference aliases
-        if groupby is not None and perturbation_column is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'perturbation_column' and 'groupby'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if groupby is not None:
-            perturbation_column = groupby
-        if perturbation_column is None:
-            raise TypeError(
-                "rank_genes_groups() requires either 'perturbation_column' or its alias 'groupby'."
-            )
-        if reference is not None and control_label is not None:
-            raise TypeError(
-                "rank_genes_groups() received both 'control_label' and 'reference'; "
-                "they are aliases for the same parameter — pass only one."
-            )
-        if reference is not None:
-            control_label = reference
+        perturbation_column, control_label = resolve_group_reference_aliases(
+            perturbation_column=perturbation_column,
+            groupby=groupby,
+            control_label=control_label,
+            reference=reference,
+            fn_name="rank_genes_groups",
+        )
 
         path = resolve_data_path(data)
         method_key = method.lower().replace("_", "-")
@@ -944,11 +866,12 @@ class _ToolsNamespace:
             "nb-glm-test": "nb_glm",
         }
         normalised = method_map.get(method_key, method_key)
-        control = _infer_control_label(path, perturbation_column, control_label)
-
+        # The control, when not given, is inferred by the DE function itself,
+        # so this call records the same arguments as a direct one and reuses
+        # (and is reused by) its result.
         base_kwargs = dict(
             perturbation_column=perturbation_column,
-            control_label=control,
+            control_label=control_label,
             gene_name_column=gene_name_column,
             perturbations=perturbations,
             output_dir=output_dir,
@@ -961,11 +884,11 @@ class _ToolsNamespace:
 
         if normalised == "wilcoxon":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
-                "n_jobs",
                 "checkpoint_interval",
                 "batch_column",
+                "format_mismatch_policy",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -989,12 +912,11 @@ class _ToolsNamespace:
                 "covariates",
                 "dispersion",
                 "fit_method",
-                "share_dispersion",
                 "max_iter",
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
-                "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl",
                 "min_mean_pert",
                 "min_total_count",
@@ -1021,7 +943,7 @@ class _ToolsNamespace:
 
         if normalised == "t_test":
             allowed = {
-                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
                 "n_jobs",
                 "checkpoint_interval",
@@ -1037,24 +959,15 @@ class _ToolsNamespace:
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
-            results = t_test(
+            result = t_test(
                 path,
+                corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
             )
-            mapped = _t_test_results_to_rank_genes(
-                path,
-                results,
-                gene_name_column=gene_name_column,
-                perturbation_column=perturbation_column,
-                control_label=control,
-                corr_method=corr_method,
-                output_dir=output_dir,
-                data_name=data_name,
-            )
-            if mapped.result is None:
+            if result.result is None:
                 raise RuntimeError("t-test did not produce an AnnData result.")
-            return mapped.result
+            return result.result
 
         raise ValueError(
             f"Unsupported differential expression method: {method}. "
@@ -1119,6 +1032,52 @@ class _ToolsNamespace:
             profiling=profiling,
             memory_limit_gb=memory_limit_gb,
             verbose=verbose,
+        )
+
+    def residual_effects(
+        self,
+        data: str | Path | ad.AnnData,
+        perturbation_column: str | pd.Series,
+        control_label: str | None = None,
+        *,
+        covariates: Sequence[str],
+        null: ResidualNull = "model",
+        min_cells: int = 10,
+        min_control_mean: float = 0.1,
+        perturbations: Iterable[str] | None = None,
+        gene_name_column: str | None = None,
+        chunk_size: int | None = None,
+        n_jobs: int | None = None,
+        memory_limit_gb: float | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        data_name: str | None = None,
+        output_path: str | Path | None = None,
+        verbose: int | bool = True,
+        force: bool = False,
+    ) -> AnnData:
+        """Perturbation effects adjusted for covariates by a model fitted on controls.
+
+        See :func:`crispyx.residual.residual_effects` for the full parameter
+        documentation.
+        """
+        return residual_effects(
+            data,
+            perturbation_column,
+            control_label,
+            covariates=covariates,
+            null=null,
+            min_cells=min_cells,
+            min_control_mean=min_control_mean,
+            perturbations=perturbations,
+            gene_name_column=gene_name_column,
+            chunk_size=chunk_size,
+            n_jobs=n_jobs,
+            memory_limit_gb=memory_limit_gb,
+            format_mismatch_policy=format_mismatch_policy,
+            data_name=data_name,
+            output_path=output_path,
+            verbose=verbose,
+            force=force,
         )
 
     def compute_overlap(self, sets_dict, *, metric="both"):

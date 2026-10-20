@@ -30,6 +30,8 @@ from .batch import BatchReducer, BatchStatistic, batch_process
 from .data import (
     AnnData,
     OverlapResult,
+    compress_h5ad,
+    concat_h5ad,
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
@@ -91,6 +93,7 @@ from .qc import (
     filter_perturbations_by_cell_count,
     quality_control_summary,
 )
+from .residual import residual_effects
 from .sample import subsample
 
 # ---------------------------------------------------------------------------
@@ -132,6 +135,7 @@ __all__ = [
     "PseudobulkMethod",
     "aggregate_pseudobulk",
     "compute_normalized_effects",
+    "residual_effects",
     "compute_pseudobulk_effects",
     # Generic batch statistics
     "BatchReducer",
@@ -153,6 +157,8 @@ __all__ = [
     "downsample_counts",
     "convert_to_csc",
     "convert_to_csr",
+    "compress_h5ad",
+    "concat_h5ad",
     "load_obs",
     "load_var",
     "write_obs",

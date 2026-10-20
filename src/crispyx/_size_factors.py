@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Above this many GB of all-expressed counts, DESeq2-style size factors are
+# computed in streaming passes instead of from one in-memory array.
+_DESEQ2_STREAMING_THRESHOLD_GB = 4.0
+
 
 def _validate_size_factors(
     size_factors: "ArrayLike", n_cells: int, *, scale: bool = True
@@ -232,7 +236,7 @@ def _deseq2_style_size_factors(
 
     # Memory check: estimate size of counts_filtered array
     counts_filtered_gb = n_cells * n_all_expressed * 8 / 1e9
-    use_streaming = counts_filtered_gb > 4.0  # >4 GB → stream to avoid OOM
+    use_streaming = counts_filtered_gb > _DESEQ2_STREAMING_THRESHOLD_GB
 
     if use_streaming:
         logger.info(

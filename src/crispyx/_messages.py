@@ -14,6 +14,8 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING
 
+from ._disk import format_bytes
+
 if TYPE_CHECKING:
     from ._disk import DiskEstimate
 
@@ -44,10 +46,14 @@ def print_disk_estimate(verbose: int | bool, name: str, estimate: "DiskEstimate"
     not the warning fired -- the warning stays unconditional (safety-relevant),
     this line is the ``verbose``-gated confirmation of what was estimated.
     """
+    required = format_bytes(estimate.required_bytes)
     if estimate.free_bytes is None:
-        message = f"estimated disk usage: {estimate.required_gb:.1f} GB (free space unknown)"
+        message = f"estimated disk usage: {required} (free space unknown)"
     else:
-        message = f"estimated disk usage: {estimate.required_gb:.1f} GB ({estimate.free_gb:.1f} GB free)"
+        message = (
+            f"estimated disk usage: {required} "
+            f"({format_bytes(estimate.free_bytes)} free)"
+        )
     vprint(verbose, name, message)
 
 
