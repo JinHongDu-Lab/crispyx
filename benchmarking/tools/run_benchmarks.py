@@ -614,11 +614,36 @@ def _local_csc_scratch(input_path: Path, csc_path: Path):
 
 
 def _copy_verified(source: Path, target: Path, chunk_bytes: int = 64 * 1024 * 1024) -> None:
-    """Chunked copy that raises instead of leaving a short file."""
+    """Chunked copy that raises instead of leaving a short file.
+
+    Both files' pages are dropped from the page cache as the copy goes (every
+    1 GiB and at the end): Slurm charges page cache to the job, so a plain
+    copy of a 63 GB input left ~125 GB of cache (source + copy) counted in
+    the job's peak memory although the method itself used ~4 GB.
+    """
+    import os
+
+    def drop(*files) -> None:
+        for f in files:
+            try:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+
     expected = source.stat().st_size
     with open(source, "rb") as fin, open(target, "wb") as fout:
+        since_drop = 0
         while chunk := fin.read(chunk_bytes):
             fout.write(chunk)
+            since_drop += len(chunk)
+            if since_drop >= 1 << 30:
+                fout.flush()
+                os.fdatasync(fout.fileno())  # dirty pages cannot be dropped
+                drop(fin, fout)
+                since_drop = 0
+        fout.flush()
+        os.fdatasync(fout.fileno())
+        drop(fin, fout)
     if target.stat().st_size != expected:
         raise OSError(f"Short copy of {source}: {target.stat().st_size} of {expected} bytes")
 

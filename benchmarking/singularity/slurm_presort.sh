@@ -52,7 +52,11 @@ if [ "${STAGE_LOCAL:-0}" = 1 ]; then
     fi
     trap 'rm -f "$LOCAL"' EXIT
     T0=$(date +%s)
-    cp --preserve=timestamps "$SRC" "$LOCAL"
+    # Direct I/O on both ends: a plain cp leaves source and copy in the page
+    # cache, which Slurm charges to the job (~2x the file size). dd drops
+    # O_DIRECT itself for a short final block.
+    dd if="$SRC" of="$LOCAL" bs=64M iflag=direct oflag=direct status=none
+    touch -r "$SRC" "$LOCAL"
     echo "Staged $SRC -> $LOCAL ($NEED bytes) in $(( $(date +%s) - T0 )) s"
     if [ "$(stat -c '%s %Y' "$SRC")" != "$(stat -c '%s %Y' "$LOCAL")" ]; then
         echo "ERROR: staged copy differs in size or mtime"; exit 1
