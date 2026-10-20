@@ -372,20 +372,20 @@ def test_a_used_result_leaves_its_file_writable(screen, tmp_path, monkeypatch, i
 
 
 @pytest.mark.parametrize("method", ["wilcoxon", "wilcoxon_stratified"])
-def test_wilcoxon_layout_follows_eviction_and_values_do_not(screen, tmp_path, monkeypatch, method):
-    """Where pages are evicted (a memory-limited job), the result is chunked
-    in column blocks matching the gene-chunk writes; elsewhere it stays
-    contiguous. The values are the same bit for bit, and a chunked run
-    resumes like a contiguous one."""
-    reference = tmp_path / "contiguous.h5ad"
-    monkeypatch.setattr(de, "_page_cache_is_charged", lambda: False)
+def test_wilcoxon_writes_column_blocks_and_resumes_in_them(screen, tmp_path, monkeypatch, method):
+    """The result is chunked in column blocks matching the gene-chunk writes,
+    with and without page eviction; the values do not depend on the chunk
+    shape, and a run resumes in the same layout."""
+    reference = tmp_path / "reference.h5ad"
     _run(method, screen, reference)
     with h5py.File(reference, "r") as f:
-        assert f["X"].chunks is None
+        assert f["X"].chunks[1] == 25  # the gene chunk width _run passes
 
-    monkeypatch.setattr(de, "_page_cache_is_charged", lambda: True)
+    from crispyx import _memory
+
+    monkeypatch.setattr(_memory, "_page_cache_is_charged", lambda: True)  # evict, as in a Slurm job
     monkeypatch.setattr(de, "_COLUMN_BLOCK_CHUNK_BYTES", 25 * 8 * 4)  # 4 rows x 25 genes
-    out = tmp_path / "chunked.h5ad"
+    out = tmp_path / "small_chunks.h5ad"
     with monkeypatch.context() as m:
         _interrupt_after(m, 2)
         with pytest.raises(Interrupted):

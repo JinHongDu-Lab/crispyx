@@ -95,7 +95,7 @@ from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
-from ._memory import _page_cache_is_charged, _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
+from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -734,21 +734,21 @@ def _create_unfilled_array(
 _COLUMN_BLOCK_CHUNK_BYTES = 1 << 20
 
 
-def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[int, int] | None:
+def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[int, int]:
     """HDF5 chunk shape for a result written one gene chunk (a block of
-    ``chunk_size`` columns) at a time, or ``None`` for a contiguous layout.
+    ``chunk_size`` columns) at a time: ``(rows, chunk_size)``, ~1 MiB.
 
-    A gene chunk of a row-major contiguous dataset is one small write per
-    group row, each straddling partial pages; when the run evicts the file
-    between chunks (its page cache counts against a memory limit, as on a
-    Slurm node), the kernel must read every such page back before writing
-    it -- 22x slower per chunk on Lustre than on local disk. Chunks of
-    ``(rows, chunk_size)`` turn each gene chunk into whole ~1 MiB writes.
-    Without eviction the pages stay cached and the contiguous layout costs
-    nothing to write, while keeping row reads cheap, so it is kept.
+    In a row-major contiguous dataset a gene chunk is one small write per
+    group row (10,922 x 4.6 KB per layer on a genome-wide screen), each
+    straddling partial pages that the filesystem must read before writing.
+    On a network filesystem that read is a round trip: on HPC2021 Lustre a
+    gene chunk took 219 s to write contiguously even with its pages cached,
+    and 918 s when they were evicted between chunks, against 22 s in these
+    chunks. On a local disk the two layouts write alike (the chunked one
+    slightly faster), so it is used everywhere; reading one row of a large
+    result reads its band of chunks (~2 ms locally), and small results are
+    read into memory whole anyway.
     """
-    if not _page_cache_is_charged():
-        return None
     width = max(1, min(int(chunk_size), n_genes))
     rows = max(1, min(n_groups, _COLUMN_BLOCK_CHUNK_BYTES // (width * 8)))
     return rows, width
@@ -3733,8 +3733,8 @@ def _wilcoxon_resumable_result(
 ) -> ResumableRun:
     """The result file a Wilcoxon run fills one gene chunk at a time: the
     AUC in ``X``, the test's layers, and the control arm's detection rate as
-    ``var["pts_rest"]``. Laid out in column blocks when the run evicts its
-    pages (:func:`_column_block_chunks`)."""
+    ``var["pts_rest"]``, laid out in column blocks matching those writes
+    (:func:`_column_block_chunks`)."""
     var = pd.DataFrame(
         {"pts_rest": np.zeros(len(gene_symbols), dtype=np.float32)},
         index=pd.Index(gene_symbols).astype(str),

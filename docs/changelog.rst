@@ -24,6 +24,17 @@ Unreleased
   (it was a matrix of zeros), and so is Scanpy's ``u_stat`` for ``t_test``
   and ``nb_glm_test``; ``t_test``'s Scanpy ``order`` now ranks untested genes
   last, like the other methods.
+* **``wilcoxon_test`` writes its results in column blocks.** Each gene chunk
+  of results was one small write per perturbation into a row-major file,
+  each needing a page read before the write; on a network filesystem that
+  is a round trip per perturbation per chunk (HPC2021 Lustre: 219 s a gene
+  chunk with the pages cached, 918 s when evicted, against 22 s now on the
+  same node and load). The result's layers are HDF5-chunked as
+  (rows, gene chunk width), ~1 MiB each, on every machine (on a local disk
+  the two layouts write alike); values are unchanged. On a 1,500-perturbation
+  Nourreddine subset writing to Lustre the test now takes 796 s, against
+  1,089 s for 0.1.8. Both Wilcoxon paths print a read / compute / write
+  split of their gene-chunk loop.
 * **Removed: ``wilcoxon_test``'s group-batch streaming path.** With the
   results on disk, the single-pass path's memory is one gene chunk, whose
   width now accounts for every perturbation's results.
