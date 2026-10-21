@@ -18,6 +18,7 @@
 #   CRISPYX_SRC=$PROJECT_ROOT/crispyx-0.1.8/src \
 #     sbatch --export=ALL,DATASET=VCC --job-name=retime-slot1 \
 #            --dependency=singleton slurm_retime_crispyx.sh
+# METHODS=<space-separated list> re-times a subset (default: all crispyx steps).
 
 set -euo pipefail
 
@@ -26,7 +27,7 @@ BENCH="$PROJECT_ROOT/benchmarking"
 D="${DATASET:?set DATASET}"
 SRC_DIR="$(readlink -f "$BENCH/results/$D")"
 T="$BENCH/results_timing/$D"
-METHODS="crispyx_qc_filtered crispyx_preprocess crispyx_pb_avg_log crispyx_pb_pseudobulk crispyx_de_t_test crispyx_de_wilcoxon crispyx_de_nb_glm"
+METHODS="${METHODS:-crispyx_qc_filtered crispyx_preprocess crispyx_pb_avg_log crispyx_pb_pseudobulk crispyx_de_t_test crispyx_de_wilcoxon crispyx_de_nb_glm}"
 
 echo "Re-timing crispyx on $D (job $SLURM_JOB_ID on $SLURMD_NODENAME, exclusive)"
 lscpu | grep -E "Model name|^CPU\(s\)"
