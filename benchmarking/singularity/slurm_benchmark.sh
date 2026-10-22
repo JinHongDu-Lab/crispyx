@@ -88,6 +88,12 @@ if [ -n "${CRISPYX_SRC:-}" ]; then
     echo "crispyx source: $CRISPYX_SRC"
 fi
 
+# Optional extra bind mounts, e.g. inputs and outputs staged on node-local
+# disk by slurm_retime_crispyx.sh (STAGE_LOCAL=1).
+if [ -n "${EXTRA_BINDS:-}" ]; then
+    ORIGIN_BIND="$ORIGIN_BIND $EXTRA_BINDS"
+fi
+
 # Note: PROJECT_ROOT is bound to /workspace to preserve all relative paths.
 # Memory is enforced by SLURM (--mem). Singularity --memory requires cgroups v2
 # unified mode, which most HPC clusters do not support.
