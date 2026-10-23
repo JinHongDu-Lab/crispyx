@@ -139,6 +139,51 @@ def _compute_mle_dispersion_numba(
     return alpha_mle
 
 
+@nb.njit(cache=True)
+def _cox_reid_adjustment_numba(
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
+    mu_g: np.ndarray,
+    alpha: float,
+) -> float:
+    """Cox-Reid adjustment ``-0.5 * log det(XᵀWX)``, ``W = mu / (1 + alpha mu)``,
+    for one gene; the design ``X`` is given in CSR form, so a one-hot batch
+    design costs a few products per sample rather than ``n_features**2``.
+
+    Zero when ``n_features`` is 0, or when ``XᵀWX`` is not positive definite
+    (as the gene-wise Cox-Reid step treats it).
+    """
+    if n_features == 0:
+        return 0.0
+    xtwx = np.zeros((n_features, n_features))
+    for i in range(x_indptr.shape[0] - 1):
+        w = mu_g[i] / (1.0 + alpha * mu_g[i])
+        for a in range(x_indptr[i], x_indptr[i + 1]):
+            wa = w * x_data[a]
+            ja = x_indices[a]
+            for b in range(x_indptr[i], x_indptr[i + 1]):
+                xtwx[ja, x_indices[b]] += wa * x_data[b]
+    # Cholesky in place: log det = 2 * sum(log diag(L)).
+    log_det = 0.0
+    for j in range(n_features):
+        d = xtwx[j, j]
+        for k in range(j):
+            d -= xtwx[j, k] * xtwx[j, k]
+        if d <= 0.0:
+            return 0.0
+        ljj = math.sqrt(d)
+        xtwx[j, j] = ljj
+        log_det += math.log(ljj)
+        for i in range(j + 1, n_features):
+            v = xtwx[i, j]
+            for k in range(j):
+                v -= xtwx[i, k] * xtwx[j, k]
+            xtwx[i, j] = v / ljj
+    return -log_det  # -0.5 * (2 * sum(log diag(L)))
+
+
 @nb.njit(parallel=True, cache=True)
 def _nb_map_grid_search_numba(
     Y: np.ndarray,
@@ -146,6 +191,10 @@ def _nb_map_grid_search_numba(
     log_trend: np.ndarray,
     log_alpha_grid: np.ndarray,
     prior_var: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
 ) -> tuple:
     """Vectorized grid search for MAP dispersion across all genes.
     
@@ -168,6 +217,9 @@ def _nb_map_grid_search_numba(
         Grid of log-dispersion values to search.
     prior_var : float
         Variance of log-normal prior.
+    x_indptr, x_indices, x_data, n_features
+        The design matrix in CSR form, for the Cox-Reid adjustment
+        (``n_features=0`` for none).
         
     Returns
     -------
@@ -226,7 +278,9 @@ def _nb_map_grid_search_numba(
             
             # Add log-prior: -0.5 * (log_alpha - log_trend)^2 / prior_var
             log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-            posterior = ll + log_prior
+            posterior = ll + log_prior + _cox_reid_adjustment_numba(
+                x_indptr, x_indices, x_data, n_features, mu_g, math.exp(log_alpha)
+            )
             
             if posterior > best_posterior:
                 best_posterior = posterior
@@ -245,6 +299,10 @@ def _brent_minimize_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
     a: float,
     b: float,
     tol: float = 1e-5,
@@ -260,7 +318,9 @@ def _brent_minimize_numba(
     
     # Initial setup
     x = w = v = a + golden * (b - a)
-    fx = fw = fv = -_nb_posterior_with_cache_numba(Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+    fx = fw = fv = -_nb_posterior_with_cache_numba(
+        Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, n_features
+    )
     
     d = 0.0  # Distance to next point
     e = 0.0  # Distance moved on the step before last
@@ -314,7 +374,9 @@ def _brent_minimize_numba(
         else:
             u = x + (tol1 if d > 0 else -tol1)
         
-        fu = -_nb_posterior_with_cache_numba(Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+        fu = -_nb_posterior_with_cache_numba(
+            Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, n_features
+        )
         
         # Update a, b, v, w, x
         if fu <= fx:
@@ -355,8 +417,13 @@ def _nb_posterior_with_cache_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
 ) -> float:
-    """Compute NB posterior (log-likelihood + log-prior) for a single gene.
+    """Compute NB posterior (Cox-Reid adjusted log-likelihood + log-prior)
+    for a single gene.
     
     Uses precomputed gammaln(Y+1) sum for efficiency.
     """
@@ -382,7 +449,9 @@ def _nb_posterior_with_cache_numba(
     # Add log-prior
     log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
     
-    return ll + log_prior
+    return ll + log_prior + _cox_reid_adjustment_numba(
+        x_indptr, x_indices, x_data, n_features, mu_g, alpha
+    )
 
 
 @nb.njit(parallel=True, cache=True)
@@ -392,6 +461,10 @@ def _nb_map_grid_search_with_refinement_numba(
     log_trend: np.ndarray,
     log_alpha_grid: np.ndarray,
     prior_var: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
     tol: float = 1e-5,
     max_refine_iter: int = 50,
 ) -> np.ndarray:
@@ -414,6 +487,9 @@ def _nb_map_grid_search_with_refinement_numba(
         Grid of log-dispersion values to search.
     prior_var : float
         Variance of log-normal prior.
+    x_indptr, x_indices, x_data, n_features
+        The design matrix in CSR form, for the Cox-Reid adjustment
+        (``n_features=0`` for none).
     tol : float
         Tolerance for Brent convergence.
     max_refine_iter : int
@@ -471,7 +547,9 @@ def _nb_map_grid_search_with_refinement_numba(
             ll -= gammaln_y_plus_1_sum
             
             log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-            posterior = ll + log_prior
+            posterior = ll + log_prior + _cox_reid_adjustment_numba(
+                x_indptr, x_indices, x_data, n_features, mu_g, math.exp(log_alpha)
+            )
             
             if posterior > best_posterior:
                 best_posterior = posterior
@@ -490,11 +568,14 @@ def _nb_map_grid_search_with_refinement_numba(
                 # Use Brent's method for refinement (more accurate than golden section)
                 refined_log_alpha = _brent_minimize_numba(
                     Y_g, mu_g, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    a, b, tol=tol, max_iter=max_refine_iter
+                    x_indptr, x_indices, x_data, n_features, a, b, tol=tol, max_iter=max_refine_iter
                 )
                 
                 # Final sanity check: ensure refinement is actually better than grid
-                refined_posterior = _nb_posterior_with_cache_numba(Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+                refined_posterior = _nb_posterior_with_cache_numba(
+                    Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
+                    x_indptr, x_indices, x_data, n_features,
+                )
                 if refined_posterior >= best_posterior:
                     best_log_alpha[g] = refined_log_alpha
                 else:

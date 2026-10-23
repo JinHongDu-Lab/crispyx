@@ -2281,7 +2281,7 @@ def nb_glm_test(
                 # Use PyDESeq2-style bounds: max(10, n_cells)
                 max_disp = max(10.0, float(n_subset))
                 disp_map = estimate_dispersion_map(
-                    Y, mu, trend, max_disp=max_disp
+                    Y, mu, trend, design=design, max_disp=max_disp
                 )
                 result["dispersion"] = disp_map
                 
@@ -2721,7 +2721,10 @@ def nb_glm_test(
                     np.maximum(mu, 1e-10, out=mu)
                     
                     max_disp = max(10.0, float(subset_n))
-                    result["dispersion"] = estimate_dispersion_map(Y, mu, trend, max_disp=max_disp)
+                    design = np.column_stack([np.ones(subset_n), perturbation_indicator])
+                    result["dispersion"] = estimate_dispersion_map(
+                        Y, mu, trend, design=design, max_disp=max_disp
+                    )
                     del Y, mu  # Free large matrices
                 else:
                     result["dispersion"] = shrink_dispersions(result["dispersion_raw"], trend)

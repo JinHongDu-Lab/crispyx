@@ -765,7 +765,7 @@ def precompute_global_dispersion(
         
         # Use fused kernel with Brent refinement
         best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(np.ones((n_cells, 1))),
             tol=1e-4,
             max_refine_iter=20,
         )
@@ -1865,11 +1865,20 @@ def shrink_dispersions(
     return shrunk
 
 
+def _design_csr(design: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """``design`` as the CSR arrays the MAP kernels take for their Cox-Reid
+    adjustment: ``(indptr, indices, data, n_features)``."""
+    csr = sp.csr_matrix(np.asarray(design, dtype=np.float64))
+    return (csr.indptr.astype(np.int64), csr.indices.astype(np.int64),
+            csr.data.astype(np.float64), int(csr.shape[1]))
+
+
 def estimate_dispersion_map(
     Y: np.ndarray,
     mu: np.ndarray,
     trend: np.ndarray,
     *,
+    design: np.ndarray,
     prior_var: float | None = None,
     min_disp: float = 1e-8,
     max_disp: float = 10.0,
@@ -1881,7 +1890,11 @@ def estimate_dispersion_map(
 
     This implements PyDESeq2-style MAP estimation where the dispersion
     is estimated by maximizing
-    ``log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)``.
+    ``log L(Y | mu, alpha) - 0.5 log det(XᵀWX) + log prior(alpha | trend, prior_var)``,
+    the Cox-Reid adjusted likelihood of the gene-wise step. Without the
+    adjustment the estimate is biased low by about ``(n - p) / n``, which
+    matters when the design has many columns for its samples (a batch
+    covariate with many levels).
 
     The prior is log-normal: ``log(alpha) ~ N(log(trend), prior_var)``.
 
@@ -1903,6 +1916,9 @@ def estimate_dispersion_map(
         Fitted mean matrix of shape (n_cells, n_genes).
     trend
         Dispersion trend values of shape (n_genes,).
+    design
+        Design matrix of shape (n_cells, n_features) that ``mu`` was fitted
+        with, for the Cox-Reid adjustment.
     prior_var
         Variance of the log-normal prior. If None, estimated from data
         using the variance of log-dispersion residuals around trend.
@@ -1941,7 +1957,8 @@ def estimate_dispersion_map(
     
     # Memory-optimized MLE estimation using Numba for speed
     # Computes per-gene MLE dispersion without large intermediate arrays
-    dof = max(n_cells - 2, 1)
+    # Residual degrees of freedom of the design ``mu`` was fitted with.
+    dof = max(n_cells - design.shape[1], 1)
     alpha_mle = _compute_mle_dispersion_numba(Y, mu, dof)
     alpha_mle = np.clip(alpha_mle, min_disp, max_disp)
     
@@ -1956,8 +1973,7 @@ def estimate_dispersion_map(
             mad = np.median(np.abs(residuals - np.median(residuals)))
             squared_logres = (1.4826 * mad) ** 2
             # PyDESeq2 formula: max(squared_logres - polygamma_correction, 0.25)
-            num_vars = 2  # intercept + perturbation
-            polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+            polygamma_corr = polygamma(1, dof / 2)
             prior_var = max(squared_logres - polygamma_corr, 0.25)
         else:
             prior_var = 0.25
@@ -1977,7 +1993,7 @@ def estimate_dispersion_map(
     if refine:
         # Use fused kernel with golden section refinement
         best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(design),
             tol=1e-4,
             max_refine_iter=20,
         )
@@ -1985,7 +2001,7 @@ def estimate_dispersion_map(
     else:
         # Grid search only (no refinement)
         best_log_alpha, best_idx = _nb_map_grid_search_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(design)
         )
         return np.exp(np.clip(best_log_alpha, log_min, log_max))
 
@@ -2044,7 +2060,7 @@ def estimate_glm_map_dispersion(
     mu = np.exp(np.clip(offset[:, None] + design @ fit.coef.T, -30, 30))
     mu[:, ~fit.converged] = normalised[:, ~fit.converged]
     dispersion = estimate_dispersion_map(
-        Y, np.maximum(mu, 1e-10), trend, max_disp=max(10.0, float(Y.shape[0])),
+        Y, np.maximum(mu, 1e-10), trend, design=design, max_disp=max(10.0, float(Y.shape[0])),
     )
     missing = ~np.isfinite(dispersion)
     dispersion[missing] = trend[missing]

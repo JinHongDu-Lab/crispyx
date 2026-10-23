@@ -224,6 +224,38 @@ def _covariate_screen(tmp_path, seed=11):
     return path
 
 
+@pytest.mark.parametrize("scope", ["global", "per_comparison"])
+def test_nb_glm_null_is_calibrated_on_a_replicated_design_with_many_batches(tmp_path, scope):
+    """A bulk-like design (two control and two knockdown replicates per batch,
+    30 batches as a covariate) leaves ~half the samples as residual degrees
+    of freedom. Without the Cox-Reid adjustment in the MAP step, dispersions
+    came out at 0.5x the truth and null z-scores had a robust sd of 1.3."""
+    rng = np.random.default_rng(0)
+    n_batches, n_genes = 30, 150
+    base = rng.lognormal(np.log(200), 1.5, n_genes)
+    alpha = 0.02 + 1.0 / base
+    batch_effect = rng.normal(0, 0.3, (n_batches, n_genes))
+    labels = [g for b in range(n_batches) for g in ["control"] * 2 + [f"KD{b}_{k}" for k in range(2) for _ in range(2)]]
+    batches = np.repeat([f"b{b}" for b in range(n_batches)], 6)
+    mu = rng.uniform(0.5, 2.0, (len(labels), 1)) * base * np.exp(batch_effect[np.repeat(np.arange(n_batches), 6)])
+    counts = rng.negative_binomial(1.0 / alpha, 1.0 / (1.0 + alpha * mu)).astype(np.float32)
+    path = tmp_path / "bulk.h5ad"
+    ad.AnnData(counts, obs=pd.DataFrame({"perturbation": labels, "batch": batches}),
+               var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])).write(path)
+
+    result = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="control", covariates=["batch"],
+        dispersion_scope=scope, size_factor_method="deseq2", min_pct_ctrl=0, min_pct_pert=0,
+        min_mean_ctrl=0, min_mean_pert=0, output_path=tmp_path / "de.h5ad", n_jobs=1, verbose=False,
+    )
+    res = ad.read_h5ad(result.result_path)
+    dispersion = res.var["dispersion"].to_numpy() if scope == "global" else res.layers["dispersion"]
+    assert 0.85 < np.median(dispersion / alpha) < 1.2
+    z = np.asarray(result.statistics).ravel()
+    z = z[np.isfinite(z)]
+    assert 0.9 < 1.4826 * np.median(np.abs(z - np.median(z))) < 1.1
+
+
 def test_frozen_control_fit_in_gene_blocks_is_bit_identical(tmp_path, monkeypatch):
     """An outsized group is fitted a block of genes at a time instead of as one
     dense (cells x genes) array; every gene's fit is its own, so the blocks

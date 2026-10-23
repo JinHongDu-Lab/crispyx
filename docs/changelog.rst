@@ -4,6 +4,21 @@ Changelog
 Unreleased
 ----------
 
+* **Fixed: ``nb_glm_test``'s MAP dispersion is Cox-Reid adjusted.** The
+  gene-wise dispersions were Cox-Reid adjusted but the MAP step that shrinks
+  them toward the trend maximised the plain likelihood, which biases a
+  dispersion low by about (n - p) / n for a design of p columns on n
+  samples. With a categorical covariate of many levels on few samples (two
+  control and two knockdown replicates per batch, 30 or 100 batches) the
+  dispersions came out at 0.44-0.50x the truth and null z-scores had a
+  robust sd of 1.30-1.36; they are now 1.01x and 1.00, as PyDESeq2's are.
+  The prior variance also uses the design's residual degrees of freedom
+  rather than assuming two columns. Results change only where the MAP step
+  runs: with ``covariates`` and ``dispersion_scope="global"``, and with
+  ``dispersion_scope="per_comparison"``. The default (no covariates, global
+  dispersion) is bit-identical. On Adamson with ``dispersion_scope=
+  "per_comparison"``, dispersions rise by a median 2.4% and agree slightly
+  better with PyDESeq2.
 * **``convert_to_csc`` and ``convert_to_csr`` evict the file they write.**
   The converted copy, often as large as the source, was written without
   eviction, so under a memory limit that charges page cache (a SLURM job)
