@@ -5254,6 +5254,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Skip methods with existing output files (default: True). Use --no-skip-existing to force re-run of specified methods.",
     )
+    parser.add_argument(
+        "--no-report",
+        dest="no_report",
+        action="store_true",
+        help="Skip the comparison report after running (regenerate it later with --regenerate-report).",
+    )
     return parser.parse_args()
 
 
@@ -6205,7 +6211,8 @@ def main() -> None:
         summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
         
        # Run evaluation (generate comparison tables and visualizations)
-        evaluate_benchmarks(config.output_dir)
+        if not args.no_report:
+            evaluate_benchmarks(config.output_dir)
 
         if not config.quiet:
             print(f"\nBenchmark complete for {config.dataset_name}")

@@ -29,12 +29,35 @@ parallel_config:
   n_cores: 32  # 128 GB, 32 cores for all datasets
 
 
+# Accuracy references on a seeded random subset of perturbations (each vs
+# the full control): Scanpy runs out of memory at 128 GB on the full data and
+# PyDESeq2 cannot load it. The same size and seed give Scanpy and PyDESeq2
+# the same 200 perturbations. Relaxed limits apply to these accuracy runs
+# only; the full-data Scanpy memory_limit results are the performance record
+# (kept in .benchmark_cache_full/).
+pydeseq2_max_perturbations: 200
+pydeseq2_subset_seed: 0
+scanpy_max_perturbations:
+  t-test: 200
+  wilcoxon: 200
+scanpy_subset_seed: 0
+method_resource_limits:
+  scanpy_de_t_test:
+    memory_limit: 240.0
+    time_limit: 259200
+  scanpy_de_wilcoxon:
+    memory_limit: 240.0
+    time_limit: 259200
+  pertpy_de_pydeseq2:
+    memory_limit: 240.0
+    time_limit: 259200
+
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
 adaptive_qc_mode: conservative  # or 'aggressive'
 
 # Methods to run (null = run all available methods)
-# Excluding NB-GLM methods (edgeR, PyDESeq2, crispyx NB-GLM)
+# PyDESeq2 and Scanpy DE on a perturbation subset (see above); no edgeR
 methods_to_run:
   - crispyx_qc_filtered
   - crispyx_pb_avg_log
@@ -45,6 +68,7 @@ methods_to_run:
   - scanpy_qc_filtered
   - scanpy_de_t_test
   - scanpy_de_wilcoxon
+  - pertpy_de_pydeseq2
 
 # Progress and output options
 show_progress: true
