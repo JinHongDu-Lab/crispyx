@@ -1,8 +1,10 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.2.1
+-------------
+
+*Released 2026-10-23.*
 
 * **Differential expression stays inside ``memory_limit_gb``.** ``t_test``,
   ``nb_glm_test``, ``wilcoxon_test`` and ``shrink_lfc`` no longer hold, or map,
