@@ -20,6 +20,7 @@
 #            --dependency=singleton slurm_retime_crispyx.sh
 # METHODS=<space-separated list> re-times a subset (default: all crispyx steps).
 # STAGE_LOCAL=1 runs on the node-local SSD where the dataset fits (see below).
+# KEEP_OUTPUTS=1 keeps the method outputs in results_timing/<dataset>.
 
 set -euo pipefail
 
@@ -98,12 +99,18 @@ echo "layout=$LAYOUT" > "$T/staging.txt"
 
 bash "$BENCH/singularity/slurm_benchmark.sh" "timing/$D.yaml" 128 "--methods $METHODS"
 
-if [ "$LAYOUT" = local ]; then
-    # Bring back the timings (regular files only; outputs stay behind).
-    rsync -rt --exclude '*.h5ad' --exclude 'de/*.csv' "$L/out/" "$T/"
+if [ "${KEEP_OUTPUTS:-0}" = 1 ]; then
+    # Keep the outputs too (to check them against earlier results); the
+    # input links are kept as well.
+    [ "$LAYOUT" = local ] && rsync -rt "$L/out/" "$T/"
+else
+    if [ "$LAYOUT" = local ]; then
+        # Bring back the timings (regular files only; outputs stay behind).
+        rsync -rt --exclude '*.h5ad' --exclude 'de/*.csv' "$L/out/" "$T/"
+    fi
+    # Keep the timings, drop the large outputs (real files only; links go too).
+    find "$T" -name "*.h5ad" \( -type f -o -type l \) -delete
+    find "$T" -name "*.csv" -path "*/de/*" -delete
 fi
-# Keep the timings, drop the large outputs (real files only; links go too).
-find "$T" -name "*.h5ad" \( -type f -o -type l \) -delete
-find "$T" -name "*.csv" -path "*/de/*" -delete
 rm -f "$BENCH/config/timing/$D.yaml"
 echo "Kept: $(ls -A "$T")"
