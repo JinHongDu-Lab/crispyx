@@ -4,6 +4,15 @@ Changelog
 Unreleased
 ----------
 
+* **In-memory AnnData is accepted** by ``t_test``, ``wilcoxon_test``,
+  ``nb_glm_test``, the QC filters and ``quality_control_summary``, the
+  three pseudobulk functions, ``residual_effects``, ``subsample``,
+  ``normalize_total_log1p`` and ``downsample_counts`` (and their ``cx.pp`` /
+  ``cx.pb`` / ``cx.tl`` forms). The object is written to a scratch file in
+  the temporary directory, streamed like any input, and removed when the
+  call returns or fails. ``output_path`` is required with such input and
+  ``resume`` is refused, since both are defined by the input file. Large
+  objects are still better saved once and passed as a path.
 * **Fixed: ``nb_glm_test``'s MAP dispersion is Cox-Reid adjusted.** The
   gene-wise dispersions were Cox-Reid adjusted but the MAP step that shrinks
   them toward the trend maximised the plain likelihood, which biases a

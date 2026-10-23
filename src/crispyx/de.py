@@ -34,6 +34,7 @@ import h5py
 from scipy.stats import norm, rankdata, t as t_dist
 
 from .data import (
+    accepts_in_memory,
     AnnData,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
@@ -962,6 +963,7 @@ def _print_de_perturbation_verbose(
         )
 
 
+@accepts_in_memory
 def t_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -1484,6 +1486,7 @@ def t_test(
     )
 
 
+@accepts_in_memory
 def nb_glm_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -4233,6 +4236,7 @@ def _wilcoxon_test_stratified(
     )
 
 
+@accepts_in_memory
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,

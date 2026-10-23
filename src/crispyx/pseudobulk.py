@@ -23,6 +23,7 @@ from ._grouping import (
     resolve_group_reference_aliases,
 )
 from .data import (
+    accepts_in_memory,
     AnnData,
     calculate_optimal_chunk_size,
     ensure_gene_symbol_column,
@@ -343,6 +344,7 @@ def _streaming_batch_corrected(
     )
 
 
+@accepts_in_memory
 def compute_normalized_effects(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -685,6 +687,7 @@ def _comparable_values(series: pd.Series) -> np.ndarray | None:
         return None
 
 
+@accepts_in_memory
 def aggregate_pseudobulk(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -1011,6 +1014,7 @@ def _has_pseudobulk_marker(path: Path) -> bool:
         backed.file.close()
 
 
+@accepts_in_memory
 def compute_pseudobulk_effects(
     data: str | Path | AnnData | ad.AnnData,
     *,

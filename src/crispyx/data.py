@@ -9,6 +9,8 @@ import socket as _socket
 import tempfile
 import time as _time
 import functools
+import inspect
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -768,6 +770,53 @@ def resolve_data_path(
         raise FileNotFoundError(f"Data file not found: {result}")
     
     return result
+
+
+def accepts_in_memory(fn: Callable) -> Callable:
+    """Let ``fn`` take an in-memory :class:`anndata.AnnData` as ``data``.
+
+    The object is written to a scratch ``.h5ad`` in a new temporary
+    directory, ``fn`` streams that file, and the directory -- with anything
+    ``fn`` derives beside its input, such as ``nb_glm_test``'s sorted copy --
+    is removed when ``fn`` returns or raises. Paths and backed AnnData pass
+    through unchanged.
+
+    An output is named after its input file by default, so with in-memory
+    input ``output_path`` is required; ``resume`` is refused, since it
+    identifies a run by its input file.
+    """
+    takes_output = "output_path" in inspect.signature(fn).parameters
+    name = fn.__name__
+
+    @functools.wraps(fn)
+    def wrapper(data, *args, **kwargs):
+        if not isinstance(data, ad.AnnData) or getattr(data, "filename", None):
+            return fn(data, *args, **kwargs)
+        if takes_output and kwargs.get("output_path") is None and kwargs.get("output_dir") is None:
+            raise ValueError(
+                f"{name}: an in-memory AnnData has no file to name the output after; "
+                "pass output_path."
+            )
+        if kwargs.get("resume"):
+            raise ValueError(
+                f"{name}: resume identifies a run by its input file, which an in-memory "
+                'AnnData does not have; save it with adata.write_h5ad("data.h5ad") and '
+                "pass the path to resume."
+            )
+        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_"))
+        try:
+            path = scratch / "input.h5ad"
+            X = data.X
+            warn_if_disk_space_low(
+                X.data.nbytes + X.indices.nbytes + X.indptr.nbytes if sp.issparse(X) else np.asarray(X).nbytes,
+                path, context=name,
+            )
+            data.write_h5ad(path)
+            return fn(path, *args, **kwargs)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    return wrapper
 
 
 def _refuse_overwriting_input(inputs: Sequence[Any], output_path: str | Path) -> None:
@@ -2543,6 +2592,7 @@ def _concat_matrices(
     return AnnData(output_path)
 
 
+@accepts_in_memory
 def normalize_total_log1p(
     data: str | Path | "AnnData" | ad.AnnData,
     output_path: str | Path | None = None,
@@ -2955,6 +3005,7 @@ def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> 
         )
 
 
+@accepts_in_memory
 def downsample_counts(
     data: str | Path | "AnnData" | ad.AnnData,
     output_path: str | Path | None = None,

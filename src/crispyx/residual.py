@@ -21,6 +21,7 @@ from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._statistics import _adjust_pvalue_matrix
 from .data import (
+    accepts_in_memory,
     AnnData,
     _ensure_csr,
     _replace_on_success,
@@ -52,6 +53,7 @@ _OPERATIONAL_ARGS = frozenset({
 _NAME = "residual_effects"
 
 
+@accepts_in_memory
 def residual_effects(
     data: str | Path | AnnData | ad.AnnData,
     perturbation_column: str | pd.Series,
