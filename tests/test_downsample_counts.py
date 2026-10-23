@@ -156,6 +156,8 @@ def test_all_cells_already_below_target_is_a_noop(tmp_path):
     target = int(lib_before.max()) + 1000
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # anndata sets pandas options that pandas 3.1 deprecates.
+        warnings.filterwarnings("ignore", message=r"The '[\w.]+' option is deprecated")
         out = cx.pp.downsample_counts(path, counts_per_cell=target, output_path=tmp_path / "out.h5ad", verbose=False)
     lib_after = _lib_sizes(out.path)
     np.testing.assert_array_equal(lib_before, lib_after)

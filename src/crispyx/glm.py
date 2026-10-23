@@ -47,7 +47,7 @@ from ._irls import (
     schur_variances,
 )
 from ._memory import (
-    _get_available_memory_mb,
+    _resolve_memory_limit_bytes,
     _estimate_dense_memory_gb,
     _estimate_gene_batch_size_fitter,
 )
@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 
 #: Maximum Newton step halvings before a gene's step is accepted as-is.
 _MAX_STEP_HALVINGS = 8
+
+#: Working size of one gene block of a frozen-control fit: its
+#: (n_pert, block) arrays -- counts, eta, mu, W, z and temporaries, about
+#: _FROZEN_WORK_ARRAYS of them -- fit in this many bytes. A typical
+#: perturbation (hundreds of cells) is one block; only an outsized group is
+#: split.
+_FROZEN_WORK_BYTES = 1 << 30
+_FROZEN_WORK_ARRAYS = 6
 
 
 @dataclass
@@ -673,12 +681,7 @@ def precompute_global_dispersion(
     estimated_memory_gb = _estimate_dense_memory_gb(n_cells, n_genes, n_copies=3)
     
     # Compute effective memory budget
-    available_memory_gb = _get_available_memory_mb() / 1000.0
-    if memory_limit_gb is not None:
-        effective_limit_gb = min(available_memory_gb, memory_limit_gb)
-    else:
-        effective_limit_gb = available_memory_gb
-    
+    effective_limit_gb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e9
     memory_budget_gb = max_dense_fraction * effective_limit_gb
     
     # Check if we need streaming mode
@@ -2054,11 +2057,11 @@ def _estimate_apeglm_prior_scale(
     init_scale: float = 1.0,
 ) -> float:
     """Estimate apeGLM prior scale parameter using PyDESeq2's adaptive method.
-    
+
     This implements the prior variance estimation from PyDESeq2's `fit_prior_var`
     function, which finds the scale parameter that balances the data likelihood
     with the Cauchy prior.
-    
+
     Parameters
     ----------
     mle_lfc
@@ -2067,32 +2070,48 @@ def _estimate_apeglm_prior_scale(
         Standard errors of the MLE estimates.
     init_scale
         Initial guess for the scale parameter.
-    
+
     Returns
     -------
     float
         Estimated prior scale parameter for the Cauchy prior.
     """
-    mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
-    if not np.any(mask):
+    return _apeglm_prior_scale_from_blocks(lambda: [(mle_lfc, se)], init_scale)
+
+
+def _apeglm_prior_scale_from_blocks(blocks, init_scale: float = 1.0) -> float:
+    """:func:`_estimate_apeglm_prior_scale` over ``(mle_lfc, se)`` pieces:
+    ``blocks()`` yields them afresh for each evaluation of the objective, so
+    a result too large to hold can be read a block at a time. With one block
+    the sums, and so the scale, are exactly those of the whole arrays."""
+
+    def pieces():
+        for mle_lfc, se in blocks():
+            mle_lfc, se = np.asarray(mle_lfc), np.asarray(se)
+            mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
+            if np.any(mask):
+                yield mle_lfc[mask] ** 2, se[mask] ** 2
+
+    if next(pieces(), None) is None:
         return init_scale
-    
-    S = mle_lfc[mask] ** 2
-    D = se[mask] ** 2
-    
+
     def objective(a: float) -> float:
         """Objective function: find a such that weighted mean of (S-D) equals a."""
-        coeff = 1.0 / (2.0 * (a + D) ** 2)
-        return float(((S - D) * coeff).sum() / coeff.sum() - a)
-    
+        numerator = denominator = 0.0
+        for S, D in pieces():
+            coeff = 1.0 / (2.0 * (a + D) ** 2)
+            numerator += ((S - D) * coeff).sum()
+            denominator += coeff.sum()
+        return float(numerator / denominator - a)
+
     # Match PyDESeq2's _fit_prior_var exactly:
     # - If objective(min_var) < 0, return min_var (maximum shrinkage)
     # - Otherwise, find root in [min_var, max_var]
     min_var, max_var = 1e-6, 400.0
-    
+
     try:
         f_min = objective(min_var)
-        
+
         if f_min < 0:
             # No root exists above min_var, use min_var (max shrinkage)
             # This is the PyDESeq2 behavior when Var(LFC) < median(SE^2)
@@ -2103,7 +2122,7 @@ def _estimate_apeglm_prior_scale(
     except Exception:
         # Fallback: use min_var for maximum shrinkage
         scale_sq = min_var
-    
+
     # PyDESeq2: prior_scale = min(sqrt(prior_var), 1.0)
     # No minimum floor on prior_scale - allow aggressive shrinkage
     return min(np.sqrt(scale_sq), 1.0)
@@ -4991,13 +5010,7 @@ class NBGLMBatchFitter:
                 "control_cache.frozen_control_W_sum and frozen_control_Wz_sum must be set."
             )
         
-        # Densify perturbation matrix if needed
-        if sp.issparse(perturbation_matrix):
-            Y_pert = np.asarray(perturbation_matrix.toarray(), dtype=np.float64)
-        else:
-            Y_pert = np.asarray(perturbation_matrix, dtype=np.float64)
-        
-        n_pert, n_genes = Y_pert.shape
+        n_pert, n_genes = perturbation_matrix.shape
         n_control = control_cache.control_n
         n_total = n_control + n_pert
         
@@ -5014,7 +5027,7 @@ class NBGLMBatchFitter:
         if valid_mask is None:
             # Without raw control_matrix, use frozen_control_Y_sum
             control_total = control_cache.frozen_control_Y_sum  # (n_genes,)
-            pert_total = Y_pert.sum(axis=0)
+            pert_total = np.asarray(perturbation_matrix.sum(axis=0), dtype=np.float64).ravel()
             total_counts = control_total + pert_total
             valid_mask = total_counts >= self.min_total_count
         
@@ -5027,8 +5040,26 @@ class NBGLMBatchFitter:
                 converged=converged, n_iter=n_iter_arr, deviance=deviance
             )
         
-        # Work with valid genes only
-        Y_pert_valid = Y_pert[:, valid_mask]
+        # Work with valid genes only, a block of genes at a time: every gene's
+        # fit is its own, so a block holds (n_pert, block) work arrays, never
+        # (n_pert, n_valid). A group whose dense arrays fit _FROZEN_WORK_BYTES
+        # is one block, densified once; a larger one (a 165k-cell
+        # non-targeting group is 51 GB per array at 38k genes) stays sparse
+        # and is densified a block at a time.
+        block = max(1, min(n_valid, _FROZEN_WORK_BYTES // max(1, n_pert * 8 * _FROZEN_WORK_ARRAYS)))
+        gene_blocks = [slice(start, min(start + block, n_valid)) for start in range(0, n_valid, block)]
+        if len(gene_blocks) == 1:
+            dense = perturbation_matrix.toarray() if sp.issparse(perturbation_matrix) else perturbation_matrix
+            Y_pert_valid = np.asarray(dense, dtype=np.float64)[:, valid_mask]
+            del dense
+
+            def Y_block(b: slice) -> np.ndarray:
+                return Y_pert_valid
+        else:
+            Y_columns = sp.csc_matrix(perturbation_matrix)[:, valid_indices]
+
+            def Y_block(b: slice) -> np.ndarray:
+                return np.asarray(Y_columns[:, b].toarray(), dtype=np.float64)
         
         # Frozen control sufficient statistics (pre-computed, constant)
         frozen_W_sum = control_cache.frozen_control_W_sum[valid_mask]  # (n_valid,)
@@ -5057,32 +5088,34 @@ class NBGLMBatchFitter:
         offset_pert = perturbation_offset[:, None]  # (n_pert, 1)
         log_min_mu = eta_floor(self.min_mu)
         
-        # Work arrays for perturbation cells only (no control arrays needed!)
-        mu_pert = np.empty((n_pert, n_valid), dtype=np.float64)
-        W_pert = np.empty_like(mu_pert)
-        
         # Convergence tracking
         gene_converged = np.zeros(n_valid, dtype=bool)
         gene_n_iter = np.zeros(n_valid, dtype=np.int32)
+        W_pert_sum = np.empty(n_valid, dtype=np.float64)
+        Wz_pert_sum = np.empty(n_valid, dtype=np.float64)
         
         for iteration in range(1, self.max_iter + 1):
-            # Perturbation cells: eta = β₀ + β₁ + offset
-            eta_pert = beta_intercept[None, :] + beta_pert[None, :] + offset_pert
-            np.clip(eta_pert, log_min_mu, 20.0, out=eta_pert)
-            np.exp(eta_pert, out=mu_pert)
-            np.maximum(mu_pert, self.min_mu, out=mu_pert)
-            
-            # Weights: W = μ² / (μ + α * μ²)
-            var_pert = mu_pert + alpha[None, :] * mu_pert * mu_pert
-            np.divide(mu_pert * mu_pert, np.maximum(var_pert, EPS), out=W_pert)
-            
-            # Working responses for perturbation cells
-            z_pert = eta_pert + (Y_pert_valid - mu_pert) / np.maximum(mu_pert, EPS)
-            z_pert_centered = z_pert - offset_pert  # Remove offset
-            
-            # Perturbation contributions to XᵀWX and XᵀWz
-            W_pert_sum = np.sum(W_pert, axis=0)  # (n_valid,)
-            Wz_pert_sum = np.sum(W_pert * z_pert_centered, axis=0)  # (n_valid,)
+            for b in gene_blocks:
+                # Perturbation cells: eta = β₀ + β₁ + offset
+                eta_pert = beta_intercept[None, b] + beta_pert[None, b] + offset_pert
+                np.clip(eta_pert, log_min_mu, 20.0, out=eta_pert)
+                mu_pert = np.exp(eta_pert)
+                np.maximum(mu_pert, self.min_mu, out=mu_pert)
+
+                # Weights: W = μ² / (μ + α * μ²)
+                var_pert = mu_pert + alpha[None, b] * mu_pert * mu_pert
+                W_pert = np.divide(mu_pert * mu_pert, np.maximum(var_pert, EPS))
+                del var_pert
+
+                # Working responses for perturbation cells
+                z_pert = eta_pert + (Y_block(b) - mu_pert) / np.maximum(mu_pert, EPS)
+                z_pert_centered = z_pert - offset_pert  # Remove offset
+                del z_pert, eta_pert, mu_pert
+
+                # Perturbation contributions to XᵀWX and XᵀWz
+                W_pert_sum[b] = np.sum(W_pert, axis=0)
+                Wz_pert_sum[b] = np.sum(W_pert * z_pert_centered, axis=0)
+                del W_pert, z_pert_centered
             
             # XᵀWX elements (2x2 matrix per gene)
             # Control contributions are FROZEN, perturbation contributions are fresh
@@ -5129,16 +5162,19 @@ class NBGLMBatchFitter:
         # Both blocks come from the UNFLOORED mean -- the control side was
         # accumulated that way by the precompute, the perturbed side is rebuilt
         # here.  See NBGLMBatchFitter._wald_weights.
-        mu_p = np.exp(
-            np.clip(
-                beta_intercept[None, :] + beta_pert[None, :] + offset_pert,
-                ETA_MIN,
-                ETA_MAX,
+        W_pert_sum = np.empty(n_valid, dtype=np.float64)
+        for b in gene_blocks:
+            mu_p = np.exp(
+                np.clip(
+                    beta_intercept[None, b] + beta_pert[None, b] + offset_pert,
+                    ETA_MIN,
+                    ETA_MAX,
+                )
             )
-        )
-        W_pert_sum = np.sum(
-            mu_p * mu_p / np.maximum(mu_p + alpha[None, :] * mu_p * mu_p, EPS), axis=0
-        )
+            W_pert_sum[b] = np.sum(
+                mu_p * mu_p / np.maximum(mu_p + alpha[None, b] * mu_p * mu_p, EPS), axis=0
+            )
+            del mu_p
         
         # Unregularized M for SE calculation
         M00 = frozen_W_wald_sum + W_pert_sum

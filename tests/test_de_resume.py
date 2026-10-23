@@ -53,12 +53,6 @@ def _run(method, screen, out: Path, **kw):
     )
 
 
-@pytest.fixture
-def streaming(monkeypatch):
-    """Force the group-batch streaming Wilcoxon path (batches of 2 groups)."""
-    monkeypatch.setattr(de, "_should_use_streaming", lambda *a, **k: (True, 0, 0, 2))
-
-
 def _interrupt_after(monkeypatch, n_saves: int) -> None:
     """Kill the run right after its ``n_saves``-th checkpoint is on disk."""
     real_save = ResumableRun.save
@@ -122,14 +116,11 @@ def _resume_dir(out: Path) -> Path:
     return out.with_name(f".{out.name}.resume")
 
 
-CASES = ["t_test", "nb_glm", "wilcoxon", "wilcoxon_stratified", "wilcoxon_streaming"]
+CASES = ["t_test", "nb_glm", "wilcoxon", "wilcoxon_stratified"]
 
 
-@pytest.mark.parametrize("case", CASES)
-def test_interrupted_run_resumes_to_the_uninterrupted_result(screen, tmp_path, monkeypatch, request, case):
-    if case == "wilcoxon_streaming":
-        request.getfixturevalue("streaming")
-    method = "wilcoxon" if case == "wilcoxon_streaming" else case
+@pytest.mark.parametrize("method", CASES)
+def test_interrupted_run_resumes_to_the_uninterrupted_result(screen, tmp_path, monkeypatch, method):
     reference = tmp_path / "reference.h5ad"
     _run(method, screen, reference)
 
@@ -152,23 +143,27 @@ def test_interrupted_run_resumes_to_the_uninterrupted_result(screen, tmp_path, m
     assert not checkpoint.exists() and not _resume_dir(out).exists()
 
 
-def test_nb_glm_resumes_after_all_fits_when_the_final_write_failed(screen, tmp_path, monkeypatch):
+@pytest.mark.parametrize("method", CASES)
+def test_killed_while_finishing_leaves_no_output_and_resumes(screen, tmp_path, monkeypatch, method):
     reference = tmp_path / "reference.h5ad"
-    _run("nb_glm", screen, reference)
+    _run(method, screen, reference)
     out = tmp_path / "result.h5ad"
-    real_write = ad.AnnData.write
 
-    def failing_write(self, *args, **kwargs):
+    def failing_stamp(*args, **kwargs):
         raise Interrupted
 
-    monkeypatch.setattr(ad.AnnData, "write", failing_write)
-    with pytest.raises(Interrupted):
-        _run("nb_glm", screen, out)
-    monkeypatch.setattr(ad.AnnData, "write", real_write)
+    with monkeypatch.context() as m:
+        m.setattr(de, "write_stamp", failing_stamp)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out)
+    # A file with matching uns but missing values would be loaded as done.
+    assert not out.exists()
 
     runs = _record_runs(monkeypatch)
-    _run("nb_glm", screen, out, resume=True)
-    assert runs[-1].resumed and len(runs[-1].progress["completed"]) == 6
+    _run(method, screen, out, resume=True)
+    assert runs[-1].resumed
+    if method in ("t_test", "nb_glm"):
+        assert len(runs[-1].progress["completed"]) == 6
     _assert_same_result(reference, out)
 
 
@@ -238,47 +233,18 @@ def test_memory_and_chunking_changes_still_resume(screen, tmp_path, monkeypatch)
             np.testing.assert_allclose(a[key][()], b[key][()], rtol=1e-5, atol=1e-5, err_msg=key)
 
 
-@pytest.mark.parametrize("case", ["wilcoxon", "wilcoxon_stratified"])
-def test_wilcoxon_killed_while_writing_leaves_no_output(screen, tmp_path, monkeypatch, case):
-    reference = tmp_path / "reference.h5ad"
-    _run(case, screen, reference)
-    out = tmp_path / "result.h5ad"
-    real_create = de._create_array
-
-    def create(group, name, **kwargs):
-        if name == "pvalue_adj":
-            raise Interrupted
-        return real_create(group, name, **kwargs)
-
-    with monkeypatch.context() as m:
-        m.setattr(de, "_create_array", create)
-        with pytest.raises(Interrupted):
-            _run(case, screen, out)
-    # A file with matching uns but missing layers would be loaded as done.
-    assert not out.exists()
-    assert not list(tmp_path.glob(f".{out.name}.partial"))
-
-    runs = _record_runs(monkeypatch)
-    _run(case, screen, out, resume=True)
-    assert runs[-1].resumed
-    _assert_same_result(reference, out)
-
-
-@pytest.mark.parametrize("case", ["wilcoxon", "wilcoxon_stratified", "wilcoxon_streaming"])
-def test_wilcoxon_killed_after_writing_is_reused(screen, tmp_path, monkeypatch, request, case):
-    """The output is stamped as it is written, before the checkpoint goes, so
-    a kill while reading the result back loses no work: the next call reuses
+@pytest.mark.parametrize("method", CASES)
+def test_killed_after_writing_is_reused(screen, tmp_path, monkeypatch, method):
+    """The output is stamped before it takes the output's name, so a kill
+    while the result is being returned loses no work: the next call reuses
     the file, with its Scanpy structure."""
-    if case == "wilcoxon_streaming":
-        request.getfixturevalue("streaming")
-    method = "wilcoxon" if case == "wilcoxon_streaming" else case
     out = tmp_path / "result.h5ad"
 
     def killed(*args, **kwargs):
         raise Interrupted
 
     with monkeypatch.context() as m:
-        m.setattr(de, "_build_result_from_h5ad", killed)
+        m.setattr(de, "RankGenesGroupsResult", killed)
         with pytest.raises(Interrupted):
             _run(method, screen, out, scanpy_format=True)
     assert not out.with_suffix(".progress.json").exists()
@@ -286,19 +252,22 @@ def test_wilcoxon_killed_after_writing_is_reused(screen, tmp_path, monkeypatch, 
     result = _run(method, screen, out, scanpy_format=True)
     assert not runs, "the finished output was recomputed"
     with h5py.File(out, "r") as f:
-        np.testing.assert_array_equal(f["uns/rank_genes_groups/full/scores"][()], result.statistics)
+        np.testing.assert_array_equal(f["uns/rank_genes_groups/full/scores"][()], np.asarray(result.statistics))
 
 
-def test_streaming_wilcoxon_restarts_when_its_work_file_is_unreadable(screen, tmp_path, monkeypatch, streaming):
+@pytest.mark.parametrize("method", CASES)
+def test_resume_restarts_when_the_work_file_is_unreadable(screen, tmp_path, monkeypatch, method):
     reference = tmp_path / "reference.h5ad"
-    _run("wilcoxon", screen, reference)
+    _run(method, screen, reference)
     out = tmp_path / "result.h5ad"
     with monkeypatch.context() as m:
         _interrupt_after(m, 1)
         with pytest.raises(Interrupted):
-            _run("wilcoxon", screen, out)
+            _run(method, screen, out)
     (_resume_dir(out) / "result.h5ad").write_bytes(b"killed mid-write")
-    _run("wilcoxon", screen, out, resume=True)
+    runs = _record_runs(monkeypatch)
+    _run(method, screen, out, resume=True)
+    assert not runs[-1].resumed
     _assert_same_result(reference, out)
 
 
@@ -328,11 +297,18 @@ def test_t_test_failed_perturbation_is_nan_not_significant(screen, tmp_path):
     assert np.isfinite(result.pvalues[1 - row]).any()
 
 
-def test_t_test_result_does_not_map_the_deleted_partial_files(screen, tmp_path):
-    result = _run("t_test", screen, tmp_path / "result.h5ad")
-    for array in (result.statistics, result.pvalues, result.pvalues_adj, result.logfoldchanges,
-                  result.mean_difference, result.pts, result.order):
-        assert type(array) is np.ndarray and array.base is None
+@pytest.mark.parametrize("method", ["t_test", "nb_glm", "wilcoxon"])
+def test_result_reads_its_rows_from_the_output_file(screen, tmp_path, method):
+    out = tmp_path / "result.h5ad"
+    result = _run(method, screen, out)
+    with h5py.File(out, "r") as f:
+        z = f["layers/z_score"][()]
+    np.testing.assert_array_equal(result.statistics[2], z[2])
+    np.testing.assert_array_equal(np.asarray(result.statistics), z)
+    np.testing.assert_array_equal(result.order[2], np.argsort(-np.where(np.isfinite(z[2]), np.abs(z[2]), -np.inf), kind="mergesort"))
+    label = result.groups[2]
+    np.testing.assert_array_equal(result[label].statistic, z[2])
+    assert (result.u_statistics is None) is (method != "wilcoxon")
 
 
 def test_t_test_rejects_a_bad_corr_method_before_reading(screen, tmp_path, monkeypatch):
@@ -365,3 +341,65 @@ def test_checkpoint_interval(n_perturbations, requested, expected):
     from crispyx._checkpoint import _get_checkpoint_interval
 
     assert _get_checkpoint_interval(n_perturbations, requested) == expected
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["small-in-memory", "large-from-file"])
+def test_result_reads_a_replaced_output_afresh(screen, tmp_path, monkeypatch, in_memory):
+    """Whether a result keeps its matrices in memory (small) or reads the
+    file per access (large), it reports the file now at its path."""
+    monkeypatch.setattr(de, "_IN_MEMORY_LAYER_FRACTION", 1.0 if in_memory else 0.0)
+    out = tmp_path / "result.h5ad"
+    first = _run("t_test", screen, out)
+    before = first.pvalues[0]
+    _run("t_test", screen, out, perturbations=["P3", "P4"])  # rewrites out, another row 0
+    second = de.RankGenesGroupsResult(out)
+    with h5py.File(out, "r") as f:
+        np.testing.assert_array_equal(second.pvalues[0], f["layers/pvalue"][0])
+        np.testing.assert_array_equal(first.pvalues[0], f["layers/pvalue"][0])
+    assert not np.array_equal(before, first.pvalues[0], equal_nan=True)
+
+
+@pytest.mark.parametrize("in_memory", [True, False], ids=["small-in-memory", "large-from-file"])
+def test_a_used_result_leaves_its_file_writable(screen, tmp_path, monkeypatch, in_memory):
+    """A result holds no handle on its file between reads, so the file can
+    be opened for writing (HDF5 refuses while the process holds it open)."""
+    monkeypatch.setattr(de, "_IN_MEMORY_LAYER_FRACTION", 1.0 if in_memory else 0.0)
+    out = tmp_path / "result.h5ad"
+    result = _run("t_test", screen, out)
+    _ = result.pvalues[0], result[result.groups[1]].statistic, np.asarray(result.order)
+    with h5py.File(out, "r+") as f:
+        f["uns"].attrs["note"] = "edited"
+
+
+@pytest.mark.parametrize("method", ["wilcoxon", "wilcoxon_stratified"])
+def test_wilcoxon_writes_column_blocks_and_resumes_in_them(screen, tmp_path, monkeypatch, method):
+    """The result is chunked in column blocks matching the gene-chunk writes,
+    with and without page eviction; the values do not depend on the chunk
+    shape, and a run resumes in the same layout."""
+    reference = tmp_path / "reference.h5ad"
+    _run(method, screen, reference)
+    with h5py.File(reference, "r") as f:
+        assert f["X"].chunks[1] == 25  # the gene chunk width _run passes
+
+    from crispyx import _memory
+
+    monkeypatch.setattr(_memory, "_page_cache_is_charged", lambda: True)  # evict, as in a Slurm job
+    monkeypatch.setattr(de, "_COLUMN_BLOCK_CHUNK_BYTES", 25 * 8 * 4)  # 4 rows x 25 genes
+    out = tmp_path / "small_chunks.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out)
+    runs = _record_runs(monkeypatch)
+    _run(method, screen, out, resume=True)
+    assert runs[-1].resumed
+    with h5py.File(out, "r") as f:
+        assert f["X"].chunks == (4, 25) and f["layers/pvalue"].chunks == (4, 25)
+    _assert_same_result(reference, out)
+
+
+def test_row_blocks_cover_whole_chunk_bands():
+    blocks = list(de._row_blocks(1000, 1 << 18, chunk_rows=7))  # 16 rows a block before rounding
+    assert all(b.start % 7 == 0 for b in blocks)
+    assert blocks[0].stop - blocks[0].start == 14
+    assert blocks[-1].stop == 1000 and sum(b.stop - b.start for b in blocks) == 1000

@@ -127,6 +127,8 @@ def test_obs_compared_by_value_not_dtype(tmp_path):
     second.write(paths[1])
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # anndata sets pandas options that pandas 3.1 deprecates.
+        warnings.filterwarnings("ignore", message=r"The '[\w.]+' option is deprecated")
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
 
 

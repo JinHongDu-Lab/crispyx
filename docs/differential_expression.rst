@@ -206,13 +206,28 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   slower.
 
 * **Memory limit** (``memory_limit_gb``): Specify the maximum memory available
-  for the analysis. For ``nb_glm_test()``, this affects chunk size calculation and
-  worker count estimation. For ``wilcoxon_test()``, it controls whether the
-  streaming path is used for large datasets (>30% of budget triggers streaming).
-  For ``t_test()``, it controls automatic cell chunk size calculation.
-  For ``shrink_lfc()``, it limits parallel workers in ``method="full"``.
-  For HPC environments with fixed allocations, set this to your SLURM ``--mem``
-  value (e.g., ``memory_limit_gb=128``).
+  for the analysis; it is capped by what the job's cgroup will still grant.
+  For ``nb_glm_test()``, this affects chunk size calculation and
+  worker count estimation. For ``wilcoxon_test()``, it sets the gene chunk
+  width (one chunk's cells and every perturbation's results for its genes are
+  held at a time). For ``t_test()``, it controls automatic cell chunk size
+  calculation. For ``shrink_lfc()``, it limits parallel workers in
+  ``method="full"``. The results themselves are never held in memory: each
+  perturbation's (or gene chunk's) values are written into the output file as
+  they are computed. For HPC environments with fixed allocations, set this to
+  your SLURM ``--mem`` value (e.g., ``memory_limit_gb=128``).
+
+* **Results are read from the output file.** The returned
+  ``RankGenesGroupsResult`` reads its matrices from the file: a matrix within
+  1% of the memory budget (any result on a personal machine, short of a
+  genome-wide screen) is read once and kept in memory; a larger one is read on
+  access, so ``result.pvalues[i]`` and ``result["KO1"]`` cost one
+  perturbation's row however large the result is, and
+  ``np.asarray(result.pvalues)`` reads the matrix. ``result.order`` is
+  computed for the rows read. A result holds no open handle on its file, and it
+  follows the file at its path: a later call that rewrites the same
+  ``output_path`` changes what an earlier result object returns; copy the
+  values (``np.asarray``) first if you need both.
 
 * **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
   ``uns["rank_genes_groups"]`` structure for interoperability with 

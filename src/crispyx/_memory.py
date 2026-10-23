@@ -6,8 +6,10 @@ determining optimal batch sizes for parallel processing.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import warnings
 from pathlib import Path
 
 import joblib
@@ -26,12 +28,67 @@ def _resolve_n_jobs(n_jobs: int | None) -> int:
     return min(joblib.effective_n_jobs(-1 if n_jobs is None else n_jobs), cpus)
 
 
-def _get_available_memory_mb() -> float:
-    """Get available system memory in MB, with fallback."""
+@functools.lru_cache(maxsize=None)
+def _page_cache_is_charged() -> bool:
+    """Whether this process's page cache counts against a memory limit: a
+    cgroup memory limit is visible, or it runs in a Slurm job (whose limit
+    a container may hide). Fixed for the life of the process.
+
+    Without such a limit -- a laptop, a workstation, an unconstrained
+    container -- the kernel reclaims page cache on its own and keeping it
+    is free, so nothing is evicted (a second pass over the same file then
+    reads from cache).
+    """
+    return _cgroup_available_bytes() is not None or "SLURM_JOB_ID" in os.environ
+
+
+def drop_file_cache(path: str | Path) -> None:
+    """Evict *path*'s clean pages from the kernel page cache, when page cache
+    counts against a memory limit (:func:`_page_cache_is_charged`).
+
+    Under a cgroup limit (SLURM, Kubernetes), page-cache pages count toward
+    it. Calling this after a streaming read, or after a block of writes,
+    keeps the file's pages out of the job's budget. Pages still dirty are
+    left for the kernel to write back, and a later call drops them; the file
+    is not synced, which would stall each call on a network filesystem
+    (~0.8 s a call on Lustre) for no gain in correctness: a killed process's
+    writes are in the page cache either way.
+
+    A no-op without such a limit, on platforms without ``posix_fadvise``
+    (macOS, Windows), or when the file cannot be opened.
+    """
+    if not hasattr(os, "posix_fadvise") or not _page_cache_is_charged():
+        return
     try:
-        return _detected_available_bytes() / 1e6
-    except ImportError:
-        return 8000.0  # 8 GB default fallback
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+class _EvictEvery:
+    """Count the bytes a streaming pass moves through some files and, every
+    ``nbytes`` of them, :func:`drop_file_cache` each file, so a pass over
+    hundreds of GB keeps about ``nbytes`` of their pages resident rather
+    than all of them.
+
+    Call it with the size of each block read or written.
+    """
+
+    def __init__(self, *paths: str | Path, nbytes: int = 1 << 30) -> None:
+        self.paths = paths
+        self.nbytes = nbytes
+        self._pending = 0
+
+    def __call__(self, moved: int) -> None:
+        self._pending += int(moved)
+        if self._pending >= self.nbytes:
+            for path in self.paths:
+                drop_file_cache(path)
+            self._pending = 0
 
 
 def _estimate_dense_memory_gb(n_cells: int, n_genes: int, n_copies: int = 3) -> float:
@@ -93,14 +150,15 @@ def _estimate_max_workers(
     n_samples: int,
     n_genes: int,
     memory_per_worker_mb: float | None = None,
-    available_mb: float | None = None,
-    memory_limit_mb: float | None = None,
+    memory_limit_gb: float | None = None,
 ) -> int:
     """Estimate maximum number of parallel workers based on memory constraints.
-    
+
     Limits worker count to prevent OOM from multiple workers each allocating
-    large work arrays.
-    
+    large work arrays: as many workers as fit 80% of the budget
+    (:func:`_resolve_memory_limit_bytes`), and no more than the CPUs this
+    process may use.
+
     Parameters
     ----------
     n_samples
@@ -109,39 +167,21 @@ def _estimate_max_workers(
         Total number of genes.
     memory_per_worker_mb
         Estimated memory per worker in MB. If None, calculated from data size.
-    available_mb
-        Available memory in MB. If None, uses 80% of system memory.
-    memory_limit_mb
-        Optional explicit memory limit in MB (e.g., from config). If provided,
-        the effective memory budget is min(available_mb, memory_limit_mb).
-        
+    memory_limit_gb
+        Explicit memory budget in GB; ``None`` uses the memory available.
+
     Returns
     -------
     int
         Recommended maximum number of workers.
     """
-    if available_mb is None:
-        # Try to get system memory, default to 8 GB if unavailable
-        try:
-            available_mb = _detected_available_bytes() / 1e6 * 0.8
-        except ImportError:
-            available_mb = 8000.0  # 8 GB default
-    
-    # Apply explicit memory limit if provided
-    if memory_limit_mb is not None:
-        effective_mb = min(available_mb, memory_limit_mb * 0.8)  # 80% of limit
-    else:
-        effective_mb = available_mb
-    
+    effective_mb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e6 * 0.8
     if memory_per_worker_mb is None:
         # Estimate: 4 work arrays + Y subset + overhead
         n_work_arrays = 5
         memory_per_worker_mb = n_samples * n_genes * 8 * n_work_arrays / 1e6
-    
     max_workers = max(1, int(effective_mb / memory_per_worker_mb))
-    cpu_count = os.cpu_count() or 4
-    
-    return min(max_workers, cpu_count)
+    return min(max_workers, _resolve_n_jobs(None))
 
 
 #: cgroup v1 files report an "unlimited" ceiling as a sentinel near 2**63
@@ -282,13 +322,63 @@ def _cgroup_available_bytes() -> float | None:
     return headroom
 
 
+def _slurm_allocation_bytes() -> float | None:
+    """The memory Slurm allocated this job on this node, from the variables
+    it exports to the job (``--mem`` as ``SLURM_MEM_PER_NODE``, ``--mem-per-cpu``
+    as ``SLURM_MEM_PER_CPU`` times ``SLURM_CPUS_ON_NODE``, both in MB), or
+    ``None`` outside a Slurm job or when neither is set."""
+    env = os.environ
+    if "SLURM_JOB_ID" not in env:
+        return None
+    try:
+        if env.get("SLURM_MEM_PER_NODE"):
+            return float(env["SLURM_MEM_PER_NODE"]) * 2**20
+        if env.get("SLURM_MEM_PER_CPU") and env.get("SLURM_CPUS_ON_NODE"):
+            return float(env["SLURM_MEM_PER_CPU"]) * float(env["SLURM_CPUS_ON_NODE"]) * 2**20
+    except ValueError:
+        pass
+    return None
+
+
+_warned_unknown_slurm_limit = False
+
+
+def _granted_bytes() -> float | None:
+    """The most memory this process's job will grant it, when that is known.
+
+    The cgroup's headroom when its limit is visible
+    (:func:`_cgroup_available_bytes`). Some clusters give a job a cgroup
+    namespace whose limit the job cannot see from inside; Slurm's own
+    record of the allocation (:func:`_slurm_allocation_bytes`) stands in
+    then. In a Slurm job where neither is available the allocation is
+    unknown: crispyx warns once and asks for ``memory_limit_gb``, since
+    sizing from the host's memory is how a run outgrows its job.
+    """
+    global _warned_unknown_slurm_limit
+    cgroup_available = _cgroup_available_bytes()
+    if cgroup_available is not None:
+        return cgroup_available
+    allocation = _slurm_allocation_bytes()
+    if allocation is None and "SLURM_JOB_ID" in os.environ and not _warned_unknown_slurm_limit:
+        _warned_unknown_slurm_limit = True
+        warnings.warn(
+            "crispyx: running in Slurm job "
+            f"{os.environ['SLURM_JOB_ID']} but cannot see its memory limit (no cgroup "
+            "limit is visible and SLURM_MEM_PER_NODE / SLURM_MEM_PER_CPU are unset); "
+            "pass memory_limit_gb set to the job's --mem so crispyx does not size "
+            "itself from the whole node's memory.",
+            stacklevel=3,
+        )
+    return allocation
+
+
 def _detected_available_bytes() -> float:
     """Memory this process may actually use, in bytes.
 
-    ``psutil.virtual_memory().available`` capped by what the cgroup will still
-    grant. Every crispyx auto-sizing path routes its host-memory reading
-    through here so that none of them can budget from memory the job's cgroup
-    will not hand out.
+    ``psutil.virtual_memory().available`` capped by what the job will grant
+    (:func:`_granted_bytes`). Every crispyx auto-sizing path routes its
+    host-memory reading through here so that none of them can budget from
+    memory the job will not hand out.
 
     Raises
     ------
@@ -298,9 +388,9 @@ def _detected_available_bytes() -> float:
     """
     import psutil
     available = float(psutil.virtual_memory().available)
-    cgroup_available = _cgroup_available_bytes()
-    if cgroup_available is not None:
-        available = min(available, cgroup_available)
+    granted = _granted_bytes()
+    if granted is not None:
+        available = min(available, granted)
     return available
 
 
@@ -309,9 +399,9 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
 
     If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
     the system with ``psutil`` and fall back to 64 GB. Either way the result
-    is capped by what the process's cgroup will still grant when there is
-    one, so a budget can never exceed what the job may actually allocate --
-    see :func:`_cgroup_available_bytes`.
+    is capped by what the job will grant when that is known, so a budget can
+    never exceed what the job may actually allocate -- see
+    :func:`_granted_bytes`.
 
     Parameters
     ----------
@@ -323,103 +413,13 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     float
         Memory budget in bytes.
     """
-    if memory_limit_gb is not None:
-        budget = memory_limit_gb * 1e9
-    else:
+    if memory_limit_gb is None:
         try:
             return _detected_available_bytes()
         except ImportError:
             return 64 * 1e9  # conservative default
-
-    cgroup_available = _cgroup_available_bytes()
-    if cgroup_available is not None:
-        budget = min(budget, cgroup_available)
+    budget = memory_limit_gb * 1e9
+    granted = _granted_bytes()
+    if granted is not None:
+        budget = min(budget, granted)
     return budget
-
-
-def _should_use_streaming(
-    n_groups: int,
-    n_genes: int,
-    *,
-    memory_limit_gb: float | None = None,
-    n_float64_arrays: int = 7,
-    n_float32_arrays: int = 2,
-    peak_multiplier: float = 5.0,
-    threshold_fraction: float = 0.30,
-) -> tuple[bool, float, float, int]:
-    """Decide whether to use group-batch streaming for output arrays.
-
-    Estimates the peak memory of the single-pass (memmap) approach, where
-    ``n_groups × n_genes`` result arrays are allocated for all groups at
-    once, then copied at the end.  If the estimated peak exceeds
-    ``threshold_fraction`` of the available memory budget, streaming is
-    recommended.
-
-    The default ``peak_multiplier=5.0`` accounts for five additive
-    contributions that are proportional to the output-array footprint:
-
-    1. Memmap pages resident in the page cache after all gene chunks
-       have been processed (~1×).
-    2. ``numpy.array()`` copies created from the memmaps before the
-       temporary directory is deleted (~1×).
-    3. Backed h5ad file pages that accumulate in RSS as gene chunks
-       are read from the sparse backing store (~1.5×).
-    4. AnnData / h5py write buffers and Python working memory (~0.5×).
-    5. glibc arena overhead and freed-but-unreturned pages (~1×).
-
-    Parameters
-    ----------
-    n_groups
-        Number of perturbation groups (excluding control).
-    n_genes
-        Number of genes.
-    memory_limit_gb
-        Explicit memory cap in GB.  ``None`` → auto-detect via psutil.
-    n_float64_arrays
-        Number of ``float64`` output arrays per group (default 7).
-    n_float32_arrays
-        Number of ``float32`` output arrays per group (default 2).
-    peak_multiplier
-        Factor applied to the memmap footprint to account for the
-        end-of-run copy, backing-file RSS, and write overhead
-        (default 4×).
-    threshold_fraction
-        Fraction of available memory above which streaming is triggered
-        (default 0.30).
-
-    Returns
-    -------
-    use_streaming : bool
-        ``True`` when the streaming path should be used.
-    estimated_peak_bytes : float
-        Estimated peak memory for the standard path.
-    memory_budget_bytes : float
-        Effective memory budget in bytes.
-    group_batch_size : int
-        Recommended group batch size (meaningful only when
-        ``use_streaming`` is ``True``).
-    """
-    bytes_per_group = n_genes * (n_float64_arrays * 8 + n_float32_arrays * 4)
-    memmap_total_bytes = n_groups * bytes_per_group
-    estimated_peak_bytes = memmap_total_bytes * peak_multiplier
-
-    memory_budget_bytes = _resolve_memory_limit_bytes(memory_limit_gb)
-    streaming_threshold = memory_budget_bytes * threshold_fraction
-    use_streaming = estimated_peak_bytes > streaming_threshold
-
-    # Calculate adaptive group batch size
-    group_batch_size = n_groups  # default: all at once
-    if use_streaming:
-        batch_budget_bytes = memory_budget_bytes * (threshold_fraction / 2)
-        group_batch_size = max(100, int(batch_budget_bytes / bytes_per_group))
-        group_batch_size = min(group_batch_size, n_groups)
-
-        logger.info(
-            "Large result matrix detected: %d groups × %d genes = "
-            "%.1f GB estimated peak (budget: %.1f GB). "
-            "Switching to streaming mode with batch_size=%d.",
-            n_groups, n_genes, estimated_peak_bytes / 1e9,
-            memory_budget_bytes / 1e9, group_batch_size,
-        )
-
-    return use_streaming, estimated_peak_bytes, memory_budget_bytes, group_batch_size

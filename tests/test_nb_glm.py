@@ -224,6 +224,24 @@ def _covariate_screen(tmp_path, seed=11):
     return path
 
 
+def test_frozen_control_fit_in_gene_blocks_is_bit_identical(tmp_path, monkeypatch):
+    """An outsized group is fitted a block of genes at a time instead of as one
+    dense (cells x genes) array; every gene's fit is its own, so the blocks
+    change no value."""
+    import h5py
+    from crispyx import glm
+
+    path = _covariate_screen(tmp_path)
+    kwargs = dict(perturbation_column="perturbation", control_label="control",
+                  freeze_control=True, n_jobs=1, verbose=False)
+    whole = nb_glm_test(path, output_path=tmp_path / "whole.h5ad", **kwargs)
+    monkeypatch.setattr(glm, "_FROZEN_WORK_BYTES", 60 * 8 * glm._FROZEN_WORK_ARRAYS * 7)  # 7 genes a block
+    blocks = nb_glm_test(path, output_path=tmp_path / "blocks.h5ad", force=True, **kwargs)
+    with h5py.File(whole.result_path, "r") as a, h5py.File(blocks.result_path, "r") as b:
+        for key in ["X", *(f"layers/{name}" for name in a["layers"])]:
+            assert a[key][()].tobytes() == b[key][()].tobytes(), key
+
+
 def test_nb_glm_global_dispersion_with_covariates(tmp_path):
     """With covariates, dispersion_scope='global' estimates one dispersion per
     gene on the controls and holds it fixed; its tests track per-comparison

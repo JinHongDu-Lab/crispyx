@@ -15,11 +15,13 @@ import os
 import shutil
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import h5py
 import numpy as np
 import pandas as pd
+
+from ._memory import drop_file_cache
 
 if TYPE_CHECKING:
     from tqdm import tqdm
@@ -303,25 +305,30 @@ def _sha256(array: np.ndarray) -> str:
 
 
 class ResumableRun:
-    """Result arrays and a progress checkpoint that outlive an interruption.
+    """A result file filled in place, and a progress checkpoint, that outlive
+    an interruption.
 
-    The arrays are memmaps in a hidden ``.{output name}.resume`` directory
-    beside the output (a temporary directory would vanish with the process,
-    taking the finished work with it). The checkpoint JSON records the call's
-    :func:`run_fingerprint` plus caller-defined progress, and :meth:`save`
-    flushes the arrays before writing it, so everything a checkpoint lists
-    as done is on disk.
+    The work file is :attr:`work_path`, ``result.h5ad`` in a hidden
+    ``.{output name}.resume`` directory beside the output (a temporary
+    directory would vanish with the process, taking the finished work with
+    it). ``scaffold(path)`` creates it with every dataset the run fills,
+    pre-sized; the run writes its results into :attr:`file` as they are
+    computed, and :meth:`finish` moves the completed file to the output.
+    Nothing is held in memory or mapped, so the run's footprint does not
+    grow with the result.
 
-    A caller that writes its partial output itself (rather than into
-    arrays) keeps it in :attr:`directory` too and names it in ``requires``.
+    The checkpoint JSON records the call's :func:`run_fingerprint` plus
+    caller-defined progress. :meth:`save` hands the file's pending data to the
+    operating system and evicts its pages before writing the checkpoint, so
+    everything a checkpoint lists as done survives the process being killed
+    and little of it stays charged to the process's memory.
 
     A run resumes only when ``resume`` is set, the checkpoint's fingerprint
-    matches this call (:func:`fingerprint_difference`), and every array
-    exists with the expected shape and dtype (plus every file named in
-    ``requires``). Otherwise the stale checkpoint and directory are
-    discarded and the run starts fresh, so a checkpoint can never be paired
-    with another run's data; a resume that throws away a checkpoint warns
-    and says why.
+    matches this call (:func:`fingerprint_difference`), and the work file
+    opens with every dataset in ``datasets`` at its expected shape and dtype.
+    Otherwise the stale checkpoint and directory are discarded and the run
+    starts fresh, so a checkpoint can never be paired with another run's
+    data; a resume that throws away a checkpoint warns and says why.
     """
 
     def __init__(
@@ -330,13 +337,15 @@ class ResumableRun:
         checkpoint_path: Path,
         *,
         fingerprint: dict,
-        arrays: dict[str, tuple[tuple[int, ...], "np.typing.DTypeLike", float | int | bool]],
         resume: bool,
-        requires: tuple[str, ...] = (),
+        scaffold: "Callable[[Path], None]",
+        datasets: "dict[str, tuple[tuple[int, ...], np.typing.DTypeLike]]",
     ) -> None:
         self.checkpoint_path = checkpoint_path
         self.fingerprint = fingerprint
         self.directory = output_path.with_name(f".{output_path.name}.resume")
+        self.work_path = self.directory / "result.h5ad"
+        self.file: h5py.File | None = None
         checkpoint = _read_checkpoint(checkpoint_path, required_keys=("fingerprint",)) if resume else None
         mismatch = (
             fingerprint_difference(checkpoint["fingerprint"], fingerprint)
@@ -350,48 +359,58 @@ class ResumableRun:
                 stacklevel=3,
             )
         self.resumed = (
-            checkpoint is not None
-            and mismatch is None
-            and all((self.directory / name).exists() for name in requires)
-            and all(
-                (self.directory / f"{name}.dat").exists()
-                and (self.directory / f"{name}.dat").stat().st_size
-                == int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize
-                for name, (shape, dtype, _fill) in arrays.items()
-            )
+            checkpoint is not None and mismatch is None and _has_datasets(self.work_path, datasets)
         )
         self.progress = {k: v for k, v in checkpoint.items() if k != "fingerprint"} if self.resumed else {}
-        self.arrays: dict[str, np.memmap] = {}
         if not self.resumed:
             self.discard()
-        self.directory.mkdir(parents=True, exist_ok=True)
-        for name, (shape, dtype, fill) in arrays.items():
-            path = self.directory / f"{name}.dat"
-            if self.resumed:
-                self.arrays[name] = np.memmap(path, mode="r+", dtype=dtype, shape=shape)
-            else:
-                array = np.memmap(path, mode="w+", dtype=dtype, shape=shape)
-                if fill != 0:
-                    array.fill(fill)
-                self.arrays[name] = array
+            self.directory.mkdir(parents=True, exist_ok=True)
+            scaffold(self.work_path)
+        self.file = h5py.File(self.work_path, "r+")
 
     def save(self, **progress) -> None:
-        """Flush the arrays, then record ``progress`` in the checkpoint."""
-        for array in self.arrays.values():
-            array.flush()
+        """Put the work file's data on disk, then record ``progress`` in the
+        checkpoint."""
+        self.file.flush()
+        drop_file_cache(self.work_path)
         _write_checkpoint_atomic(self.checkpoint_path, {"fingerprint": self.fingerprint, **progress})
 
-    def discard(self) -> None:
-        """Remove the checkpoint and the arrays (after success, or when stale).
+    def close(self) -> None:
+        """Close the work file, for the steps that finish it by path."""
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+        drop_file_cache(self.work_path)
 
-        Drops this object's references to the arrays; once the caller drops
-        its own, the mapped pages are released.
-        """
-        self.arrays = {}
+    def finish(self, output_path: Path) -> None:
+        """Move the completed work file to ``output_path`` and remove the
+        checkpoint and directory."""
+        self.close()
+        os.replace(self.work_path, output_path)
+        self.discard()
+
+    def discard(self) -> None:
+        """Remove the checkpoint and the work file (after success, or when stale)."""
+        if self.file is not None:
+            self.file.close()
+            self.file = None
         self.checkpoint_path.unlink(missing_ok=True)
-        # ignore_errors: on Windows a file still mapped by a live result view
-        # cannot be deleted; the next run on this output removes it.
         shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def _has_datasets(path: Path, datasets: dict) -> bool:
+    """Whether the h5 file at ``path`` opens and holds every dataset in
+    ``datasets`` with its ``(shape, dtype)``."""
+    try:
+        with h5py.File(path, "r") as handle:
+            return all(
+                name in handle
+                and handle[name].shape == tuple(shape)
+                and handle[name].dtype == np.dtype(dtype)
+                for name, (shape, dtype) in datasets.items()
+            )
+    except (OSError, KeyError):  # absent, or a kill mid-write left it unreadable
+        return False
 
 
 class _DummyProgress:

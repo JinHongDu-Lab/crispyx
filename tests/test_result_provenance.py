@@ -116,13 +116,14 @@ def test_force_recomputes(de_setup, capsys):
 
 def test_relabelled_source_is_recomputed(de_setup, capsys):
     method, path, output = de_setup
-    first = _run(method, path, output)
+    # A result reads its file, which the rerun replaces: keep the values.
+    first_pvalues = np.asarray(_run(method, path, output).pvalues)
     _rewrite_labels(path, np.random.default_rng(1).permutation(_labels()))
     capsys.readouterr()
     second = _run(method, path, output)
     out = capsys.readouterr().out
     assert "is not reused: the input file has changed since" in out
-    assert not np.allclose(second.pvalues, first.pvalues, equal_nan=True)
+    assert not np.allclose(second.pvalues, first_pvalues, equal_nan=True)
 
 
 @pytest.mark.parametrize(
@@ -221,31 +222,23 @@ def test_aliases_name_the_same_call(tmp_path, capsys):
     assert "Loading existing result" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("lazy", [False, True], ids=["loaded", "too-large-to-load"])
-def test_wilcoxon_scanpy_structure_is_written_however_large(tmp_path, monkeypatch, lazy):
-    """A result too large to load is still written with the Scanpy structure
-    its stamp claims, identical to the one written for a loaded result."""
-    import crispyx._memory as memory
-
-    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=True)
-    reference = tmp_path / "reference.h5ad"
-    _run("t_test", path, reference, scanpy_format=True)  # the in-memory writer
-    loaded = _run("wilcoxon", path, tmp_path / "loaded.h5ad", scanpy_format=True)
-    if lazy:
-        monkeypatch.setattr(memory, "_resolve_memory_limit_bytes", lambda _limit: 1)
+@pytest.mark.parametrize("method", ["t_test", "nb_glm", "wilcoxon"])
+def test_scanpy_structure_matches_the_result(tmp_path, method):
+    """Scanpy's structure is written from the result file's own layers, a
+    block of groups at a time, and agrees with the result it is stamped with."""
+    path = _write_counts(tmp_path / "data.h5ad", _labels(), log_normalise=_DE_METHODS[method][1])
     output = tmp_path / "result.h5ad"
-    result = _run("wilcoxon", path, output, scanpy_format=True)
-    assert (result.statistics.size == 0) == lazy
-    with h5py.File(output, "r") as f, h5py.File(tmp_path / "loaded.h5ad", "r") as g:
+    result = _run(method, path, output, scanpy_format=True)
+    with h5py.File(output, "r") as f:
         rgg = f["uns/rank_genes_groups"]
-        np.testing.assert_array_equal(rgg["full/scores"][()], loaded.statistics)
-        np.testing.assert_array_equal(rgg["full/pts_rest"][()], loaded.pts_rest)
-        np.testing.assert_array_equal(rgg["order"][()], loaded.order)
-        for name in ("full/pvals", "full/logfoldchanges", "full/auc", "full/u_stat", "full/pts", "names"):
-            np.testing.assert_array_equal(rgg[name][()], g[f"uns/rank_genes_groups/{name}"][()], err_msg=name)
-    # Same structure as the in-memory writer's, plus the AUC only a rank test has.
-    with h5py.File(reference, "r") as f, h5py.File(output, "r") as g:
-        assert sorted([*f["uns/rank_genes_groups/full"], "auc"]) == sorted(g["uns/rank_genes_groups/full"])
+        np.testing.assert_array_equal(rgg["full/scores"][()], np.asarray(result.statistics))
+        np.testing.assert_array_equal(rgg["full/logfoldchanges"][()], np.asarray(result.logfoldchanges))
+        np.testing.assert_array_equal(rgg["full/pts_rest"][()], result.pts_rest)
+        np.testing.assert_array_equal(rgg["order"][()], np.asarray(result.order))
+        assert [n.decode() for n in rgg["names"][()]] == result.groups
+        # u_stat and the AUC only a rank test has.
+        expected = {"scores", "pvals", "pvals_adj", "logfoldchanges", "pts", "pts_rest"}
+        assert set(rgg["full"]) == expected | ({"u_stat", "auc"} if method == "wilcoxon" else set())
 
 
 def _restamp_with_param(output: Path, name: str, value) -> None:

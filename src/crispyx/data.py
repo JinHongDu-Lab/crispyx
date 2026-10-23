@@ -12,7 +12,7 @@ import functools
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
@@ -23,7 +23,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
+from ._memory import _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
 from ._disk import (
@@ -36,26 +36,6 @@ from ._disk import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def drop_file_cache(path: str | Path) -> None:
-    """Advise the kernel to drop page cache for *path* (Linux only).
-
-    On cgroup-limited systems (SLURM), page-cache pages count toward the
-    memory limit.  Calling this after a streaming read prevents the cached
-    file data from consuming the cgroup budget.
-
-    The call is a no-op on non-Linux platforms or when the file cannot be
-    opened.
-    """
-    try:
-        fd = _os.open(str(path), _os.O_RDONLY)
-        try:
-            _os.posix_fadvise(fd, 0, 0, _os.POSIX_FADV_DONTNEED)
-        finally:
-            _os.close(fd)
-    except (OSError, AttributeError):
-        pass
 
 
 from numba import njit, prange
@@ -157,6 +137,14 @@ def _element_format(elem: h5py.Group | h5py.Dataset) -> str:
 _MISSING = object()
 
 
+def _read_h5ad_element(path: Path, key: str):
+    """One element (``obs``, ``var``, ``uns/<key>``) of the h5ad at ``path``,
+    decoded by anndata, without reading anything else."""
+    _finish_interrupted_swaps(path)
+    with h5py.File(path, "r") as handle:
+        return read_elem(handle[key])
+
+
 class _LazyFrameAccessor:
     """Provide a read-friendly view over ``obs``/``var`` tables with ``.load``."""
 
@@ -167,7 +155,9 @@ class _LazyFrameAccessor:
 
     def load(self) -> pd.DataFrame:
         if self._cache is None:
-            loaded = getattr(self._parent.to_memory(), self._attr)
+            # Only this table: materialising the AnnData would read X too
+            # (a 151 GB QC output, to look up one obs column).
+            loaded = _read_h5ad_element(self._parent.path, self._attr)
             if isinstance(loaded, pd.DataFrame):
                 loaded = loaded.copy()
             else:
@@ -225,7 +215,7 @@ class _LazyUnsEntry:
 
     def load(self) -> Any:
         if self._cache is _MISSING:
-            self._cache = self._parent.to_memory().uns[self._key]
+            self._cache = _read_h5ad_element(self._parent.path, f"uns/{self._key}")
         return self._cache
 
     def preview(self, n: int = 5) -> Any:
@@ -927,37 +917,49 @@ def resolve_control_label(
     *,
     verbose: int | bool = True,
 ) -> str:
-    """Return an explicit control label, inferring one when necessary."""
+    """Return an explicit control label, inferring one when necessary.
+
+    A label is inferred only when exactly one label looks like a control
+    (``ctrl``, ``control``, ``non-target``..., or exactly ``NTC``, in any
+    case). When several do,
+    the choice is not crispyx's to make -- in Huang et al.'s screens
+    ``CTRL`` is the chymotrypsin-like gene, knocked down like any other,
+    beside the ``Non-Targeting`` controls -- so it raises and asks for
+    ``control_label``.
+    """
 
     if control_label is not None:
         return str(control_label)
 
-    index = pd.Index(labels).astype(str)
+    index = pd.Index(pd.unique(pd.Index(labels).astype(str)))
     if index.empty:
         raise ValueError(
             "Cannot infer control label because no perturbation labels were provided."
         )
+    terms = ("ctrl", "control", "nontarget", "non-target", "non_target")
+    # Matched whole only: as a substring "ntc" is in gene symbols (KNTC1).
+    exact_terms = ("ntc",)
     lower = index.str.lower()
+    looks_like_control = np.array([
+        text in exact_terms
+        or any(term in text for term in terms)
+        or ("non" in text and "target" in text)
+        for text in lower
+    ], dtype=bool)
+    matches = [str(label) for label in index[looks_like_control]]
 
-    exact_terms = {"ctrl", "control", "nontarget", "non-target", "non_target"}
-    substring_terms = ("ctrl", "control", "nontarget", "non-target", "non_target")
-
-    def _select(predicate) -> str | None:
-        for label, lowered in zip(index, lower):
-            if predicate(lowered):
-                return str(label)
-        return None
-
-    candidate = _select(lambda text: text in exact_terms)
-    if candidate is None:
-        candidate = _select(lambda text: any(term in text for term in substring_terms))
-    if candidate is None:
-        candidate = _select(lambda text: ("non" in text) and ("target" in text))
-
-    if candidate is None:
+    if not matches:
         raise ValueError(
             "Unable to infer control label automatically. Please provide 'control_label' explicitly."
         )
+    if len(matches) > 1:
+        shown = ", ".join(repr(m) for m in matches[:10]) + (", ..." if len(matches) > 10 else "")
+        raise ValueError(
+            f"Several perturbation labels look like a control ({shown}); pass "
+            "control_label to say which one is. A label such as 'CTRL' can also be a "
+            "gene that was perturbed."
+        )
+    candidate = matches[0]
 
     if verbose:
         logger.info("Inferred control label '%s' from perturbation labels.", candidate)
@@ -1462,6 +1464,10 @@ def iter_matrix_chunks(
     ``read_ahead=True`` reads the next chunk on a background thread while the
     caller works on the current one -- worth it when that work releases the
     GIL (a numba kernel), so reading and computing overlap.
+
+    A backed file's pages are evicted from the page cache every GB read
+    (:class:`~crispyx._memory._EvictEvery`), so a pass over a file larger
+    than the job's memory does not fill its cgroup with cache.
     """
 
     if axis not in (0, 1):
@@ -1474,6 +1480,11 @@ def iter_matrix_chunks(
     n_obs, n_vars = matrix.shape
     length = n_obs if axis == 0 else n_vars
     read_block = _decoded_block_reader(matrix, fmt, axis, n_obs, n_vars)
+    # The file the matrix's bytes are in -- through an external link, the
+    # source of a standardized file -- not the file the AnnData was opened as.
+    node = getattr(matrix, "group", matrix)
+    source = getattr(getattr(node, "file", None), "filename", None)
+    evict = _EvictEvery(source) if source is not None else None
 
     def read(start: int) -> tuple[slice, np.ndarray | sp.spmatrix]:
         end = min(start + chunk_size, length)
@@ -1483,6 +1494,8 @@ def iter_matrix_chunks(
             block = matrix[start:end]
         else:
             block = matrix[:, start:end]
+        if evict is not None:
+            evict(block.data.nbytes + block.indices.nbytes if sp.issparse(block) else np.asarray(block).nbytes)
         if convert_to_dense:
             block = _to_dense(block)
         return slice(start, end), block
@@ -1845,6 +1858,7 @@ def _stream_write_matrix_subset(
         data_buffer: list[np.ndarray] = []
         indices_buffer: list[np.ndarray] = []
         buffer_nnz = 0
+        evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
 
         def flush() -> None:
             nonlocal offset, data_buffer, indices_buffer, buffer_nnz
@@ -1852,6 +1866,7 @@ def _stream_write_matrix_subset(
                 data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
                 indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
                 offset += buffer_nnz
+                evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
             data_buffer, indices_buffer, buffer_nnz = [], [], 0
 
         def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
@@ -2809,6 +2824,7 @@ def _normalize_total_log1p_impl(
         backed = read_backed(stream_path)
         try:
             offset = 0
+            evict = _EvictEvery(output_path, stream_path)
             for slc, block in iter_matrix_chunks(
                 backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
                 warn_slow_axis=False,
@@ -2848,6 +2864,7 @@ def _normalize_total_log1p_impl(
                     data_ds[offset : offset + nnz] = processed_data
                     indices_ds[offset : offset + nnz] = csr.indices.astype(idx_dtype)
                     offset += nnz
+                    evict(nnz * 8)
         finally:
             backed.file.close()
 
@@ -3085,6 +3102,7 @@ def downsample_counts(
             try:
                 offset = 0
                 row_offset = 0
+                evict = _EvictEvery(output_path, source_path)
                 n_chunks = (n_obs + chunk_size - 1) // chunk_size
                 with _create_progress_context(n_chunks, "pp.downsample_counts", verbose, unit="chunk") as pbar:
                     for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
@@ -3111,6 +3129,7 @@ def downsample_counts(
                             data_ds[offset : offset + nnz] = kept_data
                             indices_ds[offset : offset + nnz] = kept_indices
                             offset += nnz
+                            evict(nnz * 8)
                         row_offset += n_rows
                         pbar.update(1)
             finally:
@@ -4097,23 +4116,25 @@ def calculate_wilcoxon_chunk_size(
     n_obs: int,
     n_vars: int,
     *,
+    n_groups: int = 0,
     available_memory_gb: float | None = None,
     min_chunk: int = 32,
     max_chunk: int = 4096,
 ) -> int:
     """Calculate optimal gene chunk size for Wilcoxon rank-sum tests.
 
-    Unlike :func:`calculate_optimal_gene_chunk_size`, this function has **no
-    n_groups cap**.  Wilcoxon writes all output arrays (effect, pvalue, z-score,
-    etc.) to on-disk memory-mapped files immediately, so peak RAM per chunk is
-    independent of the number of perturbation groups.  The only effective cap is
-    a per-chunk transient-memory budget:
+    One gene chunk is held in memory at a time: the chunk's cells, densified,
+    and every group's results for its genes, which are written to the result
+    file before the next chunk is read. Per gene of the chunk that is
 
-        transient ≈ chunk_size × (n_obs × 4  +  n_ctrl × 8  +  n_pert × 4)
-                  ≈ chunk_size × n_obs × 12 bytes
+        transient ≈ n_obs × 12  +  n_groups × 128 bytes
 
-    The budget is set to 15 % of ``available_memory_gb`` so that a single chunk
-    never exceeds ~1/7th of the node RAM.
+    (dense float32 block + ctrl float64 presort + pert float32 stack; about
+    sixteen per-group float64 result and work arrays). The budget is 15 % of
+    ``available_memory_gb``, so a single chunk never exceeds ~1/7th of it.
+
+    Unlike :func:`calculate_optimal_gene_chunk_size`, there is no separate
+    ``n_groups`` cap: the group term above is what the groups cost.
 
     Parameters
     ----------
@@ -4121,6 +4142,9 @@ def calculate_wilcoxon_chunk_size(
         Number of cells in the dataset.
     n_vars
         Number of genes in the dataset (used only for logging).
+    n_groups
+        Number of perturbations tested (0 when the caller holds no per-group
+        results per chunk).
     available_memory_gb
         Available memory in GB.  When *None*, detected via :mod:`psutil`.
         On HPC nodes, pass the SLURM ``--mem`` value so the cap reflects the
@@ -4128,9 +4152,9 @@ def calculate_wilcoxon_chunk_size(
     min_chunk
         Floor for the returned chunk size (default 32).
     max_chunk
-        Ceiling for the returned chunk size (default 4096).  The cell-budget
-        cap is applied *before* this ceiling, so ``max_chunk`` is only active
-        for small/sparse datasets where the cell cap would be very large.
+        Ceiling for the returned chunk size (default 4096).  The memory cap
+        is applied *before* this ceiling, so ``max_chunk`` is only active for
+        small/sparse datasets where the memory cap would be very large.
 
     Returns
     -------
@@ -4156,12 +4180,9 @@ def calculate_wilcoxon_chunk_size(
             )
             available_memory_gb = 16.0
 
-    # Per-chunk transient memory budget: 15% of available RAM.
-    # transient ≈ chunk_size × n_obs × 12 bytes
-    # (dense float32 block + ctrl float64 presort + pert float32 stack).
     _PER_CHUNK_BUDGET_FRACTION = 0.15
     per_chunk_budget = available_memory_gb * _PER_CHUNK_BUDGET_FRACTION * 1e9
-    per_chunk_bytes_per_gene = n_obs * 12
+    per_chunk_bytes_per_gene = n_obs * 12 + n_groups * 128
     cell_cap = max(min_chunk, int(per_chunk_budget / per_chunk_bytes_per_gene))
 
     chunk_size = max(min_chunk, min(cell_cap, max_chunk))
@@ -4521,13 +4542,18 @@ def standardize_dataset(
 ) -> Path:
     """Standardize dataset column names and control labels with caching.
     
-    Creates a standardized copy of the dataset with:
+    Creates a standardized version of the dataset with:
     - perturbation_column renamed to 'perturbation'
     - control labels standardized to 'control'
     - gene_name_column set as var.index if specified
-    
-    This function uses a streaming approach to avoid loading the X matrix
-    into memory, making it suitable for very large datasets (>1M cells).
+
+    Only the metadata changes, so only the metadata is written: the
+    standardized file's ``X``, layers and ``raw.X`` are HDF5 external links
+    into ``dataset_path`` (named relative to the cache directory), which
+    anndata and crispyx read transparently. It therefore costs megabytes, not
+    a copy of the counts, and needs ``dataset_path`` to stay where it is;
+    a changed source is detected by the cache's fingerprint and
+    re-standardized.
     
     Standardized files are cached in {output_dir}/.cache/ and reused
     unless force=True.
@@ -4564,7 +4590,6 @@ def standardize_dataset(
     ... )
     """
     import datetime
-    import shutil
     
     dataset_path = Path(dataset_path)
     output_dir = Path(output_dir)
@@ -4652,28 +4677,89 @@ def standardize_dataset(
         uns_dict["standardization_metadata"] = {}
     uns_dict["standardization_metadata"].update(metadata)
     
-    # Copy h5ad file at filesystem level (streaming - no memory load)
-    logger.info(f"  - Copying dataset (streaming, no X matrix load)...")
+    # Only the metadata changes: the matrices are linked, not copied.
+    logger.info("  - Writing standardized metadata, linking the source's matrices...")
     with _replace_on_success(standardized_path) as partial:
-        shutil.copy2(dataset_path, partial)
-
-        # Modify obs/var/uns in-place using h5py
-        logger.info(f"  - Updating metadata in copied file...")
-        with h5py.File(partial, 'r+') as f:
-            # Update obs - need to rewrite the obs group
-            # Read current obs structure and update
-            _update_h5ad_dataframe(f, 'obs', obs_df)
-
-            # Update var - need to rewrite the var group
-            _update_h5ad_dataframe(f, 'var', var_df)
-
-            # Update uns - handle the standardization_metadata key
-            _update_h5ad_uns(f, 'uns', uns_dict)
+        _write_linked_h5ad(dataset_path, partial, obs=obs_df, var=var_df, uns=uns_dict)
         write_stamp(partial, stamp("standardized", fingerprint))
     
     logger.info(f"Saved standardized dataset: {standardized_path}")
     
     return standardized_path
+
+
+def h5ad_data_bytes(path: str | Path) -> int:
+    """Bytes the data of the h5ad at ``path`` occupies on disk, counting
+    datasets reached through external links -- for a file written by
+    :func:`standardize_dataset`, its source's matrices. The file's own size
+    is only its metadata then, and sizing work from it underestimates by
+    the whole matrix."""
+    total = 0
+
+    def add(_name: str, obj) -> None:
+        nonlocal total
+        if isinstance(obj, h5py.Dataset):
+            total += obj.id.get_storage_size()
+
+    with h5py.File(path, "r") as handle:
+        for key in handle:
+            node = handle[key]  # follows an external link
+            if isinstance(node, h5py.Dataset):
+                add(key, node)
+            else:
+                node.visititems(add)
+                for name in node:  # links one level down (layers/<name>, raw/X)
+                    if isinstance(node.get(name, getlink=True), h5py.ExternalLink):
+                        target = node[name]
+                        if isinstance(target, h5py.Dataset):
+                            add(name, target)
+                        else:
+                            target.visititems(add)
+    return total
+
+
+def _write_linked_h5ad(source: Path, dest: Path, *, obs: pd.DataFrame, var: pd.DataFrame, uns: dict) -> None:
+    """Write an h5ad at ``dest`` with its own ``obs``, ``var`` and ``uns`` whose
+    matrices -- ``X``, each layer, and ``raw/X`` -- are HDF5 external links
+    into ``source``.
+
+    Relabelling a dataset then costs its metadata, not a copy of its counts
+    (hundreds of GB for a genome-wide screen, and a copy that a network
+    filesystem has been seen to return short without raising). The links
+    name ``source`` relative to ``dest``'s directory, which is where HDF5
+    resolves them, so the pair can move together (an absolute path when no
+    relative one exists, across Windows drives). Everything else is copied:
+    a later write into the file -- a new layer, an ``obsm`` entry -- lands
+    in ``dest``, never in ``source``. anndata and h5py read the links
+    transparently; the file stays readable while ``source`` is where the link
+    says.
+    """
+    ad.AnnData(obs=obs, var=var, uns=uns).write(dest)
+    try:
+        target = _os.path.relpath(_os.path.abspath(source), _os.path.abspath(Path(dest).parent))
+    except ValueError:  # different drives on Windows: no relative path exists
+        target = _os.path.abspath(source)
+    # HDF5 accepts '/' on every platform, so the file reads the same anywhere.
+    target = PurePath(target).as_posix()
+    with h5py.File(source, "r") as src, h5py.File(dest, "r+") as out:
+        for key in src:
+            if key in ("obs", "var", "uns"):
+                continue
+            if key in out:
+                del out[key]
+            if key == "X":
+                out["X"] = h5py.ExternalLink(target, "/X")
+            elif key in ("layers", "raw"):
+                group = out.create_group(key)
+                for name, value in src[key].attrs.items():
+                    group.attrs[name] = value
+                for name in src[key]:
+                    if key == "layers" or name == "X":
+                        group[name] = h5py.ExternalLink(target, f"/{key}/{name}")
+                    else:
+                        src.copy(src[key][name], group, name)
+            else:
+                src.copy(src[key], out, key)
 
 
 def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame) -> None:
@@ -4735,41 +4821,6 @@ def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame)
             str_vals = col_data.astype(str).values
             grp.create_dataset(col, data=str_vals.astype('O'),
                                dtype=h5py.special_dtype(vlen=str))
-
-
-def _update_h5ad_uns(h5file: h5py.File, group_name: str, uns_dict: dict) -> None:
-    """Update uns dict in an h5ad file in-place.
-    
-    Only updates the standardization_metadata key to avoid breaking other uns data.
-    """
-    if group_name not in h5file:
-        h5file.create_group(group_name)
-    
-    grp = h5file[group_name]
-    
-    # Only update standardization_metadata to be safe
-    key = 'standardization_metadata'
-    if key in uns_dict:
-        if key in grp:
-            del grp[key]
-        
-        # Store as a group with string datasets for each subkey
-        meta_grp = grp.create_group(key)
-        meta_grp.attrs['encoding-type'] = 'dict'
-        meta_grp.attrs['encoding-version'] = '0.1.0'
-        
-        for subkey, subval in uns_dict[key].items():
-            if isinstance(subval, dict):
-                # Nested dict - store as JSON string
-                import json
-                meta_grp.create_dataset(subkey, data=json.dumps(subval),
-                                        dtype=h5py.special_dtype(vlen=str))
-            elif isinstance(subval, str):
-                meta_grp.create_dataset(subkey, data=subval,
-                                        dtype=h5py.special_dtype(vlen=str))
-            else:
-                meta_grp.create_dataset(subkey, data=str(subval),
-                                        dtype=h5py.special_dtype(vlen=str))
 
 
 def needs_sorting_for_nbglm(
@@ -5033,7 +5084,7 @@ def sort_by_perturbation(
     # Create output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     warn_if_disk_space_low(
-        1.1 * float(path.stat().st_size), output_path,
+        1.1 * float(h5ad_data_bytes(path)), output_path,
         context="sort_by_perturbation",
     )
 
@@ -5209,6 +5260,7 @@ def _write_sorted_sparse(
 
             nnz_written = 0
             ds_indptr[0] = 0
+            evict = _EvictEvery(output_path, source_path)
 
             for start in range(0, n_cells, chunk_size):
                 end = min(start + chunk_size, n_cells)
@@ -5236,6 +5288,7 @@ def _write_sorted_sparse(
                     ds_indices.resize((new_total,))
                     ds_data[nnz_written:new_total] = csr.data
                     ds_indices[nnz_written:new_total] = csr.indices
+                    evict(chunk_nnz * (csr.data.itemsize + 4))
 
                 # Write indptr for this chunk (int64 to avoid overflow
                 # when cumulative nnz exceeds INT32_MAX ≈ 2.1 billion)

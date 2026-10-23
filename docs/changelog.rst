@@ -1,6 +1,88 @@
 Changelog
 =========
 
+Version 0.2.1
+-------------
+
+*Released 2026-10-23.*
+
+* **Differential expression stays inside ``memory_limit_gb``.** ``t_test``,
+  ``nb_glm_test``, ``wilcoxon_test`` and ``shrink_lfc`` no longer hold, or map,
+  a perturbations × genes result: each perturbation's row (or gene chunk's
+  columns) is written into the result file as it is computed, a file
+  allocated up front beside the output that becomes the output when the run
+  finishes. Under a memory limit, each checkpoint evicts its pages, so they
+  are not charged to a SLURM job's memory. Results are bit-identical to
+  0.2.0's.
+* **Changed: ``RankGenesGroupsResult`` reads its result file.** A matrix
+  within 1% of the memory budget is read once and kept (as fast as before);
+  a larger one is read on access (``result.pvalues[i]`` reads one row,
+  ``np.asarray(result.pvalues)`` the matrix, ``order`` is computed per row),
+  so returning a large result no longer costs its size in memory, and
+  ``result["KO1"]`` works however large the result is (the lazy result
+  ``wilcoxon_test`` returned for large outputs raised ``IndexError`` there).
+  A later call that rewrites the same ``output_path`` changes what an earlier
+  result object reads. ``u_statistics`` is ``None`` outside ``wilcoxon_test``
+  (it was a matrix of zeros), and so is Scanpy's ``u_stat`` for ``t_test``
+  and ``nb_glm_test``; ``t_test``'s Scanpy ``order`` now ranks untested genes
+  last, like the other methods.
+* **``wilcoxon_test`` writes its results in column blocks.** Each gene chunk
+  of results was one small write per perturbation into a row-major file,
+  each needing a page read before the write; on a network filesystem that
+  is a round trip per perturbation per chunk (HPC2021 Lustre: 219 s a gene
+  chunk with the pages cached, 918 s when evicted, against 22 s now on the
+  same node and load). The result's layers are HDF5-chunked as
+  (rows, gene chunk width), ~1 MiB each, on every machine (on a local disk
+  the two layouts write alike); values are unchanged. On a 1,500-perturbation
+  Nourreddine subset writing to Lustre the test now takes 796 s, against
+  1,089 s for 0.1.8. Both Wilcoxon paths print a read / compute / write
+  split of their gene-chunk loop.
+* **Removed: ``wilcoxon_test``'s group-batch streaming path.** With the
+  results on disk, the single-pass path's memory is one gene chunk, whose
+  width now accounts for every perturbation's results.
+* **Faster, smaller ``nb_glm_test`` workers.** Each comparison's worker gets
+  its own rows rather than every cell's label (pickled once per comparison,
+  ~3.4 million strings on Huang-HCT116), checks that every perturbation has
+  cells in one pass instead of one per perturbation, and results are written
+  as they finish rather than in submission order. Requires ``joblib>=1.4``. ``uns["pvalue_correction"]`` is now
+  recorded, as for the other methods.
+* **QC's row-streaming cache is plain files** (``cache_mode="disk"``, was
+  ``"memmap"``) in ``$TMPDIR``, read and written sequentially and evicted
+  every GB, as are the outputs of the subset, concatenation, sort,
+  normalisation and downsampling writers.
+* **Fixed: QC read its whole output back into memory** to look up one
+  ``obs`` column (a lazy ``obs``/``var``/``uns`` accessor materialised the
+  AnnData, ``X`` included): 151 GB for Huang-HCT116, where QC peaked at
+  134 GB and was killed on HEK293T after writing its output. The accessors
+  now read only their element, and ``perturbation_keep`` counts labels once
+  instead of comparing every label against every cell (8 min on
+  Replogle-GW-k562).
+* **``standardize_dataset`` no longer copies the dataset.** Only the
+  metadata changes, so only the metadata is written: the standardized
+  file's ``X``, layers and ``raw.X`` are HDF5 external links into the
+  source (relative to the cache directory), read transparently by anndata
+  and crispyx. Standardizing a 350 GB screen on Lustre took ~12 hours of
+  copying, and the copy had come back short without raising three times;
+  it is now seconds. The source must stay where it is.
+* **Fixed: control inference picked a gene.** A control label is inferred
+  only when exactly one label looks like one; several (Huang et al.'s
+  ``Non-Targeting`` beside the chymotrypsin-like gene ``CTRL``) raise and ask
+  for ``control_label``. An exact ``NTC`` now counts as control-like.
+* **Streaming reads evict as they go, under a memory limit.**
+  ``iter_matrix_chunks`` drops the pages it has read from the page cache every
+  GB, so one pass over a file larger than the job no longer fills its cgroup
+  with cache (QC on Huang-HCT116: 117 GB of it). Like every eviction in
+  crispyx, it happens only when a cgroup memory limit is visible or the
+  process runs in a Slurm job; elsewhere the kernel keeps the cache.
+* **When the cgroup limit is not visible** (a job inside a container),
+  the memory budget falls back to Slurm's ``SLURM_MEM_PER_NODE`` /
+  ``SLURM_MEM_PER_CPU``, and asks for ``memory_limit_gb`` when under Slurm
+  without either.
+* **One memory budget.** ``quality_control_summary``, ``nb_glm_test``'s
+  worker and dense-matrix sizing and ``shrink_lfc``'s worker count read
+  ``memory_limit_gb`` capped by the cgroup's headroom (the memory available
+  when ``None``), instead of each detecting memory its own way.
+
 Version 0.2.0
 -------------
 

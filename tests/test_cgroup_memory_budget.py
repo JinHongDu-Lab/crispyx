@@ -241,3 +241,71 @@ def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):
     assert _memory._resolve_memory_limit_bytes(170) == pytest.approx(170e9)
     assert _conversion_buffer_budget_bytes(170) == pytest.approx(85e9)
     assert np.isfinite(_memory._resolve_memory_limit_bytes(None))
+
+
+@pytest.fixture
+def no_slurm(monkeypatch):
+    for name in ("SLURM_JOB_ID", "SLURM_MEM_PER_NODE", "SLURM_MEM_PER_CPU", "SLURM_CPUS_ON_NODE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(_memory, "_warned_unknown_slurm_limit", False)
+    monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({"SLURM_MEM_PER_NODE": "143360"}, 140 * GIB),  # --mem=140G
+        ({"SLURM_MEM_PER_CPU": "4096", "SLURM_CPUS_ON_NODE": "32"}, 128 * GIB),  # --mem-per-cpu=4G -c 32
+    ],
+    ids=["mem", "mem-per-cpu"],
+)
+def test_slurm_allocation_stands_in_for_an_invisible_cgroup(no_slurm, env, expected):
+    """A job whose cgroup limit it cannot see (a cgroup namespace) is still
+    held to its Slurm allocation."""
+    no_slurm.setenv("SLURM_JOB_ID", "42")
+    for name, value in env.items():
+        no_slurm.setenv(name, value)
+    assert _memory._granted_bytes() == pytest.approx(expected)
+    assert _memory._resolve_memory_limit_bytes(400) == pytest.approx(expected)
+    assert _memory._resolve_memory_limit_bytes(100) == pytest.approx(100e9)
+
+
+def test_unknown_slurm_allocation_asks_for_memory_limit_gb(no_slurm):
+    no_slurm.setenv("SLURM_JOB_ID", "42")
+    with pytest.warns(UserWarning, match="pass memory_limit_gb"):
+        assert _memory._granted_bytes() is None
+    # An explicit limit is taken as given.
+    assert _memory._resolve_memory_limit_bytes(100) == pytest.approx(100e9)
+
+
+def test_outside_slurm_nothing_is_granted_or_warned(no_slurm, recwarn):
+    assert _memory._granted_bytes() is None
+    assert not recwarn
+
+
+@pytest.mark.parametrize(
+    "cgroup_limit, slurm, charged",
+    [(None, False, False), (float(64 * GIB), False, True), (None, True, True)],
+    ids=["personal-machine", "cgroup-limit", "slurm-job"],
+)
+def test_page_cache_is_evicted_only_under_a_memory_limit(no_slurm, tmp_path, cgroup_limit, slurm, charged):
+    """On a machine without a memory limit the kernel manages page cache on
+    its own; evicting would only make a second read of the file slower."""
+    import os
+
+    no_slurm.setattr(_memory, "_cgroup_available_bytes", lambda: cgroup_limit)
+    if slurm:
+        no_slurm.setenv("SLURM_JOB_ID", "42")
+        no_slurm.setenv("SLURM_MEM_PER_NODE", "1024")
+    _memory._page_cache_is_charged.cache_clear()
+    calls = []
+    no_slurm.setattr(os, "posix_fadvise", lambda *args: calls.append(args), raising=False)
+    no_slurm.setattr(os, "POSIX_FADV_DONTNEED", 4, raising=False)
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"x" * 10)
+    try:
+        _memory.drop_file_cache(path)
+    finally:
+        _memory._page_cache_is_charged.cache_clear()
+    assert bool(calls) is charged

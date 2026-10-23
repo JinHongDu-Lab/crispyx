@@ -180,6 +180,8 @@ class TestUnknownFreeSpace:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("error")
+            # anndata sets pandas options that pandas 3.1 deprecates.
+            warnings.filterwarnings("ignore", message=r"The '[\w.]+' option is deprecated")
             warn_if_disk_space_low(required_bytes=1e9, output_path=tmp_path)
 
     def test_warn_if_disk_space_low_still_flags_large_write_when_unavailable(self, tmp_path, monkeypatch):
@@ -218,6 +220,8 @@ class TestWarnIfDiskSpaceLow:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("error")
+            # anndata sets pandas options that pandas 3.1 deprecates.
+            warnings.filterwarnings("ignore", message=r"The '[\w.]+' option is deprecated")
             warn_if_disk_space_low(required_bytes=1e6, output_path=tmp_path)
 
     def test_context_label_prefixes_message(self, tmp_path, monkeypatch):

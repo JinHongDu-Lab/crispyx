@@ -44,7 +44,7 @@ def test_qc_gene_filter_cache_is_removed_when_filling_it_fails(tmp_path, monkeyp
             cell_mask=np.ones(60, dtype=bool),
             gene_cell_counts=np.full(12, 10),
             output_path=tmp_path / "out.h5ad",
-            cache_mode="memmap",
+            cache_mode="disk",
             verbose=False,
         )
     assert not list(cache_root.glob("crispyx_qc_cache_*"))
