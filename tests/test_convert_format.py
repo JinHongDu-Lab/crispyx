@@ -175,7 +175,7 @@ def test_interrupted_conversion_leaves_no_output_file(tmp_path, target, monkeypa
     def boom(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cxd, "_scatter_by_key", boom)
+    monkeypatch.setattr(cxd, "_scatter_band", boom)
     with pytest.raises(KeyboardInterrupt):
         CONVERT[target](src, output_path=out, verbose=False)
     assert not out.exists()

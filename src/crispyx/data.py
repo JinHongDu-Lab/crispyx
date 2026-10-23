@@ -3283,30 +3283,36 @@ def _contiguous_bands(
     return bands
 
 
-def _scatter_by_key(
-    keys: np.ndarray,
-    vals: np.ndarray,
-    secondary: np.ndarray,
+@njit(cache=True)
+def _scatter_band(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    major0: int,
+    lo: int,
+    hi: int,
     offset: np.ndarray,
     out_vals: np.ndarray,
-    out_secondary: np.ndarray,
+    out_minor: np.ndarray,
 ) -> None:
-    """Scatter one chunk's non-zeros into compressed output buffers.
+    """Scatter one compressed chunk's non-zeros that fall in band ``[lo, hi)``
+    of the other axis into that band's transposed output buffers.
 
-    ``keys`` is the compressed-axis index (column for CSC output, row for CSR
-    output) relative to the band start and ``secondary`` the other axis index.
-    ``offset[k]`` is the next free position for key ``k`` and is advanced in
-    place, so one key's values stay in source order across chunks.
+    The chunk is CSR (rows ``major0 + r``, column ``indices``) for CSC output,
+    or CSC (columns ``major0 + c``, row ``indices``) for CSR output.
+    ``offset[k]`` is the next free position for band key ``lo + k`` and is
+    advanced in place. One linear pass in source order: each key's values
+    keep source order within and across chunks, a stable counting sort.
     """
-    order = np.argsort(keys, kind="stable")
-    keys_sorted = keys[order]
-    unique_keys, counts = np.unique(keys_sorted, return_counts=True)
-    starts = np.cumsum(counts) - counts
-    within = np.arange(keys_sorted.size) - np.repeat(starts, counts)
-    positions = np.repeat(offset[unique_keys], counts) + within
-    out_vals[positions] = vals[order].astype(out_vals.dtype, copy=False)
-    out_secondary[positions] = secondary[order]
-    offset[unique_keys] += counts
+    for m in range(indptr.shape[0] - 1):
+        minor = major0 + m
+        for j in range(indptr[m], indptr[m + 1]):
+            k = indices[j]
+            if lo <= k < hi:
+                pos = offset[k - lo]
+                out_vals[pos] = data[j]
+                out_minor[pos] = minor
+                offset[k - lo] = pos + 1
 
 
 @contextmanager
@@ -3507,7 +3513,7 @@ def convert_to_csc(
                 backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
             ):
                 csr = _ensure_csr(block)
-                np.add.at(col_nnz, csr.indices, 1)
+                col_nnz += np.bincount(csr.indices, minlength=n_vars)
                 total_nnz += csr.nnz
                 pbar.update(1)
     finally:
@@ -3563,7 +3569,6 @@ def convert_to_csc(
                 # offset[c] = next write position within the band for column c0 + c.
                 # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
                 offset = indptr[c0:c1].astype(np.int64) - base
-                whole = (c0, c1) == (0, n_vars)
                 row_global = 0
                 backed = read_backed(source_path)
                 try:
@@ -3571,20 +3576,10 @@ def convert_to_csc(
                         backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
                     ):
                         csr = _ensure_csr(block)
-                        n_chunk = csr.shape[0]
                         if csr.nnz:
-                            cols = csr.indices
-                            vals = csr.data
-                            # Global row index for every non-zero in this chunk.
-                            rows = np.repeat(
-                                np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
-                            ) + row_dtype(row_global)
-                            if not whole:
-                                keep = (cols >= c0) & (cols < c1)
-                                cols, vals, rows = cols[keep], vals[keep], rows[keep]
-                            if cols.size:
-                                _scatter_by_key(cols - c0, vals, rows, offset, band_data, band_rows)
-                        row_global += n_chunk
+                            _scatter_band(csr.indptr, csr.indices, csr.data, row_global, c0, c1,
+                                          offset, band_data, band_rows)
+                        row_global += csr.shape[0]
                         pbar.update(1)
                 finally:
                     backed.file.close()
@@ -3718,7 +3713,7 @@ def convert_to_csr(
                 ):
                     if sp.issparse(block):
                         csc = sp.csc_matrix(block)
-                        np.add.at(row_nnz, csc.indices, 1)
+                        row_nnz += np.bincount(csc.indices, minlength=n_obs)
                         total_nnz += csc.nnz
                     else:
                         # Dense column block: count non-zeros per row.
@@ -3789,7 +3784,6 @@ def convert_to_csr(
                     band_cols = np.empty(band_nnz, dtype=col_dtype)
                     # offset[r] = next write position within the band for row r0 + r.
                     offset = indptr[r0:r1].astype(np.int64) - base
-                    whole = (r0, r1) == (0, n_obs)
                     col_global = 0
                     backed = read_backed(source_path)
                     try:
@@ -3797,20 +3791,10 @@ def convert_to_csr(
                             backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
                         ):
                             csc = sp.csc_matrix(block) if sp.issparse(block) else sp.csc_matrix(np.asarray(block))
-                            n_chunk_cols = csc.shape[1]
                             if csc.nnz:
-                                rows = csc.indices
-                                vals = csc.data
-                                # Global column index for every non-zero in this chunk.
-                                cols = np.repeat(
-                                    np.arange(n_chunk_cols, dtype=col_dtype), np.diff(csc.indptr)
-                                ) + col_dtype(col_global)
-                                if not whole:
-                                    keep = (rows >= r0) & (rows < r1)
-                                    rows, vals, cols = rows[keep], vals[keep], cols[keep]
-                                if rows.size:
-                                    _scatter_by_key(rows - r0, vals, cols, offset, band_data, band_cols)
-                            col_global += n_chunk_cols
+                                _scatter_band(csc.indptr, csc.indices, csc.data, col_global, r0, r1,
+                                              offset, band_data, band_cols)
+                            col_global += csc.shape[1]
                             pbar.update(1)
                     finally:
                         backed.file.close()

@@ -4,6 +4,13 @@ Changelog
 Unreleased
 ----------
 
+* **``convert_to_csc`` and ``convert_to_csr`` are 5-8x faster.** Each
+  chunk's non-zeros were placed by a stable sort; one linear pass in
+  source order places them the same way. On 300,000 FengTS cells
+  (1.5 billion non-zeros, local SSD) the CSC conversion takes 14.5 s
+  instead of 122 s, and 19 s instead of 119 s in four column bands; files
+  are byte-identical. Most of a Wilcoxon run on a large screen was this
+  conversion (78-86% on Huang).
 * **In-memory AnnData is accepted** by ``t_test``, ``wilcoxon_test``,
   ``nb_glm_test``, the QC filters and ``quality_control_summary``, the
   three pseudobulk functions, ``residual_effects``, ``subsample``,
