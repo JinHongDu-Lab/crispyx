@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Callable, Iterable, Literal, NamedTuple, Sequence, get_args
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import scipy.sparse as sparse
 
 from . import _messages
-from ._checkpoint import _create_progress_context
+from ._checkpoint import _column_block_chunks, _create_progress_context, _create_unfilled_array, _row_blocks
 from ._provenance import KEY as _PROVENANCE_KEY, call_fingerprint, reusable, stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._memory import _resolve_memory_limit_bytes
@@ -988,11 +989,15 @@ def aggregate_pseudobulk(
             obs["sampled_with_replacement"] = bootstrap_size is not None
             var = backed.var.copy()
             var.index = pd.Index(gene_symbols, name=backed.var_names.name)
-            result = ad.AnnData(np.asarray(profiles[: len(keys)]), obs=obs, var=var)
-            result.uns["crispyx_pseudobulk"] = metadata
-            result.uns[_PROVENANCE_KEY] = stamp("pseudobulk", fingerprint)
+            uns = {"crispyx_pseudobulk": metadata, _PROVENANCE_KEY: stamp("pseudobulk", fingerprint)}
             with _replace_on_success(resolved_output) as partial:
-                result.write(partial)
+                ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
+                with h5py.File(partial, "r+") as handle:
+                    # A block of rows at a time, so the profiles are never
+                    # in memory whole.
+                    out = _create_unfilled_array(handle, "X", (len(keys), backed.n_vars), np.float64)
+                    for sl in _row_blocks(len(keys), backed.n_vars):
+                        out[sl] = profiles[sl]
             profiles._mmap.close()  # type: ignore[attr-defined]
     finally:
         backed.file.close()
@@ -1194,78 +1199,69 @@ def compute_pseudobulk_effects(
                 output_codes = np.arange(len(target_rows), dtype=np.int64)
                 n_output = len(target_rows)
 
+            if aggregate_batches:
+                n_batches = np.bincount(output_codes, minlength=n_output)
+                obs = pd.DataFrame(
+                    {
+                        perturbation_column: output_labels,
+                        "n_batches_used": n_batches,
+                    },
+                    index=pd.Index(output_labels, name="perturbation"),
+                )
+                denominator = np.bincount(output_codes, weights=harmonic, minlength=n_output)
+            else:
+                obs = pd.DataFrame(
+                    {
+                        perturbation_column: output_labels,
+                        local_batch_column: target_batches,
+                        "n_cells_target": target_counts,
+                        "n_cells_reference": control_counts,
+                        "n_cells_aggregated_target": target_aggregated_counts,
+                        "n_cells_aggregated_reference": control_aggregated_counts,
+                    },
+                    index=pd.Index(
+                        [f"effect_{i:08d}" for i in range(n_output)],
+                        name="effect_id",
+                    ),
+                )
+            uns = {
+                "crispyx_pseudobulk_effects": effect_metadata,
+                _PROVENANCE_KEY: stamp("pseudobulk_effects", fingerprint),
+            }
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
-            _accumulator_disk_estimate = warn_if_disk_space_low(
-                estimate_bytes(max(n_output, 1), bulk.n_vars, 3), tempfile.gettempdir(),
-                context="pb.effects accumulator",
+            _output_disk_estimate = warn_if_disk_space_low(
+                estimate_bytes(max(n_output, 1), bulk.n_vars, 3), resolved_output,
+                context="pb.effects",
             )
-            _messages.print_disk_estimate(verbose, "pb.effects accumulator", _accumulator_disk_estimate)
-            with tempfile.TemporaryDirectory(prefix="cx_pb_effects_") as tmpdir:
-                shape = (max(n_output, 1), bulk.n_vars)
-                effect_mm = np.memmap(Path(tmpdir) / "effect.dat", dtype=np.float64, mode="w+", shape=shape)
-                target_mm = np.memmap(Path(tmpdir) / "target.dat", dtype=np.float64, mode="w+", shape=shape)
-                reference_mm = np.memmap(Path(tmpdir) / "reference.dat", dtype=np.float64, mode="w+", shape=shape)
-                effect_mm.fill(np.nan)
-                target_mm.fill(np.nan)
-                reference_mm.fill(np.nan)
-                gene_chunk = min(512, max(bulk.n_vars, 1))
-                for start in range(0, bulk.n_vars, gene_chunk):
-                    end = min(start + gene_chunk, bulk.n_vars)
-                    source = np.asarray(bulk.X[:, start:end], dtype=np.float64)
-                    target_values = source[target_rows_arr]
-                    reference_values = source[control_rows_arr]
-                    if aggregate_batches:
-                        denominator = np.bincount(
-                            output_codes, weights=harmonic, minlength=n_output
-                        )
-                        target_num = np.zeros((n_output, end - start), dtype=np.float64)
-                        reference_num = np.zeros_like(target_num)
-                        np.add.at(target_num, output_codes, harmonic[:, None] * target_values)
-                        np.add.at(reference_num, output_codes, harmonic[:, None] * reference_values)
-                        target_chunk = target_num / denominator[:, None]
-                        reference_chunk = reference_num / denominator[:, None]
-                    else:
-                        target_chunk = target_values
-                        reference_chunk = reference_values
-                    target_mm[:n_output, start:end] = target_chunk
-                    reference_mm[:n_output, start:end] = reference_chunk
-                    effect_mm[:n_output, start:end] = target_chunk - reference_chunk
-
-                if aggregate_batches:
-                    n_batches = np.bincount(output_codes, minlength=n_output)
-                    obs = pd.DataFrame(
-                        {
-                            perturbation_column: output_labels,
-                            "n_batches_used": n_batches,
-                        },
-                        index=pd.Index(output_labels, name="perturbation"),
+            _messages.print_disk_estimate(verbose, "pb.effects", _output_disk_estimate)
+            gene_chunk = min(512, max(bulk.n_vars, 1))
+            # Each block of genes goes straight into the output's (rows,
+            # gene block) HDF5 chunks, so no step holds a whole matrix.
+            with _replace_on_success(resolved_output) as partial:
+                ad.AnnData(obs=obs, var=bulk.var.copy(), uns=uns).write(partial)
+                with h5py.File(partial, "r+") as handle:
+                    shape = (n_output, bulk.n_vars)
+                    chunks = _column_block_chunks(n_output, bulk.n_vars, gene_chunk)
+                    effect_ds, target_ds, reference_ds = (
+                        _create_unfilled_array(handle, key, shape, np.float64, chunks)
+                        for key in ("X", "layers/target_profile", "layers/reference_profile")
                     )
-                else:
-                    obs = pd.DataFrame(
-                        {
-                            perturbation_column: output_labels,
-                            local_batch_column: target_batches,
-                            "n_cells_target": target_counts,
-                            "n_cells_reference": control_counts,
-                            "n_cells_aggregated_target": target_aggregated_counts,
-                            "n_cells_aggregated_reference": control_aggregated_counts,
-                        },
-                        index=pd.Index(
-                            [f"effect_{i:08d}" for i in range(n_output)],
-                            name="effect_id",
-                        ),
-                    )
-                var = bulk.var.copy()
-                result = ad.AnnData(np.asarray(effect_mm[:n_output]), obs=obs, var=var)
-                result.layers["target_profile"] = np.asarray(target_mm[:n_output])
-                result.layers["reference_profile"] = np.asarray(reference_mm[:n_output])
-                result.uns["crispyx_pseudobulk_effects"] = effect_metadata
-                result.uns[_PROVENANCE_KEY] = stamp("pseudobulk_effects", fingerprint)
-                with _replace_on_success(resolved_output) as partial:
-                    result.write(partial)
-                effect_mm._mmap.close()  # type: ignore[attr-defined]
-                target_mm._mmap.close()  # type: ignore[attr-defined]
-                reference_mm._mmap.close()  # type: ignore[attr-defined]
+                    for start in range(0, bulk.n_vars, gene_chunk):
+                        end = min(start + gene_chunk, bulk.n_vars)
+                        source = np.asarray(bulk.X[:, start:end], dtype=np.float64)
+                        target_chunk = source[target_rows_arr]
+                        reference_chunk = source[control_rows_arr]
+                        if aggregate_batches:
+                            # Harmonic-weighted mean of each output's batch profiles.
+                            target_num = np.zeros((n_output, end - start), dtype=np.float64)
+                            reference_num = np.zeros_like(target_num)
+                            np.add.at(target_num, output_codes, harmonic[:, None] * target_chunk)
+                            np.add.at(reference_num, output_codes, harmonic[:, None] * reference_chunk)
+                            target_chunk = target_num / denominator[:, None]
+                            reference_chunk = reference_num / denominator[:, None]
+                        target_ds[:, start:end] = target_chunk
+                        reference_ds[:, start:end] = reference_chunk
+                        effect_ds[:, start:end] = target_chunk - reference_chunk
         finally:
             bulk.file.close()
         if int(verbose) >= 1:

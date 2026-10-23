@@ -155,3 +155,39 @@ def test_warns_when_disk_space_low_for_batch_corrected_accumulator(tmp_path, mon
             chunk_size=8,
         ).to_memory()
     assert result.shape[0] == 1
+
+
+def test_pseudobulk_outputs_are_written_in_blocks(tmp_path, monkeypatch):
+    """The profiles are copied into the output a block of rows at a time,
+    and effects a block of genes at a time into (rows, block) HDF5 chunks;
+    the values do not depend on the block size."""
+    import h5py
+    from crispyx import _checkpoint
+
+    rng = np.random.default_rng(1)
+    n_cells, n_genes = 120, 9
+    obs = pd.DataFrame({"perturbation": np.resize(["ctrl", "A", "B", "C"], n_cells),
+                        "batch": np.repeat(["b0", "b1", "b2"], n_cells // 3)},
+                       index=[f"cell_{i}" for i in range(n_cells)])
+    path = tmp_path / "data.h5ad"
+    ad.AnnData(sp.csr_matrix(rng.poisson(2.0, (n_cells, n_genes)).astype(float)), obs=obs,
+               var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])).write(path)
+
+    def run(name):
+        agg = cx.aggregate_pseudobulk(path, groupby=["perturbation", "batch"], method="mean_log1p",
+                                      output_path=tmp_path / f"{name}_agg.h5ad", verbose=False).to_memory()
+        eff = cx.compute_pseudobulk_effects(path, perturbation_column="perturbation", batch_column="batch",
+                                            control_label="ctrl", aggregate_batches=True,
+                                            output_path=tmp_path / f"{name}_eff.h5ad", verbose=False)
+        eff.close()
+        return agg, ad.read_h5ad(tmp_path / f"{name}_eff.h5ad")
+
+    agg, eff = run("one_block")
+    monkeypatch.setattr(_checkpoint, "_BLOCK_ELEMENTS", 2 * n_genes)  # 2 rows a block
+    small_agg, small_eff = run("small_blocks")
+    np.testing.assert_array_equal(agg.X, small_agg.X)
+    for a, b in [(eff.X, small_eff.X), *((eff.layers[k], small_eff.layers[k]) for k in eff.layers)]:
+        np.testing.assert_array_equal(a, b)
+    assert sorted(eff.layers) == ["reference_profile", "target_profile"]
+    with h5py.File(tmp_path / "one_block_eff.h5ad", "r") as f:
+        assert f["X"].chunks[1] == n_genes  # one gene block: all 9 genes

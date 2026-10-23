@@ -4,6 +4,13 @@ Changelog
 Unreleased
 ----------
 
+* **``aggregate_pseudobulk`` and ``compute_pseudobulk_effects`` no longer
+  load their result into memory to write it.** Both accumulated into
+  temporary memory-mapped files and then read them whole to write the
+  output. Profiles are now copied into the output a block of rows at a
+  time, and effects are written a block of 512 genes at a time straight
+  into the output (HDF5-chunked by gene block), with no temporary files.
+  Values are bit-identical.
 * **``convert_to_csc`` and ``convert_to_csr`` are 5-8x faster.** Each
   chunk's non-zeros were placed by a stable sort; one linear pass in
   source order places them the same way. On 300,000 FengTS cells
