@@ -3315,6 +3315,32 @@ def _write_sparse_skeleton(
         grp.create_dataset("indptr", data=indptr)
 
 
+# Bytes of one band written per call; the output's page cache is evicted
+# between calls, so a band of tens of GB never sits in a job's page cache
+# all at once.
+_BAND_WRITE_BYTES = 1 << 30
+
+
+def _write_band(
+    ds_data: h5py.Dataset,
+    ds_secondary: h5py.Dataset,
+    base: int,
+    values: np.ndarray,
+    secondary: np.ndarray,
+    evict: _EvictEvery,
+) -> None:
+    """Write a finished band of ``values`` and its row (CSC) or column (CSR)
+    indices into the pre-sized datasets at ``base``, in slices of about
+    ``_BAND_WRITE_BYTES``, reporting each slice to ``evict``."""
+    per_item = values.itemsize + secondary.itemsize
+    step = max(1, _BAND_WRITE_BYTES // per_item)
+    for start in range(0, values.shape[0], step):
+        stop = min(start + step, values.shape[0])
+        ds_data[base + start:base + stop] = values[start:stop]
+        ds_secondary[base + start:base + stop] = secondary[start:stop]
+        evict((stop - start) * per_item)
+
+
 def convert_to_csc(
     data: str | Path | "AnnData" | ad.AnnData,
     *,
@@ -3477,6 +3503,7 @@ def convert_to_csc(
             n_chunks * len(bands), "pp.convert_to_csc (pass 2)", verbose, unit="chunk"
         ) as pbar:
             ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+            evict = _EvictEvery(partial)
             for c0, c1 in bands:
                 base = int(indptr[c0])
                 band_nnz = int(indptr[c1]) - base
@@ -3510,8 +3537,7 @@ def convert_to_csc(
                         pbar.update(1)
                 finally:
                     backed.file.close()
-                ds_data[base:base + band_nnz] = band_data
-                ds_indices[base:base + band_nnz] = band_rows
+                _write_band(ds_data, ds_indices, base, band_data, band_rows, evict)
                 del band_data, band_rows
 
     _messages.print_done(verbose, "pp.convert_to_csc", f"{n_obs} cells × {n_vars} genes")
@@ -3704,6 +3730,7 @@ def convert_to_csr(
                 n_col_chunks * len(bands), "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
             ) as pbar:
                 ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+                evict = _EvictEvery(partial)
                 for r0, r1 in bands:
                     base = int(indptr[r0])
                     band_nnz = int(indptr[r1]) - base
@@ -3736,8 +3763,7 @@ def convert_to_csr(
                             pbar.update(1)
                     finally:
                         backed.file.close()
-                    ds_data[base:base + band_nnz] = band_data
-                    ds_indices[base:base + band_nnz] = band_cols
+                    _write_band(ds_data, ds_indices, base, band_data, band_cols, evict)
                     del band_data, band_cols
         else:
             # Row-chunk reading (dense source): every chunk is already in CSR
@@ -3748,6 +3774,7 @@ def convert_to_csr(
                     n_row_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
                 ) as pbar:
                     ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+                    evict = _EvictEvery(partial)
                     for _slc, block in iter_matrix_chunks(
                         backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
                     ):
@@ -3757,6 +3784,7 @@ def convert_to_csr(
                             dst_end = dst_start + csr.nnz
                             ds_data[dst_start:dst_end] = csr.data.astype(value_dtype, copy=False)
                             ds_indices[dst_start:dst_end] = csr.indices.astype(col_dtype, copy=False)
+                            evict(csr.nnz * (value_dtype.itemsize + np.dtype(col_dtype).itemsize))
                         pbar.update(1)
             finally:
                 backed.file.close()

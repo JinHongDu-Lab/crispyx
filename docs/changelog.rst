@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **``convert_to_csc`` and ``convert_to_csr`` evict the file they write.**
+  The converted copy, often as large as the source, was written without
+  eviction, so under a memory limit that charges page cache (a SLURM job)
+  its pages stayed charged to the job into the step that reads it, a
+  Wilcoxon test on the CSC copy. Each band is now written in 1 GB slices,
+  evicted as they go, as the documentation already said. Nothing changes on
+  a personal machine; files are byte-identical.
+
 Version 0.2.1
 -------------
 

@@ -102,6 +102,32 @@ def test_conversion_preserves_value_dtype(tmp_path, target, dtype):
 
 
 @targets
+@pytest.mark.parametrize("source_fmt", ["other", "dense"])
+def test_conversion_evicts_its_output_as_it_writes(tmp_path, monkeypatch, target, source_fmt):
+    """The converted file's writes are reported for page-cache eviction in
+    slices, so a large output is not left in a job's page cache."""
+    reported = []
+
+    class Recorder:
+        def __init__(self, *paths, nbytes=0):
+            self.names = [Path(p).name for p in paths]
+
+        def __call__(self, moved):
+            reported.extend((name, moved) for name in self.names)
+
+    dense = _dense()
+    src = _write(tmp_path / "src.h5ad", dense, OTHER[target] if source_fmt == "other" else "dense")
+    monkeypatch.setattr(cxd, "_EvictEvery", Recorder)
+    monkeypatch.setattr(cxd, "_BAND_WRITE_BYTES", 64)
+    out = tmp_path / "out.h5ad"
+    CONVERT[target](src, output_path=out, chunk_size=7, memory_limit_gb=1e-6, verbose=False).close()
+    _assert_canonical(out, dense, target)
+    written = [moved for name, moved in reported if name == ".out.h5ad.partial"]
+    assert len(written) > 1
+    assert sum(written) == np.count_nonzero(dense) * (dense.itemsize + 4)
+
+
+@targets
 def test_source_already_in_target_format_is_returned(tmp_path, target):
     src = _write(tmp_path / "src.h5ad", _dense(), target)
     out = tmp_path / "should_not_exist.h5ad"
