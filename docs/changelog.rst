@@ -19,6 +19,14 @@ Unreleased
   dispersion) is bit-identical. On Adamson with ``dispersion_scope=
   "per_comparison"``, dispersions rise by a median 2.4% and agree slightly
   better with PyDESeq2.
+* **``nb_glm_test`` names a confounded covariate.** A comparison whose
+  design is rank-deficient (every sample of a knockdown in a batch with no
+  controls) used to be fitted as a singular system; it now fails with the
+  offending column named, is NaN in the result, and is listed in the
+  run's warning while the other comparisons go on. A categorical covariate
+  level absent from a comparison's cells no longer adds an all-zero column.
+  The ``covariates`` docstring says numeric columns are continuous, so a
+  batch must be given as strings or a categorical.
 * **``convert_to_csc`` and ``convert_to_csr`` evict the file they write.**
   The converted copy, often as large as the source, was written without
   eviction, so under a memory limit that charges page cache (a SLURM job)

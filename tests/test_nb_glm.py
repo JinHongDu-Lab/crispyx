@@ -1608,3 +1608,39 @@ def test_shrink_lfc_full_caps_workers_by_memory_limit(tmp_path, monkeypatch):
     assert seen[:2] == [1, 1]  # one call per perturbation under the tight budget
     assert all(n >= 1 for n in seen[2:])
     np.testing.assert_allclose(shrunk["tight"], shrunk["auto"], rtol=1e-10)
+
+
+def _batched_bulk(tmp_path, batches, categorical=False):
+    rng = np.random.default_rng(1)
+    labels = np.array(["control", "control", "KD1", "KD1", "KD2", "KD2"] * (len(batches) // 6))
+    counts = rng.negative_binomial(5, 5 / 105, (len(labels), 40)).astype(np.float32)
+    batch = pd.Categorical(batches) if categorical else np.asarray(batches)
+    obs = pd.DataFrame({"perturbation": labels, "batch": batch})
+    path = tmp_path / "bulk.h5ad"
+    ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(40)])).write(path)
+    return path
+
+
+@pytest.mark.parametrize("scope", ["global", "per_comparison"])
+def test_nb_glm_names_a_batch_confounded_with_a_perturbation(tmp_path, caplog, scope):
+    """Every KD2 sample is in batch b1, which has no controls, so the batch
+    and perturbation columns of KD2's comparison are the same column: KD2
+    fails with the reason logged, and the rest of the run goes on."""
+    batches = ["b0", "b0", "b0", "b0", "b1", "b1"] * 2
+    path = _batched_bulk(tmp_path, batches)
+    with pytest.warns(UserWarning, match=r"failed and are NaN.*'KD2'"):
+        result = nb_glm_test(
+            path, perturbation_column="perturbation", control_label="control", covariates=["batch"],
+            dispersion_scope=scope, min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0,
+            output_path=tmp_path / "de.h5ad", n_jobs=1, verbose=False,
+        )
+    assert "rank-deficient; 'batch_b1'" in caplog.text
+    assert np.all(np.isnan(result["KD2"].statistic))
+    assert np.all(np.isfinite(result["KD1"].statistic))
+
+
+def test_build_design_matrix_drops_levels_absent_from_the_subset():
+    obs = pd.DataFrame({"batch": pd.Categorical(["b0", "b1", "b0", "b1"], categories=["b0", "b1", "b2"])})
+    design, names = build_design_matrix(obs, covariate_columns=["batch"], perturbation_indicator=np.array([0, 0, 1, 1]))
+    assert names == ["intercept", "perturbation", "batch_b1"]
+    assert np.all(design.any(axis=0))

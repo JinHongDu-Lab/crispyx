@@ -1559,7 +1559,11 @@ def build_design_matrix(
         if column not in obs_frame.columns:
             raise KeyError(f"Covariate '{column}' not found in obs_frame")
         series = obs_frame[column]
-        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            # A level with no samples in this frame (a batch absent from one
+            # comparison's cells) would be an all-zero column.
+            series = series.cat.remove_unused_categories()
+        if series.dtype.kind in {"O", "U"} or isinstance(series.dtype, pd.CategoricalDtype):
             dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
             if dummies.shape[1] == 0:
                 continue
@@ -1570,6 +1574,29 @@ def build_design_matrix(
             column_names.append(str(column))
     design = np.hstack(matrices) if matrices else np.empty((len(obs_frame), 0), dtype=np.float64)
     return design, column_names
+
+
+def check_full_rank(design: np.ndarray, column_names: list[str], context: str) -> None:
+    """Raise ``ValueError`` naming the columns of ``design`` that are linear
+    combinations of earlier ones, so a confounded design fails with a reason
+    instead of fitting a singular system.
+
+    ``context`` says which fit the design belongs to (e.g. a comparison).
+    """
+    if np.linalg.matrix_rank(design) == design.shape[1]:
+        return
+    dependent, rank = [], 0
+    for j in range(design.shape[1]):
+        if np.linalg.matrix_rank(design[:, : j + 1]) > rank:
+            rank += 1
+        else:
+            dependent.append(column_names[j])
+    raise ValueError(
+        f"{context}: the design is rank-deficient; {', '.join(map(repr, dependent))} "
+        "is a linear combination of the other columns. A covariate is confounded with "
+        "the perturbation (e.g. a batch with no control samples) or with another "
+        "covariate; drop or merge it."
+    )
 
 
 def fit_dispersion_trend(

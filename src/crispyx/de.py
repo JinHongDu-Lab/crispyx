@@ -61,6 +61,7 @@ from .glm import (
     NBGLMBatchFitter,
     ControlStatisticsCache,
     build_design_matrix,
+    check_full_rank,
     estimate_glm_map_dispersion,
     fit_nb_glm_batch_auto,
     estimate_covariate_effects_streaming,
@@ -1571,6 +1572,11 @@ def nb_glm_test(
         Mutually exclusive with ``control_label``.
     covariates
         Additional columns in `adata.obs` to include as covariates in the GLM.
+        String or categorical columns are one-hot encoded (first level
+        dropped); numeric columns enter as one continuous column, so give a
+        batch as strings or a categorical, not as integer codes. A design in
+        which a covariate is confounded with the perturbation (a batch with
+        no control samples) raises ``ValueError``.
     gene_name_column
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
@@ -2034,15 +2040,14 @@ def nb_glm_test(
             subset_size_factors = np.asarray(size_factors)[subset_mask]
             subset_offset = offset[subset_mask] if offset is not None else np.log(np.clip(subset_size_factors, 1e-8, None))
         
-        # Build design matrix
-        
-        # Build design matrix
         design, design_columns = build_design_matrix(
             subset_obs,
             covariate_columns=covariates,
             perturbation_indicator=indicator,
             intercept=True,
         )
+        if covariates:
+            check_full_rank(design, design_columns, f"nb_glm_test, comparison {label!r} vs control")
         perturbation_column_index = design_columns.index("perturbation")
         
         control_subset_mask = control_mask[subset_mask]
@@ -3075,14 +3080,17 @@ def nb_glm_test(
         and control_matrix is not None
     ):
         logger.info("Estimating each gene's dispersion once, on the control cells (dispersion_scope='global')...")
-        control_design, _ = build_design_matrix(
+        control_design, control_columns = build_design_matrix(
             obs_df.iloc[control_mask],
             covariate_columns=covariates,
             perturbation_indicator=np.zeros(control_n),
             intercept=True,
         )
+        control_design = np.delete(control_design, 1, axis=1)  # drop the all-zero perturbation column
+        del control_columns[1]
+        check_full_rank(control_design, control_columns, "nb_glm_test, dispersion on the control cells")
         global_dispersion, global_dispersion_trend = estimate_glm_map_dispersion(
-            np.delete(control_design, 1, axis=1),  # drop the all-zero perturbation column
+            control_design,
             control_matrix,
             offset=offset[control_mask],
             size_factors=np.asarray(size_factors)[control_mask],
