@@ -329,6 +329,8 @@ class TestFilteringMessaging:
         path = _make_dataset_for_filtering(tmp_path)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
+            # anndata sets pandas options that pandas 3.1 deprecates.
+            warnings.filterwarnings("ignore", message=r"The '[\w.]+' option is deprecated")
             filter_cells_by_gene_count(path, min_genes=0)
 
     def test_verbose_false_silences_print_but_not_warning(self, tmp_path, capsys):
