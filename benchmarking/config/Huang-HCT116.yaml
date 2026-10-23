@@ -32,14 +32,15 @@ parallel_config:
 # Accuracy references on a seeded random subset of perturbations (each vs
 # the full control): Scanpy runs out of memory at 128 GB on the full data and
 # PyDESeq2 cannot load it. The same size and seed give Scanpy and PyDESeq2
-# the same 200 perturbations. Relaxed limits apply to these accuracy runs
+# the same 50 perturbations (200 was too slow: Scanpy
+# Wilcoxon >9.7 h unfinished). Relaxed limits apply to these accuracy runs
 # only; the full-data Scanpy memory_limit results are the performance record
 # (kept in .benchmark_cache_full/).
-pydeseq2_max_perturbations: 200
+pydeseq2_max_perturbations: 50
 pydeseq2_subset_seed: 0
 scanpy_max_perturbations:
-  t-test: 200
-  wilcoxon: 200
+  t-test: 50
+  wilcoxon: 50
 scanpy_subset_seed: 0
 method_resource_limits:
   scanpy_de_t_test:
@@ -49,7 +50,9 @@ method_resource_limits:
     memory_limit: 240.0
     time_limit: 259200
   pertpy_de_pydeseq2:
-    memory_limit: 240.0
+    # Each fit holds the full control dense (166,204 x 35,120 float64 =
+    # 43.5 GiB for HCT116); 240 GB failed every fit.
+    memory_limit: 480.0
     time_limit: 259200
 
 # Adaptive QC mode
