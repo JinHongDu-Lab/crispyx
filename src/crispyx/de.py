@@ -945,6 +945,8 @@ def t_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         log-transformed expression data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     groupby
@@ -1494,6 +1496,8 @@ def nb_glm_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         raw count data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     groupby
@@ -4210,6 +4214,8 @@ def wilcoxon_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         normalised, log-transformed data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels, or the labels
         themselves as a ``pd.Series`` indexed by cell (``obs_names``), e.g.

@@ -96,6 +96,8 @@ def residual_effects(
         ``anndata.AnnData`` opened with ``backed='r'``. The function normalises
         (``log1p`` of counts per 10,000) itself and refuses input with
         non-integer or negative values in any chunk it reads.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in ``adata.obs`` naming each cell's perturbation, or a
         ``pd.Series`` of labels indexed by ``obs_names``. Cells whose label is

@@ -72,6 +72,8 @@ def subsample(
     ----------
     data
         Path to an h5ad file, :class:`crispyx.AnnData`, or a backed AnnData.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     n, frac
         Exactly one must be given. ``n`` draws exactly this many items from
         every stratum; ``frac`` draws ``round(frac * pool_size)`` items,

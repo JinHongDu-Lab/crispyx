@@ -2624,6 +2624,8 @@ def normalize_total_log1p(
     ----------
     data
         Path to source h5ad file, or a backed AnnData object.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     output_path
         Path for output h5ad file. If None, uses output_dir/data_name pattern.
     normalize
@@ -3040,6 +3042,8 @@ def downsample_counts(
     ----------
     data
         Path to source h5ad file, or a backed AnnData object.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     output_path
         Path for output h5ad file. If None, derived from ``data_name``.
     counts_per_cell

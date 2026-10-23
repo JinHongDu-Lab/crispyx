@@ -379,6 +379,8 @@ def compute_normalized_effects(
     ----------
     data
         Path to an h5ad file, or a backed AnnData object.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in ``adata.obs`` identifying perturbation groups, or a
         ``pd.Series`` of labels indexed by ``obs_names`` (nothing is written to
@@ -719,6 +721,8 @@ def aggregate_pseudobulk(
     ----------
     data
         Path to an h5ad file, :class:`crispyx.AnnData`, or a backed AnnData.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     groupby
         One observation column, or an ordered sequence of columns defining a
         pseudo-bulk sample.
