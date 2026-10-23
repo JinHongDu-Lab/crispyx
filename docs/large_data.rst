@@ -44,6 +44,13 @@ for fine-grained breakdown.
    of 1.5 billion non-zeros: 15 s) and eliminates the ~18× repeated
    full-file scans that CSR imposes.
 
+   ``memory_limit_gb`` bounds the conversion's output buffers at half of it.
+   An output larger than that is built in bands of columns. In a Slurm or
+   cgroup job, the source is read once and the later bands are spilled to
+   the temporary directory (``$TMPDIR``; about 12 bytes per non-zero for
+   float32 data), so put ``$TMPDIR`` on node-local disk. Elsewhere, each
+   band reads the source again from page cache.
+
    Because the source and destination coexist during conversion, this
    temporarily requires roughly 2× the source file's size in free disk space
    (e.g. ~54 GB for a 27 GB screen). crispyx warns automatically if the

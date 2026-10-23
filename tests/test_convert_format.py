@@ -202,3 +202,89 @@ def test_contiguous_bands_respects_budget_and_covers_everything():
     assert (6, 7) in bands
     assert _contiguous_bands(counts, per_item_bytes=1, budget_bytes=1000) == [(0, len(counts))]
     assert _contiguous_bands(np.zeros(0, dtype=np.int64), per_item_bytes=1, budget_bytes=1) == [(0, 0)]
+
+
+@targets
+@pytest.mark.parametrize("spill", ["tmp", "beside_output", "none"])
+def test_banded_conversion_reads_once_or_per_band_to_the_same_bytes(tmp_path, monkeypatch, target, spill):
+    """Several bands spill to the temporary directory (or beside the output)
+    and read the source once; with no room to spill, each band rereads it.
+    The files are identical and no spill files are left behind."""
+    import tempfile
+
+    scratch_root = tmp_path / "tmp"
+    scratch_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch_root))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    chosen = {"tmp": scratch_root, "beside_output": out_dir, "none": None}[spill]
+    monkeypatch.setattr(cxd, "_page_cache_is_charged", lambda: True)  # as in a Slurm job
+    monkeypatch.setattr(cxd, "_spill_dir", lambda *args: chosen)
+    monkeypatch.setattr(cxd, "_SPILL_READ_ITEMS", 5)  # several reads per band
+    reads = []
+    real_chunks = cxd._source_chunks
+    monkeypatch.setattr(cxd, "_source_chunks", lambda *a: (reads.append(1), real_chunks(*a))[1])
+    dense = _dense()
+    src = _write(tmp_path / "src.h5ad", dense, OTHER[target])
+    out = out_dir / "out.h5ad"
+    CONVERT[target](src, output_path=out, chunk_size=7, memory_limit_gb=1e-6, verbose=False).close()
+    _assert_canonical(out, dense, target)
+    n_bands = len(_contiguous_bands(np.count_nonzero(dense, axis=0 if target == "csc" else 1),
+                                    per_item_bytes=12, budget_bytes=_conversion_buffer_budget_bytes(1e-6)))
+    assert len(reads) == (n_bands if spill == "none" else 1)
+    assert list(scratch_root.iterdir()) == []
+    assert sorted(p.name for p in out_dir.iterdir()) == ["out.h5ad"]
+
+
+@targets
+def test_spill_files_are_removed_when_a_conversion_fails(tmp_path, monkeypatch, target):
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(cxd, "_page_cache_is_charged", lambda: True)
+    monkeypatch.setattr(cxd, "_spill_dir", lambda *args: tmp_path / "tmp")
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cxd, "_write_band", boom)  # after the spill files are written
+    src = _write(tmp_path / "src.h5ad", _dense(), OTHER[target])
+    with pytest.raises(KeyboardInterrupt):
+        CONVERT[target](src, output_path=tmp_path / "out.h5ad", memory_limit_gb=1e-6, verbose=False)
+    assert list((tmp_path / "tmp").iterdir()) == []
+
+
+def test_spill_goes_where_there_is_room(tmp_path, monkeypatch):
+    """The temporary directory first, else the output's directory (which must
+    also hold the output still to be written), else nowhere."""
+    import tempfile
+
+    tmp, out_dir = tmp_path / "tmp", tmp_path / "out"
+    tmp.mkdir()
+    out_dir.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+    free = {}
+    monkeypatch.setattr(cxd, "_free_bytes_at", lambda p: free[Path(p)])
+    output = out_dir / "x.h5ad"
+    free.update({tmp: 2000.0, out_dir: 2000.0})
+    assert cxd._spill_dir(1000, output, 500) == tmp
+    # tmp and out share a filesystem here, so each needs 1.1 x spill + output = 1600
+    free.update({tmp: 1500.0, out_dir: 1500.0})
+    assert cxd._spill_dir(1000, output, 500) is None
+    free.update({out_dir: 1700.0})
+    assert cxd._spill_dir(1000, output, 500) == out_dir
+    free.update({tmp: None, out_dir: None})  # unknown free space: do not spill
+    assert cxd._spill_dir(1000, output, 500) is None
+
+
+@targets
+def test_bands_reread_the_source_where_page_cache_is_free(tmp_path, monkeypatch, target):
+    """Without a memory limit that charges page cache, a band's re-read is
+    served from cache and spilling would only add disk traffic."""
+    monkeypatch.setattr(cxd, "_page_cache_is_charged", lambda: False)
+    monkeypatch.setattr(cxd, "_spill_dir", lambda *args: pytest.fail("spilled"))
+    dense = _dense()
+    src = _write(tmp_path / "src.h5ad", dense, OTHER[target])
+    CONVERT[target](src, output_path=tmp_path / "out.h5ad", memory_limit_gb=1e-6, verbose=False).close()
+    _assert_canonical(tmp_path / "out.h5ad", dense, target)
