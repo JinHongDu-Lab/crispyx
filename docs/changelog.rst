@@ -1,8 +1,10 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.2.2
+-------------
+
+*Released 2026-10-23.*
 
 * **``aggregate_pseudobulk`` and ``compute_pseudobulk_effects`` no longer
   load their result into memory to write it.** Both accumulated into
