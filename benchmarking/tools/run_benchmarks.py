@@ -1443,8 +1443,13 @@ def _seeded_perturbation_subset(
 
 
 def _load_perturbation_subset(path: Path, perturbation_column: str, control_label: str,
-                              max_perturbations: int, seed: int):
-    """Read only control + a seeded perturbation subset of ``path`` into memory."""
+                              max_perturbations: int, seed: int,
+                              max_control_cells: int | None = None):
+    """Read only control + a seeded perturbation subset of ``path`` into memory.
+
+    With ``max_control_cells``, the control is also reduced to a seeded random
+    sample of that many cells (the same cells for every perturbation).
+    """
     import numpy as np
     import scanpy as sc
 
@@ -1453,6 +1458,10 @@ def _load_perturbation_subset(path: Path, perturbation_column: str, control_labe
         labels = backed.obs[perturbation_column].astype(str)
         perturbations = _seeded_perturbation_subset(labels.unique(), control_label, max_perturbations, seed)
         keep = labels.isin([control_label, *perturbations]).to_numpy()
+        control = np.flatnonzero((labels == control_label).to_numpy())
+        if max_control_cells is not None and len(control) > max_control_cells:
+            rng = np.random.default_rng(seed)
+            keep[np.setdiff1d(control, rng.choice(control, size=max_control_cells, replace=False))] = False
         adata = backed[np.flatnonzero(keep)].to_memory()
     finally:
         backed.file.close()
@@ -1485,6 +1494,7 @@ def run_pydeseq2_base(
     n_jobs: int | None = None,
     max_perturbations: int | None = None,
     subset_seed: int = 0,
+    max_control_cells: int | None = None,
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
@@ -1519,8 +1529,10 @@ def run_pydeseq2_base(
         perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     else:
         adata, perturbations = _load_perturbation_subset(
-            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
         )
+    n_control_cells = int((adata.obs[perturbation_column] == control_label).sum())
     t_load_end = time.perf_counter()
     gc.collect()
     gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
@@ -1625,6 +1637,7 @@ def run_pydeseq2_base(
         "save_seconds": t_save_end - t_save_start,
         "failed_groups": n_failed,
         "subsampled": max_perturbations is not None,
+        "control_cells": n_control_cells,
     }
 
 
@@ -1837,6 +1850,9 @@ class BenchmarkConfig:
     # genome-wide screens. None = all perturbations.
     pydeseq2_max_perturbations: Optional[int] = None
     pydeseq2_subset_seed: int = 0
+    # With the subset, also fit against a seeded random sample of this many
+    # control cells (PyDESeq2 holds control + perturbation dense per fit).
+    pydeseq2_max_control_cells: Optional[int] = None
     # Same for the Scanpy DE references, per method ("t-test", "wilcoxon"),
     # e.g. {"wilcoxon": 300}. The same size and seed as PyDESeq2 selects
     # the same perturbations.
@@ -1933,6 +1949,7 @@ class BenchmarkConfig:
             docker_image=docker_image,
             pydeseq2_max_perturbations=data.get("pydeseq2_max_perturbations"),
             pydeseq2_subset_seed=data.get("pydeseq2_subset_seed", 0),
+            pydeseq2_max_control_cells=data.get("pydeseq2_max_control_cells"),
             scanpy_max_perturbations=data.get("scanpy_max_perturbations"),
             scanpy_subset_seed=data.get("scanpy_subset_seed", 0),
             method_resource_limits=data.get("method_resource_limits"),
@@ -4762,6 +4779,7 @@ def create_benchmark_suite(
     pydeseq2_subset_seed: int = 0,
     scanpy_max_perturbations: Dict[str, int] | None = None,
     scanpy_subset_seed: int = 0,
+    pydeseq2_max_control_cells: int | None = None,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -5108,6 +5126,7 @@ def create_benchmark_suite(
                 "n_jobs": n_cores,
                 "max_perturbations": pydeseq2_max_perturbations,
                 "subset_seed": pydeseq2_subset_seed,
+                "max_control_cells": pydeseq2_max_control_cells,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_qc_filtered",
@@ -5632,6 +5651,7 @@ def _run_single_benchmark(
         chunk_size=config.chunk_size,
         memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
         pydeseq2_max_perturbations=config.pydeseq2_max_perturbations,
+        pydeseq2_max_control_cells=config.pydeseq2_max_control_cells,
         pydeseq2_subset_seed=config.pydeseq2_subset_seed,
         scanpy_max_perturbations=config.scanpy_max_perturbations,
         scanpy_subset_seed=config.scanpy_subset_seed,

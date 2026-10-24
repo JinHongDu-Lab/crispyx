@@ -38,6 +38,11 @@ parallel_config:
 # (kept in .benchmark_cache_full/).
 pydeseq2_max_perturbations: 50
 pydeseq2_subset_seed: 0
+# PyDESeq2 fits each perturbation against a seeded random sample of 20,000
+# control cells (the same cells for every perturbation): with the full
+# ~166,000-cell control each fit holds a 43 GiB dense matrix and the run
+# failed at 480 GB. crispyx and Scanpy use the full control.
+pydeseq2_max_control_cells: 20000
 scanpy_max_perturbations:
   t-test: 50
   wilcoxon: 50
@@ -50,9 +55,7 @@ method_resource_limits:
     memory_limit: 240.0
     time_limit: 259200
   pertpy_de_pydeseq2:
-    # Each fit holds the full control dense (166,204 x 35,120 float64 =
-    # 43.5 GiB for HCT116); 240 GB failed every fit.
-    memory_limit: 480.0
+    memory_limit: 240.0
     time_limit: 259200
 
 # Adaptive QC mode
