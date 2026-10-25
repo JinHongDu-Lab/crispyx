@@ -257,7 +257,6 @@ def _nb_posterior_with_cache_numba(
     alpha = math.exp(log_alpha)
     r = 1.0 / alpha
     log_r = math.log(r)
-    gammaln_r = math.lgamma(r)
     cox_reid = xtwx.shape[0] > 0
     xtwx[:, :] = 0.0
 
@@ -266,9 +265,9 @@ def _nb_posterior_with_cache_numba(
         y = Y_g[i]
         mu_i = mu_g[i]
         r_plus_mu = r + mu_i + 1e-12
+        # lgamma(y + r) - lgamma(r), without libm's lgamma (see _lgamma_ratio_term)
         ll += (
-            math.lgamma(y + r)
-            - gammaln_r
+            _lgamma_ratio_term(y, r) + y * log_r
             + r * (log_r - math.log(r_plus_mu))
             + y * math.log(mu_i / r_plus_mu + 1e-12)
         )
@@ -290,7 +289,9 @@ def _nb_map_grid_search_with_refinement_numba(
     Y: np.ndarray,
     mu: np.ndarray,
     log_trend: np.ndarray,
-    log_alpha_grid: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    n_grid: int,
     prior_var: float,
     x_indptr: np.ndarray,
     x_indices: np.ndarray,
@@ -299,13 +300,11 @@ def _nb_map_grid_search_with_refinement_numba(
     tol: float = 1e-5,
     max_refine_iter: int = 50,
 ) -> np.ndarray:
-    """Fused grid search + Brent's method refinement for MAP dispersion.
-    
-    This kernel combines grid search and refinement in a single parallelized
-    pass, avoiding joblib overhead for per-gene refinement. Uses Brent's method
-    (quadratic interpolation) for refinement which is more accurate than
-    golden section search.
-    
+    """Each gene's maximum of the Cox-Reid adjusted NB log-likelihood plus the
+    log-normal prior, over log dispersion in ``[lo, hi]``: a grid of
+    ``n_grid`` points, then Brent's method between the best point's
+    neighbours (not at a bound).
+
     Parameters
     ----------
     Y : (n_cells, n_genes)
@@ -313,11 +312,14 @@ def _nb_map_grid_search_with_refinement_numba(
     mu : (n_cells, n_genes)
         Fitted mean matrix.
     log_trend : (n_genes,)
-        Log of dispersion trend values.
-    log_alpha_grid : (n_grid,)
-        Grid of log-dispersion values to search.
+        Log of the prior's mean (the dispersion trend).
+    lo, hi : (n_genes,)
+        Each gene's search range on log dispersion.
+    n_grid : int
+        Grid points over each range.
     prior_var : float
-        Variance of log-normal prior.
+        Variance of the log-normal prior (``inf`` for none: the gene-wise
+        estimate).
     x_indptr, x_indices, x_data, n_features
         The design matrix in CSR form, for the Cox-Reid adjustment
         (``n_features=0`` for none).
@@ -325,73 +327,43 @@ def _nb_map_grid_search_with_refinement_numba(
         Tolerance for Brent convergence.
     max_refine_iter : int
         Maximum refinement iterations.
-        
+
     Returns
     -------
     best_log_alpha : (n_genes,)
         Refined log-alpha value for each gene.
     """
-    n_cells, n_genes = Y.shape
-    n_grid = log_alpha_grid.shape[0]
-    
+    n_genes = Y.shape[1]
     best_log_alpha = np.zeros(n_genes, dtype=np.float64)
-    
-    # Parallelize over genes
     for g in nb.prange(n_genes):
-        best_posterior = -np.inf
-        best_k = 0
         log_trend_g = log_trend[g]
         Y_g = Y[:, g]
         mu_g = mu[:, g]
         xtwx = np.empty((n_features, n_features))
-        
-        # Precompute gammaln(Y_g + 1) for this gene - reused in refinement
-        gammaln_y_plus_1_sum = 0.0
-        for i in range(n_cells):
-            gammaln_y_plus_1_sum += math.lgamma(Y_g[i] + 1.0)
-        
-        # Stage 1: Grid search
+        step = (hi[g] - lo[g]) / (n_grid - 1)
+        # sum(lgamma(y + 1)) is constant in alpha, so it is left out (0.0).
+        best_posterior = -np.inf
+        best_k = 0
         for k in range(n_grid):
-            log_alpha = log_alpha_grid[k]
             posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
+                Y_g, mu_g, lo[g] + k * step, log_trend_g, prior_var, 0.0,
                 x_indptr, x_indices, x_data, xtwx,
             )
-            
             if posterior > best_posterior:
                 best_posterior = posterior
                 best_k = k
-        
-        best_grid_log_alpha = log_alpha_grid[best_k]
-        
-        # Stage 2: Brent's method refinement (if not at boundary)
-        # We want to MAXIMIZE the posterior, so we use Brent to find minimum of -posterior
-        if best_k > 0 and best_k < n_grid - 1:
-            # Bracket: [grid[best_k-1], grid[best_k+1]]
-            a = log_alpha_grid[best_k - 1]
-            b = log_alpha_grid[best_k + 1]
-            
-            if b - a > tol:
-                # Use Brent's method for refinement (more accurate than golden section)
-                refined_log_alpha = _brent_minimize_numba(
-                    Y_g, mu_g, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    x_indptr, x_indices, x_data, xtwx, a, b, tol=tol, max_iter=max_refine_iter
-                )
-                
-                # Final sanity check: ensure refinement is actually better than grid
-                refined_posterior = _nb_posterior_with_cache_numba(
-                    Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    x_indptr, x_indices, x_data, xtwx,
-                )
-                if refined_posterior >= best_posterior:
-                    best_log_alpha[g] = refined_log_alpha
-                else:
-                    best_log_alpha[g] = best_grid_log_alpha
-            else:
-                best_log_alpha[g] = best_grid_log_alpha
-        else:
-            best_log_alpha[g] = best_grid_log_alpha
-    
+        best = lo[g] + best_k * step
+        if 0 < best_k < n_grid - 1 and 2 * step > tol:
+            refined = _brent_minimize_numba(
+                Y_g, mu_g, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+                best - step, best + step, tol=tol, max_iter=max_refine_iter,
+            )
+            refined_posterior = _nb_posterior_with_cache_numba(
+                Y_g, mu_g, refined, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+            )
+            if refined_posterior >= best_posterior:
+                best = refined
+        best_log_alpha[g] = best
     return best_log_alpha
 
 

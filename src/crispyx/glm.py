@@ -2912,8 +2912,7 @@ def fit_glm_deseq2(
     test_column
         The column of ``design`` tested.
     genes, dispersion, shrink, min_mu, min_disp, max_disp, n_grid, tol
-        As for :func:`fit_two_group_deseq2`; ``tol`` is the dispersion
-        search's tolerance on log dispersion, over the whole range.
+        As for :func:`fit_two_group_deseq2`.
     max_iter, beta_tol, poisson_init_iter
         IRLS (:func:`fit_nb_glm_batch_auto`'s ``max_iter``, ``tol``,
         ``poisson_init_iter``).
@@ -2969,17 +2968,17 @@ def fit_glm_deseq2(
             mu[:, ~finite] = lin_mu[:, ~finite]
         mu = np.asfortranarray(np.maximum(mu, 1e-10))
         log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
-        grid = np.linspace(log_lo, log_hi, n_grid)
         x_csr = _design_csr(design)
+        full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
         genewise[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-            y_t, mu, np.zeros(idx.size), grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+            y_t, mu, np.zeros(idx.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
         trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
         final[idx] = genewise[idx]
         if shrink:
             log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
             prior_var = max(squared_logres - polygamma(1, (n - p) / 2), 0.25)
             map_disp[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-                y_t, mu, np.log(trend[idx]), grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
+                y_t, mu, np.log(trend[idx]), *full, n_grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
             final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])
 
     fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[idx], **irls)

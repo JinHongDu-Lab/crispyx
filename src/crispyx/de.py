@@ -1862,10 +1862,16 @@ def nb_glm_test(
         dispersion: float | None,
         shrink_dispersion: bool,
         lfc_shrinkage_type: str,
+        threads: int,
     ) -> dict:
         """One perturbation against the controls, fitted on their cells with the
         design ``~ covariates + perturbation`` (glm.fit_glm_deseq2); the same
-        result as the two-group worker, natural-log LFC and SE."""
+        result as the two-group worker, natural-log LFC and SE. ``threads`` is
+        this worker's share of the cores for the numba kernels, which would
+        otherwise each start one thread per core in every worker process."""
+        import numba
+
+        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
         group_mask = np.zeros(control_mask.shape[0], dtype=bool)
         group_mask[group_rows] = True
         subset_mask = control_mask | group_mask
@@ -2334,6 +2340,7 @@ def nb_glm_test(
                 min_cells_pert=min_cells_pert, min_total_count=min_total_count, max_iter=max_iter, tol=tol,
                 min_mu=min_mu, poisson_init_iter=poisson_init_iter, dispersion=dispersion,
                 shrink_dispersion=shrink_dispersion, lfc_shrinkage_type=lfc_shrinkage_type,
+                threads=max(1, requested_n_jobs // (effective_n_jobs if use_parallel else 1)),
             )
 
         if two_group:
