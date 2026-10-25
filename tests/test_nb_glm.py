@@ -1730,7 +1730,7 @@ def deseq2_parity_screen(tmp_path_factory):
 @pytest.mark.parametrize("scope", [
     "per_comparison",
     pytest.param("global", marks=pytest.mark.xfail(
-        strict=True, reason="global moments dispersion halfway to the trend (plan §2 option 0)")),
+        strict=True, reason="global moments dispersion halfway to the trend; the global scope is to be removed")),
 ])
 def test_nb_glm_matches_pydeseq2_per_comparison(tmp_path, deseq2_parity_screen, scope):
     """Dispersions, Wald z and p-values agree with PyDESeq2 per target, on
