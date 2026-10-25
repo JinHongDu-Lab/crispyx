@@ -1515,3 +1515,324 @@ def _residual_effects_rows(
                     xty[gene, total_column] += log_total * y
                 if mito_column >= 0:
                     xty[gene, mito_column] += share * y
+
+
+# =============================================================================
+# Two-group DESeq2 against a control summary
+# =============================================================================
+#
+# A comparison of one perturbation with the controls under the design
+# [intercept, perturbation] fits the two groups' means separately, so every
+# control term of DESeq2's objectives -- the NB log-likelihood, the Cox-Reid
+# term (log det X'WX = log W_control + log W_perturbed) and the intercept's
+# equation -- depends on the controls and the dispersion only. The controls
+# are summarised once (glm.ControlSummary): a per-gene histogram of their
+# non-zero counts, and per size-factor bin the first three moments of the
+# size factors and of the counts weighted by them. Terms smooth in the size
+# factor are evaluated per bin to second order around the bin centre; the
+# perturbed cells, a few hundred, are summed exactly.
+#
+# Per cell, PyDESeq2's NB negative log-likelihood less the terms free of the
+# dispersion alpha is
+#     log1p(alpha*mu)/alpha + y*log1p(alpha*mu) - G(y, 1/alpha),
+#     G(y, r) = lgamma(y + r) - lgamma(r) - y*log(r),
+# written so that no term of order r*log(r) cancels when alpha is tiny.
+
+
+@nb.njit(cache=True)
+def _lgamma_ratio_term(y, r):
+    """G(y, r) = lgamma(y + r) - lgamma(r) - y log r, stable for large r."""
+    if y == 0.0:
+        return 0.0
+    if r < 10.0:
+        return math.lgamma(y + r) - math.lgamma(r) - y * math.log(r)
+    # Stirling series for lgamma at x = y + r and at r, differenced.
+    x = y + r
+    out = (x - 0.5) * math.log1p(y / r) - y
+    out += 1.0 / (12.0 * x) - 1.0 / (12.0 * r)
+    out -= 1.0 / (360.0 * x ** 3) - 1.0 / (360.0 * r ** 3)
+    out += 1.0 / (1260.0 * x ** 5) - 1.0 / (1260.0 * r ** 5)
+    return out
+
+
+@nb.njit(cache=True)
+def _control_lin_terms(g, alpha, m, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val, hist_cnt):
+    """Controls' NB negative log-likelihood (less alpha-free terms) and sum
+    of weights mu/(1 + alpha mu) for gene ``g``, with mu = max(s m, min_mu)."""
+    nll = 0.0
+    weight = 0.0
+    floor_log = math.log1p(alpha * min_mu)
+    floor_w = min_mu / (1.0 + alpha * min_mu)
+    am = alpha * m
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        if n_b == 0.0:
+            continue
+        c = centre[b]
+        y0 = y_mom[0, g, b]
+        if c * m < min_mu:
+            nll += n_b * floor_log / alpha + y0 * floor_log
+            weight += n_b * floor_w
+            continue
+        v = 1.0 + am * c
+        f0 = math.log1p(am * c)
+        f1 = am / v
+        f2 = -(am * am) / (v * v)
+        nll += (n_b * f0 + s_mom[1, b] * f1 + 0.5 * s_mom[2, b] * f2) / alpha
+        nll += y0 * f0 + y_mom[1, g, b] * f1 + 0.5 * y_mom[2, g, b] * f2
+        weight += n_b * c * m / v + s_mom[1, b] * m / (v * v) - s_mom[2, b] * alpha * m * m / (v * v * v)
+    r = 1.0 / alpha
+    for k in range(hist_ptr[g], hist_ptr[g + 1]):
+        nll -= hist_cnt[k] * _lgamma_ratio_term(hist_val[k], r)
+    return nll, weight
+
+
+@nb.njit(cache=True)
+def _cells_lin_terms(y, s, m, alpha, min_mu):
+    """The same two quantities summed exactly over cells (counts ``y``,
+    size factors ``s``)."""
+    nll = 0.0
+    weight = 0.0
+    r = 1.0 / alpha
+    for i in range(y.shape[0]):
+        mu = s[i] * m
+        if mu < min_mu:
+            mu = min_mu
+        f0 = math.log1p(alpha * mu)
+        nll += f0 / alpha + y[i] * f0 - _lgamma_ratio_term(y[i], r)
+        weight += mu / (1.0 + alpha * mu)
+    return nll, weight
+
+
+@nb.njit(cache=True)
+def _two_group_objective(log_alpha, g, m_c, m_t, y_t, s_t, min_mu, centre, s_mom, y_mom,
+                         hist_ptr, hist_val, hist_cnt, log_prior_mean, prior_var):
+    """DESeq2's dispersion objective (to minimise): NB negative log-likelihood
+    with the Cox-Reid term, plus the log-normal prior when ``prior_var`` > 0."""
+    alpha = math.exp(log_alpha)
+    nll_c, w_c = _control_lin_terms(g, alpha, m_c, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val, hist_cnt)
+    nll_t, w_t = _cells_lin_terms(y_t, s_t, m_t, alpha, min_mu)
+    out = nll_c + nll_t + 0.5 * (math.log(w_c) + math.log(w_t))
+    if prior_var > 0.0:
+        d = log_alpha - log_prior_mean
+        out += d * d / (2.0 * prior_var)
+    return out
+
+
+@nb.njit(parallel=True, cache=True)
+def _two_group_dispersions(genes, m_c, m_t, y_t, s_t, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
+                           hist_cnt, log_lo, log_hi, log_prior_mean, prior_var, n_grid, tol):
+    """Minimise the dispersion objective over log alpha in [log_lo, log_hi]
+    for each gene in ``genes``: a grid, then golden-section search in the
+    bracket around the grid's best point. ``y_t`` is (cells, genes)."""
+    out = np.empty(genes.shape[0])
+    invphi = (math.sqrt(5.0) - 1.0) / 2.0
+    step = (log_hi - log_lo) / (n_grid - 1)
+    for i in nb.prange(genes.shape[0]):
+        g = genes[i]
+        yg = np.ascontiguousarray(y_t[:, g])
+        prior_mean = log_prior_mean[i] if prior_var > 0.0 else 0.0
+        best = 0
+        best_val = np.inf
+        for k in range(n_grid):
+            val = _two_group_objective(log_lo + k * step, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom,
+                                       y_mom, hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+            if val < best_val:
+                best_val = val
+                best = k
+        lo = log_lo + max(best - 1, 0) * step
+        hi = log_lo + min(best + 1, n_grid - 1) * step
+        x1 = hi - invphi * (hi - lo)
+        x2 = lo + invphi * (hi - lo)
+        f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
+                                  hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+        f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
+                                  hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+        while hi - lo > tol:
+            if f1 < f2:
+                hi = x2
+                x2 = x1
+                f2 = f1
+                x1 = hi - invphi * (hi - lo)
+                f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
+                                          hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+            else:
+                lo = x1
+                x1 = x2
+                f1 = f2
+                x2 = lo + invphi * (hi - lo)
+                f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
+                                          hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+        x = 0.5 * (lo + hi)
+        if best_val < min(f1, f2):  # the optimum at a bound of the range
+            x = log_lo + best * step
+        out[i] = math.exp(x)
+    return out
+
+
+@nb.njit(cache=True)
+def _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom):
+    """Controls' part of PyDESeq2's IRLS fixed-point equation for the
+    intercept ``a``, and its derivative. A cell with s*exp(a) >= min_mu adds
+    (y - mu)/(1 + alpha mu); a cell whose mean IRLS holds at min_mu adds
+    W (log(min_mu/s) - a + (y - min_mu)/min_mu), W = min_mu/(1 + alpha min_mu)."""
+    k = math.exp(a)
+    score = 0.0
+    slope = 0.0
+    w_floor = min_mu / (1.0 + alpha * min_mu)
+    ak = alpha * k
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        if n_b == 0.0:
+            continue
+        c = centre[b]
+        y0 = y_mom[0, g, b]
+        if c * k < min_mu:
+            score += w_floor * (n_b * (math.log(min_mu) - a - 1.0) - s_log[b] + y0 / min_mu)
+            slope -= n_b * w_floor
+            continue
+        y1 = y_mom[1, g, b]
+        y2 = y_mom[2, g, b]
+        v = 1.0 + ak * c
+        # sum y/(1 + alpha mu): f(s) = 1/(1 + alpha k s)
+        score += y0 / v - y1 * ak / (v * v) + y2 * ak * ak / (v * v * v)
+        # sum mu/(1 + alpha mu): g(s) = k s/(1 + alpha k s)
+        score -= n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+        # d/da per cell: -mu (1 + alpha y)/(1 + alpha mu)^2; h(s) = k s/(1 + alpha k s)^2
+        h0 = k * c / (v * v)
+        h1 = k * (1.0 - ak * c) / (v * v * v)
+        h2 = -alpha * k * k * (4.0 - 2.0 * ak * c) / (v * v * v * v)
+        slope -= n_b * h0 + s_mom[1, b] * h1 + 0.5 * s_mom[2, b] * h2
+        slope -= alpha * (y0 * h0 + y1 * h1 + 0.5 * y2 * h2)
+    return score, slope
+
+
+@nb.njit(cache=True)
+def _cells_score(y, s, b, alpha, min_mu):
+    """The perturbed cells' part of the same equation, summed exactly."""
+    k = math.exp(b)
+    score = 0.0
+    slope = 0.0
+    w_floor = min_mu / (1.0 + alpha * min_mu)
+    for i in range(y.shape[0]):
+        mu = s[i] * k
+        if mu < min_mu:
+            score += w_floor * (math.log(min_mu / s[i]) - b + (y[i] - min_mu) / min_mu)
+            slope -= w_floor
+        else:
+            v = 1.0 + alpha * mu
+            score += (y[i] - mu) / v
+            slope -= mu * (1.0 + alpha * y[i]) / (v * v)
+    return score, slope
+
+
+@nb.njit(cache=True)
+def _control_weight(a, alpha, centre, s_mom):
+    """Sum over controls of mu/(1 + alpha mu) with the unthresholded mu = s exp(a)."""
+    k = math.exp(a)
+    out = 0.0
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        if n_b == 0.0:
+            continue
+        c = centre[b]
+        v = 1.0 + alpha * k * c
+        out += n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+    return out
+
+
+@nb.njit(parallel=True, cache=True)
+def _two_group_lfc(genes, dispersion, a0, b0, y_t, s_t, min_mu, centre, s_mom, s_log, y_mom, ridge,
+                   max_iter, tol):
+    """PyDESeq2's IRLS solution for the control intercept a and the perturbed
+    group's log mean b (LFC = b - a) at the given dispersions -- damped Newton
+    on the fixed-point equations X'(W (z - X beta)) = ridge beta -- and the
+    Wald standard error of b - a from the unthresholded means."""
+    n = genes.shape[0]
+    a_out = np.full(n, np.nan)
+    b_out = np.full(n, np.nan)
+    se_out = np.full(n, np.nan)
+    converged = np.zeros(n, dtype=np.bool_)
+    for i in nb.prange(n):
+        g = genes[i]
+        alpha = dispersion[i]
+        yg = np.ascontiguousarray(y_t[:, g])
+        a = a0[i]
+        b = b0[i]
+        for _ in range(max_iter):
+            sc, dc = _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom)
+            st, dt = _cells_score(yg, s_t, b, alpha, min_mu)
+            f1 = sc - ridge * (2.0 * a - b)
+            f2 = st - ridge * (b - a)
+            j11 = dc - 2.0 * ridge
+            j22 = dt - ridge
+            det = j11 * j22 - ridge * ridge
+            if det == 0.0:
+                break
+            da = -(j22 * f1 - ridge * f2) / det
+            db = -(j11 * f2 - ridge * f1) / det
+            norm0 = abs(f1) + abs(f2)
+            step = 1.0
+            na = a
+            nb_ = b
+            for _h in range(30):
+                na = min(max(a + step * da, -30.0), 30.0)
+                nb_ = min(max(b + step * db, -30.0), 30.0)
+                sc2, _dc = _control_score(g, na, alpha, min_mu, centre, s_mom, s_log, y_mom)
+                st2, _dt = _cells_score(yg, s_t, nb_, alpha, min_mu)
+                if abs(sc2 - ridge * (2.0 * na - nb_)) + abs(st2 - ridge * (nb_ - na)) <= norm0:
+                    break
+                step *= 0.5
+            moved = max(abs(na - a), abs(nb_ - b))
+            a = na
+            b = nb_
+            if moved < tol:
+                converged[i] = True
+                break
+        k_t = math.exp(b)
+        w_t = 0.0
+        for j in range(yg.shape[0]):
+            mu = s_t[j] * k_t
+            w_t += mu / (1.0 + alpha * mu)
+        w_c = _control_weight(a, alpha, centre, s_mom)
+        # M = [[w_c + w_t, w_t], [w_t, w_t]]; H = (M + ridge I)^-1;
+        # se^2 = (H M H)[1, 1], PyDESeq2's wald_test
+        m11 = w_c + w_t + ridge
+        m22 = w_t + ridge
+        dm = m11 * m22 - w_t * w_t
+        c1 = -w_t / dm
+        c2 = m11 / dm
+        var = c1 * c1 * (w_c + w_t) + 2.0 * c1 * c2 * w_t + c2 * c2 * w_t
+        a_out[i] = a
+        b_out[i] = b
+        se_out[i] = math.sqrt(var) if var > 0.0 else np.nan
+    return a_out, b_out, se_out, converged
+
+
+@nb.njit(cache=True)
+def _accumulate_control_summary(data, indices, indptr, bin_of_row, s_rows, centre, y_mom, small_hist,
+                                big_genes, big_values, n_big):
+    """Add a CSR block of control rows to the summary: count-weighted
+    size-factor moments per (gene, bin), counts 1..small_hist.shape[1]-1 into
+    the dense histogram, larger counts into the overflow buffers (returns
+    their new length)."""
+    vmax = small_hist.shape[1] - 1
+    for r in range(indptr.shape[0] - 1):
+        b = bin_of_row[r]
+        d = s_rows[r] - centre[b]
+        for j in range(indptr[r], indptr[r + 1]):
+            y = data[j]
+            if y == 0.0:
+                continue
+            g = indices[j]
+            y_mom[0, g, b] += y
+            y_mom[1, g, b] += y * d
+            y_mom[2, g, b] += y * d * d
+            v = int(y)
+            if v <= vmax:
+                small_hist[g, v] += 1.0
+            else:
+                big_genes[n_big] = g
+                big_values[n_big] = y
+                n_big += 1
+    return n_big

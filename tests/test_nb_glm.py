@@ -872,13 +872,14 @@ def test_streaming_vs_dense_dispersion_accuracy():
     assert pearson_r > 0.95, f"Pearson correlation {pearson_r:.3f} < 0.95"
     assert spearman_r > 0.95, f"Spearman correlation {spearman_r:.3f} < 0.95"
     
-    # Trends should also be similar
+    # Trends should also be similar. The simulated dispersions do not depend
+    # on the mean, so the parametric fit can fail and fall back, as
+    # PyDESeq2's does, to a constant (mean) trend: compare values, not a
+    # correlation that a constant leaves undefined.
     trend_dense = cache_dense.global_dispersion_trend
     trend_streaming = cache_streaming.global_dispersion_trend
-    
-    valid_trend = np.isfinite(trend_dense) & np.isfinite(trend_streaming) & (trend_dense > 0) & (trend_streaming > 0)
-    trend_pearson, _ = pearsonr(np.log(trend_dense[valid_trend]), np.log(trend_streaming[valid_trend]))
-    assert trend_pearson > 0.90, f"Trend Pearson correlation {trend_pearson:.3f} < 0.90"
+    log_gap = np.abs(np.log(trend_dense) - np.log(trend_streaming))
+    assert np.all(log_gap < np.log(1.25)), f"trends differ by up to {np.exp(log_gap.max()):.2f}x"
 
 
 def test_memory_adaptive_dispersion():

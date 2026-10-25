@@ -25,6 +25,9 @@ from ._kernels import (
     _nb_map_grid_search_numba,
     _nb_map_grid_search_with_refinement_numba,
     _irls_batch_numba,
+    _accumulate_control_summary,
+    _two_group_dispersions,
+    _two_group_lfc,
 )
 
 # Import profiling utilities from dedicated module
@@ -1574,6 +1577,15 @@ def check_full_rank(design: np.ndarray, column_names: list[str], context: str) -
     )
 
 
+def _mean_dispersion_trend(dispersions: np.ndarray, min_disp: float = 1e-8) -> float:
+    """PyDESeq2's fallback trend: the 0.1%-trimmed mean of the gene-wise
+    dispersions above 10 * min_disp."""
+    from scipy.stats import trim_mean
+
+    use = dispersions[np.isfinite(dispersions) & (dispersions > 10 * min_disp)]
+    return float(trim_mean(use, proportiontocut=0.001)) if use.size else 0.1
+
+
 def fit_dispersion_trend(
     means: ArrayLike,
     dispersions: ArrayLike,
@@ -1663,8 +1675,6 @@ def fit_dispersion_trend(
             max_outer_iter = 20
             for outer_iter in range(max_outer_iter):
                 # Check convergence
-                if not (params > 1e-10).all():
-                    break
                 log_change = np.log(np.abs(params / old_params)) ** 2
                 if log_change.sum() < 1e-6 and outer_iter > 0:
                     break
@@ -1685,20 +1695,18 @@ def fit_dispersion_trend(
                         axis=0
                     )
                 
-                try:
-                    res = minimize(
-                        loss,
-                        x0=params,
-                        jac=grad,
-                        method="L-BFGS-B",
-                        bounds=[(1e-12, np.inf), (1e-12, np.inf)],
-                    )
-                    if not res.success:
-                        break
-                    params = res.x
-                    predictions = X_current @ params
-                except Exception:
-                    break
+                res = minimize(
+                    loss,
+                    x0=params,
+                    jac=grad,
+                    method="L-BFGS-B",
+                    bounds=[(1e-12, np.inf), (1e-12, np.inf)],
+                )
+                if not res.success or (res.x <= 1e-10).any():
+                    # PyDESeq2 then switches to a mean trend
+                    return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
+                params = res.x
+                predictions = X_current @ params
                 
                 # Outlier removal (PyDESeq2 style): keep genes with 1e-4 <= ratio < 15
                 pred_ratios = y_current / np.maximum(predictions, 1e-10)
@@ -1716,10 +1724,9 @@ def fit_dispersion_trend(
             trend = params[0] + params[1] / np.maximum(means_arr, 1e-8)
             trend = np.maximum(trend, 1e-8)
             return trend
-            
-        except Exception:
-            # Fall back to polynomial fit
-            pass
+
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
     
     # Fallback: log-quadratic polynomial fit (original method)
     x = np.log(np.clip(means_arr[valid_for_fit], min_mean, None))
@@ -5894,3 +5901,237 @@ def fit_nb_glm_batch_auto(
         coef=coef, se=se, dispersion=dispersion,
         converged=converged, n_iter=n_iter, deviance=deviance,
     )
+
+
+# =============================================================================
+# Two-group DESeq2 against a control summary
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ControlSummary:
+    """The controls of a screen reduced to what every comparison with them needs.
+
+    In a comparison of one perturbation with the controls under the design
+    ``[intercept, perturbation]``, every control term of DESeq2's objectives
+    depends only on the controls and the dispersion (see the kernels'
+    section header). The controls are binned by size factor; ``s_mom[k, b]``
+    is the k-th moment of the size factors about bin ``b``'s centre,
+    ``y_mom[k, g, b]`` the same weighted by gene ``g``'s counts, and smooth
+    terms are evaluated to second order about the centres. ``hist_*`` hold
+    each gene's histogram of non-zero counts (CSR by gene).
+    """
+
+    n_cells: int
+    centre: np.ndarray        # (bins,)
+    s_mom: np.ndarray         # (3, bins): count, sum(s - c), sum((s - c)^2)
+    s_log: np.ndarray         # (bins,): sum(log s)
+    y_mom: np.ndarray         # (3, genes, bins)
+    hist_ptr: np.ndarray      # (genes + 1,)
+    hist_val: np.ndarray
+    hist_cnt: np.ndarray
+    norm_mean: np.ndarray     # (genes,): mean of counts / size factor
+    total: np.ndarray         # (genes,): sum of counts
+    nnz: np.ndarray           # (genes,): cells with a count
+
+
+def summarize_controls(
+    blocks,
+    size_factors: np.ndarray,
+    n_genes: int,
+    *,
+    bin_width: float = 0.01,
+    small_count_max: int = 64,
+) -> ControlSummary:
+    """Summarise the control cells in one pass.
+
+    Parameters
+    ----------
+    blocks
+        Iterable of ``(rows, csr)``: integer positions into ``size_factors``
+        and the CSR counts of those control cells.
+    size_factors
+        Every control cell's size factor.
+    n_genes
+        Number of genes (columns).
+    bin_width
+        Width of the size-factor bins on the log scale. The second-order
+        terms leave a relative error of about ``bin_width**3 / 24`` per cell.
+        ``0`` gives every distinct size factor its own bin, which is exact.
+    small_count_max
+        Counts up to this value are tallied in a dense per-gene table.
+    """
+    s = np.asarray(size_factors, dtype=np.float64)
+    if bin_width > 0:
+        lo = np.log(s.min())
+        bin_of = np.floor((np.log(s) - lo) / bin_width).astype(np.int64)
+        n_bins = int(bin_of.max()) + 1
+        centre = np.exp(lo + (np.arange(n_bins) + 0.5) * bin_width)
+    else:
+        centre, bin_of = np.unique(s, return_inverse=True)
+        bin_of = bin_of.astype(np.int64)
+        n_bins = centre.size
+    d = s - centre[bin_of]
+    s_mom = np.vstack([
+        np.bincount(bin_of, minlength=n_bins).astype(np.float64),
+        np.bincount(bin_of, weights=d, minlength=n_bins),
+        np.bincount(bin_of, weights=d * d, minlength=n_bins),
+    ])
+    s_log = np.bincount(bin_of, weights=np.log(s), minlength=n_bins)
+
+    y_mom = np.zeros((3, n_genes, n_bins), dtype=np.float64)
+    small_hist = np.zeros((n_genes, small_count_max + 1), dtype=np.float64)
+    big_genes, big_values = [], []
+    norm_sum = np.zeros(n_genes, dtype=np.float64)
+    total = np.zeros(n_genes, dtype=np.float64)
+    nnz = np.zeros(n_genes, dtype=np.int64)
+    for rows, block in blocks:
+        csr = sp.csr_matrix(block, dtype=np.float64)
+        csr.sum_duplicates()
+        rows = np.asarray(rows)
+        buf_g = np.empty(csr.nnz, dtype=np.int64)
+        buf_v = np.empty(csr.nnz, dtype=np.float64)
+        n_big = _accumulate_control_summary(
+            csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), bin_of[rows], s[rows],
+            centre, y_mom, small_hist, buf_g, buf_v, 0,
+        )
+        big_genes.append(buf_g[:n_big])
+        big_values.append(buf_v[:n_big])
+        norm_sum += np.asarray((sp.diags(1.0 / s[rows]) @ csr).sum(axis=0)).ravel()
+        total += np.asarray(csr.sum(axis=0)).ravel()
+        nnz += np.diff(csr.tocsc().indptr)
+
+    gene_small, value_small = np.nonzero(small_hist[:, 1:])
+    gene_all = np.concatenate([gene_small] + big_genes)
+    value_all = np.concatenate([value_small + 1.0] + big_values)
+    count_all = np.concatenate([small_hist[gene_small, value_small + 1], np.ones(sum(map(len, big_genes)))])
+    keys, inverse = np.unique(np.stack([gene_all, value_all]), axis=1, return_inverse=True)
+    counts = np.bincount(inverse.ravel(), weights=count_all, minlength=keys.shape[1])
+    hist_ptr = np.zeros(n_genes + 1, dtype=np.int64)
+    np.add.at(hist_ptr, keys[0].astype(np.int64) + 1, 1)
+    return ControlSummary(
+        n_cells=int(s.size), centre=centre, s_mom=s_mom, s_log=s_log, y_mom=y_mom,
+        hist_ptr=np.cumsum(hist_ptr), hist_val=keys[1].astype(np.float64), hist_cnt=counts,
+        norm_mean=norm_sum / s.size, total=total, nnz=nnz,
+    )
+
+
+@dataclass(frozen=True)
+class TwoGroupResult:
+    """DESeq2 on one perturbation against the controls, per gene (NaN where untested).
+
+    ``lfc`` and ``se`` are natural-log; ``intercept`` is the controls' log mean."""
+
+    genewise_dispersion: np.ndarray
+    trend: np.ndarray
+    map_dispersion: np.ndarray
+    dispersion: np.ndarray
+    lfc: np.ndarray
+    se: np.ndarray
+    statistic: np.ndarray
+    pvalue: np.ndarray
+    intercept: np.ndarray
+    base_mean: np.ndarray
+    converged: np.ndarray
+    prior_var: float
+
+
+def fit_two_group_deseq2(
+    controls: ControlSummary,
+    counts: np.ndarray,
+    size_factors: np.ndarray,
+    genes: np.ndarray | None = None,
+    *,
+    min_mu: float = 0.5,
+    min_disp: float = 1e-8,
+    max_disp: float = 10.0,
+    n_grid: int = 31,
+    tol: float = 1e-6,
+    ridge: float = 1e-6,
+) -> TwoGroupResult:
+    """DESeq2's Wald test of one perturbation against the controls, as PyDESeq2
+    runs it on the design ``~ condition`` with the given size factors.
+
+    The steps are PyDESeq2's: means from the linear model (group means of the
+    normalised counts, floored at ``min_mu``); gene-wise Cox-Reid dispersions;
+    the parametric trend (mean trend if it fails); the prior variance from the
+    MAD of log residuals of genes above ``100 * min_disp``, less
+    ``trigamma((n - 2) / 2)``, at least 0.25; MAP dispersions; genes whose
+    gene-wise dispersion is more than two residual SDs above the trend keep
+    it; IRLS for the coefficients at those dispersions; the Wald test. The
+    controls enter through ``controls`` only, so the cost does not grow with
+    their number. Cook's distance outlier replacement is not done.
+
+    Parameters
+    ----------
+    controls
+        The controls' :class:`ControlSummary`.
+    counts
+        The perturbed cells' counts, dense (cells, genes).
+    size_factors
+        The perturbed cells' size factors.
+    genes
+        Indices of the genes to test (default all); others are NaN.
+    min_mu, min_disp, max_disp
+        PyDESeq2's bounds; the upper dispersion bound is
+        ``max(max_disp, number of cells)``.
+    n_grid, tol
+        Dispersion search: grid points over the log range, then
+        golden-section search to ``tol`` on log dispersion.
+    ridge
+        PyDESeq2's ridge on the coefficients.
+    """
+    from scipy.stats import norm as _norm
+
+    y = np.ascontiguousarray(counts, dtype=np.float64)
+    s = np.asarray(size_factors, dtype=np.float64)
+    n_genes = y.shape[1]
+    n_c, n_t = controls.n_cells, y.shape[0]
+    n = n_c + n_t
+    m_c = controls.norm_mean
+    m_t = (y / s[:, None]).mean(axis=0)
+    base_mean = (n_c * m_c + n_t * m_t) / n
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
+    tested &= (controls.total + y.sum(axis=0)) > 0
+    idx = np.flatnonzero(tested).astype(np.int64)
+    log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
+    summary_args = (controls.centre, controls.s_mom, controls.y_mom,
+                    controls.hist_ptr, controls.hist_val, controls.hist_cnt)
+
+    def nan():
+        return np.full(n_genes, np.nan)
+
+    genewise, trend, map_disp, dispersion = nan(), nan(), nan(), nan()
+    lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
+    converged = np.zeros(n_genes, dtype=bool)
+    if idx.size == 0:
+        return TwoGroupResult(genewise, trend, map_disp, dispersion, lfc, se, stat, pvalue, intercept,
+                              base_mean, converged, float("nan"))
+
+    genewise[idx] = _two_group_dispersions(idx, m_c, m_t, y, s, min_mu, *summary_args, log_lo, log_hi,
+                                           np.zeros(idx.size), 0.0, n_grid, tol)
+    trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
+    log_resid = np.log(genewise[idx]) - np.log(trend[idx])
+    above = genewise[idx] >= 100 * min_disp
+    resid = log_resid[above]
+    squared_logres = (np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2
+    prior_var = max(squared_logres - polygamma(1, (n - 2) / 2), 0.25)
+    map_disp[idx] = _two_group_dispersions(idx, m_c, m_t, y, s, min_mu, *summary_args, log_lo, log_hi,
+                                           np.log(trend[idx]), prior_var, n_grid, tol)
+    dispersion[idx] = map_disp[idx]
+    outlier = log_resid > 2 * np.sqrt(squared_logres)
+    dispersion[idx[outlier]] = genewise[idx[outlier]]
+
+    a, b, se_ln, ok = _two_group_lfc(
+        idx, dispersion[idx], np.log(np.maximum(m_c[idx], 1e-3)), np.log(np.maximum(m_t[idx], 1e-3)), y, s,
+        min_mu, controls.centre, controls.s_mom, controls.s_log, controls.y_mom, ridge, 250, 1e-10,
+    )
+    lfc[idx] = b - a
+    se[idx] = se_ln
+    stat[idx] = lfc[idx] / se_ln
+    pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
+    intercept[idx] = a
+    converged[idx] = ok
+    return TwoGroupResult(genewise, trend, map_disp, dispersion, lfc, se, stat, pvalue, intercept,
+                          base_mean, converged, float(prior_var))
