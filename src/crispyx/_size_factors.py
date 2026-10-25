@@ -1,8 +1,6 @@
-"""Size factor computation utilities for normalization.
-
-This module provides functions for computing library size factors
-using median-of-ratios and DESeq2-style methods.
-"""
+"""Size factors for count models: library size, causarray's geometric means
+and DESeq2's median of ratios, each against the screen's controls where a
+reference is needed (see docs/differential_expression.rst, "Size factors")."""
 
 from __future__ import annotations
 
@@ -20,118 +18,118 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-def _validate_size_factors(
-    size_factors: "ArrayLike", n_cells: int, *, scale: bool = True
-) -> np.ndarray:
-    """Validate and optionally scale user-provided size factors.
-    
-    Parameters
-    ----------
-    size_factors
-        User-provided size factors.
-    n_cells
-        Expected number of cells.
-    scale
-        If True, rescale so geometric mean equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Validated size factors.
-    """
+def _validate_size_factors(size_factors: "ArrayLike", n_cells: int) -> np.ndarray:
+    """User-provided size factors: one per cell, non-positive or non-finite
+    ones replaced by the median of the others, at geometric mean 1."""
     size_factors_arr = np.asarray(size_factors, dtype=np.float64).reshape(-1)
     if size_factors_arr.shape[0] != n_cells:
         raise ValueError(
             f"Provided size_factors have length {size_factors_arr.shape[0]} but expected {n_cells}"
         )
-    mask = np.isfinite(size_factors_arr) & (size_factors_arr > 0)
-    if not np.any(mask):
+    if not np.any(np.isfinite(size_factors_arr) & (size_factors_arr > 0)):
         raise ValueError("Provided size_factors contain no positive finite values")
-    size_factors_arr[~mask] = np.nanmedian(size_factors_arr[mask])
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors_arr, 1e-12, None))))
-        return size_factors_arr / scale_factor
-    return size_factors_arr
+    return _unit_geometric_mean(size_factors_arr)
 
 
-def _median_of_ratios_size_factors(
-    path: str | Path, *, chunk_size: int = 2048, scale: bool = True
+def _unit_geometric_mean(size_factors: np.ndarray) -> np.ndarray:
+    """Replace non-positive or non-finite factors by the median of the others
+    and rescale to geometric mean 1 (which no test depends on: a constant
+    factor is absorbed by the intercept)."""
+    valid = np.isfinite(size_factors) & (size_factors > 0)
+    if not valid.any():
+        return np.ones(size_factors.shape[0], dtype=np.float64)
+    size_factors = size_factors.copy()
+    size_factors[~valid] = np.median(size_factors[valid])
+    return size_factors / np.exp(np.mean(np.log(size_factors)))
+
+
+def _library_size_factors(path: str | Path, *, chunk_size: int = 2048) -> np.ndarray:
+    """Each cell's total count, at geometric mean 1, in one pass over ``path``."""
+    backed = read_backed(path)
+    totals = np.zeros(backed.n_obs, dtype=np.float64)
+    try:
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+            totals[slc] = np.asarray(block.sum(axis=1)).ravel()
+    finally:
+        backed.file.close()
+    return _unit_geometric_mean(totals)
+
+
+def _control_geomeans_size_factors(
+    path: str | Path,
+    labels: np.ndarray,
+    control_label: str,
+    *,
+    min_mean: float = 2.0,
+    min_genes: int = 100,
+    chunk_size: int = 2048,
 ) -> np.ndarray:
-    """Compute median-of-ratios size factors with vectorized row-median computation.
-    
-    Optimized implementation using Numba-accelerated parallel row-median kernel
-    for significant speedup on large datasets (5× faster than per-row Python loop
-    with the default chunk_size=2048).
-    
-    Parameters
-    ----------
-    path
-        Path to h5ad file with count data.
-    chunk_size
-        Number of cells to process per chunk. Larger values reduce I/O overhead
-        but use more memory. Default 2048 balances speed and memory usage.
-    scale
-        If True, rescale size factors so their geometric mean equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for each cell.
+    """causarray's ``comp_size_factor(method="geomeans")`` with the controls as reference.
+
+    Reference genes are those with a mean count of at least ``min_mean`` over
+    the controls (the ``min_genes`` highest when fewer pass); a gene's
+    reference is the geometric mean of the controls' non-zero counts. A
+    cell's factor is the median of its ratios to the reference over the
+    reference genes it counts. A cell counting none of them gets its total
+    count, put on the others' scale by their median ratio of factor to total.
+
+    Restricting the ratios to well-counted genes is what lets a median of
+    ratios track sequencing depth in sparse data: over every expressed gene
+    the ratios are mostly of counts 1 and 2 and follow only part of a depth
+    difference. Two passes over ``path``.
     """
     from ._kernels import _compute_row_medians_csr
-    
+
+    labels = np.asarray(labels)
+    is_control = labels == control_label
+    n_control = int(is_control.sum())
     backed = read_backed(path)
-    n_cells = backed.n_obs
-    n_genes = backed.n_vars
-    log_sum = np.zeros(n_genes, dtype=np.float64)
-    log_count = np.zeros(n_genes, dtype=np.int64)
+    n_cells, n_genes = backed.n_obs, backed.n_vars
+    control_sum = np.zeros(n_genes, dtype=np.float64)
+    control_nnz = np.zeros(n_genes, dtype=np.int64)
+    control_log_sum = np.zeros(n_genes, dtype=np.float64)
     try:
-        for _, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = sp.csr_matrix(block)
-            csc = csr.tocsc()
-            counts_per_gene = np.diff(csc.indptr)
-            if not counts_per_gene.any():
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+            rows = is_control[slc]
+            if not rows.any():
                 continue
-            gene_indices = np.repeat(np.arange(n_genes, dtype=np.int64), counts_per_gene)
-            data = np.log(np.clip(csc.data, 1e-12, None))
-            np.add.at(log_sum, gene_indices, data)
-            np.add.at(log_count, gene_indices, 1)
+            csc = sp.csr_matrix(block, dtype=np.float64)[rows].tocsc()
+            nnz = np.diff(csc.indptr)
+            gene_of = np.repeat(np.arange(n_genes), nnz)
+            control_nnz += nnz
+            control_sum += np.bincount(gene_of, weights=csc.data, minlength=n_genes)
+            control_log_sum += np.bincount(gene_of, weights=np.log(csc.data), minlength=n_genes)
     finally:
         backed.file.close()
-    geo_means = np.zeros(n_genes, dtype=np.float64)
-    valid_geo = log_count > 0
-    geo_means[valid_geo] = np.exp(log_sum[valid_geo] / log_count[valid_geo])
+
+    mean = control_sum / max(n_control, 1)
+    keep = mean >= min_mean
+    if keep.sum() < min(min_genes, n_genes):
+        keep = np.zeros(n_genes, dtype=bool)
+        keep[np.argsort(mean)[::-1][:min_genes]] = True
+    keep &= control_nnz > 0
+    geo_means = np.zeros(n_genes, dtype=np.float64)  # 0 leaves a gene out of the ratios
+    geo_means[keep] = np.exp(control_log_sum[keep] / control_nnz[keep])
 
     size_factors = np.full(n_cells, np.nan, dtype=np.float64)
+    totals = np.zeros(n_cells, dtype=np.float64)
     backed = read_backed(path)
     try:
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
             csr = sp.csr_matrix(block, dtype=np.float64)
-            # Vectorized row-median computation using Numba kernel
-            chunk_medians = _compute_row_medians_csr(
-                csr.data.astype(np.float64),
-                csr.indices.astype(np.int64),
-                csr.indptr.astype(np.int64),
-                geo_means,
-                csr.shape[0],
+            size_factors[slc] = _compute_row_medians_csr(
+                csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), geo_means, csr.shape[0]
             )
-            size_factors[slc] = chunk_medians
+            totals[slc] = np.asarray(csr.sum(axis=1)).ravel()
     finally:
         backed.file.close()
 
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.any(valid_sf):
-        return np.ones(n_cells, dtype=np.float64)
-    fallback = np.nanmedian(size_factors[valid_sf])
-    size_factors[~valid_sf] = fallback
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
-    return size_factors
+    found = np.isfinite(size_factors) & (size_factors > 0)
+    missing = ~found & (totals > 0)
+    if missing.any() and found.any():
+        size_factors[missing] = totals[missing] * np.median(size_factors[found] / totals[found])
+    logger.info("Control geometric-mean size factors: %d reference genes", int(keep.sum()))
+    return _unit_geometric_mean(size_factors)
 
 
 def _control_reference_size_factors(
@@ -140,7 +138,6 @@ def _control_reference_size_factors(
     control_label: str,
     *,
     chunk_size: int = 2048,
-    scale: bool = True,
 ) -> np.ndarray:
     """DESeq2 median-of-ratios size factors against a reference made of the controls.
 
@@ -160,11 +157,11 @@ def _control_reference_size_factors(
        zero in any sample compared -- or, when fewer than three remain, the
        reference genes this cell expresses.
 
-    With fewer than five reference genes (sparse single-cell data with few
-    controls), every gene expressed in some control is used, its geometric
-    mean over the controls' non-zero counts as reference, and each cell's
-    factor is the median ratio over the genes it expresses -- the fallback
-    :func:`_compute_subset_size_factors` uses.
+    Meant for counts where many genes are counted in every control
+    (pseudo-bulk, bulk). With fewer than five such genes -- most single-cell
+    data -- the factors are :func:`_control_geomeans_size_factors` instead;
+    a median of ratios over every expressed gene would track only part of
+    each cell's depth.
 
     Two passes over ``path``: the controls' rows, then every row.
 
@@ -178,8 +175,6 @@ def _control_reference_size_factors(
         The label of the control cells.
     chunk_size
         Rows per chunk.
-    scale
-        Rescale so the factors' geometric mean is 1.
     """
     from ._kernels import _compute_row_medians_csr
 
@@ -205,19 +200,19 @@ def _control_reference_size_factors(
         backed.file.close()
 
     in_every_control = control_nnz == n_control
-    every_control_mode = int(in_every_control.sum()) >= 5
+    if int(in_every_control.sum()) < 5:
+        logger.info(
+            "Only %d genes counted in every control: size_factor_method='deseq2' falls back to 'geomeans'",
+            int(in_every_control.sum()),
+        )
+        return _control_geomeans_size_factors(path, labels, control_label, chunk_size=chunk_size)
     geo_means = np.zeros(n_genes, dtype=np.float64)  # 0 marks a gene outside the reference
-    if every_control_mode:
-        geo_means[in_every_control] = np.exp(control_log_sum[in_every_control] / n_control)
-    else:
-        expressed = control_nnz > 0
-        geo_means[expressed] = np.exp(control_log_sum[expressed] / control_nnz[expressed])
+    geo_means[in_every_control] = np.exp(control_log_sum[in_every_control] / n_control)
     reference = np.flatnonzero(geo_means > 0)
 
     size_factors = np.full(n_cells, np.nan, dtype=np.float64)
-    # The reference genes' counts, kept to give each perturbation its own
-    # gene set; there are few of them in the every-control mode.
-    reference_counts = np.zeros((n_cells, reference.size), dtype=np.float64) if every_control_mode else None
+    # The reference genes' counts, kept to give each perturbation its own gene set.
+    reference_counts = np.zeros((n_cells, reference.size), dtype=np.float64)
     backed = read_backed(path)
     try:
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
@@ -225,105 +220,15 @@ def _control_reference_size_factors(
             size_factors[slc] = _compute_row_medians_csr(
                 csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), geo_means, csr.shape[0]
             )
-            if reference_counts is not None:
-                reference_counts[slc] = csr[:, reference].toarray()
+            reference_counts[slc] = csr[:, reference].toarray()
     finally:
         backed.file.close()
 
-    if reference_counts is not None:
-        perturbed = ~is_control
-        for label in np.unique(labels[perturbed]):
-            rows = np.flatnonzero(labels == label)
-            counts = reference_counts[rows]
-            keep = (counts > 0).all(axis=0)
-            if keep.sum() >= 3:
-                size_factors[rows] = np.median(counts[:, keep] / geo_means[reference[keep]], axis=1)
-
-    logger.info(
-        "Control-reference size factors: %d reference genes (%s)", reference.size,
-        "expressed in every control" if every_control_mode else "non-zero fallback",
-    )
-    valid = np.isfinite(size_factors) & (size_factors > 0)
-    if not valid.any():
-        return np.ones(n_cells, dtype=np.float64)
-    size_factors[~valid] = np.median(size_factors[valid])
-    if scale:
-        return size_factors / np.exp(np.mean(np.log(size_factors)))
-    return size_factors
-
-
-def _compute_subset_size_factors(
-    X: np.ndarray | sp.spmatrix,
-    cell_mask: np.ndarray,
-    *,
-    scale: bool = True,
-) -> np.ndarray:
-    """Compute DESeq2-style size factors for a subset of cells.
-    
-    Uses only genes expressed in ALL cells of the subset (like DESeq2/PyDESeq2).
-    
-    Parameters
-    ----------
-    X
-        Full count matrix (n_cells, n_genes).
-    cell_mask
-        Boolean mask indicating which cells to include in the subset.
-    scale
-        If True, scale so geometric mean of size factors equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for cells in the subset (length = sum(cell_mask)).
-    """
-    from scipy.stats import gmean
-    
-    # Get subset matrix
-    if sp.issparse(X):
-        X_sub = X[cell_mask, :].toarray()
-    else:
-        X_sub = np.asarray(X[cell_mask, :])
-    
-    n_cells, n_genes = X_sub.shape
-    
-    # Find genes expressed in ALL cells of subset (DESeq2 style)
-    min_per_gene = X_sub.min(axis=0)
-    all_expressed = min_per_gene > 0
-    n_reference = all_expressed.sum()
-    
-    if n_reference < 5:
-        # Fall back to median-of-ratios with non-zero filtering
-        # Compute geometric means using only non-zero values
-        log_X = np.log(np.maximum(X_sub, 1e-12))
-        log_X[X_sub == 0] = np.nan
-        geo_means = np.exp(np.nanmean(log_X, axis=0))
-        
-        # Compute ratios
-        size_factors = np.zeros(n_cells, dtype=np.float64)
-        for i in range(n_cells):
-            ratios = X_sub[i, :] / geo_means
-            valid = (X_sub[i, :] > 0) & np.isfinite(ratios) & (ratios > 0)
-            if np.sum(valid) > 0:
-                size_factors[i] = np.median(ratios[valid])
-            else:
-                size_factors[i] = np.nan
-    else:
-        # Use only genes expressed in all cells (DESeq2 style)
-        X_ref = X_sub[:, all_expressed]
-        geo_means = gmean(X_ref, axis=0)
-        ratios = X_ref / geo_means
-        size_factors = np.median(ratios, axis=1)
-    
-    # Handle invalid values
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.all(valid_sf):
-        if np.any(valid_sf):
-            fallback = np.nanmedian(size_factors[valid_sf])
-            size_factors[~valid_sf] = fallback
-        else:
-            size_factors[:] = 1.0
-    
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
-    return size_factors
+    for label in np.unique(labels[~is_control]):
+        rows = np.flatnonzero(labels == label)
+        counts = reference_counts[rows]
+        keep = (counts > 0).all(axis=0)
+        if keep.sum() >= 3:
+            size_factors[rows] = np.median(counts[:, keep] / geo_means[reference[keep]], axis=1)
+    logger.info("Control-reference size factors: %d genes counted in every control", reference.size)
+    return _unit_geometric_mean(size_factors)

@@ -106,14 +106,19 @@ def test_binned_controls_match_the_exact_summary(screen_and_reference):
     np.testing.assert_allclose(binned.lfc, exact.lfc, atol=1e-4)
 
 
-def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path):
+@pytest.mark.parametrize("size_factor_method, scope", [
+    ("libsize", "per_comparison"),
+    ("deseq2", "per_comparison"),
+    pytest.param("libsize", "global", marks=pytest.mark.xfail(
+        strict=True, reason="global moments dispersion halfway to the trend; the global scope is to be removed")),
+])
+def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size_factor_method, scope):
     """End to end: nb_glm_test with per-comparison dispersions (the control
     summary path) agrees with PyDESeq2 on each perturbation's cells, given
-    the control-reference size factors nb_glm_test computes."""
+    the size factors nb_glm_test computes. The global scope does not."""
     import anndata as ad
 
-    from crispyx._size_factors import _control_reference_size_factors
-    from crispyx.de import nb_glm_test
+    from crispyx.de import _global_size_factors, nb_glm_test
 
     rng = np.random.default_rng(1)
     counts, labels, _ = _screen(seed=1, n_pert=300)
@@ -122,12 +127,12 @@ def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path):
     path = tmp_path / "screen.h5ad"
     ad.AnnData(counts.astype(np.float32), obs=pd.DataFrame({"perturbation": labels})).write(path)
     result = nb_glm_test(
-        path, perturbation_column="perturbation", control_label="ctrl", size_factor_method="deseq2",
-        dispersion_scope="per_comparison", n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad",
+        path, perturbation_column="perturbation", control_label="ctrl", size_factor_method=size_factor_method,
+        dispersion_scope=scope, n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad",
         min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_cells_ctrl=0,
         min_cells_pert=0, min_total_count=0,
     )
-    sf = _control_reference_size_factors(path, labels, "ctrl")
+    sf = _global_size_factors(path, size_factor_method, 2048, labels, "ctrl")
     for name in ("KO1", "KO2"):
         keep = np.isin(labels, ["ctrl", name])
         sub = labels[keep].copy()

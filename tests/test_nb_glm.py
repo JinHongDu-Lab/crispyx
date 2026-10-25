@@ -280,8 +280,11 @@ def test_nb_glm_global_dispersion_with_covariates(tmp_path):
     gene on the controls and holds it fixed; its tests track per-comparison
     estimation closely."""
     path = _covariate_screen(tmp_path)
+    # g1 raises 5 of the 30 genes 2.2-fold, about a fifth more total counts:
+    # library-size factors would absorb part of that effect, a median of
+    # ratios does not.
     kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth", "donor"],
-                  min_cells_expressed=0, n_jobs=1, verbose=False)
+                  min_cells_expressed=0, n_jobs=1, verbose=False, size_factor_method="geomeans")
     shared = nb_glm_test(path, dispersion_scope="global", output_path=tmp_path / "global.h5ad", **kwargs)
     separate = nb_glm_test(path, dispersion_scope="per_comparison", output_path=tmp_path / "per.h5ad", **kwargs)
     shared_ad, separate_ad = ad.read_h5ad(shared.result_path), ad.read_h5ad(separate.result_path)
@@ -322,24 +325,6 @@ def test_nb_glm_global_dispersion_leaves_genes_sparse_in_controls_to_each_compar
     # MAP step shrinks the raw estimate used here toward the trend
     assert shared.layers["pvalue"][row, 0] < 0.01
     assert np.ptp(shared.layers["dispersion"][:, 1:], axis=0).max() == 0  # the rest stay shared
-
-
-def test_per_comparison_size_factors_fall_back_to_global_ones_on_large_data(tmp_path):
-    """Too large to load, per-comparison size factors become global ones
-    (not the unit placeholders), with a warning and the scope recorded."""
-    path = _covariate_screen(tmp_path)
-    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=["depth"],
-                  dispersion_scope="per_comparison", n_jobs=1, verbose=False)
-    # 360 cells x 30 genes: the controls (x4) fit in 70 kB, the whole matrix does not
-    budget = dict(memory_limit_gb=70e-6, max_dense_fraction=1.0)
-    with pytest.warns(UserWarning, match="too large to load"):
-        fallback = nb_glm_test(path, size_factor_scope="per_comparison",
-                               output_path=tmp_path / "fallback.h5ad", **budget, **kwargs)
-    reference = nb_glm_test(path, size_factor_scope="global", output_path=tmp_path / "global.h5ad", **kwargs)
-    fallback_ad = ad.read_h5ad(fallback.result_path)
-    assert fallback_ad.uns["size_factor_scope"] == "global"
-    assert np.isfinite(fallback.statistics).mean() > 0.9
-    np.testing.assert_allclose(fallback.statistics, reference.statistics, rtol=1e-6, equal_nan=True)
 
 
 def test_control_cache_fits_at_the_global_dispersion(tmp_path):
@@ -1544,24 +1529,6 @@ def test_nb_glm_refuses_log_transformed_input(tmp_path, storage):
     assert not (tmp_path / "out.h5ad").exists()
 
 
-def test_per_comparison_and_control_reference_size_factors_agree_up_to_a_shift(tmp_path):
-    """With one perturbation, DESeq2's ratio on all cells (per comparison) and
-    against the controls' reference (global "deseq2") differ by a common shift
-    of the LFCs: 8 of the 40 genes are 3x up, which moves the perturbed cells'
-    median ratio (by 0.11 log2 here). Effects relative to the unchanged genes
-    agree, and both find the planted genes."""
-    path, _ = _dense_screen(tmp_path / "one.h5ad", ["ctrl"] * 150 + ["KO1"] * 150)
-    control_ref = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW).logfoldchanges[0]
-    result = nb_glm_test(path, output_path=tmp_path / "per.h5ad", size_factor_scope="per_comparison", **_NB_KW)
-    per_comparison = result.logfoldchanges[0]
-    np.testing.assert_allclose(
-        per_comparison - np.median(per_comparison[8:]), control_ref - np.median(control_ref[8:]), atol=0.02
-    )
-    for lfc in (per_comparison, control_ref):
-        assert lfc[:8].mean() - lfc[8:].mean() == pytest.approx(np.log2(3), abs=0.1)
-    assert (result.pvalues[0, :8] < 1e-6).all()
-
-
 def test_per_comparison_dispersion_scope(tmp_path):
     """Per-comparison method-of-moments dispersion gives nearly the same
     coefficients (each scope fits at its own dispersion) and valid Wald
@@ -1688,90 +1655,3 @@ def test_check_full_rank_names_each_column_spanned_by_earlier_ones():
         check_full_rank(design, ["1", "a", "b", "a+2b", "3a"], "test")
     check_full_rank(design[:, :3], ["1", "a", "b"], "test")
     check_full_rank(np.empty((5, 0)), [], "test")
-
-
-# ---------------------------------------------------------------------------
-# Agreement with PyDESeq2 run per comparison (control + one perturbation)
-# ---------------------------------------------------------------------------
-
-_PARITY_PERTURBATIONS = ("KO1", "KO2")
-_NO_EXPRESSION_FILTERS = dict(min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0,
-                              min_cells_ctrl=0, min_cells_pert=0, min_total_count=0)
-
-
-@pytest.fixture(scope="module")
-def deseq2_parity_screen(tmp_path_factory):
-    """A small single-cell-like screen (400 controls, 150 cells per target,
-    300 genes from 0.3 to 30 counts per cell, dispersions scattered around a
-    DESeq2-shaped trend, 30 genes moved per target) with PyDESeq2's results
-    for each target against the controls."""
-    if DeseqDataSet is None:
-        pytest.skip("pydeseq2 is not installed")
-    rng = np.random.default_rng(0)
-    n_ctrl, n_pert, n_genes = 400, 150, 300
-    labels = np.array(["ctrl"] * n_ctrl + [p for p in _PARITY_PERTURBATIONS for _ in range(n_pert)])
-    mu = rng.lognormal(np.log(3), 1.2, n_genes)
-    alpha = (0.05 + 0.6 / mu) * rng.lognormal(0, 0.5, n_genes)
-    lfc = np.zeros((len(_PARITY_PERTURBATIONS), n_genes))
-    for row in lfc:
-        row[rng.choice(n_genes, 30, replace=False)] = rng.normal(0, 1, 30)
-    mean = mu[None, :] * rng.lognormal(0, 0.3, labels.size)[:, None]
-    for row, name in zip(lfc, _PARITY_PERTURBATIONS):
-        mean[labels == name] *= np.exp(row)
-    counts = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mean))
-    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(labels.size)])
-    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
-    path = tmp_path_factory.mktemp("parity") / "screen.h5ad"
-    ad.AnnData(counts.astype(np.float32), obs=obs, var=var).write(path)
-
-    reference = {}
-    for name in _PARITY_PERTURBATIONS:
-        keep = np.isin(labels, ["ctrl", name])
-        dds = DeseqDataSet(
-            counts=pd.DataFrame(counts[keep], index=obs.index[keep], columns=var.index),
-            metadata=pd.DataFrame({"condition": labels[keep]}, index=obs.index[keep]),
-            design="~condition", quiet=True,
-        )
-        dds.deseq2()
-        stats = DeseqStats(dds, contrast=["condition", name, "ctrl"], quiet=True)
-        stats.summary()
-        reference[name] = (
-            stats.results_df["stat"].to_numpy(), stats.results_df["pvalue"].to_numpy(),
-            dds.var["dispersions"].to_numpy(),
-        )
-    return path, reference
-
-
-@pytest.mark.parametrize("scope", [
-    "per_comparison",
-    pytest.param("global", marks=pytest.mark.xfail(
-        strict=True, reason="global moments dispersion halfway to the trend; the global scope is to be removed")),
-])
-def test_nb_glm_matches_pydeseq2_per_comparison(tmp_path, deseq2_parity_screen, scope):
-    """Dispersions, Wald z and p-values agree with PyDESeq2 per target, on
-    every gene. Measured on three seeds of this design (0.2.2): per-comparison
-    z r = 1.0000, p Spearman >= 0.9976, median |dz| <= 0.015, max |dz| <= 0.25,
-    median |log dispersion ratio| <= 0.006 (95th percentile <= 0.23); the
-    global scope reaches max |dz| of 7.5-27 and a median log ratio of 0.19."""
-    from scipy.stats import spearmanr
-
-    path, reference = deseq2_parity_screen
-    result = nb_glm_test(
-        path, perturbation_column="perturbation", control_label="ctrl", size_factor_method="deseq2",
-        scale_size_factors=False, dispersion_scope=scope, size_factor_scope=scope,
-        use_control_cache=scope == "global", output_path=tmp_path / "de.h5ad", n_jobs=1, verbose=False,
-        **_NO_EXPRESSION_FILTERS,
-    )
-    out = ad.read_h5ad(result.result_path)
-    for row, name in enumerate(out.obs_names):
-        stat, pvalue, dispersion = reference[name]
-        z, p = out.layers["z_score"][row], out.layers["pvalue"][row]
-        ours = out.layers["dispersion"][row] if "dispersion" in out.layers else out.var["dispersion"].to_numpy()
-        assert np.isfinite(z).all() and np.isfinite(stat).all()
-        dz = np.abs(z - stat)
-        log_ratio = np.abs(np.log(ours / dispersion))
-        assert np.corrcoef(z, stat)[0, 1] >= 0.999, name
-        assert spearmanr(p, pvalue)[0] >= 0.99, name
-        assert np.median(dz) <= 0.05 and dz.max() <= 0.5, (name, np.median(dz), dz.max())
-        assert np.median(log_ratio) <= 0.02, (name, np.median(log_ratio))
-        assert np.quantile(log_ratio, 0.95) <= 0.35, (name, np.quantile(log_ratio, 0.95))

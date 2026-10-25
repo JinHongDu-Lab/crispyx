@@ -201,9 +201,15 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
 * **Dispersion scope** (``dispersion_scope``): ``"global"`` (the default)
   estimates each gene's dispersion once and uses it in every comparison -- from
   all cells without covariates, and from the control cells with the covariate
-  design when ``covariates`` are given, as DESeq2 estimates dispersions once per
-  model. ``"per_comparison"`` re-estimates it for each comparison, which is
-  slower.
+  design when ``covariates`` are given. ``"per_comparison"`` runs DESeq2's
+  estimator on each comparison's cells (the controls and one perturbation), as
+  PyDESeq2 does when run per perturbation. Without covariates the controls are
+  summarised once, so a comparison costs its own cells only (about half a
+  second on 32 cores for a genome-wide screen's perturbation) and controls too
+  large for memory are streamed.
+
+* **Size factors** (``size_factor_method``, ``size_factors``): see
+  :ref:`size-factors` below.
 
 * **Memory limit** (``memory_limit_gb``): Specify the maximum memory available
   for the analysis; it is capped by what the job's cgroup will still grant.
@@ -243,6 +249,118 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
        perturbation_column="perturbation",
        method="nb_glm",
    )
+
+.. _size-factors:
+
+Size factors
+------------
+
+A size factor puts each cell's counts on a common scale: the model's mean
+for gene *g* in cell *i* is ``s_i * exp(beta_g + effect)``, so a cell with
+twice the factor is expected to show twice the counts of every gene. The
+factors are computed once for all cells; where a method needs a reference,
+the reference is the **controls**, so a control's factor does not depend on
+which perturbations the file holds or which one is compared. Multiplying all
+factors by a constant changes no test (the intercept absorbs it); they are
+reported at geometric mean 1.
+
+``size_factor_method`` chooses among three definitions:
+
+``"libsize"`` (default)
+    Each cell's total count. It measures sequencing depth precisely (a sum
+    over thousands of counts) and needs no reference. It assumes a
+    perturbation does not change the cell's total captured RNA: when a
+    perturbation strongly changes a few very highly expressed genes, or
+    transcription overall, the total moves with it and every other gene
+    looks shifted the opposite way.
+
+``"geomeans"``
+    causarray's median of ratios (``comp_size_factor(method="geomeans")``),
+    with the controls as the reference: a cell's factor is the median of
+    its ratios to the controls' geometric means (of their non-zero counts)
+    over the genes with a control mean of at least 2 that the cell counts.
+    A minority of strongly changed genes does not move a median, so it
+    resists the composition shifts library size does not. Keeping only
+    well-counted genes is what lets it follow depth: most single-cell
+    counts are 1 or 2, and a median of their ratios captures only part of
+    a depth difference.
+
+``"deseq2"``
+    DESeq2's median of ratios, on the genes counted in every control cell
+    (the reference ``estimateSizeFactors(geoMeans=...)`` takes, from the
+    controls; DESeq2's default takes it from all samples). A perturbed cell
+    uses the reference genes counted in every cell of its perturbation.
+    This is the method for **pseudo-bulk and bulk** counts, where thousands
+    of genes are counted in every sample. Single cells rarely have more
+    than a few dozen such genes (29 on Adamson, 6 on Huang-HCT116); with
+    fewer than five it falls back to ``"geomeans"``.
+
+Pass ``size_factors`` to use your own (scran's, or another tool's to compare
+like with like) instead.
+
+**How they behaved on single-cell screens.** Each definition was used for
+per-comparison NB-GLM on Adamson and on 20,000 controls of Huang-HCT116,
+with *fake perturbations* made of control cells: random ones, and ones
+drawn from the deepest 30 % of controls -- a difference in depth with no
+perturbation, which the size factors have to absorb. On well-counted genes
+(control mean of at least 1):
+
+.. list-table::
+   :header-rows: 1
+
+   * - size factors
+     - random fakes: \|z\| > 3 (expected 0.27 %)
+     - deep fakes: mean z (Huang / Adamson)
+     - deep fakes: false hits per fake (Huang)
+     - real perturbations: hits each (Huang)
+   * - ``"libsize"``
+     - 0.30 %
+     - +0.11 / -0.08
+     - 22
+     - 9
+   * - ``"geomeans"``
+     - 0.33 %
+     - +0.97 / +0.29
+     - 227
+     - 10
+   * - ``"deseq2"`` (6 genes on Huang)
+     - 0.49 %
+     - +0.94 / -0.48
+     - 374
+     - 27
+   * - median of ratios over every expressed gene (``"sparse"`` before 0.2.3)
+     - 0.45 %
+     - **+5.6 / +5.3**
+     - **6,578**
+     - 176
+
+Every definition is calibrated on random fakes; they differ when the groups
+compared differ in depth, as real perturbations often do (cell size,
+fitness). A median of ratios over every expressed gene calls nearly every
+well-counted gene up in deeper cells, which is why ``"sparse"`` (the default
+before 0.2.3) was removed. Library size absorbs depth best; ``"geomeans"`` is
+close to it (their log factors correlate at 0.98-0.99) and is the choice when
+composition shifts are a concern. Fake perturbations chosen by depth also
+differ in some biology, so no definition gives perfectly calibrated tests on
+them; the mean z is the measure of normalisation bias.
+
+**In practice:**
+
+* keep the default (``"libsize"``) for single-cell counts;
+* for a perturbation whose results look shifted as a whole -- its median log
+  fold change over all genes far from 0 -- compare with ``"geomeans"``: a
+  composition shift moves library size but not the median of ratios;
+* use ``"deseq2"`` for pseudo-bulk or bulk counts;
+* to compare with PyDESeq2 or DESeq2, give them the same size factors
+  (``dds.obs["size_factors"]``, ``sizeFactors(dds) <- ...``); a
+  per-perturbation PyDESeq2 run otherwise recomputes them on each
+  comparison's cells, and that difference, not the estimator, then
+  dominates the comparison.
+
+These comparisons are of **single-cell** data only. On pseudo-bulk or bulk
+counts, where many genes are counted in every sample and depth is averaged
+over many cells, the ranking may differ; that comparison has not been made
+yet.
 
 LFC shrinkage
 -------------

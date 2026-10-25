@@ -88,10 +88,10 @@ statistics function automatically activates — fitting the intercept-only
 model in chunks of 4,096 control cells instead of densifying the full
 control matrix. This keeps peak memory at O(chunk_size × n_genes) rather
 than O(n_control × n_genes). When ``freeze_control`` is auto-enabled,
-streaming is used unconditionally. DESeq2-style size factors
-(``size_factor_method="deseq2"``) also stream automatically when the
-intermediate counts array would exceed 4 GB, computing geometric means
-and per-cell median ratios in chunks. After each streaming phase,
+streaming is used unconditionally. Size factors are computed in one pass
+over the rows (``"libsize"``) or two (``"geomeans"``, ``"deseq2"``: the
+controls' geometric means, then each cell's median ratio), never holding
+the matrix. After each streaming phase,
 ``drop_file_cache()`` evicts file data from the kernel page cache so that
 cgroup-limited environments (e.g. SLURM) do not count cached pages toward the
 memory limit. Streaming reads, and files being written -- a DE result as it is

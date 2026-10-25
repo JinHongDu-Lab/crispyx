@@ -387,22 +387,6 @@ def _deseq2_ratio(X):
     return np.median(used / np.exp(np.log(used).mean(axis=0)), axis=1)
 
 
-def test_subset_size_factors_equal_deseq2_on_the_subset():
-    """Per-comparison size factors are DESeq2 size factors of the compared cells alone."""
-    from crispyx._size_factors import _compute_subset_size_factors
-
-    rng = np.random.default_rng(0)
-    X = rng.poisson(lam=8, size=(120, 30)).astype(np.float32) + 1
-    mask = np.zeros(120, dtype=bool)
-    mask[::2] = True
-    expected = _deseq2_ratio(X[mask])
-    np.testing.assert_allclose(
-        _compute_subset_size_factors(sp.csr_matrix(X), mask),
-        expected / np.exp(np.log(expected).mean()),
-        rtol=1e-6,  # the subset path keeps float32 counts
-    )
-
-
 def _control_reference_screen(tmp_path, *, sparse_gene=True, name="screen.h5ad", drop=None):
     """60 controls and two perturbations of 25 cells over 40 genes, every gene
     expressed in every control; KO1 never expresses gene 3, KO2 misses gene 5
@@ -431,18 +415,20 @@ def test_control_reference_size_factors_follow_deseq2_with_a_control_reference(t
     from crispyx._size_factors import _control_reference_size_factors
 
     path, X, labels = _control_reference_screen(tmp_path)
-    got = _control_reference_size_factors(path, labels, "ctrl", chunk_size=chunk_size, scale=False)
+    got = _control_reference_size_factors(path, labels, "ctrl", chunk_size=chunk_size)
 
     ctrl = X[labels == "ctrl"].astype(np.float64)
     reference = (ctrl > 0).all(axis=0)
     assert not reference[30] and reference[3] and reference[5]
     geo = np.exp(np.log(ctrl[:, reference]).mean(axis=0))
-    np.testing.assert_allclose(got[labels == "ctrl"], _deseq2_ratio(ctrl), rtol=1e-12)
+    expected = np.empty(labels.size)
+    expected[labels == "ctrl"] = _deseq2_ratio(ctrl)
     for label, missing in (("KO1", 3), ("KO2", 5)):
         genes = np.flatnonzero(reference)
         kept = genes != missing
         cells = X[labels == label][:, genes[kept]].astype(np.float64)
-        np.testing.assert_allclose(got[labels == label], np.median(cells / geo[kept], axis=1), rtol=1e-12)
+        expected[labels == label] = np.median(cells / geo[kept], axis=1)
+    np.testing.assert_allclose(got, expected / np.exp(np.log(expected).mean()), rtol=1e-12)
 
 
 def test_control_size_factors_do_not_depend_on_the_perturbations(tmp_path):
@@ -453,16 +439,17 @@ def test_control_size_factors_do_not_depend_on_the_perturbations(tmp_path):
 
     path, _, labels = _control_reference_screen(tmp_path, name="all.h5ad")
     fewer, _, fewer_labels = _control_reference_screen(tmp_path, name="fewer.h5ad", drop="KO1")
-    full = _control_reference_size_factors(path, labels, "ctrl", scale=False)
-    part = _control_reference_size_factors(fewer, fewer_labels, "ctrl", scale=False)
-    np.testing.assert_array_equal(full[labels != "KO1"], part)
+    full = _control_reference_size_factors(path, labels, "ctrl")
+    part = _control_reference_size_factors(fewer, fewer_labels, "ctrl")
+    # equal up to the rescaling to geometric mean 1, which the dropped cells change
+    ratio = full[labels != "KO1"] / part
+    np.testing.assert_allclose(ratio, ratio[0], rtol=1e-12)
 
 
-def test_control_reference_size_factors_fall_back_on_sparse_controls(tmp_path):
-    """With fewer than five genes in every control, the reference is each
-    gene's geometric mean over the controls' non-zero counts and a cell's
-    factor the median ratio over the genes it expresses."""
-    from crispyx._size_factors import _control_reference_size_factors
+def test_control_reference_size_factors_fall_back_to_geomeans_on_sparse_controls(tmp_path):
+    """With fewer than five genes counted in every control (most single-cell
+    data), "deseq2" gives the "geomeans" factors."""
+    from crispyx._size_factors import _control_geomeans_size_factors, _control_reference_size_factors
 
     rng = np.random.default_rng(5)
     labels = np.array(["ctrl"] * 40 + ["KO1"] * 20)
@@ -470,13 +457,57 @@ def test_control_reference_size_factors_fall_back_on_sparse_controls(tmp_path):
     X[:, :3] += 1  # three genes in every cell: below the five the ratio method needs
     path = tmp_path / "sparse.h5ad"
     ad.AnnData(X=sp.csr_matrix(X), obs=pd.DataFrame({"perturbation": labels})).write_h5ad(path)
-    got = _control_reference_size_factors(path, labels, "ctrl", scale=False)
+    np.testing.assert_array_equal(
+        _control_reference_size_factors(path, labels, "ctrl"), _control_geomeans_size_factors(path, labels, "ctrl")
+    )
 
+
+@pytest.mark.parametrize("chunk_size", [7, 1000])
+def test_library_size_factors_are_totals_at_geometric_mean_one(tmp_path, chunk_size):
+    from crispyx._size_factors import _library_size_factors
+
+    path, X, _ = _control_reference_screen(tmp_path)
+    totals = X.sum(axis=1).astype(np.float64)
+    np.testing.assert_allclose(_library_size_factors(path, chunk_size=chunk_size),
+                               totals / np.exp(np.log(totals).mean()), rtol=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [7, 1000])
+def test_geomeans_size_factors_follow_causarray_with_a_control_reference(tmp_path, chunk_size):
+    """causarray's comp_size_factor(method="geomeans") with the controls as
+    reference: genes with control mean >= 2 (here fewer than 100 genes, so the
+    highest-mean 100, i.e. all), geometric means of the controls' non-zero
+    counts, each cell's median ratio over those genes it counts."""
+    from crispyx._size_factors import _control_geomeans_size_factors
+
+    path, X, labels = _control_reference_screen(tmp_path)
+    got = _control_geomeans_size_factors(path, labels, "ctrl", chunk_size=chunk_size)
     ctrl = X[labels == "ctrl"].astype(np.float64)
     logged = np.where(ctrl > 0, np.log(np.where(ctrl > 0, ctrl, 1)), 0.0)
     geo = np.exp(logged.sum(axis=0) / (ctrl > 0).sum(axis=0))
-    expected = [np.median(row[row > 0] / geo[row > 0]) for row in X.astype(np.float64)]
-    np.testing.assert_allclose(got, expected, rtol=1e-12)
+    expected = np.array([np.median(row[row > 0] / geo[row > 0]) for row in X.astype(np.float64)])
+    np.testing.assert_allclose(got, expected / np.exp(np.log(expected).mean()), rtol=1e-12)
+
+
+def test_geomeans_size_factors_use_well_counted_genes_only(tmp_path):
+    """Genes with a control mean below 2 are left out once at least 100 genes
+    pass, so the many counts of 1 and 2 do not dilute the depth signal."""
+    from crispyx._size_factors import _control_geomeans_size_factors
+
+    rng = np.random.default_rng(7)
+    labels = np.array(["ctrl"] * 80 + ["KO1"] * 20)
+    lam = np.r_[np.full(150, 8.0), np.full(150, 0.3)]
+    X = rng.poisson(lam, size=(labels.size, lam.size)).astype(np.float32)
+    path = tmp_path / "mixed.h5ad"
+    ad.AnnData(X=sp.csr_matrix(X), obs=pd.DataFrame({"perturbation": labels})).write_h5ad(path)
+    got = _control_geomeans_size_factors(path, labels, "ctrl")
+    ctrl = X[labels == "ctrl"].astype(np.float64)
+    keep = ctrl.mean(axis=0) >= 2
+    assert 100 <= keep.sum() < lam.size
+    logged = np.where(ctrl > 0, np.log(np.where(ctrl > 0, ctrl, 1)), 0.0)
+    geo = np.exp(logged.sum(axis=0) / (ctrl > 0).sum(axis=0))
+    expected = np.array([np.median((row / geo)[keep & (row > 0)]) for row in X.astype(np.float64)])
+    np.testing.assert_allclose(got, expected / np.exp(np.log(expected).mean()), rtol=1e-12)
 
 
 def _write_fmt(path, X, fmt):

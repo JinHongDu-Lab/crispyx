@@ -107,9 +107,9 @@ from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strin
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._size_factors import (
     _validate_size_factors,
-    _median_of_ratios_size_factors,
+    _library_size_factors,
+    _control_geomeans_size_factors,
     _control_reference_size_factors,
-    _compute_subset_size_factors,
 )
 from ._statistics import (
     _tie_correction,
@@ -506,13 +506,16 @@ _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
 
 
 def _global_size_factors(
-    path: Path, method: str, chunk_size: int, scale: bool, labels: np.ndarray, control_label: str
+    path: Path, method: str, chunk_size: int, labels: np.ndarray, control_label: str
 ) -> np.ndarray:
-    """Size factors over every cell in ``path`` by ``method``; ``"deseq2"``
-    takes the controls as the reference (:func:`_control_reference_size_factors`)."""
+    """Every cell's size factor by ``method`` (see ``nb_glm_test``), at geometric mean 1."""
+    if method == "libsize":
+        return _library_size_factors(path, chunk_size=chunk_size)
+    if method == "geomeans":
+        return _control_geomeans_size_factors(path, labels, control_label, chunk_size=chunk_size)
     if method == "deseq2":
-        return _control_reference_size_factors(path, labels, control_label, chunk_size=chunk_size, scale=scale)
-    return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
+        return _control_reference_size_factors(path, labels, control_label, chunk_size=chunk_size)
+    raise ValueError(f"size_factor_method must be 'libsize', 'geomeans' or 'deseq2', not {method!r}")
 
 
 def _fit_at_global_dispersion(design, counts, global_dispersion, **fit_kwargs):
@@ -1439,9 +1442,7 @@ def nb_glm_test(
     perturbations: Iterable[str] | None = None,
     # ---- Size factor parameters ----
     size_factors: ArrayLike | None = None,
-    size_factor_method: Literal["sparse", "deseq2"] = "sparse",
-    size_factor_scope: Literal["global", "per_comparison"] = "global",
-    scale_size_factors: bool = True,
+    size_factor_method: Literal["libsize", "geomeans", "deseq2"] = "libsize",
     # ---- Dispersion parameters ----
     dispersion: float | None = None,
     dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
@@ -1526,49 +1527,34 @@ def nb_glm_test(
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
     size_factors
-        Optional array of per-cell size factors. If None, computes size factors
-        using the method specified by ``size_factor_method``.
+        Per-cell size factors to use as given (rescaled to geometric mean 1),
+        e.g. scran's or an external run's. If None, ``size_factor_method``
+        computes them, once for all cells; how the methods differ, and how
+        they behaved on single-cell screens, is in the user guide
+        (:ref:`size-factors`).
     size_factor_method
-        Method for computing size factors when ``size_factors`` is None.
+        How size factors are computed when ``size_factors`` is None.
 
-        - ``"sparse"``: Sparse-aware median-of-ratios (default). Computes geometric
-          means using only non-zero values, suitable for sparse single-cell data.
-        - ``"deseq2"``: DESeq2's median-of-ratios against a reference made of
-          the control cells. DESeq2 computes size factors once for all samples
-          of a model and divides each sample by a reference of per-gene
-          geometric means, which ``estimateSizeFactors(geoMeans=...)`` lets
-          the caller supply; here those geometric means are taken over the
-          controls, on the genes counted in every control cell. A control's
-          factor is then DESeq2's ratio on the controls alone, and does not
-          depend on the perturbations in the file or the one compared. A
-          perturbed cell is divided by the same reference, on the reference
-          genes counted in every cell of its perturbation (as DESeq2 drops a
-          gene that is zero in any sample compared). With fewer than five
-          genes counted in every control, each gene's geometric mean over the
-          controls' non-zero counts is the reference and a cell's factor its
-          median ratio over the genes it expresses. Not the reference
-          DESeq2 uses by default (all samples' geometric means), and not what
-          a per-perturbation PyDESeq2 run computes: that recomputes the
-          factors on control + perturbation, so a control's factor changes
-          with the perturbation compared.
-    size_factor_scope
-        Scope for size factor computation.
+        - ``"libsize"`` (default): each cell's total count. Tracks sequencing
+          depth exactly; assumes a perturbation does not change a cell's
+          total captured RNA.
+        - ``"geomeans"``: causarray's median of ratios
+          (``comp_size_factor(method="geomeans")``) against the controls: a
+          cell's median ratio to the controls' geometric means of their
+          non-zero counts, over the genes with a control mean of at least 2.
+          Robust to a minority of strongly changed genes.
+        - ``"deseq2"``: DESeq2's median of ratios against the controls'
+          geometric means, on the genes counted in every control cell (the
+          reference ``estimateSizeFactors(geoMeans=...)`` accepts, taken from
+          the controls; DESeq2's default takes it from all samples). A
+          perturbed cell uses the reference genes counted in every cell of its
+          perturbation. Meant for pseudo-bulk and bulk counts; with fewer than
+          five genes counted in every control (most single-cell data) it falls
+          back to ``"geomeans"``.
 
-        - ``"global"`` (default): Compute size factors once on the full dataset.
-          Recommended for CRISPR screens where all cells come from the same
-          experiment and share a common sequencing depth distribution. Faster
-          when combined with use_control_cache=True. Note: produces different
-          results from PyDESeq2 (rho ~ 0.7-0.8) which uses per-comparison normalization.
-        - ``"per_comparison"``: Compute size factors separately for each control +
-          perturbation comparison. This matches PyDESeq2's behavior exactly,
-          leading to near-perfect LFC, statistic, and p-value concordance
-          (rho > 0.97 on Tian-crispra, rho > 0.99 on Adamson_subset). Use this when
-          PyDESeq2 compatibility is required or for bulk RNA-seq style analysis.
-    scale_size_factors
-        If True (default), scale size factors so their geometric mean equals 1.
-        This is the standard DESeq2/crispyx behavior. If False, use raw
-        median-of-ratios size factors without rescaling, which matches
-        PyDESeq2's default behavior and can improve numerical alignment.
+        The reference, where there is one, is the controls, so a control's
+        factor does not depend on the perturbations in the file or the one
+        compared.
     dispersion
         Fixed NB dispersion used for every gene and comparison. If None, it is
         estimated (see ``dispersion_scope``).
@@ -1736,7 +1722,7 @@ def nb_glm_test(
         XᵀWX contributions) once and reuse them across all perturbation comparisons.
         This can significantly reduce memory and computation time when there are
         many perturbations and the control group is large. Only applies when
-        no covariates are specified and size_factor_scope="global".
+        no covariates are specified.
     freeze_control
         Whether to use frozen control sufficient statistics instead of raw control
         matrix for parallel fitting. This dramatically reduces per-worker memory
@@ -1928,20 +1914,10 @@ def nb_glm_test(
         )
         _messages.vprint(verbose, "nb_glm_test", f"chunk_size={chunk_size} (auto)")
 
-    # For per_comparison size factors, we skip the expensive global computation
-    # since size factors will be recomputed per-comparison anyway.
-    # We use dummy size factors here (will be overwritten per-comparison).
-    size_factors_given = size_factors is not None
-    if size_factor_scope == "per_comparison" and size_factors is None:
-        # Dummy size factors - will be replaced in worker
-        size_factors = np.ones(n_cells_total, dtype=np.float64)
-        logger.debug("Skipping global size factor computation for per_comparison mode")
-    elif size_factors is None:
-        size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors, labels, control_label)
+    if size_factors is None:
+        size_factors = _global_size_factors(path, size_factor_method, chunk_size, labels, control_label)
     else:
-        size_factors = _validate_size_factors(
-            size_factors, n_cells_total, scale=scale_size_factors
-        )
+        size_factors = _validate_size_factors(size_factors, n_cells_total)
 
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
@@ -1988,8 +1964,6 @@ def nb_glm_test(
         use_map_dispersion: bool,
         lfc_shrinkage_type: str,
         pts_rest_shared: np.ndarray,
-        full_X: np.ndarray | sp.csr_matrix | None = None,
-        per_comparison_sf: bool = False,
         se_method: str = "sandwich",
     ) -> dict:
         """Fit NB-GLM for a single perturbation group and return results."""
@@ -1999,14 +1973,8 @@ def nb_glm_test(
         subset_obs = obs_df.iloc[subset_mask]
         indicator = group_mask[subset_mask].astype(np.float64)
         
-        # Compute per-comparison size factors if requested (matches PyDESeq2)
-        if per_comparison_sf and full_X is not None:
-            subset_sf = _compute_subset_size_factors(full_X, subset_mask, scale=True)
-            subset_size_factors = subset_sf
-            subset_offset = np.log(np.clip(subset_sf, 1e-8, None))
-        else:
-            subset_size_factors = np.asarray(size_factors)[subset_mask]
-            subset_offset = offset[subset_mask] if offset is not None else np.log(np.clip(subset_size_factors, 1e-8, None))
+        subset_size_factors = np.asarray(size_factors)[subset_mask]
+        subset_offset = offset[subset_mask] if offset is not None else np.log(np.clip(subset_size_factors, 1e-8, None))
         
         design, design_columns = build_design_matrix(
             subset_obs,
@@ -2832,7 +2800,6 @@ def nb_glm_test(
     two_group = (
         not covariates
         and dispersion_scope == "per_comparison"
-        and size_factor_scope == "global"
         and dispersion is None
         and shrink_dispersion
         and use_map_dispersion
@@ -2941,7 +2908,6 @@ def nb_glm_test(
     can_use_cache_early = (
         use_control_cache and
         len(covariates) == 0 and
-        size_factor_scope == "global" and
         not two_group
     )
         
@@ -3022,7 +2988,7 @@ def nb_glm_test(
     ):
         raise MemoryError(
             f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
-            "fit the memory budget, and only covariates=None with size_factor_scope='global', "
+            "fit the memory budget, and only covariates=None with "
             "dispersion_scope='global' and shrink_dispersion=True streams them from disk. Raise "
             "memory_limit_gb, aggregate to pseudo-bulk first (cx.pb.aggregate), or use those settings."
         )
@@ -3061,7 +3027,6 @@ def nb_glm_test(
     can_use_cache = (
         use_control_cache and
         len(covariates) == 0 and
-        size_factor_scope == "global" and
         not two_group
     )
 
@@ -3076,7 +3041,6 @@ def nb_glm_test(
     elif (
         not can_use_cache
         and dispersion_scope == "global"
-        and size_factor_scope == "global"
         and shrink_dispersion
         and use_map_dispersion
         and control_matrix is not None
@@ -3118,8 +3082,7 @@ def nb_glm_test(
     # =====================================================================
     # For very large datasets (e.g., Replogle-GW-k562: 2M cells × 8K genes),
     # loading the full matrix would exceed memory. Check this ONCE before
-    # any full matrix loads (full_X for per-comparison SF, all_cell_matrix
-    # for global dispersion).
+    # any full matrix loads (all_cell_matrix for global dispersion).
     estimated_matrix_gb = n_cells_total * n_genes * 8 / 1e9  # float64
     memory_budget_gb = max_dense_fraction * budget_gb
     use_streaming_mode = estimated_matrix_gb > memory_budget_gb
@@ -3130,35 +3093,6 @@ def nb_glm_test(
             f"{estimated_matrix_gb:.1f} GB > {memory_budget_gb:.1f} GB budget. "
             f"Using streaming mode for memory efficiency."
         )
-        
-    # For per-comparison size factors, we need the full count matrix
-    # Skip if streaming mode - worker will fall back to global SF
-    if size_factor_scope == "per_comparison":
-        if use_streaming_mode:
-            _messages.warn(
-                "nb_glm_test",
-                f"the data ({estimated_matrix_gb:.1f} GB) is too large to load for "
-                "size_factor_scope='per_comparison'; using global size factors "
-                "(recorded in uns['size_factor_scope']).",
-            )
-            size_factor_scope = "global"
-            if not size_factors_given:  # the placeholder ones would leave counts unnormalised
-                size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors, labels, control_label)
-                offset = np.log(np.clip(size_factors, 1e-8, None))
-            full_X = None
-        else:
-            logger.info("Using per-comparison size factors for PyDESeq2 compatibility...")
-            backed = read_backed(path)
-            try:
-                full_X = backed.X[:]
-                if sp.issparse(full_X):
-                    full_X = sp.csr_matrix(full_X, dtype=np.float64)
-                else:
-                    full_X = np.asarray(full_X, dtype=np.float64)
-            finally:
-                backed.file.close()
-    else:
-        full_X = None
         
     # Precompute control statistics once if using cache
     control_cache = None
@@ -3330,7 +3264,6 @@ def nb_glm_test(
             "size_factors": size_factors,
             "original_dataset_path": str(path),  # For shrink_lfc to reload data
             "size_factor_method": size_factor_method,
-            "size_factor_scope": size_factor_scope,
             "dispersion_scope": dispersion_scope,
             "frozen_control": frozen_control,
             "de_filter": {
@@ -3630,8 +3563,6 @@ def nb_glm_test(
                         use_map_dispersion=use_map_dispersion,
                         lfc_shrinkage_type=lfc_shrinkage_type,
                         pts_rest_shared=pts_rest_shared,
-                        full_X=full_X,
-                        per_comparison_sf=(size_factor_scope == "per_comparison"),
                         se_method=se_method,
                     )
                     for label in candidates_to_run
@@ -3749,8 +3680,6 @@ def nb_glm_test(
                             use_map_dispersion=use_map_dispersion,
                             lfc_shrinkage_type=lfc_shrinkage_type,
                             pts_rest_shared=pts_rest_shared,
-                            full_X=full_X,
-                            per_comparison_sf=(size_factor_scope == "per_comparison"),
                             se_method=se_method,
                             )
                     _write_result_row(res, label)
@@ -5339,7 +5268,7 @@ def shrink_lfc(
         if size_factors_global is not None:
             size_factors_all = np.asarray(size_factors_global, dtype=np.float64)
         else:
-            size_factors_all = _median_of_ratios_size_factors(original_path)
+            size_factors_all = _library_size_factors(original_path)
         control_idx = np.where(labels == control_label)[0]
         if len(control_idx) == 0:
             backed.file.close()

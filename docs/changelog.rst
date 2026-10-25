@@ -10,24 +10,38 @@ Unreleased
   log fold changes correlated 0.93 with those from the counts, and the
   z-scores had half their spread. It now raises before any work, after
   reading one slice of the matrix.
-* **``size_factor_method="deseq2"`` takes the controls as the reference.**
-  It used the genes counted in every cell of the file, which on single-cell
-  data are a handful (8 on Huang-HCT116) or none, and then fell back to the
-  sparse method. Size factors are now DESeq2's median of ratios against the
-  controls' geometric means on the genes counted in every control cell: a
-  control's factor is DESeq2's ratio on the controls alone and does not
-  depend on the perturbations in the file, and a perturbed cell is divided
-  by the same reference on the genes counted in every cell of its
-  perturbation. Results with ``size_factor_method="deseq2"`` change.
+* **Size factors default to library size; ``"geomeans"`` is added;
+  ``"deseq2"`` takes the controls as the reference; ``"sparse"``,
+  ``size_factor_scope`` and ``scale_size_factors`` are removed.**
+  ``size_factor_method`` is ``"libsize"`` (each cell's total count, the
+  default), ``"geomeans"`` (causarray's median of ratios on genes with a
+  control mean of at least 2, against the controls' geometric means) or
+  ``"deseq2"`` (DESeq2's median of ratios on the genes counted in every
+  control, for pseudo-bulk and bulk; it falls back to ``"geomeans"`` with
+  fewer than five such genes). Every reference is the controls, so a
+  control's factor does not depend on the perturbations compared.
+  ``"sparse"`` -- a median of ratios over every expressed gene, the default
+  until now and what ``"deseq2"`` fell back to on single-cell data -- followed
+  only part of a depth difference: on fake perturbations drawn from the
+  deepest control cells it called nearly every well-counted gene up (mean z
+  +5.6 and 6,578 false hits per fake on Huang-HCT116, against +0.11 and 22
+  with library size), and real perturbations that differ in depth got
+  inflated hit counts (176 against 9). Per-comparison size factors
+  (``size_factor_scope``) recomputed every control's factor in each
+  comparison, rested on the handful of genes counted in every cell compared,
+  and could not run at scale; ``scale_size_factors`` changed no test. The user
+  guide compares the methods (single-cell data; pseudo-bulk not yet).
+  NB-GLM results computed with default size factors change.
 * **Per-comparison NB-GLM runs at the scale of a genome-wide screen, as
   DESeq2 would.** Without covariates, ``dispersion_scope="per_comparison"``
-  (with global size factors and no in-call shrinkage) now summarises the
+  (without in-call shrinkage) now summarises the
   controls once -- a count histogram per gene and size-factor-binned
   moments -- and fits each perturbation from that summary and its own
   cells, following PyDESeq2's steps (linear-model means, gene-wise Cox-Reid
   dispersions, parametric trend, prior variance, MAP, outlier rule, IRLS
   with the mean floor and ridge, Wald test). Given the same size factors it
-  matches PyDESeq2 to a median 1e-3 in z. On 20,000 Huang-HCT116 controls
+  matches PyDESeq2 to a median 1e-3 in z (z r >= 0.9999 on Adamson and
+  Tian). On 20,000 Huang-HCT116 controls
   and 20 perturbations it takes 16 s and 3.4 GB on a 32-core Mac, against
   14 min per perturbation for the previous per-comparison code and 300 s
   and 58 GB for ``dispersion_scope="global"``; controls too large for
