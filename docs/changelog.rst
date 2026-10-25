@@ -19,6 +19,24 @@ Unreleased
   depend on the perturbations in the file, and a perturbed cell is divided
   by the same reference on the genes counted in every cell of its
   perturbation. Results with ``size_factor_method="deseq2"`` change.
+* **Per-comparison NB-GLM runs at the scale of a genome-wide screen, as
+  DESeq2 would.** Without covariates, ``dispersion_scope="per_comparison"``
+  (with global size factors and no in-call shrinkage) now summarises the
+  controls once -- a count histogram per gene and size-factor-binned
+  moments -- and fits each perturbation from that summary and its own
+  cells, following PyDESeq2's steps (linear-model means, gene-wise Cox-Reid
+  dispersions, parametric trend, prior variance, MAP, outlier rule, IRLS
+  with the mean floor and ridge, Wald test). Given the same size factors it
+  matches PyDESeq2 to a median 1e-3 in z. On 20,000 Huang-HCT116 controls
+  and 20 perturbations it takes 16 s and 3.4 GB on a 32-core Mac, against
+  14 min per perturbation for the previous per-comparison code and 300 s
+  and 58 GB for ``dispersion_scope="global"``; controls too large for
+  memory are streamed. Standard errors no longer come out about 5 % small
+  (they were computed at a gene-wise dispersion the LFC was not refitted
+  at). Results with ``dispersion_scope="per_comparison"`` change.
+* The dispersion trend falls back, as PyDESeq2's does, to the trimmed mean
+  of the gene-wise dispersions when the parametric fit fails, instead of
+  keeping a near-zero coefficient or fitting a polynomial.
 
 Version 0.2.2
 -------------

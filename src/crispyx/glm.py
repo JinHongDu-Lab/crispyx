@@ -5915,18 +5915,19 @@ class ControlSummary:
     In a comparison of one perturbation with the controls under the design
     ``[intercept, perturbation]``, every control term of DESeq2's objectives
     depends only on the controls and the dispersion (see the kernels'
-    section header). The controls are binned by size factor; ``s_mom[k, b]``
-    is the k-th moment of the size factors about bin ``b``'s centre,
-    ``y_mom[k, g, b]`` the same weighted by gene ``g``'s counts, and smooth
-    terms are evaluated to second order about the centres. ``hist_*`` hold
-    each gene's histogram of non-zero counts (CSR by gene).
+    section header). The controls are binned by size factor (occupied bins
+    only); ``s_mom[k, b]`` is the k-th moment of the size factors about bin
+    ``b``'s centre, ``y_mom[k, g, b]`` the same weighted by gene ``g``'s
+    counts, and smooth terms are evaluated to third order about the
+    centres. ``hist_*`` hold each gene's histogram of non-zero counts (CSR
+    by gene).
     """
 
     n_cells: int
     centre: np.ndarray        # (bins,)
-    s_mom: np.ndarray         # (3, bins): count, sum(s - c), sum((s - c)^2)
+    s_mom: np.ndarray         # (4, bins): count, sum (s - c)^k for k = 1..3
     s_log: np.ndarray         # (bins,): sum(log s)
-    y_mom: np.ndarray         # (3, genes, bins)
+    y_mom: np.ndarray         # (4, genes, bins)
     hist_ptr: np.ndarray      # (genes + 1,)
     hist_val: np.ndarray
     hist_cnt: np.ndarray
@@ -5935,12 +5936,30 @@ class ControlSummary:
     nnz: np.ndarray           # (genes,): cells with a count
 
 
+def _size_factor_bins(s: np.ndarray, bin_width: float):
+    """Occupied bins of width ``bin_width`` on log ``s`` (one per distinct
+    value when 0): centres, each value's bin, the moments of ``s`` about the
+    centres (4, bins) and the sums of log ``s``."""
+    if bin_width > 0:
+        lo = np.log(s.min())
+        raw = np.floor((np.log(s) - lo) / bin_width).astype(np.int64)
+        used, bin_of = np.unique(raw, return_inverse=True)
+        centre = np.exp(lo + (used + 0.5) * bin_width)
+    else:
+        centre, bin_of = np.unique(s, return_inverse=True)
+    bin_of = bin_of.astype(np.int64).ravel()
+    d = s - centre[bin_of]
+    n_bins = centre.size
+    mom = np.vstack([np.bincount(bin_of, weights=d ** k, minlength=n_bins) for k in range(4)])
+    return centre, bin_of, mom, np.bincount(bin_of, weights=np.log(s), minlength=n_bins)
+
+
 def summarize_controls(
     blocks,
     size_factors: np.ndarray,
     n_genes: int,
     *,
-    bin_width: float = 0.01,
+    bin_width: float = 0.02,
     small_count_max: int = 64,
 ) -> ControlSummary:
     """Summarise the control cells in one pass.
@@ -5955,31 +5974,20 @@ def summarize_controls(
     n_genes
         Number of genes (columns).
     bin_width
-        Width of the size-factor bins on the log scale. The second-order
-        terms leave a relative error of about ``bin_width**3 / 24`` per cell.
-        ``0`` gives every distinct size factor its own bin, which is exact.
+        Width of the size-factor bins on the log scale. Smooth terms are
+        evaluated to third order about the bin centres; the larger error is
+        a gene whose mean s*m crosses the floor ``min_mu`` inside a bin, which
+        is held wholly on one side of it. At the default, dispersions move by
+        at most about 2e-4 relative to one bin per distinct size factor
+        (``0``, exact), standard errors by 3e-5.
     small_count_max
         Counts up to this value are tallied in a dense per-gene table.
     """
     s = np.asarray(size_factors, dtype=np.float64)
-    if bin_width > 0:
-        lo = np.log(s.min())
-        bin_of = np.floor((np.log(s) - lo) / bin_width).astype(np.int64)
-        n_bins = int(bin_of.max()) + 1
-        centre = np.exp(lo + (np.arange(n_bins) + 0.5) * bin_width)
-    else:
-        centre, bin_of = np.unique(s, return_inverse=True)
-        bin_of = bin_of.astype(np.int64)
-        n_bins = centre.size
-    d = s - centre[bin_of]
-    s_mom = np.vstack([
-        np.bincount(bin_of, minlength=n_bins).astype(np.float64),
-        np.bincount(bin_of, weights=d, minlength=n_bins),
-        np.bincount(bin_of, weights=d * d, minlength=n_bins),
-    ])
-    s_log = np.bincount(bin_of, weights=np.log(s), minlength=n_bins)
+    centre, bin_of, s_mom, s_log = _size_factor_bins(s, bin_width)
+    n_bins = centre.size
 
-    y_mom = np.zeros((3, n_genes, n_bins), dtype=np.float64)
+    y_mom = np.zeros((4, n_genes, n_bins), dtype=np.float64)
     small_hist = np.zeros((n_genes, small_count_max + 1), dtype=np.float64)
     big_genes, big_values = [], []
     norm_sum = np.zeros(n_genes, dtype=np.float64)
@@ -6048,6 +6056,7 @@ def fit_two_group_deseq2(
     n_grid: int = 31,
     tol: float = 1e-6,
     ridge: float = 1e-6,
+    bin_width: float = 0.02,
 ) -> TwoGroupResult:
     """DESeq2's Wald test of one perturbation against the controls, as PyDESeq2
     runs it on the design ``~ condition`` with the given size factors.
@@ -6076,8 +6085,11 @@ def fit_two_group_deseq2(
         PyDESeq2's bounds; the upper dispersion bound is
         ``max(max_disp, number of cells)``.
     n_grid, tol
-        Dispersion search: grid points over the log range, then
-        golden-section search to ``tol`` on log dispersion.
+        Gene-wise dispersion search: grid points over the log range, then
+        golden-section search to ``tol`` on log dispersion. The MAP search
+        uses 7 points between the gene-wise estimate and the trend.
+    bin_width
+        The perturbed cells' size-factor bins (as :func:`summarize_controls`).
     ridge
         PyDESeq2's ridge on the coefficients.
     """
@@ -6096,8 +6108,13 @@ def fit_two_group_deseq2(
     tested &= (controls.total + y.sum(axis=0)) > 0
     idx = np.flatnonzero(tested).astype(np.int64)
     log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
-    summary_args = (controls.centre, controls.s_mom, controls.y_mom,
-                    controls.hist_ptr, controls.hist_val, controls.hist_cnt)
+    # The perturbed cells: size factors binned for the dense terms, each
+    # gene's non-zero counts (CSC) summed exactly.
+    t_centre, _bin, t_mom, _log = _size_factor_bins(s, bin_width)
+    csc = sp.csc_matrix(y)
+    t_args = (csc.indptr.astype(np.int64), csc.data, s[csc.indices])
+    summary_args = (controls.centre, controls.s_mom, controls.y_mom, controls.hist_ptr, controls.hist_val,
+                    controls.hist_cnt, t_centre, t_mom)
 
     def nan():
         return np.full(n_genes, np.nan)
@@ -6109,7 +6126,8 @@ def fit_two_group_deseq2(
         return TwoGroupResult(genewise, trend, map_disp, dispersion, lfc, se, stat, pvalue, intercept,
                               base_mean, converged, float("nan"))
 
-    genewise[idx] = _two_group_dispersions(idx, m_c, m_t, y, s, min_mu, *summary_args, log_lo, log_hi,
+    full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
+    genewise[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *full,
                                            np.zeros(idx.size), 0.0, n_grid, tol)
     trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
     log_resid = np.log(genewise[idx]) - np.log(trend[idx])
@@ -6117,8 +6135,14 @@ def fit_two_group_deseq2(
     resid = log_resid[above]
     squared_logres = (np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2
     prior_var = max(squared_logres - polygamma(1, (n - 2) / 2), 0.25)
-    map_disp[idx] = _two_group_dispersions(idx, m_c, m_t, y, s, min_mu, *summary_args, log_lo, log_hi,
-                                           np.log(trend[idx]), prior_var, n_grid, tol)
+    # The MAP lies between the gene-wise estimate and the trend (the prior's
+    # mean) where the likelihood has one mode; a short grid over that bracket
+    # keeps a second mode from being missed.
+    log_gw, log_trend = np.log(genewise[idx]), np.log(trend[idx])
+    bracket = (np.clip(np.minimum(log_gw, log_trend) - 0.1, log_lo, log_hi),
+               np.clip(np.maximum(log_gw, log_trend) + 0.1, log_lo, log_hi))
+    map_disp[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *bracket,
+                                           log_trend, prior_var, 7, tol)
     dispersion[idx] = map_disp[idx]
     outlier = log_resid > 2 * np.sqrt(squared_logres)
     dispersion[idx[outlier]] = genewise[idx[outlier]]

@@ -66,6 +66,8 @@ from .glm import (
     check_full_rank,
     estimate_glm_map_dispersion,
     fit_nb_glm_batch_auto,
+    fit_two_group_deseq2,
+    summarize_controls,
     estimate_covariate_effects_streaming,
     estimate_dispersion_map,
     estimate_global_dispersion_streaming,
@@ -2823,7 +2825,38 @@ def nb_glm_test(
     _ctrl_streaming_threshold = max_dense_fraction * budget_gb
     use_streaming_control = (control_matrix_gb * 4) > _ctrl_streaming_threshold
 
-    if use_streaming_control:
+    # Each perturbation against the controls under ~ condition, with DESeq2's
+    # dispersions estimated per comparison: every control term depends on the
+    # controls only, so they are summarised in one pass and a comparison
+    # costs its own cells (glm.fit_two_group_deseq2).
+    two_group = (
+        not covariates
+        and dispersion_scope == "per_comparison"
+        and size_factor_scope == "global"
+        and dispersion is None
+        and shrink_dispersion
+        and use_map_dispersion
+        and lfc_shrinkage_type == "none"
+    )
+    control_summary = None
+    if two_group:
+        use_streaming_control = False
+        control_matrix = None
+        control_rows = np.flatnonzero(control_mask)
+        control_sf = np.asarray(size_factors, dtype=np.float64)[control_rows]
+        backed = read_backed(path)
+        try:
+            def _control_blocks():
+                for start in range(0, control_rows.size, 4096):
+                    rows = control_rows[start:start + 4096]
+                    yield np.arange(start, start + rows.size), backed.X[rows, :]
+
+            control_summary = summarize_controls(_control_blocks(), control_sf, n_genes)
+        finally:
+            backed.file.close()
+        drop_file_cache(path)
+        control_expr_counts = control_summary.nnz
+    elif use_streaming_control:
         logger.info(
             f"Large control group: {control_n:,} cells × {n_genes:,} genes = "
             f"{control_matrix_gb:.1f} GB dense. Using streaming control statistics."
@@ -2906,9 +2939,10 @@ def nb_glm_test(
         
     # Decide early if we can use control cache (needed for memory estimation)
     can_use_cache_early = (
-        use_control_cache and 
+        use_control_cache and
         len(covariates) == 0 and
-        size_factor_scope == "global"
+        size_factor_scope == "global" and
+        not two_group
     )
         
     # =====================================================================
@@ -3025,9 +3059,10 @@ def nb_glm_test(
     # Control cache is used when: no covariates, use_control_cache=True, global SF
     # Per-comparison size factors require fresh computation per comparison
     can_use_cache = (
-        use_control_cache and 
+        use_control_cache and
         len(covariates) == 0 and
-        size_factor_scope == "global"
+        size_factor_scope == "global" and
+        not two_group
     )
 
     # Without the control cache (covariates, or use_control_cache=False) the
@@ -3406,8 +3441,61 @@ def nb_glm_test(
         effective_n_jobs = memory_limited_workers
     effective_n_jobs = max(1, effective_n_jobs)
 
-    # For small number of perturbations to run, run sequentially to avoid overhead
-    use_parallel = n_to_run >= 4 and effective_n_jobs > 1
+    # For small number of perturbations to run, run sequentially to avoid overhead.
+    # The two-group path runs comparisons in turn, each parallel over genes.
+    use_parallel = n_to_run >= 4 and effective_n_jobs > 1 and not two_group
+
+    def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
+        """One perturbation against the control summary; same result as the
+        other workers, natural-log LFC and SE."""
+        block = backed_x[rows, :]
+        y = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
+        s_t = np.asarray(size_factors, dtype=np.float64)[rows]
+        group_n = y.shape[0]
+        group_expr_counts = np.count_nonzero(y, axis=0)
+        group_total = y.sum(axis=0)
+        valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
+        valid &= ~_low_expr_in_both_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_expr_counts,
+            pert_mean=group_total / max(group_n, 1),
+            control_mean=control_summary.total / max(control_n, 1),
+            n_pert_cells=group_n,
+            n_control_cells=control_n,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
+        )
+        valid &= ~_nonestimable_glm_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_expr_counts,
+            min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert,
+        )
+        valid &= (control_summary.total + group_total) >= min_total_count
+        fit = fit_two_group_deseq2(control_summary, y, s_t, np.flatnonzero(valid), min_mu=min_mu)
+        tested = fit.converged & np.isfinite(fit.statistic)
+        lfc = np.where(tested, fit.lfc, np.nan)
+        return {
+            "group_idx": group_idx,
+            "n_tested": int(valid.sum()),
+            "effect": lfc,
+            "statistic": np.where(tested, fit.statistic, np.nan),
+            "pvalue": np.where(tested, fit.pvalue, np.nan),
+            "logfc": lfc,
+            "logfc_raw": lfc.copy(),
+            "intercept": np.where(tested, fit.intercept, np.nan),
+            "se": np.where(tested, fit.se, np.nan),
+            "pts": (group_expr_counts / max(group_n, 1)).astype(np.float32),
+            "pts_rest": pts_rest_shared.astype(np.float32),
+            "dispersion": fit.dispersion,
+            "dispersion_raw": fit.genewise_dispersion,
+            "dispersion_trend": fit.trend,
+            "mean": fit.base_mean,
+            "iterations": np.zeros(n_genes, dtype=np.int32),
+            "converged": fit.converged,
+        }
 
     # Log progress info
     if resume and completed_labels:
@@ -3569,6 +3657,34 @@ def nb_glm_test(
                 # Save checkpoint periodically
                 if n_processed % eff_checkpoint_interval == 0:
                     _save_checkpoint()
+        elif two_group:
+            import numba
+
+            # Threads share the one control summary, so the per-worker memory
+            # limit above (sized for processes that each hold the controls)
+            # does not apply: use the cores asked for.
+            threads = numba.get_num_threads()
+            numba.set_num_threads(min(requested_n_jobs, numba.config.NUMBA_NUM_THREADS))
+            backed = read_backed(path)
+            try:
+                for label in candidates_to_run:
+                    try:
+                        res = _fit_two_group_worker(candidate_to_idx[label], label, backed.X, group_rows[label])
+                        _write_result_row(res, label)
+                        newly_completed.append(label)
+                        n_tested_list.append(res["n_tested"])
+                        _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
+                    except Exception as e:
+                        logger.error(f"Failed perturbation {label}: {e}")
+                        newly_failed.append(label)
+                        _write_failed_row(label)
+                    n_processed += 1
+                    pbar.update(1)
+                    if n_processed % eff_checkpoint_interval == 0:
+                        _save_checkpoint()
+            finally:
+                backed.file.close()
+                numba.set_num_threads(threads)
         else:
             # Run sequentially
             for label in candidates_to_run:

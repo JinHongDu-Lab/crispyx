@@ -354,16 +354,26 @@ def test_control_cache_fits_at_the_global_dispersion(tmp_path):
     np.testing.assert_allclose(cached.statistics, uncached.statistics, rtol=1e-4, equal_nan=True)
 
 
-@pytest.mark.parametrize("covariates", [["depth"], []])
-def test_controls_too_large_for_memory_raise_unless_the_cache_streams_them(tmp_path, covariates):
-    """Only the control cache streams the controls; any other setup used to
-    return all-NaN results with the errors only logged."""
+def test_controls_too_large_for_memory_raise_with_covariates(tmp_path):
+    """With covariates the controls are fitted in memory; when they do not
+    fit, the call raises (it used to return all-NaN with the errors only
+    logged)."""
     path = _covariate_screen(tmp_path)
-    kwargs = dict(perturbation_column="perturbation", control_label="control", covariates=covariates,
-                  dispersion_scope="per_comparison", memory_limit_gb=1e-6, n_jobs=1, verbose=False,
-                  output_path=tmp_path / "out.h5ad")
     with pytest.raises(MemoryError, match="pseudo-bulk"):
-        nb_glm_test(path, **kwargs)
+        nb_glm_test(path, perturbation_column="perturbation", control_label="control", covariates=["depth"],
+                    dispersion_scope="per_comparison", memory_limit_gb=1e-6, n_jobs=1, verbose=False,
+                    output_path=tmp_path / "out.h5ad")
+
+
+def test_per_comparison_dispersion_streams_the_controls(tmp_path):
+    """Without covariates, per-comparison dispersions come from the control
+    summary, built in one streaming pass: controls that do not fit the memory
+    budget are no obstacle."""
+    path = _covariate_screen(tmp_path)
+    result = nb_glm_test(path, perturbation_column="perturbation", control_label="control",
+                         dispersion_scope="per_comparison", memory_limit_gb=1e-6, n_jobs=1, verbose=False,
+                         output_path=tmp_path / "out.h5ad")
+    assert np.isfinite(result.statistics).any()
 
 
 @pytest.mark.parametrize("covariates", [["depth", "donor"], []], ids=["covariates", "control_cache"])

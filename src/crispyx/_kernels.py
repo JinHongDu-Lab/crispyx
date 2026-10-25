@@ -1540,79 +1540,119 @@ def _residual_effects_rows(
 
 
 @nb.njit(cache=True)
-def _lgamma_ratio_term(y, r):
-    """G(y, r) = lgamma(y + r) - lgamma(r) - y log r, stable for large r."""
-    if y == 0.0:
-        return 0.0
-    if r < 10.0:
-        return math.lgamma(y + r) - math.lgamma(r) - y * math.log(r)
-    # Stirling series for lgamma at x = y + r and at r, differenced.
+def _stirling_ratio_term(y, r):
+    """lgamma(y + r) - lgamma(r) - y log r for r >= 10, from Stirling's series
+    at y + r and r, differenced so that no O(r log r) terms cancel."""
     x = y + r
     out = (x - 0.5) * math.log1p(y / r) - y
     out += 1.0 / (12.0 * x) - 1.0 / (12.0 * r)
-    out -= 1.0 / (360.0 * x ** 3) - 1.0 / (360.0 * r ** 3)
+    out -= 1.0 / (360.0 * x * x * x) - 1.0 / (360.0 * r * r * r)
     out += 1.0 / (1260.0 * x ** 5) - 1.0 / (1260.0 * r ** 5)
     return out
 
 
 @nb.njit(cache=True)
-def _control_lin_terms(g, alpha, m, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val, hist_cnt):
-    """Controls' NB negative log-likelihood (less alpha-free terms) and sum
-    of weights mu/(1 + alpha mu) for gene ``g``, with mu = max(s m, min_mu)."""
+def _lgamma_ratio_term(y, r):
+    """G(y, r) = lgamma(y + r) - lgamma(r) - y log r for an integer count y.
+
+    Without libm's lgamma, which writes the global ``signgam`` on every call
+    and so stalls every thread that calls it at once: a count below 32 sums
+    log1p(i/r) for i < y, exactly; a larger one takes the first steps exactly
+    until r + k >= 10 and the rest from Stirling's series.
+    """
+    if y < 32.0:
+        out = 0.0
+        for i in range(int(y)):
+            out += math.log1p(i / r)
+        return out
+    k = 0
+    out = 0.0
+    while r + k < 10.0:
+        out += math.log1p(k / r)
+        k += 1
+    # lgamma(y + r) - lgamma(r + k) - (y - k) log(r + k), plus the change of base
+    return out + _stirling_ratio_term(y - k, r + k) + (y - k) * math.log1p(k / r)
+
+
+@nb.njit(cache=True)
+def _dense_lin_terms(alpha, m, min_mu, centre, s_mom):
+    """Over binned cells with mu = max(s m, min_mu): sum of log1p(alpha mu)/alpha
+    and of the weights mu/(1 + alpha mu), to third order in s about each centre."""
     nll = 0.0
     weight = 0.0
     floor_log = math.log1p(alpha * min_mu)
     floor_w = min_mu / (1.0 + alpha * min_mu)
-    am = alpha * m
+    a = alpha * m
     for b in range(centre.shape[0]):
         n_b = s_mom[0, b]
-        if n_b == 0.0:
-            continue
         c = centre[b]
-        y0 = y_mom[0, g, b]
         if c * m < min_mu:
-            nll += n_b * floor_log / alpha + y0 * floor_log
+            nll += n_b * floor_log / alpha
             weight += n_b * floor_w
             continue
-        v = 1.0 + am * c
-        f0 = math.log1p(am * c)
-        f1 = am / v
-        f2 = -(am * am) / (v * v)
-        nll += (n_b * f0 + s_mom[1, b] * f1 + 0.5 * s_mom[2, b] * f2) / alpha
-        nll += y0 * f0 + y_mom[1, g, b] * f1 + 0.5 * y_mom[2, g, b] * f2
-        weight += n_b * c * m / v + s_mom[1, b] * m / (v * v) - s_mom[2, b] * alpha * m * m / (v * v * v)
-    r = 1.0 / alpha
-    for k in range(hist_ptr[g], hist_ptr[g + 1]):
-        nll -= hist_cnt[k] * _lgamma_ratio_term(hist_val[k], r)
+        v = 1.0 + a * c
+        u = a / v
+        # log1p(a s): derivatives a/v, -a^2/v^2, 2a^3/v^3
+        nll += (n_b * math.log1p(a * c) + s_mom[1, b] * u - 0.5 * s_mom[2, b] * u * u
+                + s_mom[3, b] * u * u * u / 3.0) / alpha
+        # m s/(1 + a s): derivatives m/v^2, -2am/v^3, 6a^2 m/v^4
+        mv = m / v
+        weight += n_b * c * mv + s_mom[1, b] * mv / v - s_mom[2, b] * u * mv / v + s_mom[3, b] * u * u * mv / v
     return nll, weight
 
 
 @nb.njit(cache=True)
-def _cells_lin_terms(y, s, m, alpha, min_mu):
-    """The same two quantities summed exactly over cells (counts ``y``,
-    size factors ``s``)."""
-    nll = 0.0
-    weight = 0.0
+def _control_count_terms(g, alpha, m, min_mu, centre, y_mom, hist_ptr, hist_val, hist_cnt):
+    """Controls' count-weighted part of the NB negative log-likelihood for
+    gene ``g``: sum of y log1p(alpha mu) - G(y, 1/alpha)."""
+    out = 0.0
+    floor_log = math.log1p(alpha * min_mu)
+    a = alpha * m
+    for b in range(centre.shape[0]):
+        y0 = y_mom[0, g, b]
+        if y0 == 0.0:
+            continue
+        c = centre[b]
+        if c * m < min_mu:
+            out += y0 * floor_log
+            continue
+        u = a / (1.0 + a * c)
+        out += y0 * math.log1p(a * c) + y_mom[1, g, b] * u - 0.5 * y_mom[2, g, b] * u * u \
+            + y_mom[3, g, b] * u * u * u / 3.0
+    r = 1.0 / alpha
+    for k in range(hist_ptr[g], hist_ptr[g + 1]):
+        out -= hist_cnt[k] * _lgamma_ratio_term(hist_val[k], r)
+    return out
+
+
+@nb.njit(cache=True)
+def _cells_count_terms(y, s, m, alpha, min_mu):
+    """The same, summed exactly over a gene's non-zero counts ``y`` in cells
+    with size factors ``s``."""
+    out = 0.0
     r = 1.0 / alpha
     for i in range(y.shape[0]):
         mu = s[i] * m
         if mu < min_mu:
             mu = min_mu
-        f0 = math.log1p(alpha * mu)
-        nll += f0 / alpha + y[i] * f0 - _lgamma_ratio_term(y[i], r)
-        weight += mu / (1.0 + alpha * mu)
-    return nll, weight
+        out += y[i] * math.log1p(alpha * mu) - _lgamma_ratio_term(y[i], r)
+    return out
 
 
 @nb.njit(cache=True)
-def _two_group_objective(log_alpha, g, m_c, m_t, y_t, s_t, min_mu, centre, s_mom, y_mom,
-                         hist_ptr, hist_val, hist_cnt, log_prior_mean, prior_var):
+def _two_group_objective(log_alpha, g, m_c, m_t, t_y, t_s, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
+                         hist_cnt, t_centre, t_mom, log_prior_mean, prior_var):
     """DESeq2's dispersion objective (to minimise): NB negative log-likelihood
-    with the Cox-Reid term, plus the log-normal prior when ``prior_var`` > 0."""
+    with the Cox-Reid term, plus the log-normal prior when ``prior_var`` > 0.
+    Controls from their summary; the perturbed cells' size factors binned
+    (``t_centre``, ``t_mom``) and their non-zero counts ``t_y`` summed exactly."""
     alpha = math.exp(log_alpha)
-    nll_c, w_c = _control_lin_terms(g, alpha, m_c, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val, hist_cnt)
-    nll_t, w_t = _cells_lin_terms(y_t, s_t, m_t, alpha, min_mu)
-    out = nll_c + nll_t + 0.5 * (math.log(w_c) + math.log(w_t))
+    dense_c, w_c = _dense_lin_terms(alpha, m_c, min_mu, centre, s_mom)
+    dense_t, w_t = _dense_lin_terms(alpha, m_t, min_mu, t_centre, t_mom)
+    out = dense_c + dense_t
+    out += _control_count_terms(g, alpha, m_c, min_mu, centre, y_mom, hist_ptr, hist_val, hist_cnt)
+    out += _cells_count_terms(t_y, t_s, m_t, alpha, min_mu)
+    out += 0.5 * (math.log(w_c) + math.log(w_t))
     if prior_var > 0.0:
         d = log_alpha - log_prior_mean
         out += d * d / (2.0 * prior_var)
@@ -1620,52 +1660,55 @@ def _two_group_objective(log_alpha, g, m_c, m_t, y_t, s_t, min_mu, centre, s_mom
 
 
 @nb.njit(parallel=True, cache=True)
-def _two_group_dispersions(genes, m_c, m_t, y_t, s_t, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
-                           hist_cnt, log_lo, log_hi, log_prior_mean, prior_var, n_grid, tol):
-    """Minimise the dispersion objective over log alpha in [log_lo, log_hi]
-    for each gene in ``genes``: a grid, then golden-section search in the
-    bracket around the grid's best point. ``y_t`` is (cells, genes)."""
+def _two_group_dispersions(genes, m_c, m_t, t_ptr, t_y, t_s, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
+                           hist_cnt, t_centre, t_mom, lo_bound, hi_bound, log_prior_mean, prior_var, n_grid, tol):
+    """Minimise the dispersion objective over log alpha in [lo_bound[i],
+    hi_bound[i]] for each gene in ``genes``: a grid of ``n_grid`` points, then
+    golden-section search in the bracket around the grid's best point. The
+    perturbed cells' non-zero counts of gene g are t_y[t_ptr[g]:t_ptr[g+1]]."""
     out = np.empty(genes.shape[0])
     invphi = (math.sqrt(5.0) - 1.0) / 2.0
-    step = (log_hi - log_lo) / (n_grid - 1)
     for i in nb.prange(genes.shape[0]):
         g = genes[i]
-        yg = np.ascontiguousarray(y_t[:, g])
+        yg = t_y[t_ptr[g]:t_ptr[g + 1]]
+        sg = t_s[t_ptr[g]:t_ptr[g + 1]]
         prior_mean = log_prior_mean[i] if prior_var > 0.0 else 0.0
+        lo_i = lo_bound[i]
+        step = (hi_bound[i] - lo_i) / (n_grid - 1)
         best = 0
         best_val = np.inf
         for k in range(n_grid):
-            val = _two_group_objective(log_lo + k * step, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom,
-                                       y_mom, hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+            val = _two_group_objective(lo_i + k * step, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom,
+                                       hist_ptr, hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
             if val < best_val:
                 best_val = val
                 best = k
-        lo = log_lo + max(best - 1, 0) * step
-        hi = log_lo + min(best + 1, n_grid - 1) * step
+        lo = lo_i + max(best - 1, 0) * step
+        hi = lo_i + min(best + 1, n_grid - 1) * step
         x1 = hi - invphi * (hi - lo)
         x2 = lo + invphi * (hi - lo)
-        f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
-                                  hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
-        f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
-                                  hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+        f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                  hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+        f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                  hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
         while hi - lo > tol:
             if f1 < f2:
                 hi = x2
                 x2 = x1
                 f2 = f1
                 x1 = hi - invphi * (hi - lo)
-                f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
-                                          hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+                f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                          hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
             else:
                 lo = x1
                 x1 = x2
                 f1 = f2
                 x2 = lo + invphi * (hi - lo)
-                f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, s_t, min_mu, centre, s_mom, y_mom,
-                                          hist_ptr, hist_val, hist_cnt, prior_mean, prior_var)
+                f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                          hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
         x = 0.5 * (lo + hi)
         if best_val < min(f1, f2):  # the optimum at a bound of the range
-            x = log_lo + best * step
+            x = lo_i + best * step
         out[i] = math.exp(x)
     return out
 
@@ -1694,10 +1737,11 @@ def _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom):
         y1 = y_mom[1, g, b]
         y2 = y_mom[2, g, b]
         v = 1.0 + ak * c
-        # sum y/(1 + alpha mu): f(s) = 1/(1 + alpha k s)
-        score += y0 / v - y1 * ak / (v * v) + y2 * ak * ak / (v * v * v)
-        # sum mu/(1 + alpha mu): g(s) = k s/(1 + alpha k s)
-        score -= n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+        # sum y/(1 + alpha mu): f(s) = 1/(1 + alpha k s), to third order
+        score += y0 / v - y1 * ak / (v * v) + y2 * ak * ak / (v * v * v) - y_mom[3, g, b] * ak ** 3 / v ** 4
+        # sum mu/(1 + alpha mu): g(s) = k s/(1 + alpha k s), to third order
+        score -= (n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+                  + s_mom[3, b] * alpha * alpha * k ** 3 / v ** 4)
         # d/da per cell: -mu (1 + alpha y)/(1 + alpha mu)^2; h(s) = k s/(1 + alpha k s)^2
         h0 = k * c / (v * v)
         h1 = k * (1.0 - ak * c) / (v * v * v)
@@ -1737,7 +1781,8 @@ def _control_weight(a, alpha, centre, s_mom):
             continue
         c = centre[b]
         v = 1.0 + alpha * k * c
-        out += n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+        out += (n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+                + s_mom[3, b] * alpha * alpha * k ** 3 / v ** 4)
     return out
 
 
@@ -1828,6 +1873,7 @@ def _accumulate_control_summary(data, indices, indptr, bin_of_row, s_rows, centr
             y_mom[0, g, b] += y
             y_mom[1, g, b] += y * d
             y_mom[2, g, b] += y * d * d
+            y_mom[3, g, b] += y * d * d * d
             v = int(y)
             if v <= vmax:
                 small_hist[g, v] += 1.0

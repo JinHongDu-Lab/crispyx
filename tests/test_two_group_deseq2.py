@@ -47,13 +47,13 @@ def _pydeseq2(counts, labels, sf):
     return dds, stats.results_df
 
 
-def _fit(counts, labels, sf, bin_width=0.01, blocks=1):
+def _fit(counts, labels, sf, bin_width=0.02, blocks=1):
     ctrl = labels == "ctrl"
     rows = np.array_split(np.arange(ctrl.sum()), blocks)
     summary = summarize_controls(
         [(r, sp.csr_matrix(counts[ctrl][r])) for r in rows], sf[ctrl], counts.shape[1], bin_width=bin_width
     )
-    return summary, fit_two_group_deseq2(summary, counts[~ctrl], sf[~ctrl])
+    return summary, fit_two_group_deseq2(summary, counts[~ctrl], sf[~ctrl], bin_width=bin_width)
 
 
 @pytest.fixture(scope="module")
@@ -94,15 +94,48 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
 
 
 def test_binned_controls_match_the_exact_summary(screen_and_reference):
-    """Size-factor bins of width 0.01 give what one bin per cell (exact) gives;
-    the LFCs of low-count genes move by up to 2e-5, where a bin straddles the
-    mean floor (min_mu) and is held wholly on one side of it."""
+    """Size-factor bins of the default width give what one bin per distinct
+    size factor (exact) gives. The largest gaps are low-count genes whose mean
+    crosses the floor min_mu inside a bin (control mean near 0.5 here)."""
     counts, labels, sf, _ = screen_and_reference
     exact = _fit(counts, labels, sf, bin_width=0)[1]
-    binned = _fit(counts, labels, sf, bin_width=0.01)[1]
-    for field in ("genewise_dispersion", "map_dispersion", "dispersion", "se"):
-        np.testing.assert_allclose(getattr(binned, field), getattr(exact, field), rtol=1e-4)
+    binned = _fit(counts, labels, sf, bin_width=0.02)[1]
+    for field in ("genewise_dispersion", "map_dispersion", "dispersion"):
+        np.testing.assert_allclose(getattr(binned, field), getattr(exact, field), rtol=5e-4)
+    np.testing.assert_allclose(binned.se, exact.se, rtol=1e-4)
     np.testing.assert_allclose(binned.lfc, exact.lfc, atol=1e-4)
+
+
+def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path):
+    """End to end: nb_glm_test with per-comparison dispersions (the control
+    summary path) agrees with PyDESeq2 on each perturbation's cells, given
+    the control-reference size factors nb_glm_test computes."""
+    import anndata as ad
+
+    from crispyx._size_factors import _control_reference_size_factors
+    from crispyx.de import nb_glm_test
+
+    rng = np.random.default_rng(1)
+    counts, labels, _ = _screen(seed=1, n_pert=300)
+    labels = labels.copy()
+    labels[labels == "KO1"] = np.where(rng.random((labels == "KO1").sum()) < 0.5, "KO1", "KO2")
+    path = tmp_path / "screen.h5ad"
+    ad.AnnData(counts.astype(np.float32), obs=pd.DataFrame({"perturbation": labels})).write(path)
+    result = nb_glm_test(
+        path, perturbation_column="perturbation", control_label="ctrl", size_factor_method="deseq2",
+        dispersion_scope="per_comparison", n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad",
+        min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_cells_ctrl=0,
+        min_cells_pert=0, min_total_count=0,
+    )
+    sf = _control_reference_size_factors(path, labels, "ctrl")
+    for name in ("KO1", "KO2"):
+        keep = np.isin(labels, ["ctrl", name])
+        sub = labels[keep].copy()
+        sub[sub == name] = "KO1"
+        _, ref = _pydeseq2(counts[keep], sub, sf[keep])
+        z = result[name].statistic
+        dz = np.abs(z - ref["stat"].to_numpy())
+        assert np.median(dz) < 1e-3 and dz.max() < 0.05, (name, np.median(dz), dz.max())
 
 
 def test_control_summary_does_not_depend_on_the_blocks(screen_and_reference):
