@@ -26,7 +26,8 @@ import scipy.sparse as sp
 
 from . import _messages
 from ._memory import (
-    _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _page_cache_is_charged, _resolve_n_jobs,
+    _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
+    _resolve_n_jobs,
 )
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
@@ -775,45 +776,74 @@ def resolve_data_path(
     return result
 
 
-def accepts_in_memory(fn: Callable) -> Callable:
+def _anndata_nbytes(adata: ad.AnnData) -> int:
+    """Approximate size of ``adata`` written to an ``.h5ad``: its matrices
+    (``X``, ``raw``, ``layers``, ``obsm`` ...) and its ``obs``/``var``."""
+    def nbytes(value: Any) -> int:
+        if sp.issparse(value):
+            return value.data.nbytes + value.indices.nbytes + value.indptr.nbytes
+        if isinstance(value, pd.DataFrame):
+            return int(value.memory_usage(deep=True).sum())
+        return int(getattr(value, "nbytes", 0))
+
+    matrices = [adata.X, adata.obs, adata.var]
+    if adata.raw is not None:
+        matrices += [adata.raw.X, adata.raw.var]
+    for slot in (adata.layers, adata.obsm, adata.varm, adata.obsp, adata.varp):
+        matrices += list(slot.values())
+    return sum(nbytes(m) for m in matrices if m is not None)
+
+
+def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = True) -> Callable:
     """Let ``fn`` take an in-memory :class:`anndata.AnnData` as ``data``.
 
-    The object is written to a scratch ``.h5ad`` in a new temporary
-    directory, ``fn`` streams that file, and the directory -- with anything
-    ``fn`` derives beside its input, such as ``nb_glm_test``'s sorted copy --
-    is removed when ``fn`` returns or raises. Paths and backed AnnData pass
-    through unchanged.
+    The object is written to a scratch ``.h5ad`` in a new directory under
+    :func:`_scratch_root`, ``fn`` streams that file, and the directory --
+    with anything ``fn`` derives beside its input, such as ``nb_glm_test``'s
+    sorted copy -- is removed when ``fn`` returns or raises, or by a later
+    run's sweep after a kill. Paths and backed AnnData pass through
+    unchanged.
 
     An output is named after its input file by default, so with in-memory
-    input ``output_path`` is required; ``resume`` is refused, since it
-    identifies a run by its input file.
+    input ``output_path`` (or ``output_dir``) is required, unless
+    ``output_required=False`` says ``fn`` writes nothing without one;
+    ``resume`` is refused, since it identifies a run by its input file.
     """
-    takes_output = "output_path" in inspect.signature(fn).parameters
+    if fn is None:
+        return functools.partial(accepts_in_memory, output_required=output_required)
+    signature = inspect.signature(fn)
+    needs_output = output_required and "output_path" in signature.parameters
     name = fn.__name__
 
     @functools.wraps(fn)
     def wrapper(data, *args, **kwargs):
         if not isinstance(data, ad.AnnData) or getattr(data, "filename", None):
             return fn(data, *args, **kwargs)
-        if takes_output and kwargs.get("output_path") is None and kwargs.get("output_dir") is None:
+        bound = signature.bind_partial(data, *args, **kwargs)
+        bound.apply_defaults()
+        given = bound.arguments
+        output_path, output_dir = given.get("output_path"), given.get("output_dir")
+        if needs_output and output_path is None and output_dir is None:
             raise ValueError(
                 f"{name}: an in-memory AnnData has no file to name the output after; "
                 "pass output_path."
             )
-        if kwargs.get("resume"):
+        if given.get("resume"):
             raise ValueError(
                 f"{name}: resume identifies a run by its input file, which an in-memory "
                 'AnnData does not have; save it with adata.write_h5ad("data.h5ad") and '
                 "pass the path to resume."
             )
-        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_"))
+        # Room for the copy and one file derived from it (nb_glm_test's sorted copy).
+        required = 2 * _anndata_nbytes(data)
+        fallback = Path(output_path).parent if output_path is not None else Path(output_dir or ".")
+        root = _scratch_root(required, fallback)
+        root.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_scratch_copies(root, fn_name=name, verbose=given.get("verbose", False))
+        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_", dir=root))
         try:
             path = scratch / "input.h5ad"
-            X = data.X
-            warn_if_disk_space_low(
-                X.data.nbytes + X.indices.nbytes + X.indptr.nbytes if sp.issparse(X) else np.asarray(X).nbytes,
-                path, context=name,
-            )
+            warn_if_disk_space_low(required, path, context=name)
             data.write_h5ad(path)
             return fn(path, *args, **kwargs)
         finally:
@@ -1300,16 +1330,18 @@ def _process_is_alive(pid: int) -> bool:
 def _sweep_stale_scratch_copies(
     scratch_dir: Path, *, fn_name: str, verbose: int | bool = False
 ) -> None:
-    """Remove temporary fast-axis copies left behind by dead runs.
+    """Remove scratch files and directories left behind by dead runs: the
+    temporary fast-axis copies, an in-memory input's copy
+    (:func:`accepts_in_memory`) and a conversion's spill files.
 
-    The copies are deleted in a ``finally`` block, which a ``SIGKILL`` (an
+    They are deleted in a ``finally`` block, which a ``SIGKILL`` (an
     out-of-memory kill, a scheduler timeout) skips -- leaving a hidden file
-    the size of the source matrix next to the output. Nothing else would ever
+    the size of the source matrix behind. Nothing else would ever
     clean those up: ``atexit`` does not run on ``SIGKILL`` either. So a run
-    that sees a mismatched source first sweeps the copies of runs that are
+    that may write one first sweeps that location of runs that are
     demonstrably gone.
 
-    "Demonstrably" is the whole difficulty: ``scratch_dir`` is the output
+    "Demonstrably" is the whole difficulty: ``scratch_dir`` may be the output
     directory, which a cluster job array shares across nodes, so the owning
     PID may belong to another machine entirely and say nothing about liveness
     here. Hence the age guard below, which is the load-bearing one -- a
@@ -1333,15 +1365,21 @@ def _sweep_stale_scratch_copies(
         if pid == _os.getpid() and host == _HOST_TAG:
             continue
         try:
-            age = now - entry.stat().st_mtime
+            # A scratch directory's files are what a live run keeps writing.
+            stamps = [entry.stat().st_mtime]
+            if entry.is_dir():
+                stamps += [child.stat().st_mtime for child in entry.iterdir()]
         except OSError:
             continue
-        if age < _STALE_SCRATCH_SECONDS:
+        if now - max(stamps) < _STALE_SCRATCH_SECONDS:
             continue
         if host == _HOST_TAG and _process_is_alive(pid):
             continue
         try:
-            entry.unlink()
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
         except OSError:
             continue
         _messages.vprint(
@@ -1441,14 +1479,12 @@ def stream_on_fast_axis(
                 f"Point output_path at a volume with more room, or run "
                 f"cx.pp.convert_to_{target}(path) there once. "
                 + _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
-                stacklevel=4,
             )
             policy = "warn"
     if policy == "warn":
         _messages.warn(
             fn_name,
             _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
-            stacklevel=4,
         )
         # The one-time logger guardrail, emitted once per process.
         _warn_slow_axis(fmt, axis)
@@ -1480,7 +1516,6 @@ def stream_on_fast_axis(
                 f"cx.pp.convert_to_{target}(path, output_path=...). "
                 f"format_mismatch_policy='off' streams the source as-is if you would "
                 f"rather pay the re-read.",
-                stacklevel=4,
             )
         convert = convert_to_csc if target == "csc" else convert_to_csr
         convert(path, output_path=tmp_path, memory_limit_gb=memory_limit_gb, verbose=verbose)
@@ -3472,35 +3507,85 @@ def _source_chunks(source_path: Path, axis: int, chunk_size: int) -> Iterator[tu
 #: Spilled triples read back per call when a band is rebuilt from its files.
 _SPILL_READ_ITEMS = 1 << 25
 
+#: File descriptors kept free for everything else the process opens.
+_SPARE_OPEN_FILES = 64
 
-def _spill_dir(spill_bytes: float, output_path: Path, output_bytes: float) -> Path | None:
-    """Where the converters can spill ``spill_bytes``: the temporary
-    directory (node-local on a cluster), else the output's directory, or
-    ``None`` when neither has room or free space is unknown. A directory on
-    the output's filesystem must also hold the output still to be written."""
+
+def _scratch_root(required_bytes: float, fallback: Path) -> Path:
+    """Where a scratch file of ``required_bytes`` goes: the temporary
+    directory -- node-local on a cluster, off a synced or shared output
+    volume on a personal computer -- when it is on disk and has room, else
+    ``fallback``. A RAM-backed one (:func:`~crispyx._memory._is_ram_backed`)
+    would hold the file in memory, charged to the job's limit."""
+    tmp = Path(tempfile.gettempdir())
+    free = _free_bytes_at(tmp)
+    if not _is_ram_backed(tmp) and free is not None and free >= 1.1 * required_bytes:
+        return tmp
+    return fallback
+
+
+def _spill_dir(
+    spill_bytes: float, output_path: Path, output_bytes: float, source_path: Path, reread_bytes: float
+) -> Path | None:
+    """Where the converters can spill ``spill_bytes`` instead of re-reading
+    ``reread_bytes`` of the source: the temporary directory, else the
+    output's directory, or ``None`` when neither qualifies. A candidate must
+    be on disk (not RAM-backed), have room -- on the output's filesystem,
+    for the output still to be written too -- and, on the source's
+    filesystem, be cheaper than the re-reads: spilling writes and reads
+    back ``spill_bytes``. Free space unknown disqualifies a candidate."""
     output_dir = output_path.parent
-    try:
-        output_dev = output_dir.stat().st_dev
-    except OSError:
-        output_dev = None
-    for candidate in (Path(tempfile.gettempdir()), output_dir):
-        free = _free_bytes_at(candidate)
-        if free is None:
-            continue
+
+    def device(path: Path) -> int | None:
         try:
-            same_fs = candidate.stat().st_dev == output_dev
+            return path.stat().st_dev
         except OSError:
+            return None
+
+    output_dev, source_dev = device(output_dir), device(source_path)
+    for candidate in (Path(tempfile.gettempdir()), output_dir):
+        free, dev = _free_bytes_at(candidate), device(candidate)
+        if free is None or dev is None or _is_ram_backed(candidate):
             continue
-        if free >= 1.1 * spill_bytes + (output_bytes if same_fs else 0.0):
+        if dev == source_dev and 2 * spill_bytes >= reread_bytes:
+            continue
+        if free >= 1.1 * spill_bytes + (output_bytes if dev == output_dev else 0.0):
             return candidate
     return None
+
+
+def _reserve_open_files(n: int) -> bool:
+    """Whether ``n`` more files can be open at once, raising the soft
+    ``RLIMIT_NOFILE`` toward the hard limit when it is too low (it is often
+    1024 on a cluster node, with a much higher hard limit)."""
+    try:
+        import resource
+    except ImportError:  # Windows: no per-process descriptor limit to raise
+        return True
+    try:
+        in_use = len(_os.listdir("/proc/self/fd"))
+    except OSError:
+        in_use = _SPARE_OPEN_FILES
+    needed = in_use + n + _SPARE_OPEN_FILES
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= needed:
+        return True
+    if hard != resource.RLIM_INFINITY and hard < needed:
+        return False
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _transpose_in_bands(
     partial: Path,
     output_path: Path,
     *,
-    chunks: Callable[[], Iterator[tuple[int, sp.spmatrix]]],
+    source_path: Path,
+    axis: int,
+    chunk_size: int,
     n_chunks: int,
     bands: list[tuple[int, int]],
     indptr: np.ndarray,
@@ -3511,41 +3596,47 @@ def _transpose_in_bands(
     verbose: int | bool,
 ) -> None:
     """Fill the pre-sized ``X/data`` and ``X/indices`` of ``partial`` with the
-    transpose of the compressed ``chunks()``, one band of output keys
-    (columns for CSC, rows for CSR) at a time.
+    transpose of ``source_path``'s compressed chunks along ``axis``, one band
+    of output keys (columns for CSC, rows for CSR) at a time.
 
     With one band the source is read once. With several, each band reads
     the source again -- except where page cache counts against a memory
     limit (:func:`~crispyx._memory._page_cache_is_charged`, e.g. a Slurm
-    job). There the re-reads cannot come from cache, since the source's
-    pages are evicted, so it is read once: the first band is built in memory
-    while the others' non-zeros are appended to spill files (in the
-    temporary directory, else beside the output), each then read back to
-    build its band. On HPC2021 Lustre a 5-band conversion took 824 s
-    re-reading; elsewhere a re-read is served from cache, and spilling was
-    slower (Mac SSD, 4 bands: 26.5 s spilled vs 20.8 s re-read). All paths
-    give the same bytes.
+    job). There a re-read cannot come from cache, since the source's pages
+    are evicted, so the source is read once where :func:`_spill_dir` finds
+    somewhere worth spilling to: the first band is built in memory while the
+    others' non-zeros are appended to one spill file per band, each then
+    read back to build its band. Elsewhere a re-read is served from cache
+    and spilling would only add disk traffic. All paths give the same bytes.
     """
     minor_dtype = np.dtype(minor_dtype)
     n_keys = indptr.shape[0] - 1
     key_dtype = np.dtype(np.int32 if n_keys <= np.iinfo(np.int32).max else np.int64)
-    triple_bytes = key_dtype.itemsize + minor_dtype.itemsize + value_dtype.itemsize
+    # One record per spilled non-zero, widest field first so every field is
+    # aligned (align=True pads the record to a multiple of the widest).
+    fields = sorted([("key", key_dtype), ("minor", minor_dtype), ("value", value_dtype)],
+                    key=lambda field: -field[1].itemsize)
+    record_dtype = np.dtype(fields, align=True)
     total_nnz = int(indptr[-1])
     output_bytes = total_nnz * (value_dtype.itemsize + minor_dtype.itemsize)
-    spill_bytes = (total_nnz - int(indptr[bands[0][1]])) * triple_bytes
-    spill = len(bands) > 1 and _page_cache_is_charged()
-    spill_dir = _spill_dir(spill_bytes, output_path, output_bytes) if spill else None
-    if len(bands) > 1:
+    n_bands = len(bands)
+    spill_bytes = (total_nnz - int(indptr[bands[0][1]])) * record_dtype.itemsize
+    spill = n_bands > 1 and _page_cache_is_charged()
+    spill_dir = None
+    if spill and _reserve_open_files(n_bands - 1):
+        reread_bytes = (n_bands - 1) * _matrix_shape_and_nbytes(source_path)[1]
+        spill_dir = _spill_dir(spill_bytes, output_path, output_bytes, source_path, reread_bytes)
+    if n_bands > 1:
         if spill_dir is not None:
             how = f"one pass over the source, spilling {format_bytes(spill_bytes)} to {spill_dir}"
         elif spill:
-            how = f"{len(bands)} passes over the source (no room to spill {format_bytes(spill_bytes)})"
+            how = f"{n_bands} passes over the source (spilling {format_bytes(spill_bytes)} does not pay here)"
         else:
-            how = f"{len(bands)} passes over the source"
+            how = f"{n_bands} passes over the source"
         _messages.vprint(
             verbose, fn_name,
             f"output buffers need {format_bytes(output_bytes)}; converting in "
-            f"{len(bands)} {band_kind} bands, {how}",
+            f"{n_bands} {band_kind} bands, {how}",
         )
 
     def band_buffers(lo: int, hi: int):
@@ -3559,10 +3650,10 @@ def _transpose_in_bands(
         ds_data, ds_minor = dest["X/data"], dest["X/indices"]
         evict = _EvictEvery(partial)
         if spill_dir is None:
-            with _create_progress_context(n_chunks * len(bands), f"{fn_name} (pass 2)", verbose, unit="chunk") as pbar:
+            with _create_progress_context(n_chunks * n_bands, f"{fn_name} (pass 2)", verbose, unit="chunk") as pbar:
                 for lo, hi in bands:
                     base, band_vals, band_minor, offset = band_buffers(lo, hi)
-                    for major0, chunk in chunks():
+                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
                         if chunk.nnz:
                             _scatter_band(chunk.indptr, chunk.indices, chunk.data, major0, lo, hi,
                                           offset, band_vals, band_minor)
@@ -3571,61 +3662,53 @@ def _transpose_in_bands(
                     del band_vals, band_minor
             return
 
-        n_bands = len(bands)
         band_of = np.repeat(np.arange(n_bands, dtype=np.int32), [hi - lo for lo, hi in bands])
+        _sweep_stale_scratch_copies(spill_dir, fn_name=fn_name, verbose=verbose)
         scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{fn_name}_{_os.getpid()}-{_HOST_TAG}_",
                                         dir=spill_dir))
-        parts = [(key_dtype, "key"), (minor_dtype, "minor"), (value_dtype, "value")]
-        paths = [[scratch / f"band{b}.{name}" for _dtype, name in parts] for b in range(n_bands)]
-        spill_evict = _EvictEvery(*(path for band in paths[1:] for path in band))
+        paths = [scratch / f"band{b}" for b in range(n_bands)]
+        spill_evict = _EvictEvery(*paths[1:])
         try:
             with _create_progress_context(n_chunks + n_bands - 1, f"{fn_name} (pass 2)", verbose, unit="step") as pbar:
                 lo0, hi0 = bands[0]
                 base0, band_vals, band_minor, offset0 = band_buffers(lo0, hi0)
-                handles = [[open(path, "wb") for path in band] for band in paths[1:]]
+                handles = []
                 try:
-                    for major0, chunk in chunks():
+                    for path in paths[1:]:
+                        handles.append(open(path, "wb"))
+                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
                         if chunk.nnz:
                             counts = np.bincount(band_of[chunk.indices], minlength=n_bands)
                             starts = np.zeros(n_bands + 1, dtype=np.int64)
                             np.cumsum(counts, out=starts[1:])
-                            keys = np.empty(chunk.nnz, dtype=key_dtype)
-                            minors = np.empty(chunk.nnz, dtype=minor_dtype)
-                            vals = np.empty(chunk.nnz, dtype=value_dtype)
+                            records = np.empty(chunk.nnz, dtype=record_dtype)
                             _split_by_band(chunk.indptr, chunk.indices, chunk.data, major0, band_of,
-                                           starts[:-1].copy(), keys, minors, vals)
-                            _scatter_coo(keys[:starts[1]], minors[:starts[1]], vals[:starts[1]], lo0,
+                                           starts[:-1].copy(), records["key"], records["minor"], records["value"])
+                            first = records[:starts[1]]
+                            _scatter_coo(first["key"], first["minor"], first["value"], lo0,
                                          offset0, band_vals, band_minor)
                             for b in range(1, n_bands):
-                                s, e = starts[b], starts[b + 1]
-                                for handle, array in zip(handles[b - 1], (keys, minors, vals)):
-                                    handle.write(array[s:e].tobytes())
-                                spill_evict(int(e - s) * triple_bytes)
+                                handles[b - 1].write(records[starts[b]:starts[b + 1]])
+                            spill_evict(int(chunk.nnz - starts[1]) * record_dtype.itemsize)
                         pbar.update(1)
                 finally:
-                    for band in handles:
-                        for handle in band:
-                            handle.close()
+                    for handle in handles:
+                        handle.close()
                 _write_band(ds_data, ds_minor, base0, band_vals, band_minor, evict)
                 del band_vals, band_minor
                 for b in range(1, n_bands):
                     lo, hi = bands[b]
                     base, band_vals, band_minor, offset = band_buffers(lo, hi)
                     remaining = band_vals.shape[0]
-                    files = [open(path, "rb") for path in paths[b]]
-                    try:
+                    with open(paths[b], "rb") as handle:
                         while remaining:
                             n = min(remaining, _SPILL_READ_ITEMS)
-                            keys, minors, vals = (np.fromfile(f, dtype=dtype, count=n)
-                                                  for f, (dtype, _name) in zip(files, parts))
-                            _scatter_coo(keys, minors, vals, lo, offset, band_vals, band_minor)
-                            spill_evict(n * triple_bytes)
+                            records = np.fromfile(handle, dtype=record_dtype, count=n)
+                            _scatter_coo(records["key"], records["minor"], records["value"], lo,
+                                         offset, band_vals, band_minor)
+                            spill_evict(n * record_dtype.itemsize)
                             remaining -= n
-                    finally:
-                        for f in files:
-                            f.close()
-                    for path in paths[b]:
-                        path.unlink()
+                    paths[b].unlink()
                     _write_band(ds_data, ds_minor, base, band_vals, band_minor, evict)
                     del band_vals, band_minor
                     pbar.update(1)
@@ -3786,7 +3869,7 @@ def convert_to_csc(
         )
         _transpose_in_bands(
             partial, output_path,
-            chunks=lambda: _source_chunks(source_path, 0, chunk_size), n_chunks=n_chunks,
+            source_path=source_path, axis=0, chunk_size=chunk_size, n_chunks=n_chunks,
             bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=row_dtype,
             fn_name="pp.convert_to_csc", band_kind="column", verbose=verbose,
         )
@@ -3972,7 +4055,7 @@ def convert_to_csr(
             )
             _transpose_in_bands(
                 partial, output_path,
-                chunks=lambda: _source_chunks(source_path, 1, chunk_size), n_chunks=n_col_chunks,
+                source_path=source_path, axis=1, chunk_size=chunk_size, n_chunks=n_col_chunks,
                 bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=col_dtype,
                 fn_name="pp.convert_to_csr", band_kind="row", verbose=verbose,
             )

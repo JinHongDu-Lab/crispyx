@@ -86,3 +86,39 @@ def test_scratch_copy_is_removed_when_the_run_fails(tmp_path, scratch_root):
         cx.t_test(_screen(), perturbation_column="no_such_column", control_label="control",
                   output_path=tmp_path / "de.h5ad", verbose=False)
     assert list(scratch_root.iterdir()) == []
+
+
+def test_output_path_given_by_position_or_through_the_namespace(tmp_path, scratch_root):
+    adata = _screen()
+    for result in (
+        cx.normalize_total_log1p(adata, tmp_path / "positional.h5ad", verbose=False),
+        cx.pp.normalize_total_log1p(adata, output_path=tmp_path / "namespace.h5ad", verbose=False),
+        cx.pp.downsample_counts(adata, tmp_path / "ds.h5ad", counts_per_cell=5, verbose=False),
+    ):
+        assert result.shape == adata.shape
+        result.close()
+    assert list(scratch_root.iterdir()) == []
+
+
+def test_qc_summary_without_an_output_returns_masks_only(tmp_path, scratch_root):
+    result = cx.quality_control_summary(_screen(), perturbation_column="perturbation", control_label="control",
+                                        min_genes=1, min_cells_per_perturbation=1, min_cells_per_gene=1,
+                                        verbose=False)
+    assert result.cell_mask.shape == (120,)
+    assert list(scratch_root.iterdir()) == [] and list(tmp_path.glob("*.h5ad")) == []
+
+
+def test_scratch_copy_goes_beside_the_output_when_tmp_is_in_memory(tmp_path, scratch_root, monkeypatch):
+    """A RAM-backed /tmp would hold the copy in memory, charged to the job."""
+    import crispyx.data as cxd
+
+    monkeypatch.setattr(cxd, "_is_ram_backed", lambda path: True)
+    seen = []
+    real_write = ad.AnnData.write_h5ad
+    monkeypatch.setattr(ad.AnnData, "write_h5ad", lambda self, path, **kw: (seen.append(path), real_write(self, path, **kw))[1])
+    out_dir = tmp_path / "out"
+    cx.t_test(_screen(log=True), perturbation_column="perturbation", control_label="control",
+              output_path=out_dir / "de.h5ad", verbose=False)
+    assert seen[0].parent.parent == out_dir
+    assert list(scratch_root.iterdir()) == []
+    assert [p.name for p in out_dir.iterdir() if p.name.startswith(".cx_")] == []

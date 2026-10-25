@@ -25,10 +25,14 @@ Version 0.2.2
   converters work in bands, and each band re-read the source. Where page
   cache counts against the limit (a Slurm or cgroup job) those re-reads
   come from storage. There the first band is now built in memory while the
-  other bands' non-zeros are spilled to the temporary directory (about
-  12 bytes each for float32 data; beside the output when the temporary
-  directory lacks room, and the old re-reads when neither has it), then
-  read back band by band. On HPC2021 (source on Lustre, spill on node-local
+  other bands' non-zeros are spilled to one file per band in the temporary
+  directory (about 12 bytes each for float32 data), then read back band by
+  band. A RAM-backed temporary directory (``tmpfs``) is skipped, since the
+  spill would count against the same limit; the output's directory is used
+  instead when it has room and, on the source's filesystem, only where the
+  spill's write and read cost less than the re-reads; otherwise the
+  re-reads stay. The soft open-file limit is raised toward the hard one
+  when the bands need it. On HPC2021 (source on Lustre, spill on node-local
   ``/tmp``), a 17.6 GB, 429,000-cell file converts in 5 bands in 330-400 s,
   against 600-720 s re-reading and 711 s for 0.2.1, and in 1 band in
   ~240 s. The full Huang-HCT116 screen (206 GB, 3.4 million cells, 3 bands,
@@ -41,10 +45,17 @@ Version 0.2.2
   three pseudobulk functions, ``residual_effects``, ``subsample``,
   ``normalize_total_log1p`` and ``downsample_counts`` (and their ``cx.pp`` /
   ``cx.pb`` / ``cx.tl`` forms). The object is written to a scratch file in
-  the temporary directory, streamed like any input, and removed when the
-  call returns or fails. ``output_path`` is required with such input and
+  the temporary directory when it is on disk and has room (else beside the
+  output), streamed like any input, and removed when the call returns or
+  fails; a later run removes one a killed run left. ``output_path``, by
+  keyword or position, is required with such input (except by
+  ``quality_control_summary``, which then returns its masks only) and
   ``resume`` is refused, since both are defined by the input file. Large
   objects are still better saved once and passed as a path.
+* **Warnings point at the line that called crispyx.** Each warning named a
+  fixed number of frames up, which a helper or the in-memory wrapper made
+  land inside crispyx (with an absolute path to its source). Warnings are
+  now attributed to the first frame outside the package.
 * **Fixed: ``nb_glm_test``'s MAP dispersion is Cox-Reid adjusted.** The
   gene-wise dispersions were Cox-Reid adjusted but the MAP step that shrinks
   them toward the trend maximised the plain likelihood, which biases a

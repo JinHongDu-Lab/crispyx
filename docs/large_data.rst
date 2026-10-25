@@ -48,8 +48,9 @@ for fine-grained breakdown.
    An output larger than that is built in bands of columns. In a Slurm or
    cgroup job, the source is read once and the later bands are spilled to
    the temporary directory (``$TMPDIR``; about 12 bytes per non-zero for
-   float32 data), so put ``$TMPDIR`` on node-local disk. Elsewhere, each
-   band reads the source again from page cache.
+   float32 data), so put ``$TMPDIR`` on node-local disk. A RAM-backed
+   ``$TMPDIR`` (``tmpfs``) is skipped, as the spill would count against the
+   job's memory. Elsewhere, each band reads the source again from page cache.
 
    Because the source and destination coexist during conversion, this
    temporarily requires roughly 2× the source file's size in free disk space

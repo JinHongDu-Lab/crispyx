@@ -12,7 +12,7 @@ import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from numpy.typing import ArrayLike
-from scipy.linalg import cho_factor, cho_solve, solve as scipy_solve
+from scipy.linalg import cho_factor, cho_solve, qr as scipy_qr, solve as scipy_solve
 from scipy.optimize import minimize_scalar, minimize, brentq
 from scipy.special import gammaln, digamma, polygamma
 
@@ -740,8 +740,7 @@ def precompute_global_dispersion(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2  # intercept + perturbation
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -891,8 +890,7 @@ def _precompute_global_dispersion_streaming(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -1051,8 +1049,7 @@ def precompute_global_dispersion_from_path(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -1582,15 +1579,18 @@ def check_full_rank(design: np.ndarray, column_names: list[str], context: str) -
     instead of fitting a singular system.
 
     ``context`` says which fit the design belongs to (e.g. a comparison).
+
+    One QR of ``design``: column ``j`` lies in the span of the columns
+    before it exactly when ``R[j, j]`` vanishes, at ``matrix_rank``'s
+    tolerance.
     """
-    if np.linalg.matrix_rank(design) == design.shape[1]:
+    if design.shape[1] == 0:
         return
-    dependent, rank = [], 0
-    for j in range(design.shape[1]):
-        if np.linalg.matrix_rank(design[:, : j + 1]) > rank:
-            rank += 1
-        else:
-            dependent.append(column_names[j])
+    diag = np.abs(np.diag(scipy_qr(design, mode="r", check_finite=False)[0]))
+    tol = diag.max() * max(design.shape) * np.finfo(np.float64).eps
+    dependent = [column_names[j] for j in np.flatnonzero(diag <= tol)]
+    if not dependent:
+        return
     raise ValueError(
         f"{context}: the design is rank-deficient; {', '.join(map(repr, dependent))} "
         "is a linear combination of the other columns. A covariate is confounded with "

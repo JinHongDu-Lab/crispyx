@@ -1636,7 +1636,7 @@ def _qc_masks_only(
     )
 
 
-@accepts_in_memory
+@accepts_in_memory(output_required=False)
 def quality_control_summary(
     data: str | Path | AnnData | ad.AnnData,
     *,

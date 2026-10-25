@@ -1644,3 +1644,15 @@ def test_build_design_matrix_drops_levels_absent_from_the_subset():
     design, names = build_design_matrix(obs, covariate_columns=["batch"], perturbation_indicator=np.array([0, 0, 1, 1]))
     assert names == ["intercept", "perturbation", "batch_b1"]
     assert np.all(design.any(axis=0))
+
+
+def test_check_full_rank_names_each_column_spanned_by_earlier_ones():
+    from crispyx.glm import check_full_rank
+
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=(2, 50))
+    design = np.column_stack([np.ones(50), a, b, a + 2 * b, 3 * a])
+    with pytest.raises(ValueError, match=r"'a\+2b', '3a' is a linear combination"):
+        check_full_rank(design, ["1", "a", "b", "a+2b", "3a"], "test")
+    check_full_rank(design[:, :3], ["1", "a", "b"], "test")
+    check_full_rank(np.empty((5, 0)), [], "test")

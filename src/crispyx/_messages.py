@@ -11,6 +11,8 @@ structure, print prefixes that didn't track a renamed function) across the
 
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 from typing import TYPE_CHECKING
 
@@ -57,14 +59,29 @@ def print_disk_estimate(verbose: int | bool, name: str, estimate: "DiskEstimate"
     vprint(verbose, name, message)
 
 
-def warn(context: str, message: str, *, category: type[Warning] = UserWarning, stacklevel: int = 2) -> None:
-    """``warnings.warn`` with the ``"{context}: "`` prefix ``_disk.py`` already uses.
+#: Where crispyx's own frames come from; :func:`emit` skips past them.
+_PACKAGE_DIR = os.path.dirname(__file__) + os.sep
+
+
+def emit(message: str, category: type[Warning] = UserWarning) -> None:
+    """``warnings.warn`` attributed to the first frame outside crispyx -- the
+    user's call -- however deep inside crispyx (helpers, decorators) it is
+    raised, so no call site has to count frames for a ``stacklevel``."""
+    level, frame = 1, sys._getframe()
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame = frame.f_back
+        level += 1
+    warnings.warn(message, category, stacklevel=level)
+
+
+def warn(context: str, message: str, *, category: type[Warning] = UserWarning) -> None:
+    """:func:`emit` with the ``"{context}: "`` prefix ``_disk.py`` already uses.
 
     Warnings are never gated on ``verbose`` -- they signal something the
     caller should know about regardless of verbosity, the same way
     ``_disk.py``'s disk-space warnings already work.
     """
-    warnings.warn(f"{context}: {message}", category, stacklevel=stacklevel + 1)
+    emit(f"{context}: {message}", category)
 
 
 __all__ = [
@@ -73,5 +90,6 @@ __all__ = [
     "print_saving",
     "print_done",
     "print_disk_estimate",
+    "emit",
     "warn",
 ]

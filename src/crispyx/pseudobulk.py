@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-import warnings
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NamedTuple, Sequence, get_args
 
@@ -831,7 +830,6 @@ def aggregate_pseudobulk(
             _messages.warn(
                 "pb.aggregate",
                 f"{n_missing} cells have missing grouping values and are excluded.",
-                stacklevel=2,
             )
         raw_codes = np.full(backed.n_obs, -1, dtype=np.int64)
         if usable.any():
@@ -1097,14 +1095,13 @@ def compute_pseudobulk_effects(
             # scale it detected, so the mistake is detectable here for both a saved
             # artifact and cell-level input aggregated a moment ago.
             if str(marker.get("input_scale", "")) == "counts":
-                warnings.warn(
+                _messages.emit(
                     "The input to compute_pseudobulk_effects() looks like raw counts, "
                     "and this function does not normalise library size, so the effect "
                     "will be confounded by sequencing depth. Normalise first with "
                     "cx.pp.normalize_total_log1p(), or use cx.pb.normalized_effects(), "
                     "which normalises internally.",
                     UserWarning,
-                    stacklevel=3,
                 )
             marker_groupby = [str(x) for x in np.asarray(marker.get("groupby", [])).tolist()]
             if perturbation_column not in bulk.obs.columns:
@@ -1155,7 +1152,6 @@ def compute_pseudobulk_effects(
                     "pb.effects",
                     "Dropping target profiles without a same-batch control. "
                     f"Affected batches: {sorted(missing_batches)[:5]}",
-                    stacklevel=2,
                 )
 
             target_rows_arr = np.asarray(target_rows, dtype=np.int64)

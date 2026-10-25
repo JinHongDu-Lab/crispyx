@@ -263,6 +263,23 @@ class TestStaleScratchSweep:
         assert not stale.exists()
         assert not partial.exists()
 
+    def test_removes_a_dead_runs_scratch_directory_once_its_files_are_stale(self, tmp_path):
+        """An in-memory input's copy and a conversion's spill files live in a
+        directory; its files, not the directory, show whether a run still
+        writes there."""
+        old = 2 * _STALE_SCRATCH_SECONDS
+        name = self._name(self._dead_pid()).removesuffix(".csc.h5ad")
+        scratch = tmp_path / name
+        scratch.mkdir()
+        self._touch(scratch, "input.h5ad")  # written just now
+        stamp = time.time() - old
+        os.utime(scratch, (stamp, stamp))
+        _sweep_stale_scratch_copies(tmp_path, fn_name="demo")
+        assert scratch.exists()
+        os.utime(scratch / "input.h5ad", (stamp, stamp))
+        _sweep_stale_scratch_copies(tmp_path, fn_name="demo")
+        assert not scratch.exists()
+
     def test_keeps_copies_of_live_runs(self, tmp_path):
         old = 2 * _STALE_SCRATCH_SECONDS
         live = self._touch(tmp_path, self._name(os.getpid()), age=old)

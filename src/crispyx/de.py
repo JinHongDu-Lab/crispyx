@@ -8,7 +8,6 @@ import dataclasses
 import logging
 import os
 import shutil
-import warnings
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -1830,13 +1829,12 @@ def nb_glm_test(
     # extremely slow on CSC.  Recommend the CSR standardized file.
     _storage_fmt = get_matrix_storage_format(path)
     if _storage_fmt == "csc":
-        warnings.warn(
+        _messages.emit(
             f"The input file '{path.name}' stores its matrix in CSC format. "
             "NB-GLM performs row-wise access (size factors, control matrix, "
             "per-perturbation slices) which is very slow on CSC. "
             "Use the CSR-format standardized file for much better performance.",
             UserWarning,
-            stacklevel=2,
         )
 
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
@@ -3791,7 +3789,6 @@ def _wilcoxon_test_stratified(
                 "wilcoxon_test",
                 f"{n_excluded} cells have a missing '{batch_column}' value and are "
                 "excluded from the batch-stratified test.",
-                stacklevel=2,
             )
         if n_batches < 1:
             raise ValueError(
@@ -3871,7 +3868,6 @@ def _wilcoxon_test_stratified(
                 "containing both perturbation and control cells; stratified "
                 "rank statistics for these perturbations will be "
                 f"set to NaN. Examples: {examples}",
-                stacklevel=2,
             )
 
         # Pooled control cell count per candidate (for LFC/pts, batch-agnostic)

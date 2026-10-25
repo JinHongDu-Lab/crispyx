@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import shutil
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -21,6 +20,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from . import _messages
 from ._memory import drop_file_cache
 
 if TYPE_CHECKING:
@@ -426,10 +426,9 @@ class ResumableRun:
             else "it cannot be read"
         )
         if checkpoint is not None and mismatch is not None:
-            warnings.warn(
+            _messages.emit(
                 f"Not resuming from the checkpoint at {checkpoint_path}: {mismatch}. "
                 "Discarding it and starting over.",
-                stacklevel=3,
             )
         self.resumed = (
             checkpoint is not None and mismatch is None and _has_datasets(self.work_path, datasets)

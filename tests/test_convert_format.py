@@ -257,25 +257,59 @@ def test_spill_files_are_removed_when_a_conversion_fails(tmp_path, monkeypatch, 
 
 def test_spill_goes_where_there_is_room(tmp_path, monkeypatch):
     """The temporary directory first, else the output's directory (which must
-    also hold the output still to be written), else nowhere."""
+    also hold the output still to be written), else nowhere; never a
+    RAM-backed directory, nor one on the source's filesystem where writing
+    and reading back the spill costs more than re-reading the source."""
     import tempfile
 
     tmp, out_dir = tmp_path / "tmp", tmp_path / "out"
     tmp.mkdir()
     out_dir.mkdir()
+    source = tmp_path / "src.h5ad"
+    source.touch()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp))
     free = {}
     monkeypatch.setattr(cxd, "_free_bytes_at", lambda p: free[Path(p)])
     output = out_dir / "x.h5ad"
     free.update({tmp: 2000.0, out_dir: 2000.0})
-    assert cxd._spill_dir(1000, output, 500) == tmp
+    assert cxd._spill_dir(1000, output, 500, source, 1e9) == tmp
     # tmp and out share a filesystem here, so each needs 1.1 x spill + output = 1600
     free.update({tmp: 1500.0, out_dir: 1500.0})
-    assert cxd._spill_dir(1000, output, 500) is None
+    assert cxd._spill_dir(1000, output, 500, source, 1e9) is None
     free.update({out_dir: 1700.0})
-    assert cxd._spill_dir(1000, output, 500) == out_dir
+    assert cxd._spill_dir(1000, output, 500, source, 1e9) == out_dir
     free.update({tmp: None, out_dir: None})  # unknown free space: do not spill
-    assert cxd._spill_dir(1000, output, 500) is None
+    assert cxd._spill_dir(1000, output, 500, source, 1e9) is None
+    free.update({tmp: 2000.0, out_dir: 2000.0})
+    # Same filesystem as the source: 2 x 1000 B of spill I/O vs 1500 B of re-reads.
+    assert cxd._spill_dir(1000, output, 500, source, 1500) is None
+    monkeypatch.setattr(cxd, "_is_ram_backed", lambda p: Path(p) == tmp)
+    assert cxd._spill_dir(1000, output, 500, source, 1e9) == out_dir
+
+
+def test_ram_backed_filesystems_are_read_from_the_mount_table(tmp_path, monkeypatch):
+    import builtins
+    import io
+
+    from crispyx import _memory
+
+    table = f"/dev/sda1 / ext4 rw 0 0\ntmpfs {tmp_path} tmpfs rw 0 0\n"
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda path, *a, **k: io.StringIO(table)
+                        if path == "/proc/self/mounts" else real_open(path, *a, **k))
+    monkeypatch.setattr(_memory.os.path, "realpath", lambda p: str(p))
+    assert _memory._is_ram_backed(tmp_path / "x")
+    assert not _memory._is_ram_backed(Path(str(tmp_path) + "-sibling"))
+    assert not _memory._is_ram_backed(Path("/home/x"))
+
+
+def test_spilling_reserves_one_open_file_per_band(monkeypatch):
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    assert cxd._reserve_open_files(10)
+    if hard != resource.RLIM_INFINITY:
+        assert not cxd._reserve_open_files(hard + 1)
+    assert resource.getrlimit(resource.RLIMIT_NOFILE)[1] == hard
 
 
 @targets
