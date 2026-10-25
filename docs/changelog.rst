@@ -24,13 +24,16 @@ Version 0.2.2
   once.** When the output buffers exceed half of ``memory_limit_gb`` the
   converters work in bands, and each band re-read the source. Where page
   cache counts against the limit (a Slurm or cgroup job) those re-reads
-  come from storage: on HPC2021 Lustre (a 17.6 GB, 429,000-cell file) each
-  extra pass cost 95-130 s, 4 of them ~530 s of an 824 s conversion. There
-  the first band is now built in memory while the other bands' non-zeros
-  are spilled to the temporary directory (about 12 bytes each for float32
-  data; beside the output when the temporary directory lacks room, and
-  the old re-reads when neither has it), then read back band by band. Off
-  such a limit a re-read is served from page cache and spilling was
+  come from storage. There the first band is now built in memory while the
+  other bands' non-zeros are spilled to the temporary directory (about
+  12 bytes each for float32 data; beside the output when the temporary
+  directory lacks room, and the old re-reads when neither has it), then
+  read back band by band. On HPC2021 (source on Lustre, spill on node-local
+  ``/tmp``), a 17.6 GB, 429,000-cell file converts in 5 bands in 330-400 s,
+  against 600-720 s re-reading and 711 s for 0.2.1, and in 1 band in
+  ~240 s. The full Huang-HCT116 screen (206 GB, 3.4 million cells, 3 bands,
+  110 GB spilled) converts in 8,144-8,350 s, against 21,542 s for 0.2.1.
+  Off such a limit a re-read is served from page cache and spilling was
   slower (Mac SSD, 4 bands: 26.5 s against 20.8 s), so nothing changes
   there. Files are byte-identical either way.
 * **In-memory AnnData is accepted** by ``t_test``, ``wilcoxon_test``,
