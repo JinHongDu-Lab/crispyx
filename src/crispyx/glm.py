@@ -12,7 +12,7 @@ import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from numpy.typing import ArrayLike
-from scipy.linalg import cho_factor, cho_solve, qr as scipy_qr, solve as scipy_solve
+from scipy.linalg import qr as scipy_qr
 from scipy.optimize import minimize_scalar, minimize, brentq
 from scipy.special import gammaln, digamma, polygamma
 
@@ -24,7 +24,6 @@ from ._kernels import (
     _compute_mle_dispersion_numba,
     _nb_map_grid_search_numba,
     _nb_map_grid_search_with_refinement_numba,
-    _wls_solve_2x2_numba,
     _irls_batch_numba,
 )
 
@@ -36,15 +35,19 @@ from ._irls import (
     EPS,
     ETA_MAX,
     ETA_MIN,
+    PIVOT_FLOOR,
     Deviance,
     OneHotGroups,
     eta_floor,
     gram_batched,
     irls_weights,
     precondition_columns,
+    sandwich_variances_2x2,
     schur_complement,
     schur_solve,
     schur_variances,
+    solve_spd_2x2,
+    wls_solve,
 )
 from ._memory import (
     _resolve_memory_limit_bytes,
@@ -1356,39 +1359,11 @@ class NBGLMFitter:
         if weights.shape != (self.n_samples,):
             raise ValueError("weights must have shape (n_samples,)")
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
-        x_weighted = self.design * w_sqrt[:, None]
-        z_weighted = y_working * w_sqrt
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        xtwz = x_weighted.T @ z_weighted
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            beta = cho_solve((c, lower), xtwz, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            try:
-                beta = np.linalg.solve(xtwx, xtwz)
-            except np.linalg.LinAlgError:
-                beta = np.linalg.pinv(xtwx) @ xtwz
-            try:
-                inv_hessian = np.linalg.inv(xtwx)
-            except np.linalg.LinAlgError:
-                inv_hessian = np.linalg.pinv(xtwx)
-        return beta, inv_hessian
+        return wls_solve(self.design * w_sqrt[:, None], y_working * w_sqrt, self.ridge_penalty or 0.0)
 
     def _hessian_inverse(self, weights: np.ndarray) -> np.ndarray:
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
-        x_weighted = self.design * w_sqrt[:, None]
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            inv_hessian = np.linalg.pinv(xtwx)
-        return inv_hessian
+        return wls_solve(self.design * w_sqrt[:, None], ridge=self.ridge_penalty or 0.0)[1]
 
     def _hat_diagonal(self, weights: np.ndarray, inv_hessian: np.ndarray) -> np.ndarray:
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
@@ -2379,8 +2354,9 @@ def _fit_gene_apeglm_lbfgsb(
         cauchy_hess = 2 * (prior_scale_sq - beta_lfc**2) / (prior_scale_sq + beta_lfc**2)**2
         XtWX[shrink_index, shrink_index] += cauchy_hess
         
-        inv_hess = np.linalg.inv(XtWX)
-        se_map = np.sqrt(max(inv_hess[shrink_index, shrink_index], 1e-10))
+        unit = np.zeros(n_params)
+        unit[shrink_index] = 1.0
+        se_map = np.sqrt(max(np.linalg.solve(XtWX, unit)[shrink_index], 1e-10))
     except (np.linalg.LinAlgError, ValueError):
         se_map = mle_se_j
     
@@ -4495,12 +4471,7 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # Solve 2x2 systems analytically using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            beta0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
+            beta0, beta1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
             
             beta = np.vstack([beta0, beta1])  # (n_features, n_genes)
             return beta
@@ -4592,14 +4563,9 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # 2x2 matrix inverse diagonal elements:
-            # For M = [[a, b], [b, c]], M^-1 = (1/det) * [[c, -b], [-b, a]]
-            # So diag(M^-1) = [c/det, a/det]
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            inv_diag_0 = xtwx_11 / det  # Variance of beta_0 (intercept)
-            inv_diag_1 = xtwx_00 / det  # Variance of beta_1 (perturbation effect)
+            # diag(M^-1): component k of the solution of M v = e_k.
+            inv_diag_0 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 1.0, 0.0)[0]  # intercept
+            inv_diag_1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 0.0, 1.0)[1]  # perturbation
             
             se = np.vstack([
                 np.sqrt(np.maximum(inv_diag_0, 1e-12)),
@@ -4611,23 +4577,22 @@ class NBGLMBatchFitter:
             # and inverted in the preconditioned column basis.
             xtwx = gram_batched(self._design_scaled, W, ridge=self._ridge_scaled)
             
-            # Invert all matrices at once and extract diagonal
+            # diag(M^-1)_j = ||L^-1 e_j||^2 for the Cholesky factor M = L L';
+            # a gene whose matrix is not positive definite keeps SE = inf.
             se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
+            eye = np.eye(n_features)
             try:
-                inv_xtwx = np.linalg.inv(xtwx)  # (n_genes, n_features, n_features)
-                # Extract diagonal of each inverse matrix
-                diag_inv = np.diagonal(inv_xtwx, axis1=1, axis2=2)  # (n_genes, n_features)
+                factor = np.linalg.cholesky(xtwx)  # (n_genes, n_features, n_features)
+                diag_inv = (np.linalg.solve(factor, np.broadcast_to(eye, xtwx.shape)) ** 2).sum(axis=1)
                 se = np.sqrt(np.maximum(diag_inv, 1e-12)).T  # (n_features, n_genes)
-                se /= self._col_scale[:, None]
             except np.linalg.LinAlgError:
-                # Fallback to per-gene inversion for singular matrices
                 for g in range(n_genes):
                     try:
-                        inv_xtwx_g = np.linalg.inv(xtwx[g])
-                        se[:, g] = np.sqrt(np.maximum(np.diag(inv_xtwx_g), 1e-12))
+                        factor_g = np.linalg.cholesky(xtwx[g])
                     except np.linalg.LinAlgError:
-                        pass
-                se /= self._col_scale[:, None]
+                        continue
+                    se[:, g] = np.sqrt(np.maximum((np.linalg.solve(factor_g, eye) ** 2).sum(axis=0), 1e-12))
+            se /= self._col_scale[:, None]
             
             return se
     
@@ -4693,8 +4658,9 @@ class NBGLMBatchFitter:
                 xtwx_00 = np.sum(W, axis=0)
                 xtwx_01 = X1 @ W
                 xtwx_11 = np.sum(X1_sq[:, None] * W, axis=0)
-                det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-                log_det = np.log(np.maximum(det, 1e-12))
+                # log det from the LDL' pivots, as solve_spd_2x2 factors it.
+                d0 = np.maximum(xtwx_00, PIVOT_FLOOR)
+                log_det = np.log(d0) + np.log(np.maximum(xtwx_11 - xtwx_01 ** 2 / d0, PIVOT_FLOOR))
             else:
                 XtWX = gram_batched(X, W)
                 try:
@@ -4880,12 +4846,7 @@ class NBGLMBatchFitter:
             xtwx_00 = xtwx_00 + ridge
             xtwx_11 = xtwx_11 + ridge
             
-            # Solve 2x2 system using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)
-            
-            beta_new_0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta_new_1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
+            beta_new_0, beta_new_1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
             
             beta_new = np.vstack([beta_new_0, beta_new_1])
             
@@ -4913,12 +4874,8 @@ class NBGLMBatchFitter:
             if np.all(gene_converged):
                 break
 
-        # Compute final standard errors using sandwich estimator (PyDESeq2 style)
-        # SE = sqrt(c' @ H @ M @ H @ c) where:
-        #   M = XᵀWX (unregularized Fisher information)
-        #   Mr = M + ridge*I (regularized)
-        #   H = inv(Mr)
-        #   c = [0, 1] for perturbation effect
+        # Final standard errors from the sandwich estimator (PyDESeq2 style):
+        # SE^2 = c' H M H c, M = XᵀWX unregularised, H = (M + ridge I)^-1.
         #
         # The weights are rebuilt from the UNFLOORED mean: ``min_mu`` steadies
         # the iteration above and has no place in the reported covariance,
@@ -4935,36 +4892,11 @@ class NBGLMBatchFitter:
             mu_p * mu_p / np.maximum(mu_p + alpha[None, :] * mu_p * mu_p, EPS), axis=0
         )
         
-        # Unregularized M
-        M00 = W_control_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2: inv = (1/det) * [[d, -b], [-c, a]]
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For contrast c = [0, 1]: Hc = [H[0,1], H[1,1]] = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        # = Hc0² * M00 + 2 * Hc0 * Hc1 * M01 + Hc1² * M11
-        var_pert = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
+        # M = [[sum W, sum_pert W], [sum_pert W, sum_pert W]]
+        var_intercept, var_pert = sandwich_variances_2x2(
+            W_control_sum + W_pert_sum, W_pert_sum, W_pert_sum, self.ridge_penalty
+        )
         se_pert = np.sqrt(np.maximum(var_pert, 1e-12))
-        
-        # For intercept, contrast c = [1, 0]: Hc = [H00, H01]
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
         se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
         
         se_valid = np.vstack([se_intercept, se_pert])  # (n_features, n_valid)
@@ -5219,36 +5151,13 @@ class NBGLMBatchFitter:
             )
             del mu_p
         
-        # Unregularized M for SE calculation
-        M00 = frozen_W_wald_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For β₁ contrast c = [0, 1]: Hc = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        var_pert_effect = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
+        # Sandwich variances, the unregularised M built from the frozen
+        # control weights. The intercept's is an approximation (the frozen
+        # β₀'s own SE would be more accurate), kept for consistency.
+        var_intercept, var_pert_effect = sandwich_variances_2x2(
+            frozen_W_wald_sum + W_pert_sum, W_pert_sum, W_pert_sum, self.ridge_penalty
+        )
         se_pert = np.sqrt(np.maximum(var_pert_effect, 1e-12))
-        
-        # For intercept SE (using frozen β₀'s original SE would be more accurate,
-        # but we approximate with the sandwich estimator for consistency)
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
         se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
         
         # Store results

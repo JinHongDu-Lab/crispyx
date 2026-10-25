@@ -14,6 +14,10 @@ import numba as nb
 import numpy as np
 from numba.extending import get_cython_function_address
 
+from ._irls import solve_spd_2x2
+
+_solve_spd_2x2 = nb.njit(cache=True)(solve_spd_2x2)
+
 # =============================================================================
 # Numba-accelerated gammaln using scipy's cython implementation
 # =============================================================================
@@ -523,87 +527,6 @@ def _nb_map_grid_search_with_refinement_numba(
             best_log_alpha[g] = best_grid_log_alpha
     
     return best_log_alpha
-
-
-# =============================================================================
-# IRLS batch processing kernels
-# =============================================================================
-
-@nb.njit(cache=True)
-def _wls_solve_2x2_numba(
-    W: np.ndarray,
-    z: np.ndarray,
-    X: np.ndarray,
-    ridge: float,
-) -> tuple:
-    """Solve weighted least squares for 2-parameter model (intercept + perturbation).
-    
-    Optimized for the common case of [1, perturbation_indicator] design matrix.
-    Uses direct 2x2 matrix inversion which is faster than general solve.
-    
-    Parameters
-    ----------
-    W : (n_samples,)
-        IRLS weights for current gene.
-    z : (n_samples,)
-        Working response for current gene.
-    X : (n_samples, 2)
-        Design matrix [1, perturbation_indicator].
-    ridge : float
-        Ridge penalty for regularization.
-        
-    Returns
-    -------
-    beta : (2,)
-        Fitted coefficients [intercept, perturbation_effect].
-    se : (2,)
-        Standard errors.
-    """
-    n_samples = W.shape[0]
-    
-    # Compute X'WX elements directly (2x2 matrix)
-    xtwx_00 = 0.0  # sum(W)
-    xtwx_01 = 0.0  # sum(W * x1)
-    xtwx_11 = 0.0  # sum(W * x1^2)
-    xtwz_0 = 0.0   # sum(W * z)
-    xtwz_1 = 0.0   # sum(W * z * x1)
-    
-    for i in range(n_samples):
-        w_i = W[i]
-        z_i = z[i]
-        x1_i = X[i, 1]  # perturbation indicator
-        
-        xtwx_00 += w_i
-        xtwx_01 += w_i * x1_i
-        xtwx_11 += w_i * x1_i * x1_i
-        xtwz_0 += w_i * z_i
-        xtwz_1 += w_i * z_i * x1_i
-    
-    # Add ridge penalty
-    xtwx_00 += ridge
-    xtwx_11 += ridge
-    
-    # Direct 2x2 inverse
-    det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-    if abs(det) < 1e-12:
-        det = 1e-12
-    
-    inv_00 = xtwx_11 / det
-    inv_01 = -xtwx_01 / det
-    inv_11 = xtwx_00 / det
-    
-    # beta = inv(X'WX) @ X'Wz
-    beta_0 = inv_00 * xtwz_0 + inv_01 * xtwz_1
-    beta_1 = inv_01 * xtwz_0 + inv_11 * xtwz_1
-    
-    # SE = sqrt(diag(inv(X'WX)))
-    se_0 = np.sqrt(max(inv_00, 1e-12))
-    se_1 = np.sqrt(max(inv_11, 1e-12))
-    
-    beta = np.array([beta_0, beta_1])
-    se = np.array([se_0, se_1])
-    
-    return beta, se
 
 
 # =============================================================================
@@ -1347,8 +1270,8 @@ def _irls_batch_numba(
                 # Working response: z = eta + (y - mu) / mu
                 z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, EPS_K) - offset[i]
             
-            # Solve WLS: beta_new = (X'WX + ridge*I)^{-1} X'Wz
-            # For 2-feature case, use direct formula
+            # Solve WLS: (X'WX + ridge*I) beta_new = X'Wz
+            # For 2-feature case, accumulate the 2x2 system directly
             if n_features == 2:
                 xtwx_00 = ridge
                 xtwx_01 = 0.0
@@ -1367,12 +1290,7 @@ def _irls_batch_numba(
                     xtwz_0 += w_i * z_i
                     xtwz_1 += w_i * z_i * x1_i
                 
-                det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-                if abs(det) < 1e-12:
-                    det = 1e-12
-                
-                beta_new_0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-                beta_new_1 = (-xtwx_01 * xtwz_0 + xtwx_00 * xtwz_1) / det
+                beta_new_0, beta_new_1 = _solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
                 
                 # Check convergence
                 diff = max(abs(beta_new_0 - beta_g[0]), abs(beta_new_1 - beta_g[1]))

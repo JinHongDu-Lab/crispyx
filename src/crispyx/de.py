@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import h5py
+from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import norm, rankdata, t as t_dist
 
 from .data import (
@@ -2230,6 +2231,8 @@ def nb_glm_test(
                 # SE from IRLS was computed using MoM dispersion, but Wald test
                 # should use MAP dispersion for proper variance estimation
                 ridge = 1e-6
+                unit = np.zeros(design.shape[1])
+                unit[perturbation_column_index] = 1.0
                 for local_idx, gene_idx in enumerate(valid_indices):
                     if not valid_results[local_idx]:
                         continue
@@ -2237,13 +2240,12 @@ def nb_glm_test(
                     mu_gene = mu[:, gene_idx]
                     disp_gene = disp_map[gene_idx]
                     W = mu_gene / (1.0 + mu_gene * disp_gene)
-                    # Compute (X'WX + ridge*I)^{-1}
-                    XtW = design.T * W[None, :]
-                    XtWX = XtW @ design
-                    XtWX += ridge * np.eye(design.shape[1])
+                    # SE^2 = e_k' (X'WX + ridge*I)^-1 e_k, from a Cholesky factor
+                    XtWX = (design.T * W[None, :]) @ design
+                    XtWX[np.diag_indices_from(XtWX)] += ridge
                     try:
-                        inv_XtWX = np.linalg.inv(XtWX)
-                        se_new = np.sqrt(np.maximum(inv_XtWX[perturbation_column_index, perturbation_column_index], 1e-10))
+                        variance = cho_solve(cho_factor(XtWX, check_finite=False), unit, check_finite=False)
+                        se_new = np.sqrt(np.maximum(variance[perturbation_column_index], 1e-10))
                     except np.linalg.LinAlgError:
                         se_new = result["se"][gene_idx]  # Keep original SE on failure
                     # Update SE, statistic, and p-value

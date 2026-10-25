@@ -52,6 +52,15 @@ Version 0.2.2
   ``quality_control_summary``, which then returns its masks only) and
   ``resume`` is refused, since both are defined by the input file. Large
   objects are still better saved once and passed as a path.
+* **The GLM's linear algebra goes through factorisations.** No coefficient
+  or standard error is computed from an explicit inverse or pseudo-inverse
+  any more: two-column fits solve their 2x2 systems by an ``LDL'``
+  factorisation (replacing Cramer's rule with its determinant clamped at
+  1e-12), standard errors come from Cholesky solves, a singular
+  weighted least-squares fit falls back to an SVD of the weighted design,
+  and ``check_full_rank`` reads dependent columns off one QR. On Adamson
+  this moves results by rounding only (1e-10 relative; the per-comparison
+  MAP dispersion, refined to a 1e-4 tolerance, by up to 5e-6).
 * **Warnings point at the line that called crispyx.** Each warning named a
   fixed number of frames up, which a helper or the in-memory wrapper made
   land inside crispyx (with an absolute path to its source). Warnings are
@@ -68,7 +77,7 @@ Version 0.2.2
   rather than assuming two columns. Results change only where the MAP step
   runs: with ``covariates`` and ``dispersion_scope="global"``, and with
   ``dispersion_scope="per_comparison"``. The default (no covariates, global
-  dispersion) is bit-identical. On Adamson with ``dispersion_scope=
+  dispersion) agrees to rounding (1e-10 relative). On Adamson with ``dispersion_scope=
   "per_comparison"``, dispersions rise by a median 2.4% and agree slightly
   better with PyDESeq2.
 * **``nb_glm_test`` names a confounded covariate.** A comparison whose

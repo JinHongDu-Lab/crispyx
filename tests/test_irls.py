@@ -13,6 +13,9 @@ from crispyx._irls import (
     gram_batched,
     irls_weights,
     precondition_columns,
+    sandwich_variances_2x2,
+    solve_spd_2x2,
+    wls_solve,
     working_response,
 )
 
@@ -354,3 +357,50 @@ def test_subset_accepts_already_sliced_counts(rng):
     fresh = deviance.subset(idx).total(np.log(mu), mu)
     reused = deviance.subset(idx, counts[:, idx]).total(np.log(mu), mu)
     np.testing.assert_array_equal(fresh, reused)
+
+
+# --------------------------------------------------------------------------
+# Factorisation-based solves
+# --------------------------------------------------------------------------
+
+def test_solve_spd_2x2_matches_a_dense_solve(rng):
+    a, c = rng.uniform(1, 5, (2, 100))
+    b = rng.uniform(-1, 1, 100) * np.sqrt(a * c)
+    r0, r1 = rng.normal(size=(2, 100))
+    x0, x1 = solve_spd_2x2(a, b, c, r0, r1)
+    for g in range(100):
+        expected = np.linalg.solve([[a[g], b[g]], [b[g], c[g]]], [r0[g], r1[g]])
+        np.testing.assert_allclose([x0[g], x1[g]], expected, rtol=1e-10)
+
+
+def test_solve_spd_2x2_stays_finite_on_a_singular_system():
+    x0, x1 = solve_spd_2x2(np.array([1.0]), np.array([1.0]), np.array([1.0]), 1.0, 2.0)
+    assert np.isfinite(x0).all() and np.isfinite(x1).all()
+
+
+def test_sandwich_variances_2x2_match_the_dense_formula(rng):
+    m00, m11 = rng.uniform(2, 5, 2)
+    m01, ridge = 0.7, 1e-3
+    M = np.array([[m00, m01], [m01, m11]])
+    H = np.linalg.solve(M + ridge * np.eye(2), np.eye(2))
+    np.testing.assert_allclose(sandwich_variances_2x2(m00, m01, m11, ridge), np.diag(H @ M @ H), rtol=1e-10)
+
+
+@pytest.mark.parametrize("ridge", [0.0, 0.5])
+def test_wls_solve_matches_least_squares(rng, ridge):
+    x = rng.normal(size=(40, 3))
+    z = rng.normal(size=40)
+    beta, cov = wls_solve(x, z, ridge)
+    gram = x.T @ x + ridge * np.eye(3)
+    np.testing.assert_allclose(beta, np.linalg.solve(gram, x.T @ z), rtol=1e-10)
+    np.testing.assert_allclose(cov, np.linalg.solve(gram, np.eye(3)), rtol=1e-10)
+
+
+def test_wls_solve_gives_the_minimum_norm_solution_of_a_rank_deficient_design(rng):
+    a = rng.normal(size=40)
+    x = np.column_stack([np.ones(40), a, 2 * a])
+    z = rng.normal(size=40)
+    beta, cov = wls_solve(x, z)
+    np.testing.assert_allclose(beta, np.linalg.lstsq(x, z, rcond=None)[0], atol=1e-10)
+    np.testing.assert_allclose(cov, np.linalg.pinv(x.T @ x), atol=1e-8)
+    assert wls_solve(x)[0] is None
