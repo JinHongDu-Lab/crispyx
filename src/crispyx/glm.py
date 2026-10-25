@@ -12,7 +12,7 @@ import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from numpy.typing import ArrayLike
-from scipy.linalg import cho_factor, cho_solve, solve as scipy_solve
+from scipy.linalg import qr as scipy_qr
 from scipy.optimize import minimize_scalar, minimize, brentq
 from scipy.special import gammaln, digamma, polygamma
 
@@ -24,8 +24,10 @@ from ._kernels import (
     _compute_mle_dispersion_numba,
     _nb_map_grid_search_numba,
     _nb_map_grid_search_with_refinement_numba,
-    _wls_solve_2x2_numba,
     _irls_batch_numba,
+    _accumulate_control_summary,
+    _two_group_dispersions,
+    _two_group_lfc,
 )
 
 # Import profiling utilities from dedicated module
@@ -36,15 +38,19 @@ from ._irls import (
     EPS,
     ETA_MAX,
     ETA_MIN,
+    PIVOT_FLOOR,
     Deviance,
     OneHotGroups,
     eta_floor,
     gram_batched,
     irls_weights,
     precondition_columns,
+    sandwich_variances_2x2,
     schur_complement,
     schur_solve,
     schur_variances,
+    solve_spd_2x2,
+    wls_solve,
 )
 from ._memory import (
     _resolve_memory_limit_bytes,
@@ -740,8 +746,7 @@ def precompute_global_dispersion(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2  # intercept + perturbation
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -765,7 +770,7 @@ def precompute_global_dispersion(
         
         # Use fused kernel with Brent refinement
         best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(np.ones((n_cells, 1))),
             tol=1e-4,
             max_refine_iter=20,
         )
@@ -891,8 +896,7 @@ def _precompute_global_dispersion_streaming(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -1051,8 +1055,7 @@ def precompute_global_dispersion_from_path(
         residuals = log_alpha[valid] - log_trend[valid]
         mad = np.median(np.abs(residuals - np.median(residuals)))
         squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+        polygamma_corr = polygamma(1, dof / 2)
         prior_var = max(squared_logres - polygamma_corr, 0.25)
     else:
         prior_var = 0.25
@@ -1359,39 +1362,11 @@ class NBGLMFitter:
         if weights.shape != (self.n_samples,):
             raise ValueError("weights must have shape (n_samples,)")
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
-        x_weighted = self.design * w_sqrt[:, None]
-        z_weighted = y_working * w_sqrt
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        xtwz = x_weighted.T @ z_weighted
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            beta = cho_solve((c, lower), xtwz, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            try:
-                beta = np.linalg.solve(xtwx, xtwz)
-            except np.linalg.LinAlgError:
-                beta = np.linalg.pinv(xtwx) @ xtwz
-            try:
-                inv_hessian = np.linalg.inv(xtwx)
-            except np.linalg.LinAlgError:
-                inv_hessian = np.linalg.pinv(xtwx)
-        return beta, inv_hessian
+        return wls_solve(self.design * w_sqrt[:, None], y_working * w_sqrt, self.ridge_penalty or 0.0)
 
     def _hessian_inverse(self, weights: np.ndarray) -> np.ndarray:
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
-        x_weighted = self.design * w_sqrt[:, None]
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            inv_hessian = np.linalg.pinv(xtwx)
-        return inv_hessian
+        return wls_solve(self.design * w_sqrt[:, None], ridge=self.ridge_penalty or 0.0)[1]
 
     def _hat_diagonal(self, weights: np.ndarray, inv_hessian: np.ndarray) -> np.ndarray:
         w_sqrt = np.sqrt(np.maximum(weights, 0.0))
@@ -1559,7 +1534,11 @@ def build_design_matrix(
         if column not in obs_frame.columns:
             raise KeyError(f"Covariate '{column}' not found in obs_frame")
         series = obs_frame[column]
-        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            # A level with no samples in this frame (a batch absent from one
+            # comparison's cells) would be an all-zero column.
+            series = series.cat.remove_unused_categories()
+        if series.dtype.kind in {"O", "U"} or isinstance(series.dtype, pd.CategoricalDtype):
             dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
             if dummies.shape[1] == 0:
                 continue
@@ -1570,6 +1549,41 @@ def build_design_matrix(
             column_names.append(str(column))
     design = np.hstack(matrices) if matrices else np.empty((len(obs_frame), 0), dtype=np.float64)
     return design, column_names
+
+
+def check_full_rank(design: np.ndarray, column_names: list[str], context: str) -> None:
+    """Raise ``ValueError`` naming the columns of ``design`` that are linear
+    combinations of earlier ones, so a confounded design fails with a reason
+    instead of fitting a singular system.
+
+    ``context`` says which fit the design belongs to (e.g. a comparison).
+
+    One QR of ``design``: column ``j`` lies in the span of the columns
+    before it exactly when ``R[j, j]`` vanishes, at ``matrix_rank``'s
+    tolerance.
+    """
+    if design.shape[1] == 0:
+        return
+    diag = np.abs(np.diag(scipy_qr(design, mode="r", check_finite=False)[0]))
+    tol = diag.max() * max(design.shape) * np.finfo(np.float64).eps
+    dependent = [column_names[j] for j in np.flatnonzero(diag <= tol)]
+    if not dependent:
+        return
+    raise ValueError(
+        f"{context}: the design is rank-deficient; {', '.join(map(repr, dependent))} "
+        "is a linear combination of the other columns. A covariate is confounded with "
+        "the perturbation (e.g. a batch with no control samples) or with another "
+        "covariate; drop or merge it."
+    )
+
+
+def _mean_dispersion_trend(dispersions: np.ndarray, min_disp: float = 1e-8) -> float:
+    """PyDESeq2's fallback trend: the 0.1%-trimmed mean of the gene-wise
+    dispersions above 10 * min_disp."""
+    from scipy.stats import trim_mean
+
+    use = dispersions[np.isfinite(dispersions) & (dispersions > 10 * min_disp)]
+    return float(trim_mean(use, proportiontocut=0.001)) if use.size else 0.1
 
 
 def fit_dispersion_trend(
@@ -1661,8 +1675,6 @@ def fit_dispersion_trend(
             max_outer_iter = 20
             for outer_iter in range(max_outer_iter):
                 # Check convergence
-                if not (params > 1e-10).all():
-                    break
                 log_change = np.log(np.abs(params / old_params)) ** 2
                 if log_change.sum() < 1e-6 and outer_iter > 0:
                     break
@@ -1683,20 +1695,18 @@ def fit_dispersion_trend(
                         axis=0
                     )
                 
-                try:
-                    res = minimize(
-                        loss,
-                        x0=params,
-                        jac=grad,
-                        method="L-BFGS-B",
-                        bounds=[(1e-12, np.inf), (1e-12, np.inf)],
-                    )
-                    if not res.success:
-                        break
-                    params = res.x
-                    predictions = X_current @ params
-                except Exception:
-                    break
+                res = minimize(
+                    loss,
+                    x0=params,
+                    jac=grad,
+                    method="L-BFGS-B",
+                    bounds=[(1e-12, np.inf), (1e-12, np.inf)],
+                )
+                if not res.success or (res.x <= 1e-10).any():
+                    # PyDESeq2 then switches to a mean trend
+                    return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
+                params = res.x
+                predictions = X_current @ params
                 
                 # Outlier removal (PyDESeq2 style): keep genes with 1e-4 <= ratio < 15
                 pred_ratios = y_current / np.maximum(predictions, 1e-10)
@@ -1714,10 +1724,9 @@ def fit_dispersion_trend(
             trend = params[0] + params[1] / np.maximum(means_arr, 1e-8)
             trend = np.maximum(trend, 1e-8)
             return trend
-            
-        except Exception:
-            # Fall back to polynomial fit
-            pass
+
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
     
     # Fallback: log-quadratic polynomial fit (original method)
     x = np.log(np.clip(means_arr[valid_for_fit], min_mean, None))
@@ -1865,11 +1874,20 @@ def shrink_dispersions(
     return shrunk
 
 
+def _design_csr(design: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """``design`` as the CSR arrays the MAP kernels take for their Cox-Reid
+    adjustment: ``(indptr, indices, data, n_features)``."""
+    csr = sp.csr_matrix(np.asarray(design, dtype=np.float64))
+    return (csr.indptr.astype(np.int64), csr.indices.astype(np.int64),
+            csr.data.astype(np.float64), int(csr.shape[1]))
+
+
 def estimate_dispersion_map(
     Y: np.ndarray,
     mu: np.ndarray,
     trend: np.ndarray,
     *,
+    design: np.ndarray,
     prior_var: float | None = None,
     min_disp: float = 1e-8,
     max_disp: float = 10.0,
@@ -1881,7 +1899,11 @@ def estimate_dispersion_map(
 
     This implements PyDESeq2-style MAP estimation where the dispersion
     is estimated by maximizing
-    ``log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)``.
+    ``log L(Y | mu, alpha) - 0.5 log det(XᵀWX) + log prior(alpha | trend, prior_var)``,
+    the Cox-Reid adjusted likelihood of the gene-wise step. Without the
+    adjustment the estimate is biased low by about ``(n - p) / n``, which
+    matters when the design has many columns for its samples (a batch
+    covariate with many levels).
 
     The prior is log-normal: ``log(alpha) ~ N(log(trend), prior_var)``.
 
@@ -1903,6 +1925,9 @@ def estimate_dispersion_map(
         Fitted mean matrix of shape (n_cells, n_genes).
     trend
         Dispersion trend values of shape (n_genes,).
+    design
+        Design matrix of shape (n_cells, n_features) that ``mu`` was fitted
+        with, for the Cox-Reid adjustment.
     prior_var
         Variance of the log-normal prior. If None, estimated from data
         using the variance of log-dispersion residuals around trend.
@@ -1941,7 +1966,8 @@ def estimate_dispersion_map(
     
     # Memory-optimized MLE estimation using Numba for speed
     # Computes per-gene MLE dispersion without large intermediate arrays
-    dof = max(n_cells - 2, 1)
+    # Residual degrees of freedom of the design ``mu`` was fitted with.
+    dof = max(n_cells - design.shape[1], 1)
     alpha_mle = _compute_mle_dispersion_numba(Y, mu, dof)
     alpha_mle = np.clip(alpha_mle, min_disp, max_disp)
     
@@ -1956,8 +1982,7 @@ def estimate_dispersion_map(
             mad = np.median(np.abs(residuals - np.median(residuals)))
             squared_logres = (1.4826 * mad) ** 2
             # PyDESeq2 formula: max(squared_logres - polygamma_correction, 0.25)
-            num_vars = 2  # intercept + perturbation
-            polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
+            polygamma_corr = polygamma(1, dof / 2)
             prior_var = max(squared_logres - polygamma_corr, 0.25)
         else:
             prior_var = 0.25
@@ -1977,7 +2002,7 @@ def estimate_dispersion_map(
     if refine:
         # Use fused kernel with golden section refinement
         best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(design),
             tol=1e-4,
             max_refine_iter=20,
         )
@@ -1985,7 +2010,7 @@ def estimate_dispersion_map(
     else:
         # Grid search only (no refinement)
         best_log_alpha, best_idx = _nb_map_grid_search_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var
+            Y, mu, log_trend, log_alpha_grid, prior_var, *_design_csr(design)
         )
         return np.exp(np.clip(best_log_alpha, log_min, log_max))
 
@@ -2044,7 +2069,7 @@ def estimate_glm_map_dispersion(
     mu = np.exp(np.clip(offset[:, None] + design @ fit.coef.T, -30, 30))
     mu[:, ~fit.converged] = normalised[:, ~fit.converged]
     dispersion = estimate_dispersion_map(
-        Y, np.maximum(mu, 1e-10), trend, max_disp=max(10.0, float(Y.shape[0])),
+        Y, np.maximum(mu, 1e-10), trend, design=design, max_disp=max(10.0, float(Y.shape[0])),
     )
     missing = ~np.isfinite(dispersion)
     dispersion[missing] = trend[missing]
@@ -2336,8 +2361,9 @@ def _fit_gene_apeglm_lbfgsb(
         cauchy_hess = 2 * (prior_scale_sq - beta_lfc**2) / (prior_scale_sq + beta_lfc**2)**2
         XtWX[shrink_index, shrink_index] += cauchy_hess
         
-        inv_hess = np.linalg.inv(XtWX)
-        se_map = np.sqrt(max(inv_hess[shrink_index, shrink_index], 1e-10))
+        unit = np.zeros(n_params)
+        unit[shrink_index] = 1.0
+        se_map = np.sqrt(max(np.linalg.solve(XtWX, unit)[shrink_index], 1e-10))
     except (np.linalg.LinAlgError, ValueError):
         se_map = mle_se_j
     
@@ -4452,12 +4478,7 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # Solve 2x2 systems analytically using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            beta0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
+            beta0, beta1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
             
             beta = np.vstack([beta0, beta1])  # (n_features, n_genes)
             return beta
@@ -4549,14 +4570,9 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # 2x2 matrix inverse diagonal elements:
-            # For M = [[a, b], [b, c]], M^-1 = (1/det) * [[c, -b], [-b, a]]
-            # So diag(M^-1) = [c/det, a/det]
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            inv_diag_0 = xtwx_11 / det  # Variance of beta_0 (intercept)
-            inv_diag_1 = xtwx_00 / det  # Variance of beta_1 (perturbation effect)
+            # diag(M^-1): component k of the solution of M v = e_k.
+            inv_diag_0 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 1.0, 0.0)[0]  # intercept
+            inv_diag_1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 0.0, 1.0)[1]  # perturbation
             
             se = np.vstack([
                 np.sqrt(np.maximum(inv_diag_0, 1e-12)),
@@ -4568,23 +4584,22 @@ class NBGLMBatchFitter:
             # and inverted in the preconditioned column basis.
             xtwx = gram_batched(self._design_scaled, W, ridge=self._ridge_scaled)
             
-            # Invert all matrices at once and extract diagonal
+            # diag(M^-1)_j = ||L^-1 e_j||^2 for the Cholesky factor M = L L';
+            # a gene whose matrix is not positive definite keeps SE = inf.
             se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
+            eye = np.eye(n_features)
             try:
-                inv_xtwx = np.linalg.inv(xtwx)  # (n_genes, n_features, n_features)
-                # Extract diagonal of each inverse matrix
-                diag_inv = np.diagonal(inv_xtwx, axis1=1, axis2=2)  # (n_genes, n_features)
+                factor = np.linalg.cholesky(xtwx)  # (n_genes, n_features, n_features)
+                diag_inv = (np.linalg.solve(factor, np.broadcast_to(eye, xtwx.shape)) ** 2).sum(axis=1)
                 se = np.sqrt(np.maximum(diag_inv, 1e-12)).T  # (n_features, n_genes)
-                se /= self._col_scale[:, None]
             except np.linalg.LinAlgError:
-                # Fallback to per-gene inversion for singular matrices
                 for g in range(n_genes):
                     try:
-                        inv_xtwx_g = np.linalg.inv(xtwx[g])
-                        se[:, g] = np.sqrt(np.maximum(np.diag(inv_xtwx_g), 1e-12))
+                        factor_g = np.linalg.cholesky(xtwx[g])
                     except np.linalg.LinAlgError:
-                        pass
-                se /= self._col_scale[:, None]
+                        continue
+                    se[:, g] = np.sqrt(np.maximum((np.linalg.solve(factor_g, eye) ** 2).sum(axis=0), 1e-12))
+            se /= self._col_scale[:, None]
             
             return se
     
@@ -4650,8 +4665,9 @@ class NBGLMBatchFitter:
                 xtwx_00 = np.sum(W, axis=0)
                 xtwx_01 = X1 @ W
                 xtwx_11 = np.sum(X1_sq[:, None] * W, axis=0)
-                det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-                log_det = np.log(np.maximum(det, 1e-12))
+                # log det from the LDL' pivots, as solve_spd_2x2 factors it.
+                d0 = np.maximum(xtwx_00, PIVOT_FLOOR)
+                log_det = np.log(d0) + np.log(np.maximum(xtwx_11 - xtwx_01 ** 2 / d0, PIVOT_FLOOR))
             else:
                 XtWX = gram_batched(X, W)
                 try:
@@ -4837,12 +4853,7 @@ class NBGLMBatchFitter:
             xtwx_00 = xtwx_00 + ridge
             xtwx_11 = xtwx_11 + ridge
             
-            # Solve 2x2 system using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)
-            
-            beta_new_0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta_new_1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
+            beta_new_0, beta_new_1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
             
             beta_new = np.vstack([beta_new_0, beta_new_1])
             
@@ -4870,12 +4881,8 @@ class NBGLMBatchFitter:
             if np.all(gene_converged):
                 break
 
-        # Compute final standard errors using sandwich estimator (PyDESeq2 style)
-        # SE = sqrt(c' @ H @ M @ H @ c) where:
-        #   M = XᵀWX (unregularized Fisher information)
-        #   Mr = M + ridge*I (regularized)
-        #   H = inv(Mr)
-        #   c = [0, 1] for perturbation effect
+        # Final standard errors from the sandwich estimator (PyDESeq2 style):
+        # SE^2 = c' H M H c, M = XᵀWX unregularised, H = (M + ridge I)^-1.
         #
         # The weights are rebuilt from the UNFLOORED mean: ``min_mu`` steadies
         # the iteration above and has no place in the reported covariance,
@@ -4892,36 +4899,11 @@ class NBGLMBatchFitter:
             mu_p * mu_p / np.maximum(mu_p + alpha[None, :] * mu_p * mu_p, EPS), axis=0
         )
         
-        # Unregularized M
-        M00 = W_control_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2: inv = (1/det) * [[d, -b], [-c, a]]
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For contrast c = [0, 1]: Hc = [H[0,1], H[1,1]] = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        # = Hc0² * M00 + 2 * Hc0 * Hc1 * M01 + Hc1² * M11
-        var_pert = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
+        # M = [[sum W, sum_pert W], [sum_pert W, sum_pert W]]
+        var_intercept, var_pert = sandwich_variances_2x2(
+            W_control_sum + W_pert_sum, W_pert_sum, W_pert_sum, self.ridge_penalty
+        )
         se_pert = np.sqrt(np.maximum(var_pert, 1e-12))
-        
-        # For intercept, contrast c = [1, 0]: Hc = [H00, H01]
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
         se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
         
         se_valid = np.vstack([se_intercept, se_pert])  # (n_features, n_valid)
@@ -5176,36 +5158,13 @@ class NBGLMBatchFitter:
             )
             del mu_p
         
-        # Unregularized M for SE calculation
-        M00 = frozen_W_wald_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For β₁ contrast c = [0, 1]: Hc = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        var_pert_effect = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
+        # Sandwich variances, the unregularised M built from the frozen
+        # control weights. The intercept's is an approximation (the frozen
+        # β₀'s own SE would be more accurate), kept for consistency.
+        var_intercept, var_pert_effect = sandwich_variances_2x2(
+            frozen_W_wald_sum + W_pert_sum, W_pert_sum, W_pert_sum, self.ridge_penalty
+        )
         se_pert = np.sqrt(np.maximum(var_pert_effect, 1e-12))
-        
-        # For intercept SE (using frozen β₀'s original SE would be more accurate,
-        # but we approximate with the sandwich estimator for consistency)
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
         se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
         
         # Store results
@@ -5942,3 +5901,261 @@ def fit_nb_glm_batch_auto(
         coef=coef, se=se, dispersion=dispersion,
         converged=converged, n_iter=n_iter, deviance=deviance,
     )
+
+
+# =============================================================================
+# Two-group DESeq2 against a control summary
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ControlSummary:
+    """The controls of a screen reduced to what every comparison with them needs.
+
+    In a comparison of one perturbation with the controls under the design
+    ``[intercept, perturbation]``, every control term of DESeq2's objectives
+    depends only on the controls and the dispersion (see the kernels'
+    section header). The controls are binned by size factor (occupied bins
+    only); ``s_mom[k, b]`` is the k-th moment of the size factors about bin
+    ``b``'s centre, ``y_mom[k, g, b]`` the same weighted by gene ``g``'s
+    counts, and smooth terms are evaluated to third order about the
+    centres. ``hist_*`` hold each gene's histogram of non-zero counts (CSR
+    by gene).
+    """
+
+    n_cells: int
+    centre: np.ndarray        # (bins,)
+    s_mom: np.ndarray         # (4, bins): count, sum (s - c)^k for k = 1..3
+    s_log: np.ndarray         # (bins,): sum(log s)
+    y_mom: np.ndarray         # (4, genes, bins)
+    hist_ptr: np.ndarray      # (genes + 1,)
+    hist_val: np.ndarray
+    hist_cnt: np.ndarray
+    norm_mean: np.ndarray     # (genes,): mean of counts / size factor
+    total: np.ndarray         # (genes,): sum of counts
+    nnz: np.ndarray           # (genes,): cells with a count
+
+
+def _size_factor_bins(s: np.ndarray, bin_width: float):
+    """Occupied bins of width ``bin_width`` on log ``s`` (one per distinct
+    value when 0): centres, each value's bin, the moments of ``s`` about the
+    centres (4, bins) and the sums of log ``s``."""
+    if bin_width > 0:
+        lo = np.log(s.min())
+        raw = np.floor((np.log(s) - lo) / bin_width).astype(np.int64)
+        used, bin_of = np.unique(raw, return_inverse=True)
+        centre = np.exp(lo + (used + 0.5) * bin_width)
+    else:
+        centre, bin_of = np.unique(s, return_inverse=True)
+    bin_of = bin_of.astype(np.int64).ravel()
+    d = s - centre[bin_of]
+    n_bins = centre.size
+    mom = np.vstack([np.bincount(bin_of, weights=d ** k, minlength=n_bins) for k in range(4)])
+    return centre, bin_of, mom, np.bincount(bin_of, weights=np.log(s), minlength=n_bins)
+
+
+def summarize_controls(
+    blocks,
+    size_factors: np.ndarray,
+    n_genes: int,
+    *,
+    bin_width: float = 0.02,
+    small_count_max: int = 64,
+) -> ControlSummary:
+    """Summarise the control cells in one pass.
+
+    Parameters
+    ----------
+    blocks
+        Iterable of ``(rows, csr)``: integer positions into ``size_factors``
+        and the CSR counts of those control cells.
+    size_factors
+        Every control cell's size factor.
+    n_genes
+        Number of genes (columns).
+    bin_width
+        Width of the size-factor bins on the log scale. Smooth terms are
+        evaluated to third order about the bin centres; the larger error is
+        a gene whose mean s*m crosses the floor ``min_mu`` inside a bin, which
+        is held wholly on one side of it. At the default, dispersions move by
+        at most about 2e-4 relative to one bin per distinct size factor
+        (``0``, exact), standard errors by 3e-5.
+    small_count_max
+        Counts up to this value are tallied in a dense per-gene table.
+    """
+    s = np.asarray(size_factors, dtype=np.float64)
+    centre, bin_of, s_mom, s_log = _size_factor_bins(s, bin_width)
+    n_bins = centre.size
+
+    y_mom = np.zeros((4, n_genes, n_bins), dtype=np.float64)
+    small_hist = np.zeros((n_genes, small_count_max + 1), dtype=np.float64)
+    big_genes, big_values = [], []
+    norm_sum = np.zeros(n_genes, dtype=np.float64)
+    total = np.zeros(n_genes, dtype=np.float64)
+    nnz = np.zeros(n_genes, dtype=np.int64)
+    for rows, block in blocks:
+        csr = sp.csr_matrix(block, dtype=np.float64)
+        csr.sum_duplicates()
+        rows = np.asarray(rows)
+        buf_g = np.empty(csr.nnz, dtype=np.int64)
+        buf_v = np.empty(csr.nnz, dtype=np.float64)
+        n_big = _accumulate_control_summary(
+            csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), bin_of[rows], s[rows],
+            centre, y_mom, small_hist, buf_g, buf_v, 0,
+        )
+        big_genes.append(buf_g[:n_big])
+        big_values.append(buf_v[:n_big])
+        norm_sum += np.asarray((sp.diags(1.0 / s[rows]) @ csr).sum(axis=0)).ravel()
+        total += np.asarray(csr.sum(axis=0)).ravel()
+        nnz += np.diff(csr.tocsc().indptr)
+
+    gene_small, value_small = np.nonzero(small_hist[:, 1:])
+    gene_all = np.concatenate([gene_small] + big_genes)
+    value_all = np.concatenate([value_small + 1.0] + big_values)
+    count_all = np.concatenate([small_hist[gene_small, value_small + 1], np.ones(sum(map(len, big_genes)))])
+    keys, inverse = np.unique(np.stack([gene_all, value_all]), axis=1, return_inverse=True)
+    counts = np.bincount(inverse.ravel(), weights=count_all, minlength=keys.shape[1])
+    hist_ptr = np.zeros(n_genes + 1, dtype=np.int64)
+    np.add.at(hist_ptr, keys[0].astype(np.int64) + 1, 1)
+    return ControlSummary(
+        n_cells=int(s.size), centre=centre, s_mom=s_mom, s_log=s_log, y_mom=y_mom,
+        hist_ptr=np.cumsum(hist_ptr), hist_val=keys[1].astype(np.float64), hist_cnt=counts,
+        norm_mean=norm_sum / s.size, total=total, nnz=nnz,
+    )
+
+
+@dataclass(frozen=True)
+class TwoGroupResult:
+    """DESeq2 on one perturbation against the controls, per gene (NaN where untested).
+
+    ``lfc`` and ``se`` are natural-log; ``intercept`` is the controls' log mean."""
+
+    genewise_dispersion: np.ndarray
+    trend: np.ndarray
+    map_dispersion: np.ndarray
+    dispersion: np.ndarray
+    lfc: np.ndarray
+    se: np.ndarray
+    statistic: np.ndarray
+    pvalue: np.ndarray
+    intercept: np.ndarray
+    base_mean: np.ndarray
+    converged: np.ndarray
+    prior_var: float
+
+
+def fit_two_group_deseq2(
+    controls: ControlSummary,
+    counts: np.ndarray,
+    size_factors: np.ndarray,
+    genes: np.ndarray | None = None,
+    *,
+    min_mu: float = 0.5,
+    min_disp: float = 1e-8,
+    max_disp: float = 10.0,
+    n_grid: int = 31,
+    tol: float = 1e-6,
+    ridge: float = 1e-6,
+    bin_width: float = 0.02,
+) -> TwoGroupResult:
+    """DESeq2's Wald test of one perturbation against the controls, as PyDESeq2
+    runs it on the design ``~ condition`` with the given size factors.
+
+    The steps are PyDESeq2's: means from the linear model (group means of the
+    normalised counts, floored at ``min_mu``); gene-wise Cox-Reid dispersions;
+    the parametric trend (mean trend if it fails); the prior variance from the
+    MAD of log residuals of genes above ``100 * min_disp``, less
+    ``trigamma((n - 2) / 2)``, at least 0.25; MAP dispersions; genes whose
+    gene-wise dispersion is more than two residual SDs above the trend keep
+    it; IRLS for the coefficients at those dispersions; the Wald test. The
+    controls enter through ``controls`` only, so the cost does not grow with
+    their number. Cook's distance outlier replacement is not done.
+
+    Parameters
+    ----------
+    controls
+        The controls' :class:`ControlSummary`.
+    counts
+        The perturbed cells' counts, dense (cells, genes).
+    size_factors
+        The perturbed cells' size factors.
+    genes
+        Indices of the genes to test (default all); others are NaN.
+    min_mu, min_disp, max_disp
+        PyDESeq2's bounds; the upper dispersion bound is
+        ``max(max_disp, number of cells)``.
+    n_grid, tol
+        Gene-wise dispersion search: grid points over the log range, then
+        golden-section search to ``tol`` on log dispersion. The MAP search
+        uses 7 points between the gene-wise estimate and the trend.
+    bin_width
+        The perturbed cells' size-factor bins (as :func:`summarize_controls`).
+    ridge
+        PyDESeq2's ridge on the coefficients.
+    """
+    from scipy.stats import norm as _norm
+
+    y = np.ascontiguousarray(counts, dtype=np.float64)
+    s = np.asarray(size_factors, dtype=np.float64)
+    n_genes = y.shape[1]
+    n_c, n_t = controls.n_cells, y.shape[0]
+    n = n_c + n_t
+    m_c = controls.norm_mean
+    m_t = (y / s[:, None]).mean(axis=0)
+    base_mean = (n_c * m_c + n_t * m_t) / n
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
+    tested &= (controls.total + y.sum(axis=0)) > 0
+    idx = np.flatnonzero(tested).astype(np.int64)
+    log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
+    # The perturbed cells: size factors binned for the dense terms, each
+    # gene's non-zero counts (CSC) summed exactly.
+    t_centre, _bin, t_mom, _log = _size_factor_bins(s, bin_width)
+    csc = sp.csc_matrix(y)
+    t_args = (csc.indptr.astype(np.int64), csc.data, s[csc.indices])
+    summary_args = (controls.centre, controls.s_mom, controls.y_mom, controls.hist_ptr, controls.hist_val,
+                    controls.hist_cnt, t_centre, t_mom)
+
+    def nan():
+        return np.full(n_genes, np.nan)
+
+    genewise, trend, map_disp, dispersion = nan(), nan(), nan(), nan()
+    lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
+    converged = np.zeros(n_genes, dtype=bool)
+    if idx.size == 0:
+        return TwoGroupResult(genewise, trend, map_disp, dispersion, lfc, se, stat, pvalue, intercept,
+                              base_mean, converged, float("nan"))
+
+    full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
+    genewise[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *full,
+                                           np.zeros(idx.size), 0.0, n_grid, tol)
+    trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
+    log_resid = np.log(genewise[idx]) - np.log(trend[idx])
+    above = genewise[idx] >= 100 * min_disp
+    resid = log_resid[above]
+    squared_logres = (np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2
+    prior_var = max(squared_logres - polygamma(1, (n - 2) / 2), 0.25)
+    # The MAP lies between the gene-wise estimate and the trend (the prior's
+    # mean) where the likelihood has one mode; a short grid over that bracket
+    # keeps a second mode from being missed.
+    log_gw, log_trend = np.log(genewise[idx]), np.log(trend[idx])
+    bracket = (np.clip(np.minimum(log_gw, log_trend) - 0.1, log_lo, log_hi),
+               np.clip(np.maximum(log_gw, log_trend) + 0.1, log_lo, log_hi))
+    map_disp[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *bracket,
+                                           log_trend, prior_var, 7, tol)
+    dispersion[idx] = map_disp[idx]
+    outlier = log_resid > 2 * np.sqrt(squared_logres)
+    dispersion[idx[outlier]] = genewise[idx[outlier]]
+
+    a, b, se_ln, ok = _two_group_lfc(
+        idx, dispersion[idx], np.log(np.maximum(m_c[idx], 1e-3)), np.log(np.maximum(m_t[idx], 1e-3)), y, s,
+        min_mu, controls.centre, controls.s_mom, controls.s_log, controls.y_mom, ridge, 250, 1e-10,
+    )
+    lfc[idx] = b - a
+    se[idx] = se_ln
+    stat[idx] = lfc[idx] / se_ln
+    pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
+    intercept[idx] = a
+    converged[idx] = ok
+    return TwoGroupResult(genewise, trend, map_disp, dispersion, lfc, se, stat, pvalue, intercept,
+                          base_mean, converged, float(prior_var))

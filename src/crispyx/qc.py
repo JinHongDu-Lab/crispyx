@@ -21,6 +21,7 @@ from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
+    accepts_in_memory,
     h5ad_data_bytes,
     AnnData,
     _ensure_csr,
@@ -302,6 +303,7 @@ def _warn_if_heavily_filtered(
         )
 
 
+@accepts_in_memory
 def filter_cells_by_gene_count(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -322,6 +324,7 @@ def filter_cells_by_gene_count(
     ----------
     data
         Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
+        An in-memory AnnData is streamed from a temporary copy.
     min_genes
         Minimum number of expressed genes per cell.
     gene_name_column
@@ -390,6 +393,7 @@ def filter_cells_by_gene_count(
     return mask
 
 
+@accepts_in_memory
 def filter_perturbations_by_cell_count(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -406,6 +410,7 @@ def filter_perturbations_by_cell_count(
     ----------
     data
         Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
+        An in-memory AnnData is streamed from a temporary copy.
     perturbation_column
         Column in obs containing perturbation labels.
     control_label
@@ -470,6 +475,7 @@ def filter_perturbations_by_cell_count(
     return mask
 
 
+@accepts_in_memory
 def filter_genes_by_cell_count(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -486,6 +492,7 @@ def filter_genes_by_cell_count(
     ----------
     data
         Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
+        An in-memory AnnData is streamed from a temporary copy.
     min_cells
         Minimum number of cells expressing each gene.
     cell_mask
@@ -1629,6 +1636,7 @@ def _qc_masks_only(
     )
 
 
+@accepts_in_memory(output_required=False)
 def quality_control_summary(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -1659,6 +1667,8 @@ def quality_control_summary(
     ----------
     data
         Path to h5ad file, or a crispyx AnnData / backed anndata.AnnData.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     min_genes
         Minimum number of expressed genes per cell.
     min_cells_per_perturbation

@@ -10,6 +10,8 @@ from typing import Literal
 
 import numpy as np
 
+from ._irls import sandwich_variances_2x2, solve_spd_2x2
+
 
 def _low_expr_in_both_mask(
     *,
@@ -266,28 +268,12 @@ def _compute_se_batched(
         # Free work arrays
         del eta_ctrl, eta_pert, mu_ctrl, mu_pert, W_ctrl, W_pert
         
-        # Regularized: Mr = M + ridge*I
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # Inverse: H = inv(Mr) for 2x2 matrix
-        det_r = Mr00 * Mr11 - Mr01 ** 2
-        np.maximum(det_r, 1e-12, out=det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # Compute SE based on method
         if se_method == "fisher":
-            # Fisher information SE: SE = sqrt(diag(inv(X'WX + ridge*I)))
-            # For perturbation effect, this is just H11
-            var_pert = H11
+            # Fisher information SE^2 = e_1' (M + ridge*I)^-1 e_1
+            var_pert = solve_spd_2x2(M00 + ridge, M01, M11 + ridge, 0.0, 1.0)[1]
         else:
-            # Sandwich SE for perturbation effect (contrast [0, 1])
-            # SE = sqrt(c' @ H @ M @ H @ c) where c = [0, 1]
-            var_pert = H01**2 * M00 + 2 * H01 * H11 * M01 + H11**2 * M11
+            # Sandwich SE^2 = e_1' H M H e_1, H = (M + ridge*I)^-1
+            var_pert = sandwich_variances_2x2(M00, M01, M11, ridge)[1]
         
         se[g_start:g_end] = np.sqrt(np.maximum(var_pert, 1e-12))
     

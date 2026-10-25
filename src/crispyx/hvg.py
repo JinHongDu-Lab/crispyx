@@ -11,7 +11,6 @@ in this package are crispyx's own reimplementations.
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -177,11 +176,10 @@ def _check_looks_like_counts(
         if values.size == 0:
             continue
         if not _looks_like_counts(values):
-            warnings.warn(
+            _messages.emit(
                 "flavor='seurat_v3' expects raw count data, but non-integer or "
                 "negative values were found. Results may be unreliable.",
                 UserWarning,
-                stacklevel=2,
             )
         break
 

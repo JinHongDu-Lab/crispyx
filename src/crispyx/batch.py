@@ -653,7 +653,6 @@ def batch_process(
             _messages.warn(
                 "tl.batch_process",
                 f"{n_missing_batch} cells have a missing '{batch_column}' value and are excluded.",
-                stacklevel=2,
             )
 
         reference_code = -2
@@ -817,7 +816,6 @@ def batch_process(
                     "tl.batch_process",
                     "Existing partial output does not match this call's parameters "
                     "or source; restarting from scratch, which overwrites it.",
-                    stacklevel=2,
                 )
 
         n_layer_arrays = 2 * len(channels) if channels else 2
@@ -846,7 +844,6 @@ def batch_process(
                     "finishes. Copy it aside first if you still need it, or pass "
                     "resume=True to fill it in place from where the last run "
                     "stopped.",
-                    stacklevel=2,
                 )
             if checkpoint_path.exists():
                 try:
@@ -955,7 +952,6 @@ def batch_process(
                             "obs['n_batches_used'] may undercount batches used only in "
                             "the skipped chunks. Pass force=True for an exact recount "
                             "if this matters.",
-                            stacklevel=2,
                         )
                 elif recovered_via_scan and last_completed_chunk >= 0:
                     _messages.warn(
@@ -964,7 +960,6 @@ def batch_process(
                         "was missing/corrupted); obs['n_batches_used'] may undercount "
                         "batches used only in the recovered chunks. Pass force=True "
                         "for an exact recount if this matters.",
-                        stacklevel=2,
                     )
 
                 def _save_checkpoint(chunk_idx: int) -> None:
@@ -1112,7 +1107,6 @@ def batch_process(
                 "tl.batch_process",
                 f"{int(untestable.sum())} group(s) have no usable batch statistics; "
                 f"results are NaN. Examples: {examples}",
-                stacklevel=2,
             )
 
         final_obs = pd.DataFrame(

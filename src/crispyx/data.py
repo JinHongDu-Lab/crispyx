@@ -9,6 +9,8 @@ import socket as _socket
 import tempfile
 import time as _time
 import functools
+import inspect
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -23,10 +25,14 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import _messages
-from ._memory import _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _resolve_n_jobs
+from ._memory import (
+    _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
+    _resolve_n_jobs,
+)
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
 from ._disk import (
+    _free_bytes_at,
     assess_bytes,
     estimate_bytes,
     estimate_conversion_bytes,
@@ -770,6 +776,83 @@ def resolve_data_path(
     return result
 
 
+def _anndata_nbytes(adata: ad.AnnData) -> int:
+    """Approximate size of ``adata`` written to an ``.h5ad``: its matrices
+    (``X``, ``raw``, ``layers``, ``obsm`` ...) and its ``obs``/``var``."""
+    def nbytes(value: Any) -> int:
+        if sp.issparse(value):
+            return value.data.nbytes + value.indices.nbytes + value.indptr.nbytes
+        if isinstance(value, pd.DataFrame):
+            return int(value.memory_usage(deep=True).sum())
+        return int(getattr(value, "nbytes", 0))
+
+    matrices = [adata.X, adata.obs, adata.var]
+    if adata.raw is not None:
+        matrices += [adata.raw.X, adata.raw.var]
+    for slot in (adata.layers, adata.obsm, adata.varm, adata.obsp, adata.varp):
+        # anndata >= 0.13 also lists X under the key None in .layers.
+        matrices += [value for key, value in slot.items() if key is not None]
+    return sum(nbytes(m) for m in matrices if m is not None)
+
+
+def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = True) -> Callable:
+    """Let ``fn`` take an in-memory :class:`anndata.AnnData` as ``data``.
+
+    The object is written to a scratch ``.h5ad`` in a new directory under
+    :func:`_scratch_root`, ``fn`` streams that file, and the directory --
+    with anything ``fn`` derives beside its input, such as ``nb_glm_test``'s
+    sorted copy -- is removed when ``fn`` returns or raises, or by a later
+    run's sweep after a kill. Paths and backed AnnData pass through
+    unchanged.
+
+    An output is named after its input file by default, so with in-memory
+    input ``output_path`` (or ``output_dir``) is required, unless
+    ``output_required=False`` says ``fn`` writes nothing without one;
+    ``resume`` is refused, since it identifies a run by its input file.
+    """
+    if fn is None:
+        return functools.partial(accepts_in_memory, output_required=output_required)
+    signature = inspect.signature(fn)
+    needs_output = output_required and "output_path" in signature.parameters
+    name = fn.__name__
+
+    @functools.wraps(fn)
+    def wrapper(data, *args, **kwargs):
+        if not isinstance(data, ad.AnnData) or getattr(data, "filename", None):
+            return fn(data, *args, **kwargs)
+        bound = signature.bind_partial(data, *args, **kwargs)
+        bound.apply_defaults()
+        given = bound.arguments
+        output_path, output_dir = given.get("output_path"), given.get("output_dir")
+        if needs_output and output_path is None and output_dir is None:
+            raise ValueError(
+                f"{name}: an in-memory AnnData has no file to name the output after; "
+                "pass output_path."
+            )
+        if given.get("resume"):
+            raise ValueError(
+                f"{name}: resume identifies a run by its input file, which an in-memory "
+                'AnnData does not have; save it with adata.write_h5ad("data.h5ad") and '
+                "pass the path to resume."
+            )
+        # Room for the copy and one file derived from it (nb_glm_test's sorted copy).
+        required = 2 * _anndata_nbytes(data)
+        fallback = Path(output_path).parent if output_path is not None else Path(output_dir or ".")
+        root = _scratch_root(required, fallback)
+        root.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_scratch_copies(root, fn_name=name, verbose=given.get("verbose", False))
+        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_", dir=root))
+        try:
+            path = scratch / "input.h5ad"
+            warn_if_disk_space_low(required, path, context=name)
+            data.write_h5ad(path)
+            return fn(path, *args, **kwargs)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    return wrapper
+
+
 def _refuse_overwriting_input(inputs: Sequence[Any], output_path: str | Path) -> None:
     """Raise ``ValueError`` when ``output_path`` is one of the input files.
 
@@ -1248,16 +1331,18 @@ def _process_is_alive(pid: int) -> bool:
 def _sweep_stale_scratch_copies(
     scratch_dir: Path, *, fn_name: str, verbose: int | bool = False
 ) -> None:
-    """Remove temporary fast-axis copies left behind by dead runs.
+    """Remove scratch files and directories left behind by dead runs: the
+    temporary fast-axis copies, an in-memory input's copy
+    (:func:`accepts_in_memory`) and a conversion's spill files.
 
-    The copies are deleted in a ``finally`` block, which a ``SIGKILL`` (an
+    They are deleted in a ``finally`` block, which a ``SIGKILL`` (an
     out-of-memory kill, a scheduler timeout) skips -- leaving a hidden file
-    the size of the source matrix next to the output. Nothing else would ever
+    the size of the source matrix behind. Nothing else would ever
     clean those up: ``atexit`` does not run on ``SIGKILL`` either. So a run
-    that sees a mismatched source first sweeps the copies of runs that are
+    that may write one first sweeps that location of runs that are
     demonstrably gone.
 
-    "Demonstrably" is the whole difficulty: ``scratch_dir`` is the output
+    "Demonstrably" is the whole difficulty: ``scratch_dir`` may be the output
     directory, which a cluster job array shares across nodes, so the owning
     PID may belong to another machine entirely and say nothing about liveness
     here. Hence the age guard below, which is the load-bearing one -- a
@@ -1281,15 +1366,21 @@ def _sweep_stale_scratch_copies(
         if pid == _os.getpid() and host == _HOST_TAG:
             continue
         try:
-            age = now - entry.stat().st_mtime
+            # A scratch directory's files are what a live run keeps writing.
+            stamps = [entry.stat().st_mtime]
+            if entry.is_dir():
+                stamps += [child.stat().st_mtime for child in entry.iterdir()]
         except OSError:
             continue
-        if age < _STALE_SCRATCH_SECONDS:
+        if now - max(stamps) < _STALE_SCRATCH_SECONDS:
             continue
         if host == _HOST_TAG and _process_is_alive(pid):
             continue
         try:
-            entry.unlink()
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
         except OSError:
             continue
         _messages.vprint(
@@ -1389,14 +1480,12 @@ def stream_on_fast_axis(
                 f"Point output_path at a volume with more room, or run "
                 f"cx.pp.convert_to_{target}(path) there once. "
                 + _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
-                stacklevel=4,
             )
             policy = "warn"
     if policy == "warn":
         _messages.warn(
             fn_name,
             _slow_axis_cost_message(path, fmt=fmt, axis=axis, chunk_size=chunk_size),
-            stacklevel=4,
         )
         # The one-time logger guardrail, emitted once per process.
         _warn_slow_axis(fmt, axis)
@@ -1428,7 +1517,6 @@ def stream_on_fast_axis(
                 f"cx.pp.convert_to_{target}(path, output_path=...). "
                 f"format_mismatch_policy='off' streams the source as-is if you would "
                 f"rather pay the re-read.",
-                stacklevel=4,
             )
         convert = convert_to_csc if target == "csc" else convert_to_csr
         convert(path, output_path=tmp_path, memory_limit_gb=memory_limit_gb, verbose=verbose)
@@ -2543,6 +2631,7 @@ def _concat_matrices(
     return AnnData(output_path)
 
 
+@accepts_in_memory
 def normalize_total_log1p(
     data: str | Path | "AnnData" | ad.AnnData,
     output_path: str | Path | None = None,
@@ -2574,6 +2663,8 @@ def normalize_total_log1p(
     ----------
     data
         Path to source h5ad file, or a backed AnnData object.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     output_path
         Path for output h5ad file. If None, uses output_dir/data_name pattern.
     normalize
@@ -2955,6 +3046,7 @@ def _validate_counts_chunk(chunk: np.ndarray | sp.spmatrix, *, context: str) -> 
         )
 
 
+@accepts_in_memory
 def downsample_counts(
     data: str | Path | "AnnData" | ad.AnnData,
     output_path: str | Path | None = None,
@@ -2989,6 +3081,8 @@ def downsample_counts(
     ----------
     data
         Path to source h5ad file, or a backed AnnData object.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     output_path
         Path for output h5ad file. If None, derived from ``data_name``.
     counts_per_cell
@@ -3232,30 +3326,36 @@ def _contiguous_bands(
     return bands
 
 
-def _scatter_by_key(
-    keys: np.ndarray,
-    vals: np.ndarray,
-    secondary: np.ndarray,
+@njit(cache=True)
+def _scatter_band(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    major0: int,
+    lo: int,
+    hi: int,
     offset: np.ndarray,
     out_vals: np.ndarray,
-    out_secondary: np.ndarray,
+    out_minor: np.ndarray,
 ) -> None:
-    """Scatter one chunk's non-zeros into compressed output buffers.
+    """Scatter one compressed chunk's non-zeros that fall in band ``[lo, hi)``
+    of the other axis into that band's transposed output buffers.
 
-    ``keys`` is the compressed-axis index (column for CSC output, row for CSR
-    output) relative to the band start and ``secondary`` the other axis index.
-    ``offset[k]`` is the next free position for key ``k`` and is advanced in
-    place, so one key's values stay in source order across chunks.
+    The chunk is CSR (rows ``major0 + r``, column ``indices``) for CSC output,
+    or CSC (columns ``major0 + c``, row ``indices``) for CSR output.
+    ``offset[k]`` is the next free position for band key ``lo + k`` and is
+    advanced in place. One linear pass in source order: each key's values
+    keep source order within and across chunks, a stable counting sort.
     """
-    order = np.argsort(keys, kind="stable")
-    keys_sorted = keys[order]
-    unique_keys, counts = np.unique(keys_sorted, return_counts=True)
-    starts = np.cumsum(counts) - counts
-    within = np.arange(keys_sorted.size) - np.repeat(starts, counts)
-    positions = np.repeat(offset[unique_keys], counts) + within
-    out_vals[positions] = vals[order].astype(out_vals.dtype, copy=False)
-    out_secondary[positions] = secondary[order]
-    offset[unique_keys] += counts
+    for m in range(indptr.shape[0] - 1):
+        minor = major0 + m
+        for j in range(indptr[m], indptr[m + 1]):
+            k = indices[j]
+            if lo <= k < hi:
+                pos = offset[k - lo]
+                out_vals[pos] = data[j]
+                out_minor[pos] = minor
+                offset[k - lo] = pos + 1
 
 
 @contextmanager
@@ -3313,6 +3413,308 @@ def _write_sparse_skeleton(
         grp.create_dataset("data", shape=(total_nnz,), dtype=value_dtype, chunks=chunk_arg)
         grp.create_dataset("indices", shape=(total_nnz,), dtype=index_dtype, chunks=chunk_arg)
         grp.create_dataset("indptr", data=indptr)
+
+
+# Bytes of one band written per call; the output's page cache is evicted
+# between calls, so a band of tens of GB never sits in a job's page cache
+# all at once.
+_BAND_WRITE_BYTES = 1 << 30
+
+
+def _write_band(
+    ds_data: h5py.Dataset,
+    ds_secondary: h5py.Dataset,
+    base: int,
+    values: np.ndarray,
+    secondary: np.ndarray,
+    evict: _EvictEvery,
+) -> None:
+    """Write a finished band of ``values`` and its row (CSC) or column (CSR)
+    indices into the pre-sized datasets at ``base``, in slices of about
+    ``_BAND_WRITE_BYTES``, reporting each slice to ``evict``."""
+    per_item = values.itemsize + secondary.itemsize
+    step = max(1, _BAND_WRITE_BYTES // per_item)
+    for start in range(0, values.shape[0], step):
+        stop = min(start + step, values.shape[0])
+        ds_data[base + start:base + stop] = values[start:stop]
+        ds_secondary[base + start:base + stop] = secondary[start:stop]
+        evict((stop - start) * per_item)
+
+
+@njit(cache=True)
+def _split_by_band(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    major0: int,
+    band_of: np.ndarray,
+    cursor: np.ndarray,
+    keys: np.ndarray,
+    minors: np.ndarray,
+    vals: np.ndarray,
+) -> None:
+    """Group one compressed chunk's non-zeros by the band of their key
+    (``band_of[key]``), each band's in source order: band ``b`` fills
+    ``keys``/``minors``/``vals`` from ``cursor[b]``, which is advanced."""
+    for m in range(indptr.shape[0] - 1):
+        minor = major0 + m
+        for j in range(indptr[m], indptr[m + 1]):
+            k = indices[j]
+            b = band_of[k]
+            pos = cursor[b]
+            keys[pos] = k
+            minors[pos] = minor
+            vals[pos] = data[j]
+            cursor[b] = pos + 1
+
+
+@njit(cache=True)
+def _scatter_coo(
+    keys: np.ndarray,
+    minors: np.ndarray,
+    vals: np.ndarray,
+    lo: int,
+    offset: np.ndarray,
+    out_vals: np.ndarray,
+    out_minor: np.ndarray,
+) -> None:
+    """:func:`_scatter_band` for non-zeros already split out as
+    ``(key, minor, value)`` triples of band ``[lo, ...)``, in source order."""
+    for i in range(keys.shape[0]):
+        k = keys[i] - lo
+        pos = offset[k]
+        out_vals[pos] = vals[i]
+        out_minor[pos] = minors[i]
+        offset[k] = pos + 1
+
+
+def _source_chunks(source_path: Path, axis: int, chunk_size: int) -> Iterator[tuple[int, sp.spmatrix]]:
+    """``(first major index, chunk)`` over the source: CSR row chunks for
+    ``axis=0``, CSC column chunks for ``axis=1``."""
+    backed = read_backed(source_path)
+    try:
+        major0 = 0
+        for _slc, block in iter_matrix_chunks(backed, axis=axis, chunk_size=chunk_size, convert_to_dense=False):
+            if axis == 0:
+                chunk = _ensure_csr(block)
+            else:
+                chunk = sp.csc_matrix(block) if sp.issparse(block) else sp.csc_matrix(np.asarray(block))
+            yield major0, chunk
+            major0 += chunk.shape[axis]
+    finally:
+        backed.file.close()
+
+
+#: Spilled triples read back per call when a band is rebuilt from its files.
+_SPILL_READ_ITEMS = 1 << 25
+
+#: File descriptors kept free for everything else the process opens.
+_SPARE_OPEN_FILES = 64
+
+
+def _scratch_root(required_bytes: float, fallback: Path) -> Path:
+    """Where a scratch file of ``required_bytes`` goes: the temporary
+    directory -- node-local on a cluster, off a synced or shared output
+    volume on a personal computer -- when it is on disk and has room, else
+    ``fallback``. A RAM-backed one (:func:`~crispyx._memory._is_ram_backed`)
+    would hold the file in memory, charged to the job's limit."""
+    tmp = Path(tempfile.gettempdir())
+    free = _free_bytes_at(tmp)
+    if not _is_ram_backed(tmp) and free is not None and free >= 1.1 * required_bytes:
+        return tmp
+    return fallback
+
+
+def _spill_dir(
+    spill_bytes: float, output_path: Path, output_bytes: float, source_path: Path, reread_bytes: float
+) -> Path | None:
+    """Where the converters can spill ``spill_bytes`` instead of re-reading
+    ``reread_bytes`` of the source: the temporary directory, else the
+    output's directory, or ``None`` when neither qualifies. A candidate must
+    be on disk (not RAM-backed), have room -- on the output's filesystem,
+    for the output still to be written too -- and, on the source's
+    filesystem, be cheaper than the re-reads: spilling writes and reads
+    back ``spill_bytes``. Free space unknown disqualifies a candidate."""
+    output_dir = output_path.parent
+
+    def device(path: Path) -> int | None:
+        try:
+            return path.stat().st_dev
+        except OSError:
+            return None
+
+    output_dev, source_dev = device(output_dir), device(source_path)
+    for candidate in (Path(tempfile.gettempdir()), output_dir):
+        free, dev = _free_bytes_at(candidate), device(candidate)
+        if free is None or dev is None or _is_ram_backed(candidate):
+            continue
+        if dev == source_dev and 2 * spill_bytes >= reread_bytes:
+            continue
+        if free >= 1.1 * spill_bytes + (output_bytes if dev == output_dev else 0.0):
+            return candidate
+    return None
+
+
+def _reserve_open_files(n: int) -> bool:
+    """Whether ``n`` more files can be open at once, raising the soft
+    ``RLIMIT_NOFILE`` toward the hard limit when it is too low (it is often
+    1024 on a cluster node, with a much higher hard limit)."""
+    try:
+        import resource
+    except ImportError:  # Windows: no per-process descriptor limit to raise
+        return True
+    try:
+        in_use = len(_os.listdir("/proc/self/fd"))
+    except OSError:
+        in_use = _SPARE_OPEN_FILES
+    needed = in_use + n + _SPARE_OPEN_FILES
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= needed:
+        return True
+    if hard != resource.RLIM_INFINITY and hard < needed:
+        return False
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _transpose_in_bands(
+    partial: Path,
+    output_path: Path,
+    *,
+    source_path: Path,
+    axis: int,
+    chunk_size: int,
+    n_chunks: int,
+    bands: list[tuple[int, int]],
+    indptr: np.ndarray,
+    value_dtype: np.dtype,
+    minor_dtype: np.dtype,
+    fn_name: str,
+    band_kind: str,
+    verbose: int | bool,
+) -> None:
+    """Fill the pre-sized ``X/data`` and ``X/indices`` of ``partial`` with the
+    transpose of ``source_path``'s compressed chunks along ``axis``, one band
+    of output keys (columns for CSC, rows for CSR) at a time.
+
+    With one band the source is read once. With several, each band reads
+    the source again -- except where page cache counts against a memory
+    limit (:func:`~crispyx._memory._page_cache_is_charged`, e.g. a Slurm
+    job). There a re-read cannot come from cache, since the source's pages
+    are evicted, so the source is read once where :func:`_spill_dir` finds
+    somewhere worth spilling to: the first band is built in memory while the
+    others' non-zeros are appended to one spill file per band, each then
+    read back to build its band. Elsewhere a re-read is served from cache
+    and spilling would only add disk traffic. All paths give the same bytes.
+    """
+    minor_dtype = np.dtype(minor_dtype)
+    n_keys = indptr.shape[0] - 1
+    key_dtype = np.dtype(np.int32 if n_keys <= np.iinfo(np.int32).max else np.int64)
+    # One record per spilled non-zero, widest field first so every field is
+    # aligned (align=True pads the record to a multiple of the widest).
+    fields = sorted([("key", key_dtype), ("minor", minor_dtype), ("value", value_dtype)],
+                    key=lambda field: -field[1].itemsize)
+    record_dtype = np.dtype(fields, align=True)
+    total_nnz = int(indptr[-1])
+    output_bytes = total_nnz * (value_dtype.itemsize + minor_dtype.itemsize)
+    n_bands = len(bands)
+    spill_bytes = (total_nnz - int(indptr[bands[0][1]])) * record_dtype.itemsize
+    spill = n_bands > 1 and _page_cache_is_charged()
+    spill_dir = None
+    if spill and _reserve_open_files(n_bands - 1):
+        reread_bytes = (n_bands - 1) * _matrix_shape_and_nbytes(source_path)[1]
+        spill_dir = _spill_dir(spill_bytes, output_path, output_bytes, source_path, reread_bytes)
+    if n_bands > 1:
+        if spill_dir is not None:
+            how = f"one pass over the source, spilling {format_bytes(spill_bytes)} to {spill_dir}"
+        elif spill:
+            how = f"{n_bands} passes over the source (spilling {format_bytes(spill_bytes)} does not pay here)"
+        else:
+            how = f"{n_bands} passes over the source"
+        _messages.vprint(
+            verbose, fn_name,
+            f"output buffers need {format_bytes(output_bytes)}; converting in "
+            f"{n_bands} {band_kind} bands, {how}",
+        )
+
+    def band_buffers(lo: int, hi: int):
+        base = int(indptr[lo])
+        n = int(indptr[hi]) - base
+        # offset[k] = next write position within the band for key lo + k;
+        # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
+        return base, np.empty(n, dtype=value_dtype), np.empty(n, dtype=minor_dtype), indptr[lo:hi].astype(np.int64) - base
+
+    with h5py.File(partial, "r+") as dest:
+        ds_data, ds_minor = dest["X/data"], dest["X/indices"]
+        evict = _EvictEvery(partial)
+        if spill_dir is None:
+            with _create_progress_context(n_chunks * n_bands, f"{fn_name} (pass 2)", verbose, unit="chunk") as pbar:
+                for lo, hi in bands:
+                    base, band_vals, band_minor, offset = band_buffers(lo, hi)
+                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
+                        if chunk.nnz:
+                            _scatter_band(chunk.indptr, chunk.indices, chunk.data, major0, lo, hi,
+                                          offset, band_vals, band_minor)
+                        pbar.update(1)
+                    _write_band(ds_data, ds_minor, base, band_vals, band_minor, evict)
+                    del band_vals, band_minor
+            return
+
+        band_of = np.repeat(np.arange(n_bands, dtype=np.int32), [hi - lo for lo, hi in bands])
+        _sweep_stale_scratch_copies(spill_dir, fn_name=fn_name, verbose=verbose)
+        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{fn_name}_{_os.getpid()}-{_HOST_TAG}_",
+                                        dir=spill_dir))
+        paths = [scratch / f"band{b}" for b in range(n_bands)]
+        spill_evict = _EvictEvery(*paths[1:])
+        try:
+            with _create_progress_context(n_chunks + n_bands - 1, f"{fn_name} (pass 2)", verbose, unit="step") as pbar:
+                lo0, hi0 = bands[0]
+                base0, band_vals, band_minor, offset0 = band_buffers(lo0, hi0)
+                handles = []
+                try:
+                    for path in paths[1:]:
+                        handles.append(open(path, "wb"))
+                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
+                        if chunk.nnz:
+                            counts = np.bincount(band_of[chunk.indices], minlength=n_bands)
+                            starts = np.zeros(n_bands + 1, dtype=np.int64)
+                            np.cumsum(counts, out=starts[1:])
+                            records = np.empty(chunk.nnz, dtype=record_dtype)
+                            _split_by_band(chunk.indptr, chunk.indices, chunk.data, major0, band_of,
+                                           starts[:-1].copy(), records["key"], records["minor"], records["value"])
+                            first = records[:starts[1]]
+                            _scatter_coo(first["key"], first["minor"], first["value"], lo0,
+                                         offset0, band_vals, band_minor)
+                            for b in range(1, n_bands):
+                                handles[b - 1].write(records[starts[b]:starts[b + 1]])
+                            spill_evict(int(chunk.nnz - starts[1]) * record_dtype.itemsize)
+                        pbar.update(1)
+                finally:
+                    for handle in handles:
+                        handle.close()
+                _write_band(ds_data, ds_minor, base0, band_vals, band_minor, evict)
+                del band_vals, band_minor
+                for b in range(1, n_bands):
+                    lo, hi = bands[b]
+                    base, band_vals, band_minor, offset = band_buffers(lo, hi)
+                    remaining = band_vals.shape[0]
+                    with open(paths[b], "rb") as handle:
+                        while remaining:
+                            n = min(remaining, _SPILL_READ_ITEMS)
+                            records = np.fromfile(handle, dtype=record_dtype, count=n)
+                            _scatter_coo(records["key"], records["minor"], records["value"], lo,
+                                         offset, band_vals, band_minor)
+                            spill_evict(n * record_dtype.itemsize)
+                            remaining -= n
+                    paths[b].unlink()
+                    _write_band(ds_data, ds_minor, base, band_vals, band_minor, evict)
+                    del band_vals, band_minor
+                    pbar.update(1)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def convert_to_csc(
@@ -3430,7 +3832,7 @@ def convert_to_csc(
                 backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
             ):
                 csr = _ensure_csr(block)
-                np.add.at(col_nnz, csr.indices, 1)
+                col_nnz += np.bincount(csr.indices, minlength=n_vars)
                 total_nnz += csr.nnz
                 pbar.update(1)
     finally:
@@ -3455,64 +3857,23 @@ def convert_to_csc(
     # Scatter CSR non-zeros into CSC buffers one column band at a time and
     # write each finished band into the pre-sized output datasets. A band is
     # as many contiguous columns as fit the memory budget; when the whole
-    # output fits there is a single band, i.e. a single pass as before.
-    per_item_bytes = value_dtype.itemsize + np.dtype(row_dtype).itemsize
+    # output fits there is a single band.
     bands = _contiguous_bands(
         col_nnz,
-        per_item_bytes=per_item_bytes,
+        per_item_bytes=value_dtype.itemsize + np.dtype(row_dtype).itemsize,
         budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
     )
-    if len(bands) > 1:
-        _messages.vprint(
-            verbose, "pp.convert_to_csc",
-            f"output buffers need {total_nnz * per_item_bytes / 1e9:.1f} GB; converting in "
-            f"{len(bands)} column bands ({len(bands)} passes over the source)",
-        )
     with _replace_on_success(output_path) as partial:
         _write_sparse_skeleton(
             partial, obs, var, encoding="csc_matrix", shape=(n_obs, n_vars),
             indptr=indptr, total_nnz=total_nnz, value_dtype=value_dtype, index_dtype=row_dtype,
         )
-        with h5py.File(partial, "r+") as dest, _create_progress_context(
-            n_chunks * len(bands), "pp.convert_to_csc (pass 2)", verbose, unit="chunk"
-        ) as pbar:
-            ds_data, ds_indices = dest["X/data"], dest["X/indices"]
-            for c0, c1 in bands:
-                base = int(indptr[c0])
-                band_nnz = int(indptr[c1]) - base
-                band_data = np.empty(band_nnz, dtype=value_dtype)
-                band_rows = np.empty(band_nnz, dtype=row_dtype)
-                # offset[c] = next write position within the band for column c0 + c.
-                # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
-                offset = indptr[c0:c1].astype(np.int64) - base
-                whole = (c0, c1) == (0, n_vars)
-                row_global = 0
-                backed = read_backed(source_path)
-                try:
-                    for _slc, block in iter_matrix_chunks(
-                        backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-                    ):
-                        csr = _ensure_csr(block)
-                        n_chunk = csr.shape[0]
-                        if csr.nnz:
-                            cols = csr.indices
-                            vals = csr.data
-                            # Global row index for every non-zero in this chunk.
-                            rows = np.repeat(
-                                np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
-                            ) + row_dtype(row_global)
-                            if not whole:
-                                keep = (cols >= c0) & (cols < c1)
-                                cols, vals, rows = cols[keep], vals[keep], rows[keep]
-                            if cols.size:
-                                _scatter_by_key(cols - c0, vals, rows, offset, band_data, band_rows)
-                        row_global += n_chunk
-                        pbar.update(1)
-                finally:
-                    backed.file.close()
-                ds_data[base:base + band_nnz] = band_data
-                ds_indices[base:base + band_nnz] = band_rows
-                del band_data, band_rows
+        _transpose_in_bands(
+            partial, output_path,
+            source_path=source_path, axis=0, chunk_size=chunk_size, n_chunks=n_chunks,
+            bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=row_dtype,
+            fn_name="pp.convert_to_csc", band_kind="column", verbose=verbose,
+        )
 
     _messages.print_done(verbose, "pp.convert_to_csc", f"{n_obs} cells × {n_vars} genes")
 
@@ -3641,7 +4002,7 @@ def convert_to_csr(
                 ):
                     if sp.issparse(block):
                         csc = sp.csc_matrix(block)
-                        np.add.at(row_nnz, csc.indices, 1)
+                        row_nnz += np.bincount(csc.indices, minlength=n_obs)
                         total_nnz += csc.nnz
                     else:
                         # Dense column block: count non-zeros per row.
@@ -3688,57 +4049,17 @@ def convert_to_csr(
         if source_is_csc:
             # Column-chunk reading (fast on CSC), scattered into CSR buffers one
             # row band at a time -- the transpose of convert_to_csc's pass 2.
-            per_item_bytes = value_dtype.itemsize + np.dtype(col_dtype).itemsize
             bands = _contiguous_bands(
                 row_nnz,
-                per_item_bytes=per_item_bytes,
+                per_item_bytes=value_dtype.itemsize + np.dtype(col_dtype).itemsize,
                 budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
             )
-            if len(bands) > 1:
-                _messages.vprint(
-                    verbose, "pp.convert_to_csr",
-                    f"output buffers need {total_nnz * per_item_bytes / 1e9:.1f} GB; converting in "
-                    f"{len(bands)} row bands ({len(bands)} passes over the source)",
-                )
-            with h5py.File(partial, "r+") as dest, _create_progress_context(
-                n_col_chunks * len(bands), "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
-            ) as pbar:
-                ds_data, ds_indices = dest["X/data"], dest["X/indices"]
-                for r0, r1 in bands:
-                    base = int(indptr[r0])
-                    band_nnz = int(indptr[r1]) - base
-                    band_data = np.empty(band_nnz, dtype=value_dtype)
-                    band_cols = np.empty(band_nnz, dtype=col_dtype)
-                    # offset[r] = next write position within the band for row r0 + r.
-                    offset = indptr[r0:r1].astype(np.int64) - base
-                    whole = (r0, r1) == (0, n_obs)
-                    col_global = 0
-                    backed = read_backed(source_path)
-                    try:
-                        for _slc, block in iter_matrix_chunks(
-                            backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-                        ):
-                            csc = sp.csc_matrix(block) if sp.issparse(block) else sp.csc_matrix(np.asarray(block))
-                            n_chunk_cols = csc.shape[1]
-                            if csc.nnz:
-                                rows = csc.indices
-                                vals = csc.data
-                                # Global column index for every non-zero in this chunk.
-                                cols = np.repeat(
-                                    np.arange(n_chunk_cols, dtype=col_dtype), np.diff(csc.indptr)
-                                ) + col_dtype(col_global)
-                                if not whole:
-                                    keep = (rows >= r0) & (rows < r1)
-                                    rows, vals, cols = rows[keep], vals[keep], cols[keep]
-                                if rows.size:
-                                    _scatter_by_key(rows - r0, vals, cols, offset, band_data, band_cols)
-                            col_global += n_chunk_cols
-                            pbar.update(1)
-                    finally:
-                        backed.file.close()
-                    ds_data[base:base + band_nnz] = band_data
-                    ds_indices[base:base + band_nnz] = band_cols
-                    del band_data, band_cols
+            _transpose_in_bands(
+                partial, output_path,
+                source_path=source_path, axis=1, chunk_size=chunk_size, n_chunks=n_col_chunks,
+                bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=col_dtype,
+                fn_name="pp.convert_to_csr", band_kind="row", verbose=verbose,
+            )
         else:
             # Row-chunk reading (dense source): every chunk is already in CSR
             # order, so it is written straight into the output datasets.
@@ -3748,6 +4069,7 @@ def convert_to_csr(
                     n_row_chunks, "pp.convert_to_csr (pass 2)", verbose, unit="chunk"
                 ) as pbar:
                     ds_data, ds_indices = dest["X/data"], dest["X/indices"]
+                    evict = _EvictEvery(partial)
                     for _slc, block in iter_matrix_chunks(
                         backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
                     ):
@@ -3757,6 +4079,7 @@ def convert_to_csr(
                             dst_end = dst_start + csr.nnz
                             ds_data[dst_start:dst_end] = csr.data.astype(value_dtype, copy=False)
                             ds_indices[dst_start:dst_end] = csr.indices.astype(col_dtype, copy=False)
+                            evict(csr.nnz * (value_dtype.itemsize + np.dtype(col_dtype).itemsize))
                         pbar.update(1)
             finally:
                 backed.file.close()

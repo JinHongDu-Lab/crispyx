@@ -13,6 +13,7 @@ import pandas as pd
 from . import _messages
 from ._grouping import _group_seed
 from .data import (
+    accepts_in_memory,
     AnnData,
     read_backed,
     resolve_data_path,
@@ -44,6 +45,7 @@ def _normalise_groupby(groupby: str | Sequence[str] | None) -> list[str]:
     return columns
 
 
+@accepts_in_memory
 def subsample(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -70,6 +72,8 @@ def subsample(
     ----------
     data
         Path to an h5ad file, :class:`crispyx.AnnData`, or a backed AnnData.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     n, frac
         Exactly one must be given. ``n`` draws exactly this many items from
         every stratum; ``frac`` draws ``round(frac * pool_size)`` items,
