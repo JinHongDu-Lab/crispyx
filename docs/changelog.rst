@@ -10,6 +10,15 @@ Unreleased
   log fold changes correlated 0.93 with those from the counts, and the
   z-scores had half their spread. It now raises before any work, after
   reading one slice of the matrix.
+* **``size_factor_method="deseq2"`` takes the controls as the reference.**
+  It used the genes counted in every cell of the file, which on single-cell
+  data are a handful (8 on Huang-HCT116) or none, and then fell back to the
+  sparse method. Size factors are now DESeq2's median of ratios against the
+  controls' geometric means on the genes counted in every control cell: a
+  control's factor is DESeq2's ratio on the controls alone and does not
+  depend on the perturbations in the file, and a perturbed cell is divided
+  by the same reference on the genes counted in every cell of its
+  perturbation. Results with ``size_factor_method="deseq2"`` change.
 
 Version 0.2.2
 -------------

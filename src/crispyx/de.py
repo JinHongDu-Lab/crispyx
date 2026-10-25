@@ -106,7 +106,7 @@ from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cac
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
-    _deseq2_style_size_factors,
+    _control_reference_size_factors,
     _compute_subset_size_factors,
 )
 from ._statistics import (
@@ -503,10 +503,13 @@ def _uns_value(uns: h5py.Group, key: str, default=None):
 _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
 
 
-def _global_size_factors(path: Path, method: str, chunk_size: int, scale: bool) -> np.ndarray:
-    """Size factors over every cell in ``path`` by ``method``."""
+def _global_size_factors(
+    path: Path, method: str, chunk_size: int, scale: bool, labels: np.ndarray, control_label: str
+) -> np.ndarray:
+    """Size factors over every cell in ``path`` by ``method``; ``"deseq2"``
+    takes the controls as the reference (:func:`_control_reference_size_factors`)."""
     if method == "deseq2":
-        return _deseq2_style_size_factors(path, chunk_size=chunk_size, scale=scale)
+        return _control_reference_size_factors(path, labels, control_label, chunk_size=chunk_size, scale=scale)
     return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
 
 
@@ -1528,9 +1531,24 @@ def nb_glm_test(
 
         - ``"sparse"``: Sparse-aware median-of-ratios (default). Computes geometric
           means using only non-zero values, suitable for sparse single-cell data.
-        - ``"deseq2"``: Classic DESeq2/PyDESeq2 style. Uses only genes expressed in
-          ALL cells (typically ~50-100 genes). Provides better numerical alignment
-          with PyDESeq2 results but may be less robust for very sparse data.
+        - ``"deseq2"``: DESeq2's median-of-ratios against a reference made of
+          the control cells. DESeq2 computes size factors once for all samples
+          of a model and divides each sample by a reference of per-gene
+          geometric means, which ``estimateSizeFactors(geoMeans=...)`` lets
+          the caller supply; here those geometric means are taken over the
+          controls, on the genes counted in every control cell. A control's
+          factor is then DESeq2's ratio on the controls alone, and does not
+          depend on the perturbations in the file or the one compared. A
+          perturbed cell is divided by the same reference, on the reference
+          genes counted in every cell of its perturbation (as DESeq2 drops a
+          gene that is zero in any sample compared). With fewer than five
+          genes counted in every control, each gene's geometric mean over the
+          controls' non-zero counts is the reference and a cell's factor its
+          median ratio over the genes it expresses. Not the reference
+          DESeq2 uses by default (all samples' geometric means), and not what
+          a per-perturbation PyDESeq2 run computes: that recomputes the
+          factors on control + perturbation, so a control's factor changes
+          with the perturbation compared.
     size_factor_scope
         Scope for size factor computation.
 
@@ -1917,7 +1935,7 @@ def nb_glm_test(
         size_factors = np.ones(n_cells_total, dtype=np.float64)
         logger.debug("Skipping global size factor computation for per_comparison mode")
     elif size_factors is None:
-        size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
+        size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors, labels, control_label)
     else:
         size_factors = _validate_size_factors(
             size_factors, n_cells_total, scale=scale_size_factors
@@ -3090,7 +3108,7 @@ def nb_glm_test(
             )
             size_factor_scope = "global"
             if not size_factors_given:  # the placeholder ones would leave counts unnormalised
-                size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors)
+                size_factors = _global_size_factors(path, size_factor_method, chunk_size, scale_size_factors, labels, control_label)
                 offset = np.log(np.clip(size_factors, 1e-8, None))
             full_X = None
         else:

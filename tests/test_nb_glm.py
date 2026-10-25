@@ -1533,18 +1533,22 @@ def test_nb_glm_refuses_log_transformed_input(tmp_path, storage):
     assert not (tmp_path / "out.h5ad").exists()
 
 
-def test_per_comparison_size_factors_agree_with_global_for_a_single_comparison(tmp_path):
-    """With one perturbation the compared cells are all cells, so the scope
-    should barely matter (the global scope takes the cached-control path,
-    hence not bit-identical)."""
+def test_per_comparison_and_control_reference_size_factors_agree_up_to_a_shift(tmp_path):
+    """With one perturbation, DESeq2's ratio on all cells (per comparison) and
+    against the controls' reference (global "deseq2") differ by a common shift
+    of the LFCs: 8 of the 40 genes are 3x up, which moves the perturbed cells'
+    median ratio (by 0.11 log2 here). Effects relative to the unchanged genes
+    agree, and both find the planted genes."""
     path, _ = _dense_screen(tmp_path / "one.h5ad", ["ctrl"] * 150 + ["KO1"] * 150)
-    global_sf = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW)
-    per_comparison = nb_glm_test(path, output_path=tmp_path / "per.h5ad", size_factor_scope="per_comparison", **_NB_KW)
-    np.testing.assert_allclose(per_comparison.logfoldchanges, global_sf.logfoldchanges, atol=0.02)
-    lfc = per_comparison.logfoldchanges[0]
-    # Planted genes are 3x the rest (median-of-ratios on 40 genes shifts both groups alike).
-    assert lfc[:8].mean() - lfc[8:].mean() == pytest.approx(np.log2(3), abs=0.1)
-    assert (per_comparison.pvalues[0, :8] < 1e-6).all()
+    control_ref = nb_glm_test(path, output_path=tmp_path / "global.h5ad", **_NB_KW).logfoldchanges[0]
+    result = nb_glm_test(path, output_path=tmp_path / "per.h5ad", size_factor_scope="per_comparison", **_NB_KW)
+    per_comparison = result.logfoldchanges[0]
+    np.testing.assert_allclose(
+        per_comparison - np.median(per_comparison[8:]), control_ref - np.median(control_ref[8:]), atol=0.02
+    )
+    for lfc in (per_comparison, control_ref):
+        assert lfc[:8].mean() - lfc[8:].mean() == pytest.approx(np.log2(3), abs=0.1)
+    assert (result.pvalues[0, :8] < 1e-6).all()
 
 
 def test_per_comparison_dispersion_scope(tmp_path):

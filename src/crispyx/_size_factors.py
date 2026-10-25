@@ -20,11 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Above this many GB of all-expressed counts, DESeq2-style size factors are
-# computed in streaming passes instead of from one in-memory array.
-_DESEQ2_STREAMING_THRESHOLD_GB = 4.0
-
-
 def _validate_size_factors(
     size_factors: "ArrayLike", n_cells: int, *, scale: bool = True
 ) -> np.ndarray:
@@ -139,167 +134,121 @@ def _median_of_ratios_size_factors(
     return size_factors
 
 
-def _deseq2_style_size_factors(
+def _control_reference_size_factors(
     path: str | Path,
+    labels: np.ndarray,
+    control_label: str,
     *,
-    chunk_size: int = 256,
+    chunk_size: int = 2048,
     scale: bool = True,
-    early_termination_threshold: int = 10,
 ) -> np.ndarray:
-    """Compute DESeq2-style size factors using only genes expressed in all cells.
-    
-    This method computes size factors in the same way as DESeq2/PyDESeq2:
-    1. Find genes expressed (count > 0) in ALL cells
-    2. Compute geometric mean of counts per gene across all cells
-    3. For each cell, compute ratios of counts to geometric means
-    4. Take median of ratios as the size factor
-    
-    This approach works well for bulk RNA-seq where most genes are expressed in all
-    samples, but may have issues with very sparse single-cell data where few genes
-    are expressed in all cells.
-    
-    **Optimization (2026-01-13)**: The all_expressed check is now vectorized using
-    sparse column operations (O(n_genes) instead of O(n_cells × n_genes)), with
-    early termination when too few genes remain after initial chunks.
-    
+    """DESeq2 median-of-ratios size factors against a reference made of the controls.
+
+    DESeq2 computes size factors once for all samples of a model and takes
+    each sample's median ratio to a reference of per-gene geometric means;
+    ``estimateSizeFactors(geoMeans=...)`` lets the caller supply that
+    reference. Here the reference comes from the control cells, so a control
+    cell's factor does not depend on which perturbations the file holds or are
+    compared, and every comparison sees the same control factors:
+
+    1. reference genes are those with a count in every control cell; their
+       geometric means over the controls are the reference;
+    2. a control cell's factor is the median of its ratios to the reference
+       (DESeq2's ratio method on the controls alone);
+    3. a perturbed cell's factor uses the reference genes with a count in
+       every cell of its perturbation -- DESeq2 likewise drops a gene that is
+       zero in any sample compared -- or, when fewer than three remain, the
+       reference genes this cell expresses.
+
+    With fewer than five reference genes (sparse single-cell data with few
+    controls), every gene expressed in some control is used, its geometric
+    mean over the controls' non-zero counts as reference, and each cell's
+    factor is the median ratio over the genes it expresses -- the fallback
+    :func:`_compute_subset_size_factors` uses.
+
+    Two passes over ``path``: the controls' rows, then every row.
+
     Parameters
     ----------
     path
-        Path to h5ad file with count data.
+        h5ad file of raw counts.
+    labels
+        Each cell's perturbation label, in row order.
+    control_label
+        The label of the control cells.
     chunk_size
-        Number of cells to process per chunk.
+        Rows per chunk.
     scale
-        If True, rescale size factors so their geometric mean equals 1.
-    early_termination_threshold
-        If fewer than this many genes remain after processing a chunk,
-        fall back to sparse method immediately. Default 10.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for each cell.
+        Rescale so the factors' geometric mean is 1.
     """
-    from scipy.stats import gmean
-    
+    from ._kernels import _compute_row_medians_csr
+
+    labels = np.asarray(labels)
+    is_control = labels == control_label
+    n_control = int(is_control.sum())
     backed = read_backed(path)
-    n_cells = backed.n_obs
-    n_genes = backed.n_vars
-    
-    # First pass: find genes expressed in all cells
-    # VECTORIZED: Use sparse column counts instead of O(n_cells × n_genes) loop
-    # A gene is expressed in ALL cells of a chunk iff its nnz == chunk_n_rows
-    all_expressed = np.ones(n_genes, dtype=bool)
-    cells_processed = 0
+    n_cells, n_genes = backed.n_obs, backed.n_vars
+    control_nnz = np.zeros(n_genes, dtype=np.int64)
+    control_log_sum = np.zeros(n_genes, dtype=np.float64)
     try:
-        for _, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = sp.csr_matrix(block)
-            chunk_n_rows = csr.shape[0]
-            cells_processed += chunk_n_rows
-            
-            # VECTORIZED: Count non-zeros per gene (column) in O(nnz + n_genes) time
-            # Convert to CSC for efficient column access
-            csc = csr.tocsc()
-            nnz_per_gene = np.diff(csc.indptr)  # O(n_genes)
-            
-            # Gene is NOT expressed in all cells of this chunk if nnz < chunk_n_rows
-            genes_missing_in_chunk = nnz_per_gene < chunk_n_rows
-            all_expressed[genes_missing_in_chunk] = False
-            
-            # EARLY TERMINATION: If too few genes remain, fall back immediately
-            n_remaining = all_expressed.sum()
-            if n_remaining < early_termination_threshold:
-                logger.warning(
-                    f"Only {n_remaining} genes expressed in all cells after "
-                    f"{cells_processed:,}/{n_cells:,} cells. Falling back to sparse method."
-                )
-                backed.file.close()
-                return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+            rows = is_control[slc]
+            if not rows.any():
+                continue
+            csc = sp.csr_matrix(block, dtype=np.float64)[rows].tocsc()
+            nnz = np.diff(csc.indptr)
+            control_nnz += nnz
+            control_log_sum += np.bincount(
+                np.repeat(np.arange(n_genes), nnz), weights=np.log(csc.data), minlength=n_genes
+            )
     finally:
         backed.file.close()
-    
-    n_all_expressed = np.sum(all_expressed)
-    if n_all_expressed < 10:
-        logger.warning(
-            f"Only {n_all_expressed} genes expressed in all cells. "
-            "Consider using size_factor_method='sparse' for sparse data."
-        )
-    if n_all_expressed == 0:
-        logger.warning(
-            "No genes expressed in all cells. Falling back to sparse method."
-        )
-        return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
-    
-    # Collect counts for all-expressed genes
-    all_expressed_idx = np.where(all_expressed)[0]
 
-    # Memory check: estimate size of counts_filtered array
-    counts_filtered_gb = n_cells * n_all_expressed * 8 / 1e9
-    use_streaming = counts_filtered_gb > _DESEQ2_STREAMING_THRESHOLD_GB
-
-    if use_streaming:
-        logger.info(
-            f"Large counts_filtered ({n_cells:,} × {n_all_expressed:,} = "
-            f"{counts_filtered_gb:.1f} GB). Using streaming DESeq2 size factors."
-        )
-
-        # Streaming Pass 2: compute geometric means via log-sum accumulation.
-        # All selected genes have count > 0 in every cell, so log is finite.
-        log_sum = np.zeros(n_all_expressed, dtype=np.float64)
-        backed = read_backed(path)
-        try:
-            for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
-            ):
-                block_arr = np.asarray(block, dtype=np.float64)
-                block_filtered = block_arr[:, all_expressed_idx]
-                log_sum += np.log(np.maximum(block_filtered, 1e-300)).sum(axis=0)
-        finally:
-            backed.file.close()
-        geo_means = np.exp(log_sum / n_cells)
-
-        # Streaming Pass 3: compute per-cell median of ratios
-        size_factors = np.full(n_cells, np.nan, dtype=np.float64)
-        backed = read_backed(path)
-        try:
-            for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
-            ):
-                block_arr = np.asarray(block, dtype=np.float64)
-                block_filtered = block_arr[:, all_expressed_idx]
-                ratios = block_filtered / geo_means
-                size_factors[slc] = np.median(ratios, axis=1)
-        finally:
-            backed.file.close()
+    in_every_control = control_nnz == n_control
+    every_control_mode = int(in_every_control.sum()) >= 5
+    geo_means = np.zeros(n_genes, dtype=np.float64)  # 0 marks a gene outside the reference
+    if every_control_mode:
+        geo_means[in_every_control] = np.exp(control_log_sum[in_every_control] / n_control)
     else:
-        counts_filtered = np.zeros((n_cells, n_all_expressed), dtype=np.float64)
-        backed = read_backed(path)
-        try:
-            for slc, block in iter_matrix_chunks(
-                backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
-            ):
-                block_arr = np.asarray(block)
-                counts_filtered[slc.start:slc.stop, :] = block_arr[:, all_expressed_idx]
-        finally:
-            backed.file.close()
+        expressed = control_nnz > 0
+        geo_means[expressed] = np.exp(control_log_sum[expressed] / control_nnz[expressed])
+    reference = np.flatnonzero(geo_means > 0)
 
-        # Compute geometric means per gene
-        geo_means = gmean(counts_filtered, axis=0)
+    size_factors = np.full(n_cells, np.nan, dtype=np.float64)
+    # The reference genes' counts, kept to give each perturbation its own
+    # gene set; there are few of them in the every-control mode.
+    reference_counts = np.zeros((n_cells, reference.size), dtype=np.float64) if every_control_mode else None
+    backed = read_backed(path)
+    try:
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+            csr = sp.csr_matrix(block, dtype=np.float64)
+            size_factors[slc] = _compute_row_medians_csr(
+                csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), geo_means, csr.shape[0]
+            )
+            if reference_counts is not None:
+                reference_counts[slc] = csr[:, reference].toarray()
+    finally:
+        backed.file.close()
 
-        # Compute ratios and take median
-        ratios = counts_filtered / geo_means
-        size_factors = np.median(ratios, axis=1)
-    
-    # Handle any invalid values
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.all(valid_sf):
-        fallback = np.nanmedian(size_factors[valid_sf])
-        size_factors[~valid_sf] = fallback
-    
+    if reference_counts is not None:
+        perturbed = ~is_control
+        for label in np.unique(labels[perturbed]):
+            rows = np.flatnonzero(labels == label)
+            counts = reference_counts[rows]
+            keep = (counts > 0).all(axis=0)
+            if keep.sum() >= 3:
+                size_factors[rows] = np.median(counts[:, keep] / geo_means[reference[keep]], axis=1)
+
+    logger.info(
+        "Control-reference size factors: %d reference genes (%s)", reference.size,
+        "expressed in every control" if every_control_mode else "non-zero fallback",
+    )
+    valid = np.isfinite(size_factors) & (size_factors > 0)
+    if not valid.any():
+        return np.ones(n_cells, dtype=np.float64)
+    size_factors[~valid] = np.median(size_factors[valid])
     if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
+        return size_factors / np.exp(np.mean(np.log(size_factors)))
     return size_factors
 
 

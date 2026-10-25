@@ -381,46 +381,102 @@ def test_wilcoxon_format_mismatch_policy(small_adata, tmp_path, caplog):
         wilcoxon_test(norm_path, output_path=tmp_path / "n_jobs.h5ad", n_jobs=2, **common)
 
 
-@pytest.mark.parametrize("zero_gene", [False, True], ids=["all-expressed", "one-gene-with-zeros"])
-def test_deseq2_size_factors_streaming_matches_in_memory(tmp_path, monkeypatch, zero_gene):
-    """Forcing the streaming passes gives the same size factors as the
-    in-memory path, and both match DESeq2's median-of-ratios definition."""
-    import crispyx._size_factors as size_factors
-
-    rng = np.random.default_rng(42)
-    X = rng.poisson(lam=5, size=(200, 50)).astype(np.float32) + 1
-    if zero_gene:
-        X[::3, 7] = 0  # gene 7 is not expressed in every cell, so it is left out
-    path = tmp_path / "sf.h5ad"
-    ad.AnnData(X=sp.csr_matrix(X)).write_h5ad(path)
-
-    in_memory = size_factors._deseq2_style_size_factors(path, chunk_size=64)
-    monkeypatch.setattr(size_factors, "_DESEQ2_STREAMING_THRESHOLD_GB", 0.0)
-    streamed = size_factors._deseq2_style_size_factors(path, chunk_size=64)
-    np.testing.assert_allclose(streamed, in_memory, rtol=1e-10, atol=1e-12)
-
-    used = (np.delete(X, 7, axis=1) if zero_gene else X).astype(np.float64)
-    geo_means = np.exp(np.log(used).mean(axis=0))
-    expected = np.median(used / geo_means, axis=1)
-    expected /= np.exp(np.log(expected).mean())
-    np.testing.assert_allclose(in_memory, expected, rtol=1e-10)
+def _deseq2_ratio(X):
+    """DESeq2's median-of-ratios size factors of the rows of X (genes with a zero dropped)."""
+    used = X[:, (X > 0).all(axis=0)].astype(np.float64)
+    return np.median(used / np.exp(np.log(used).mean(axis=0)), axis=1)
 
 
-def test_subset_size_factors_equal_deseq2_on_the_subset(tmp_path):
+def test_subset_size_factors_equal_deseq2_on_the_subset():
     """Per-comparison size factors are DESeq2 size factors of the compared cells alone."""
-    from crispyx._size_factors import _compute_subset_size_factors, _deseq2_style_size_factors
+    from crispyx._size_factors import _compute_subset_size_factors
 
     rng = np.random.default_rng(0)
     X = rng.poisson(lam=8, size=(120, 30)).astype(np.float32) + 1
     mask = np.zeros(120, dtype=bool)
     mask[::2] = True
-    path = tmp_path / "subset.h5ad"
-    ad.AnnData(X=sp.csr_matrix(X[mask])).write_h5ad(path)
+    expected = _deseq2_ratio(X[mask])
     np.testing.assert_allclose(
         _compute_subset_size_factors(sp.csr_matrix(X), mask),
-        _deseq2_style_size_factors(path),
+        expected / np.exp(np.log(expected).mean()),
         rtol=1e-6,  # the subset path keeps float32 counts
     )
+
+
+def _control_reference_screen(tmp_path, *, sparse_gene=True, name="screen.h5ad", drop=None):
+    """60 controls and two perturbations of 25 cells over 40 genes, every gene
+    expressed in every control; KO1 never expresses gene 3, KO2 misses gene 5
+    in one cell; gene 30 is absent from some controls when ``sparse_gene``."""
+    rng = np.random.default_rng(3)
+    labels = np.array(["ctrl"] * 60 + ["KO1"] * 25 + ["KO2"] * 25)
+    X = rng.poisson(lam=6, size=(labels.size, 40)).astype(np.float32) + 1
+    X *= rng.uniform(0.5, 2.0, size=(labels.size, 1)).round(1)
+    X = np.round(X)
+    X[labels == "KO1", 3] = 0
+    X[np.flatnonzero(labels == "KO2")[0], 5] = 0
+    if sparse_gene:
+        X[:10, 30] = 0
+    keep = np.ones(labels.size, dtype=bool) if drop is None else labels != drop
+    obs = pd.DataFrame({"perturbation": labels[keep]}, index=[f"c{i}" for i in np.flatnonzero(keep)])
+    path = tmp_path / name
+    ad.AnnData(X=sp.csr_matrix(X[keep]), obs=obs).write_h5ad(path)
+    return path, X[keep], labels[keep]
+
+
+@pytest.mark.parametrize("chunk_size", [7, 1000])
+def test_control_reference_size_factors_follow_deseq2_with_a_control_reference(tmp_path, chunk_size):
+    """Controls: DESeq2's ratio on the controls alone. Perturbed cells: the
+    controls' reference over the reference genes expressed in every cell of
+    their perturbation. Independent of the chunking."""
+    from crispyx._size_factors import _control_reference_size_factors
+
+    path, X, labels = _control_reference_screen(tmp_path)
+    got = _control_reference_size_factors(path, labels, "ctrl", chunk_size=chunk_size, scale=False)
+
+    ctrl = X[labels == "ctrl"].astype(np.float64)
+    reference = (ctrl > 0).all(axis=0)
+    assert not reference[30] and reference[3] and reference[5]
+    geo = np.exp(np.log(ctrl[:, reference]).mean(axis=0))
+    np.testing.assert_allclose(got[labels == "ctrl"], _deseq2_ratio(ctrl), rtol=1e-12)
+    for label, missing in (("KO1", 3), ("KO2", 5)):
+        genes = np.flatnonzero(reference)
+        kept = genes != missing
+        cells = X[labels == label][:, genes[kept]].astype(np.float64)
+        np.testing.assert_allclose(got[labels == label], np.median(cells / geo[kept], axis=1), rtol=1e-12)
+
+
+def test_control_size_factors_do_not_depend_on_the_perturbations(tmp_path):
+    """Leaving a perturbation out of the file leaves every control's factor
+    (and the other perturbation's) unchanged, so a comparison's controls are
+    the same whatever else the screen holds."""
+    from crispyx._size_factors import _control_reference_size_factors
+
+    path, _, labels = _control_reference_screen(tmp_path, name="all.h5ad")
+    fewer, _, fewer_labels = _control_reference_screen(tmp_path, name="fewer.h5ad", drop="KO1")
+    full = _control_reference_size_factors(path, labels, "ctrl", scale=False)
+    part = _control_reference_size_factors(fewer, fewer_labels, "ctrl", scale=False)
+    np.testing.assert_array_equal(full[labels != "KO1"], part)
+
+
+def test_control_reference_size_factors_fall_back_on_sparse_controls(tmp_path):
+    """With fewer than five genes in every control, the reference is each
+    gene's geometric mean over the controls' non-zero counts and a cell's
+    factor the median ratio over the genes it expresses."""
+    from crispyx._size_factors import _control_reference_size_factors
+
+    rng = np.random.default_rng(5)
+    labels = np.array(["ctrl"] * 40 + ["KO1"] * 20)
+    X = rng.poisson(lam=1.0, size=(labels.size, 25)).astype(np.float32)
+    X[:, :3] += 1  # three genes in every cell: below the five the ratio method needs
+    path = tmp_path / "sparse.h5ad"
+    ad.AnnData(X=sp.csr_matrix(X), obs=pd.DataFrame({"perturbation": labels})).write_h5ad(path)
+    got = _control_reference_size_factors(path, labels, "ctrl", scale=False)
+
+    ctrl = X[labels == "ctrl"].astype(np.float64)
+    logged = np.where(ctrl > 0, np.log(np.where(ctrl > 0, ctrl, 1)), 0.0)
+    geo = np.exp(logged.sum(axis=0) / (ctrl > 0).sum(axis=0))
+    expected = [np.median(row[row > 0] / geo[row > 0]) for row in X.astype(np.float64)]
+    np.testing.assert_allclose(got, expected, rtol=1e-12)
 
 
 def _write_fmt(path, X, fmt):
