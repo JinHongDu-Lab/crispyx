@@ -78,9 +78,8 @@ class _PreprocessingNamespace:
         chunk_size: int = 2048,
         verbose: int | bool = True,
     ):
-        path = resolve_data_path(data)
         return filter_cells_by_gene_count(
-            path,
+            data,
             min_genes=min_genes,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
@@ -97,9 +96,8 @@ class _PreprocessingNamespace:
         chunk_size: int = 2048,
         verbose: int | bool = True,
     ):
-        path = resolve_data_path(data)
         return filter_genes_by_cell_count(
-            path,
+            data,
             min_cells=min_cells,
             cell_mask=cell_mask,
             gene_name_column=gene_name_column,
@@ -117,9 +115,8 @@ class _PreprocessingNamespace:
         base_mask: np.ndarray | None = None,
         verbose: int | bool = True,
     ):
-        path = resolve_data_path(data)
         return filter_perturbations_by_cell_count(
-            path,
+            data,
             perturbation_column=perturbation_column,
             control_label=control_label,
             min_cells=min_cells,
@@ -146,9 +143,8 @@ class _PreprocessingNamespace:
 
         See :func:`crispyx.subsample` for the full parameter documentation.
         """
-        path = resolve_data_path(data)
         return subsample(
-            path,
+            data,
             n=n,
             frac=frac,
             groupby=groupby,
@@ -178,9 +174,8 @@ class _PreprocessingNamespace:
         cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
         verbose: int | bool = True,
     ):
-        path = resolve_data_path(data)
         result = quality_control_summary(
-            path,
+            data,
             min_genes=min_genes,
             min_cells_per_perturbation=min_cells_per_perturbation,
             min_cells_per_gene=min_cells_per_gene,
@@ -690,7 +685,7 @@ class _PseudobulkNamespace:
         See :func:`crispyx.compute_normalized_effects`.
         """
         return compute_normalized_effects(
-            resolve_data_path(data),
+            data,
             perturbation_column=perturbation_column,
             groupby=groupby,
             control_label=control_label,
@@ -853,7 +848,6 @@ class _ToolsNamespace:
             fn_name="rank_genes_groups",
         )
 
-        path = resolve_data_path(data)
         method_key = method.lower().replace("_", "-")
         method_map = {
             "wilcoxon": "wilcoxon",
@@ -898,7 +892,7 @@ class _ToolsNamespace:
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
             result = wilcoxon_test(
-                path,
+                data,
                 corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
@@ -932,7 +926,7 @@ class _ToolsNamespace:
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
             result = nb_glm_test(
-                path,
+                data,
                 corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
@@ -960,7 +954,7 @@ class _ToolsNamespace:
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
             result = t_test(
-                path,
+                data,
                 corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,

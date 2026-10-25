@@ -381,10 +381,10 @@ def test_wilcoxon_writes_column_blocks_and_resumes_in_them(screen, tmp_path, mon
     with h5py.File(reference, "r") as f:
         assert f["X"].chunks[1] == 25  # the gene chunk width _run passes
 
-    from crispyx import _memory
+    from crispyx import _checkpoint, _memory
 
     monkeypatch.setattr(_memory, "_page_cache_is_charged", lambda: True)  # evict, as in a Slurm job
-    monkeypatch.setattr(de, "_COLUMN_BLOCK_CHUNK_BYTES", 25 * 8 * 4)  # 4 rows x 25 genes
+    monkeypatch.setattr(_checkpoint, "_COLUMN_BLOCK_CHUNK_BYTES", 25 * 8 * 4)  # 4 rows x 25 genes
     out = tmp_path / "small_chunks.h5ad"
     with monkeypatch.context() as m:
         _interrupt_after(m, 2)

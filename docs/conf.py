@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
+import runpy
 import sys
 from pathlib import Path
-
-try:
-    import tomllib  # Python 3.11+
-except ModuleNotFoundError:
-    import tomli as tomllib  # Python 3.10 fallback
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-with (PROJECT_ROOT / "pyproject.toml").open("rb") as fh:
-    project_meta = tomllib.load(fh)
-
 project = "crispyx"
-version = project_meta.get("project", {}).get("version", "0.0.0")
+version = runpy.run_path(str(SRC_PATH / "crispyx" / "_version.py"))["__version__"]
 release = version
 copyright = "2026, crispyx Team"
 author = "crispyx Team"

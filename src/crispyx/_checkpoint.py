@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import shutil
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -21,6 +20,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from . import _messages
 from ._memory import drop_file_cache
 
 if TYPE_CHECKING:
@@ -304,6 +304,79 @@ def _sha256(array: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
+#: Elements per block when a result matrix is read or rewritten a block of
+#: rows at a time (32 MB of float64), so no step holds a whole result.
+_BLOCK_ELEMENTS = 1 << 22
+
+
+def _row_blocks(n_rows: int, n_genes: int, chunk_rows: int | None = None):
+    """Slices covering ``n_rows`` rows of ``n_genes`` columns, about
+    :data:`_BLOCK_ELEMENTS` elements each. With ``chunk_rows`` (the rows of
+    an HDF5 chunk), each slice is whole bands of chunks, so no chunk is read
+    twice."""
+    step = max(1, _BLOCK_ELEMENTS // max(n_genes, 1))
+    if chunk_rows:
+        step = max(1, round(step / chunk_rows)) * chunk_rows
+    for start in range(0, n_rows, step):
+        yield slice(start, min(start + step, n_rows))
+
+
+def _chunk_rows(dataset) -> int | None:
+    """Rows in one HDF5 chunk of ``dataset`` (``None`` when contiguous or
+    not an HDF5 dataset)."""
+    chunks = getattr(dataset, "chunks", None)
+    return chunks[0] if chunks else None
+
+
+def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
+    """``group.create_dataset`` tagged as an anndata dense array."""
+    ds = group.create_dataset(name, **kwargs)
+    ds.attrs["encoding-type"] = "array"
+    ds.attrs["encoding-version"] = "0.2.0"
+    return ds
+
+
+def _create_unfilled_array(
+    group: h5py.Group, name: str, shape: tuple[int, ...], dtype, chunks: tuple[int, ...] | None = None,
+) -> h5py.Dataset:
+    """An anndata dense array whose storage is allocated now but never
+    filled: creating it writes nothing (on disk it is a sparse hole until
+    written), and the file's layout is final from the start, so filling it
+    later only writes data -- a kill mid-write leaves a readable file.
+    Unwritten elements read as zero. Contiguous, or in HDF5 ``chunks``
+    (every chunk allocated up front, so the layout is still final)."""
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
+    dcpl.set_fill_time(h5py.h5d.FILL_TIME_NEVER)
+    if chunks is not None:
+        dcpl.set_chunk(tuple(int(c) for c in chunks))
+    return _create_array(group, name, shape=shape, dtype=dtype, dcpl=dcpl)
+
+
+#: Bytes in one HDF5 chunk of a result written in column blocks.
+_COLUMN_BLOCK_CHUNK_BYTES = 1 << 20
+
+
+def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[int, int]:
+    """HDF5 chunk shape for a result written one gene chunk (a block of
+    ``chunk_size`` columns) at a time: ``(rows, chunk_size)``, ~1 MiB.
+
+    In a row-major contiguous dataset a gene chunk is one small write per
+    group row (10,922 x 4.6 KB per layer on a genome-wide screen), each
+    straddling partial pages that the filesystem must read before writing.
+    On a network filesystem that read is a round trip: on Lustre a
+    gene chunk took 219 s to write contiguously even with its pages cached,
+    and 918 s when they were evicted between chunks, against 22 s in these
+    chunks. On a local disk the two layouts write alike (the chunked one
+    slightly faster), so it is used everywhere; reading one row of a large
+    result reads its band of chunks (~2 ms locally), and small results are
+    read into memory whole anyway.
+    """
+    width = max(1, min(int(chunk_size), n_genes))
+    rows = max(1, min(n_groups, _COLUMN_BLOCK_CHUNK_BYTES // (width * 8)))
+    return rows, width
+
+
 class ResumableRun:
     """A result file filled in place, and a progress checkpoint, that outlive
     an interruption.
@@ -353,10 +426,9 @@ class ResumableRun:
             else "it cannot be read"
         )
         if checkpoint is not None and mismatch is not None:
-            warnings.warn(
+            _messages.emit(
                 f"Not resuming from the checkpoint at {checkpoint_path}: {mismatch}. "
                 "Discarding it and starting over.",
-                stacklevel=3,
             )
         self.resumed = (
             checkpoint is not None and mismatch is None and _has_datasets(self.work_path, datasets)

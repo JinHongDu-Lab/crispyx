@@ -11,7 +11,6 @@ resource allocator. There is no override parameter analogous to
 from __future__ import annotations
 
 import shutil
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -194,25 +193,25 @@ def warn_if_disk_space_low(
     ``verbose``-gated confirmation alongside this unconditional warning
     without re-running the free-space lookup.
     """
+    from . import _messages  # _messages imports this module
+
     estimate = assess_bytes(required_bytes, output_path)
     label = f"{context}: " if context else ""
 
     if estimate.free_bytes is not None and not estimate.sufficient:
-        warnings.warn(
+        _messages.emit(
             f"{label}estimated disk usage ({format_bytes(estimate.required_bytes)}) "
             f"leaves less than {min_free_fraction:.0%} free space at {estimate.path} "
             f"({format_bytes(estimate.free_bytes)} currently free). The operation may fail "
             "with 'No space left on device'. Free up space or point output_path/TMPDIR at a "
             "volume with more room before rerunning.",
-            stacklevel=3,
         )
     elif estimate.required_gb > large_file_gb:
-        warnings.warn(
+        _messages.emit(
             f"{label}this operation will write approximately "
             f"{format_bytes(estimate.required_bytes)} to disk. "
             "Streaming keeps memory bounded, but the on-disk footprint (and the time to write "
             "it) is not -- make sure the output volume has room before running large batches.",
-            stacklevel=3,
         )
 
     return estimate

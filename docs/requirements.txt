@@ -4,4 +4,3 @@ sphinx-copybutton>=0.5
 nbsphinx>=0.9
 ipykernel>=6.0
 pandoc>=2.3
-tomli>=2.0; python_version < "3.11"

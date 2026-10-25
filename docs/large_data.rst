@@ -39,9 +39,18 @@ for fine-grained breakdown.
 
    For small datasets (files < ~12.5 GB), the CSC conversion overhead is
    negligible (< 1 s on fast NVMe) and the total wilcoxon time is dominated
-   by process startup (2–3 s). For large screens (Feng-gwsf 15 GB, Feng-gwsnf
-   27 GB) the CSC conversion itself takes ~60–120 s but eliminates the ~18×
-   repeated full-file scans that CSR imposes.
+   by process startup (2–3 s). For a large screen the conversion itself
+   takes seconds per GB on a local SSD (300,000 Feng-ts cells, a 12 GB file
+   of 1.5 billion non-zeros: 15 s) and eliminates the ~18× repeated
+   full-file scans that CSR imposes.
+
+   ``memory_limit_gb`` bounds the conversion's output buffers at half of it.
+   An output larger than that is built in bands of columns. In a Slurm or
+   cgroup job, the source is read once and the later bands are spilled to
+   the temporary directory (``$TMPDIR``; about 12 bytes per non-zero for
+   float32 data), so put ``$TMPDIR`` on node-local disk. A RAM-backed
+   ``$TMPDIR`` (``tmpfs``) is skipped, as the spill would count against the
+   job's memory. Elsewhere, each band reads the source again from page cache.
 
    Because the source and destination coexist during conversion, this
    temporarily requires roughly 2× the source file's size in free disk space

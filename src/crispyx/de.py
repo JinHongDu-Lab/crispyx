@@ -8,7 +8,6 @@ import dataclasses
 import logging
 import os
 import shutil
-import warnings
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -31,9 +30,11 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import h5py
+from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import norm, rankdata, t as t_dist
 
 from .data import (
+    accepts_in_memory,
     AnnData,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
@@ -61,6 +62,7 @@ from .glm import (
     NBGLMBatchFitter,
     ControlStatisticsCache,
     build_design_matrix,
+    check_full_rank,
     estimate_glm_map_dispersion,
     fit_nb_glm_batch_auto,
     estimate_covariate_effects_streaming,
@@ -87,9 +89,13 @@ from ._kernels import (
 )
 from ._checkpoint import (
     ResumableRun,
+    _chunk_rows,
+    _column_block_chunks,
+    _create_unfilled_array,
     _get_checkpoint_interval,
     _create_progress_context,
     _DummyProgress,
+    _row_blocks,
 )
 from . import _messages
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
@@ -681,79 +687,6 @@ def _release_chunk_memory() -> None:
         pass  # Non-Linux or libc without malloc_trim
 
 
-#: Elements per block when a result matrix is read or rewritten a block of
-#: rows at a time (32 MB of float64), so no step holds a whole result.
-_BLOCK_ELEMENTS = 1 << 22
-
-
-def _row_blocks(n_rows: int, n_genes: int, chunk_rows: int | None = None):
-    """Slices covering ``n_rows`` rows of ``n_genes`` columns, about
-    :data:`_BLOCK_ELEMENTS` elements each. With ``chunk_rows`` (the rows of
-    an HDF5 chunk), each slice is whole bands of chunks, so no chunk is read
-    twice."""
-    step = max(1, _BLOCK_ELEMENTS // max(n_genes, 1))
-    if chunk_rows:
-        step = max(1, round(step / chunk_rows)) * chunk_rows
-    for start in range(0, n_rows, step):
-        yield slice(start, min(start + step, n_rows))
-
-
-def _chunk_rows(dataset) -> int | None:
-    """Rows in one HDF5 chunk of ``dataset`` (``None`` when contiguous or
-    not an HDF5 dataset)."""
-    chunks = getattr(dataset, "chunks", None)
-    return chunks[0] if chunks else None
-
-
-def _create_array(group: h5py.Group, name: str, **kwargs) -> h5py.Dataset:
-    """``group.create_dataset`` tagged as an anndata dense array."""
-    ds = group.create_dataset(name, **kwargs)
-    ds.attrs["encoding-type"] = "array"
-    ds.attrs["encoding-version"] = "0.2.0"
-    return ds
-
-
-def _create_unfilled_array(
-    group: h5py.Group, name: str, shape: tuple[int, ...], dtype, chunks: tuple[int, ...] | None = None,
-) -> h5py.Dataset:
-    """An anndata dense array whose storage is allocated now but never
-    filled: creating it writes nothing (on disk it is a sparse hole until
-    written), and the file's layout is final from the start, so filling it
-    later only writes data -- a kill mid-write leaves a readable file.
-    Unwritten elements read as zero. Contiguous, or in HDF5 ``chunks``
-    (every chunk allocated up front, so the layout is still final)."""
-    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
-    dcpl.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
-    dcpl.set_fill_time(h5py.h5d.FILL_TIME_NEVER)
-    if chunks is not None:
-        dcpl.set_chunk(tuple(int(c) for c in chunks))
-    return _create_array(group, name, shape=shape, dtype=dtype, dcpl=dcpl)
-
-
-#: Bytes in one HDF5 chunk of a Wilcoxon result written in column blocks.
-_COLUMN_BLOCK_CHUNK_BYTES = 1 << 20
-
-
-def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[int, int]:
-    """HDF5 chunk shape for a result written one gene chunk (a block of
-    ``chunk_size`` columns) at a time: ``(rows, chunk_size)``, ~1 MiB.
-
-    In a row-major contiguous dataset a gene chunk is one small write per
-    group row (10,922 x 4.6 KB per layer on a genome-wide screen), each
-    straddling partial pages that the filesystem must read before writing.
-    On a network filesystem that read is a round trip: on HPC2021 Lustre a
-    gene chunk took 219 s to write contiguously even with its pages cached,
-    and 918 s when they were evicted between chunks, against 22 s in these
-    chunks. On a local disk the two layouts write alike (the chunked one
-    slightly faster), so it is used everywhere; reading one row of a large
-    result reads its band of chunks (~2 ms locally), and small results are
-    read into memory whole anyway.
-    """
-    width = max(1, min(int(chunk_size), n_genes))
-    rows = max(1, min(n_groups, _COLUMN_BLOCK_CHUNK_BYTES // (width * 8)))
-    return rows, width
-
-
 def _resumable_result(
     output_path: Path,
     checkpoint_path: Path,
@@ -961,6 +894,7 @@ def _print_de_perturbation_verbose(
         )
 
 
+@accepts_in_memory
 def t_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -1011,6 +945,8 @@ def t_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         log-transformed expression data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     groupby
@@ -1483,6 +1419,7 @@ def t_test(
     )
 
 
+@accepts_in_memory
 def nb_glm_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -1559,6 +1496,8 @@ def nb_glm_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         raw count data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     groupby
@@ -1571,6 +1510,11 @@ def nb_glm_test(
         Mutually exclusive with ``control_label``.
     covariates
         Additional columns in `adata.obs` to include as covariates in the GLM.
+        String or categorical columns are one-hot encoded (first level
+        dropped); numeric columns enter as one continuous column, so give a
+        batch as strings or a categorical, not as integer codes. A design in
+        which a covariate is confounded with the perturbation (a batch with
+        no control samples) raises ``ValueError``.
     gene_name_column
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
@@ -1886,13 +1830,12 @@ def nb_glm_test(
     # extremely slow on CSC.  Recommend the CSR standardized file.
     _storage_fmt = get_matrix_storage_format(path)
     if _storage_fmt == "csc":
-        warnings.warn(
+        _messages.emit(
             f"The input file '{path.name}' stores its matrix in CSC format. "
             "NB-GLM performs row-wise access (size factors, control matrix, "
             "per-perturbation slices) which is very slow on CSC. "
             "Use the CSR-format standardized file for much better performance.",
             UserWarning,
-            stacklevel=2,
         )
 
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
@@ -2034,15 +1977,14 @@ def nb_glm_test(
             subset_size_factors = np.asarray(size_factors)[subset_mask]
             subset_offset = offset[subset_mask] if offset is not None else np.log(np.clip(subset_size_factors, 1e-8, None))
         
-        # Build design matrix
-        
-        # Build design matrix
         design, design_columns = build_design_matrix(
             subset_obs,
             covariate_columns=covariates,
             perturbation_indicator=indicator,
             intercept=True,
         )
+        if covariates:
+            check_full_rank(design, design_columns, f"nb_glm_test, comparison {label!r} vs control")
         perturbation_column_index = design_columns.index("perturbation")
         
         control_subset_mask = control_mask[subset_mask]
@@ -2281,7 +2223,7 @@ def nb_glm_test(
                 # Use PyDESeq2-style bounds: max(10, n_cells)
                 max_disp = max(10.0, float(n_subset))
                 disp_map = estimate_dispersion_map(
-                    Y, mu, trend, max_disp=max_disp
+                    Y, mu, trend, design=design, max_disp=max_disp
                 )
                 result["dispersion"] = disp_map
                 
@@ -2289,6 +2231,8 @@ def nb_glm_test(
                 # SE from IRLS was computed using MoM dispersion, but Wald test
                 # should use MAP dispersion for proper variance estimation
                 ridge = 1e-6
+                unit = np.zeros(design.shape[1])
+                unit[perturbation_column_index] = 1.0
                 for local_idx, gene_idx in enumerate(valid_indices):
                     if not valid_results[local_idx]:
                         continue
@@ -2296,13 +2240,12 @@ def nb_glm_test(
                     mu_gene = mu[:, gene_idx]
                     disp_gene = disp_map[gene_idx]
                     W = mu_gene / (1.0 + mu_gene * disp_gene)
-                    # Compute (X'WX + ridge*I)^{-1}
-                    XtW = design.T * W[None, :]
-                    XtWX = XtW @ design
-                    XtWX += ridge * np.eye(design.shape[1])
+                    # SE^2 = e_k' (X'WX + ridge*I)^-1 e_k, from a Cholesky factor
+                    XtWX = (design.T * W[None, :]) @ design
+                    XtWX[np.diag_indices_from(XtWX)] += ridge
                     try:
-                        inv_XtWX = np.linalg.inv(XtWX)
-                        se_new = np.sqrt(np.maximum(inv_XtWX[perturbation_column_index, perturbation_column_index], 1e-10))
+                        variance = cho_solve(cho_factor(XtWX, check_finite=False), unit, check_finite=False)
+                        se_new = np.sqrt(np.maximum(variance[perturbation_column_index], 1e-10))
                     except np.linalg.LinAlgError:
                         se_new = result["se"][gene_idx]  # Keep original SE on failure
                     # Update SE, statistic, and p-value
@@ -2721,7 +2664,10 @@ def nb_glm_test(
                     np.maximum(mu, 1e-10, out=mu)
                     
                     max_disp = max(10.0, float(subset_n))
-                    result["dispersion"] = estimate_dispersion_map(Y, mu, trend, max_disp=max_disp)
+                    design = np.column_stack([np.ones(subset_n), perturbation_indicator])
+                    result["dispersion"] = estimate_dispersion_map(
+                        Y, mu, trend, design=design, max_disp=max_disp
+                    )
                     del Y, mu  # Free large matrices
                 else:
                     result["dispersion"] = shrink_dispersions(result["dispersion_raw"], trend)
@@ -3072,14 +3018,17 @@ def nb_glm_test(
         and control_matrix is not None
     ):
         logger.info("Estimating each gene's dispersion once, on the control cells (dispersion_scope='global')...")
-        control_design, _ = build_design_matrix(
+        control_design, control_columns = build_design_matrix(
             obs_df.iloc[control_mask],
             covariate_columns=covariates,
             perturbation_indicator=np.zeros(control_n),
             intercept=True,
         )
+        control_design = np.delete(control_design, 1, axis=1)  # drop the all-zero perturbation column
+        del control_columns[1]
+        check_full_rank(control_design, control_columns, "nb_glm_test, dispersion on the control cells")
         global_dispersion, global_dispersion_trend = estimate_glm_map_dispersion(
-            np.delete(control_design, 1, axis=1),  # drop the all-zero perturbation column
+            control_design,
             control_matrix,
             offset=offset[control_mask],
             size_factors=np.asarray(size_factors)[control_mask],
@@ -3842,7 +3791,6 @@ def _wilcoxon_test_stratified(
                 "wilcoxon_test",
                 f"{n_excluded} cells have a missing '{batch_column}' value and are "
                 "excluded from the batch-stratified test.",
-                stacklevel=2,
             )
         if n_batches < 1:
             raise ValueError(
@@ -3922,7 +3870,6 @@ def _wilcoxon_test_stratified(
                 "containing both perturbation and control cells; stratified "
                 "rank statistics for these perturbations will be "
                 f"set to NaN. Examples: {examples}",
-                stacklevel=2,
             )
 
         # Pooled control cell count per candidate (for LFC/pts, batch-agnostic)
@@ -4222,6 +4169,7 @@ def _wilcoxon_test_stratified(
     )
 
 
+@accepts_in_memory
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -4264,6 +4212,8 @@ def wilcoxon_test(
     data
         Path to an h5ad file, or a crispyx AnnData / backed anndata.AnnData containing
         normalised, log-transformed data.
+        An in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels, or the labels
         themselves as a ``pd.Series`` indexed by cell (``obs_names``), e.g.

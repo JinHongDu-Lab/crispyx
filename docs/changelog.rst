@@ -1,6 +1,107 @@
 Changelog
 =========
 
+Version 0.2.2
+-------------
+
+*Released 2026-10-25.*
+
+* **``aggregate_pseudobulk`` and ``compute_pseudobulk_effects`` no longer
+  load their result into memory to write it.** Both accumulated into
+  temporary memory-mapped files and then read them whole to write the
+  output. Profiles are now copied into the output a block of rows at a
+  time, and effects are written a block of 512 genes at a time straight
+  into the output (HDF5-chunked by gene block), with no temporary files.
+  Values are bit-identical.
+* **``convert_to_csc`` and ``convert_to_csr`` are 5-8x faster.** Each
+  chunk's non-zeros were placed by a stable sort; one linear pass in
+  source order places them the same way. On 300,000 FengTS cells
+  (1.5 billion non-zeros, local SSD) the CSC conversion takes 14.5 s
+  instead of 122 s, and 19 s instead of 119 s in four column bands; files
+  are byte-identical. Most of a Wilcoxon run on a large screen was this
+  conversion (78-86% on Huang).
+* **Under a memory limit, a conversion in several bands reads its source
+  once.** When the output buffers exceed half of ``memory_limit_gb`` the
+  converters work in bands, and each band re-read the source. Where page
+  cache counts against the limit (a Slurm or cgroup job) those re-reads
+  come from storage. There the first band is now built in memory while the
+  other bands' non-zeros are spilled to one file per band in the temporary
+  directory (about 12 bytes each for float32 data), then read back band by
+  band. A RAM-backed temporary directory (``tmpfs``) is skipped, since the
+  spill would count against the same limit; the output's directory is used
+  instead when it has room and, on the source's filesystem, only where the
+  spill's write and read cost less than the re-reads; otherwise the
+  re-reads stay. The soft open-file limit is raised toward the hard one
+  when the bands need it. On a Slurm-based HPC cluster (source on Lustre,
+  spill on node-local ``/tmp``), a 17.6 GB, 429,000-cell file converts in 5 bands in 330-400 s,
+  against 600-720 s re-reading and 711 s for 0.2.1, and in 1 band in
+  ~240 s. The full Huang-HCT116 screen (206 GB, 3.4 million cells, 3 bands,
+  110 GB spilled) converts in 8,144-8,350 s, against 21,542 s for 0.2.1.
+  Off such a limit a re-read is served from page cache and spilling was
+  slower (Mac SSD, 4 bands: 26.5 s against 20.8 s), so nothing changes
+  there. Files are byte-identical either way.
+* **In-memory AnnData is accepted** by ``t_test``, ``wilcoxon_test``,
+  ``nb_glm_test``, the QC filters and ``quality_control_summary``, the
+  three pseudobulk functions, ``residual_effects``, ``subsample``,
+  ``normalize_total_log1p`` and ``downsample_counts`` (and their ``cx.pp`` /
+  ``cx.pb`` / ``cx.tl`` forms). The object is written to a scratch file in
+  the temporary directory when it is on disk and has room (else beside the
+  output), streamed like any input, and removed when the call returns or
+  fails; a later run removes one a killed run left. ``output_path``, by
+  keyword or position, is required with such input (except by
+  ``quality_control_summary``, which then returns its masks only) and
+  ``resume`` is refused, since both are defined by the input file. Large
+  objects are still better saved once and passed as a path.
+* **The GLM's linear algebra goes through factorisations.** No coefficient
+  or standard error is computed from an explicit inverse or pseudo-inverse
+  any more: two-column fits solve their 2x2 systems by an ``LDL'``
+  factorisation (replacing Cramer's rule with its determinant clamped at
+  1e-12), standard errors come from Cholesky solves, a singular
+  weighted least-squares fit falls back to an SVD of the weighted design,
+  and ``check_full_rank`` reads dependent columns off one QR. On Adamson
+  this moves results by rounding only (1e-10 relative; the per-comparison
+  MAP dispersion, refined to a 1e-4 tolerance, by up to 5e-6).
+* **``crispyx.__version__`` is the running code's version.** It was read
+  from the installed distribution's metadata, so a source checkout run with
+  another crispyx installed reported -- and stamped into its outputs'
+  provenance -- the installed version. The version is now set once, in
+  ``crispyx/_version.py``, which the package and its build metadata both
+  read.
+* **Warnings point at the line that called crispyx.** Each warning named a
+  fixed number of frames up, which a helper or the in-memory wrapper made
+  land inside crispyx (with an absolute path to its source). Warnings are
+  now attributed to the first frame outside the package.
+* **Fixed: ``nb_glm_test``'s MAP dispersion is Cox-Reid adjusted.** The
+  gene-wise dispersions were Cox-Reid adjusted but the MAP step that shrinks
+  them toward the trend maximised the plain likelihood, which biases a
+  dispersion low by about (n - p) / n for a design of p columns on n
+  samples. With a categorical covariate of many levels on few samples (two
+  control and two knockdown replicates per batch, 30 or 100 batches) the
+  dispersions came out at 0.44-0.50x the truth and null z-scores had a
+  robust sd of 1.30-1.36; they are now 1.01x and 1.00, as PyDESeq2's are.
+  The prior variance also uses the design's residual degrees of freedom
+  rather than assuming two columns. Results change only where the MAP step
+  runs: with ``covariates`` and ``dispersion_scope="global"``, and with
+  ``dispersion_scope="per_comparison"``. The default (no covariates, global
+  dispersion) agrees to rounding (1e-10 relative). On Adamson with ``dispersion_scope=
+  "per_comparison"``, dispersions rise by a median 2.4% and agree slightly
+  better with PyDESeq2.
+* **``nb_glm_test`` names a confounded covariate.** A comparison whose
+  design is rank-deficient (every sample of a knockdown in a batch with no
+  controls) used to be fitted as a singular system; it now fails with the
+  offending column named, is NaN in the result, and is listed in the
+  run's warning while the other comparisons go on. A categorical covariate
+  level absent from a comparison's cells no longer adds an all-zero column.
+  The ``covariates`` docstring says numeric columns are continuous, so a
+  batch must be given as strings or a categorical.
+* **``convert_to_csc`` and ``convert_to_csr`` evict the file they write.**
+  The converted copy, often as large as the source, was written without
+  eviction, so under a memory limit that charges page cache (a SLURM job)
+  its pages stayed charged to the job into the step that reads it, a
+  Wilcoxon test on the CSC copy. Each band is now written in 1 GB slices,
+  evicted as they go, as the documentation already said. Nothing changes on
+  a personal machine; files are byte-identical.
+
 Version 0.2.1
 -------------
 
@@ -29,7 +130,7 @@ Version 0.2.1
 * **``wilcoxon_test`` writes its results in column blocks.** Each gene chunk
   of results was one small write per perturbation into a row-major file,
   each needing a page read before the write; on a network filesystem that
-  is a round trip per perturbation per chunk (HPC2021 Lustre: 219 s a gene
+  is a round trip per perturbation per chunk (on Lustre: 219 s a gene
   chunk with the pages cached, 918 s when evicted, against 22 s now on the
   same node and load). The result's layers are HDF5-chunked as
   (rows, gene chunk width), ~1 MiB each, on every machine (on a local disk

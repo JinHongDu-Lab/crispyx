@@ -92,18 +92,44 @@ class TestWarn:
         with pytest.warns(DeprecationWarning, match="ctx: msg"):
             warn("ctx", "msg", category=DeprecationWarning)
 
-    def test_stacklevel_attributes_to_caller_of_warn(self):
-        """warn()'s default stacklevel=2 should attribute the warning to
-        whichever function *calls* the function containing warn() -- the
-        same place a direct `warnings.warn(msg, stacklevel=2)` in that
-        function's body would attribute to -- not to _messages.py, and not
-        to _pretend_public_function's own line either.
-        """
+    def test_attributes_to_the_first_frame_outside_crispyx(self):
+        """A warning points at the first caller outside crispyx -- here
+        _pretend_public_function's own line, as this test file is not
+        crispyx -- not at _messages.py."""
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            this_call_line = sys._getframe().f_lineno + 1
             _pretend_public_function()
 
         assert len(caught) == 1
         assert caught[0].filename == __file__
-        assert caught[0].lineno == this_call_line
+        assert caught[0].lineno == _pretend_public_function.__code__.co_firstlineno + 2
+
+    @pytest.mark.parametrize("in_memory", [False, True])
+    def test_a_decorated_function_warns_at_the_users_call(self, tmp_path, in_memory):
+        """However deep inside crispyx it is raised -- through the
+        accepts_in_memory wrapper and the function's helpers -- a warning
+        names the line that called crispyx."""
+        import anndata as ad
+        import numpy as np
+        import pandas as pd
+
+        import crispyx as cx
+
+        rng = np.random.default_rng(0)
+        labels = np.repeat(["ctrl", "KD1", "KD2"], 10)
+        adata = ad.AnnData(
+            rng.poisson(5, (labels.size, 8)).astype(np.float32),
+            obs=pd.DataFrame({"perturbation": labels, "batch": np.tile(["b1", "b2"], 15)}, index=[f"c{i}" for i in range(labels.size)]),
+        )
+        data = adata
+        if not in_memory:
+            data = tmp_path / "counts.h5ad"
+            adata.write_h5ad(data)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            this_call_line = sys._getframe().f_lineno + 1
+            cx.compute_pseudobulk_effects(data, perturbation_column="perturbation", batch_column="batch", control_label="ctrl", output_path=tmp_path / "eff.h5ad", verbose=False)
+
+        raw = [w for w in caught if "raw counts" in str(w.message)]
+        assert raw, [str(w.message) for w in caught]
+        assert all((w.filename, w.lineno) == (__file__, this_call_line) for w in raw)

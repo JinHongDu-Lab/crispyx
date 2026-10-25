@@ -14,6 +14,10 @@ import numba as nb
 import numpy as np
 from numba.extending import get_cython_function_address
 
+from ._irls import solve_spd_2x2
+
+_solve_spd_2x2 = nb.njit(cache=True)(solve_spd_2x2)
+
 # =============================================================================
 # Numba-accelerated gammaln using scipy's cython implementation
 # =============================================================================
@@ -139,6 +143,31 @@ def _compute_mle_dispersion_numba(
     return alpha_mle
 
 
+@nb.njit(cache=True)
+def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
+    """``-0.5 * log det(xtwx)`` from a Cholesky factorisation in place.
+
+    Zero for an empty matrix (no Cox-Reid adjustment), or one that is not
+    positive definite (as the gene-wise Cox-Reid step treats it).
+    """
+    log_det = 0.0
+    for j in range(xtwx.shape[0]):
+        d = xtwx[j, j]
+        for k in range(j):
+            d -= xtwx[j, k] * xtwx[j, k]
+        if d <= 0.0:
+            return 0.0
+        ljj = math.sqrt(d)
+        xtwx[j, j] = ljj
+        log_det += math.log(ljj)
+        for i in range(j + 1, xtwx.shape[0]):
+            v = xtwx[i, j]
+            for k in range(j):
+                v -= xtwx[i, k] * xtwx[j, k]
+            xtwx[i, j] = v / ljj
+    return -log_det  # -0.5 * (2 * sum(log diag(L)))
+
+
 @nb.njit(parallel=True, cache=True)
 def _nb_map_grid_search_numba(
     Y: np.ndarray,
@@ -146,6 +175,10 @@ def _nb_map_grid_search_numba(
     log_trend: np.ndarray,
     log_alpha_grid: np.ndarray,
     prior_var: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
 ) -> tuple:
     """Vectorized grid search for MAP dispersion across all genes.
     
@@ -168,6 +201,9 @@ def _nb_map_grid_search_numba(
         Grid of log-dispersion values to search.
     prior_var : float
         Variance of log-normal prior.
+    x_indptr, x_indices, x_data, n_features
+        The design matrix in CSR form, for the Cox-Reid adjustment
+        (``n_features=0`` for none).
         
     Returns
     -------
@@ -182,14 +218,6 @@ def _nb_map_grid_search_numba(
     best_log_alpha = np.zeros(n_genes, dtype=np.float64)
     best_idx = np.zeros(n_genes, dtype=np.int64)
     
-    # Precompute alpha and log(alpha) values for grid
-    alpha_grid = np.exp(log_alpha_grid)
-    r_grid = 1.0 / alpha_grid
-    log_r_grid = np.log(r_grid)
-    gammaln_r_grid = np.empty(n_grid, dtype=np.float64)
-    for k in range(n_grid):
-        gammaln_r_grid[k] = math.lgamma(r_grid[k])
-    
     # Parallelize over genes
     for g in nb.prange(n_genes):
         best_posterior = -np.inf
@@ -197,6 +225,7 @@ def _nb_map_grid_search_numba(
         log_trend_g = log_trend[g]
         Y_g = Y[:, g]
         mu_g = mu[:, g]
+        xtwx = np.empty((n_features, n_features))
         
         # Precompute gammaln(Y_g + 1) for this gene - only done once, not n_grid times!
         gammaln_y_plus_1 = 0.0
@@ -205,28 +234,10 @@ def _nb_map_grid_search_numba(
         
         for k in range(n_grid):
             log_alpha = log_alpha_grid[k]
-            r = r_grid[k]
-            log_r = log_r_grid[k]
-            gammaln_r = gammaln_r_grid[k]
-            
-            # Compute NB log-likelihood inline for speed
-            ll = 0.0
-            for i in range(n_cells):
-                y = Y_g[i]
-                mu_i = mu_g[i]
-                r_plus_mu = r + mu_i + 1e-12
-                ll += (
-                    math.lgamma(y + r)
-                    - gammaln_r
-                    + r * (log_r - math.log(r_plus_mu))
-                    + y * math.log(mu_i / r_plus_mu + 1e-12)
-                )
-            # Subtract gammaln(Y+1) term (precomputed)
-            ll -= gammaln_y_plus_1
-            
-            # Add log-prior: -0.5 * (log_alpha - log_trend)^2 / prior_var
-            log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-            posterior = ll + log_prior
+            posterior = _nb_posterior_with_cache_numba(
+                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1,
+                x_indptr, x_indices, x_data, xtwx,
+            )
             
             if posterior > best_posterior:
                 best_posterior = posterior
@@ -245,6 +256,10 @@ def _brent_minimize_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    xtwx: np.ndarray,
     a: float,
     b: float,
     tol: float = 1e-5,
@@ -260,7 +275,9 @@ def _brent_minimize_numba(
     
     # Initial setup
     x = w = v = a + golden * (b - a)
-    fx = fw = fv = -_nb_posterior_with_cache_numba(Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+    fx = fw = fv = -_nb_posterior_with_cache_numba(
+        Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, xtwx
+    )
     
     d = 0.0  # Distance to next point
     e = 0.0  # Distance moved on the step before last
@@ -314,7 +331,9 @@ def _brent_minimize_numba(
         else:
             u = x + (tol1 if d > 0 else -tol1)
         
-        fu = -_nb_posterior_with_cache_numba(Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+        fu = -_nb_posterior_with_cache_numba(
+            Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, xtwx
+        )
         
         # Update a, b, v, w, x
         if fu <= fx:
@@ -355,17 +374,27 @@ def _nb_posterior_with_cache_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    xtwx: np.ndarray,
 ) -> float:
-    """Compute NB posterior (log-likelihood + log-prior) for a single gene.
-    
-    Uses precomputed gammaln(Y+1) sum for efficiency.
+    """Cox-Reid adjusted NB log-likelihood plus log-prior for one gene.
+
+    Uses the precomputed ``gammaln(Y+1)`` sum. ``XᵀWX``, ``W = mu / (1 +
+    alpha mu)``, is accumulated into the work buffer ``xtwx`` (``(0, 0)``
+    for no adjustment) in the same pass over the cells as the likelihood;
+    the design ``X`` is given in CSR form, so a one-hot batch design costs a
+    few products per cell rather than ``n_features**2``.
     """
     n_cells = Y_g.shape[0]
     alpha = math.exp(log_alpha)
     r = 1.0 / alpha
     log_r = math.log(r)
     gammaln_r = math.lgamma(r)
-    
+    cox_reid = xtwx.shape[0] > 0
+    xtwx[:, :] = 0.0
+
     ll = 0.0
     for i in range(n_cells):
         y = Y_g[i]
@@ -377,12 +406,17 @@ def _nb_posterior_with_cache_numba(
             + r * (log_r - math.log(r_plus_mu))
             + y * math.log(mu_i / r_plus_mu + 1e-12)
         )
+        if cox_reid:
+            w = mu_i / (1.0 + alpha * mu_i)
+            for a in range(x_indptr[i], x_indptr[i + 1]):
+                wa = w * x_data[a]
+                ja = x_indices[a]
+                for b in range(x_indptr[i], x_indptr[i + 1]):
+                    xtwx[ja, x_indices[b]] += wa * x_data[b]
     ll -= gammaln_y_plus_1_sum
-    
-    # Add log-prior
+
     log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-    
-    return ll + log_prior
+    return ll + log_prior + _neg_half_log_det_numba(xtwx)
 
 
 @nb.njit(parallel=True, cache=True)
@@ -392,6 +426,10 @@ def _nb_map_grid_search_with_refinement_numba(
     log_trend: np.ndarray,
     log_alpha_grid: np.ndarray,
     prior_var: float,
+    x_indptr: np.ndarray,
+    x_indices: np.ndarray,
+    x_data: np.ndarray,
+    n_features: int,
     tol: float = 1e-5,
     max_refine_iter: int = 50,
 ) -> np.ndarray:
@@ -414,6 +452,9 @@ def _nb_map_grid_search_with_refinement_numba(
         Grid of log-dispersion values to search.
     prior_var : float
         Variance of log-normal prior.
+    x_indptr, x_indices, x_data, n_features
+        The design matrix in CSR form, for the Cox-Reid adjustment
+        (``n_features=0`` for none).
     tol : float
         Tolerance for Brent convergence.
     max_refine_iter : int
@@ -429,14 +470,6 @@ def _nb_map_grid_search_with_refinement_numba(
     
     best_log_alpha = np.zeros(n_genes, dtype=np.float64)
     
-    # Precompute alpha and log(alpha) values for grid
-    alpha_grid = np.exp(log_alpha_grid)
-    r_grid = 1.0 / alpha_grid
-    log_r_grid = np.log(r_grid)
-    gammaln_r_grid = np.empty(n_grid, dtype=np.float64)
-    for k in range(n_grid):
-        gammaln_r_grid[k] = math.lgamma(r_grid[k])
-    
     # Parallelize over genes
     for g in nb.prange(n_genes):
         best_posterior = -np.inf
@@ -444,6 +477,7 @@ def _nb_map_grid_search_with_refinement_numba(
         log_trend_g = log_trend[g]
         Y_g = Y[:, g]
         mu_g = mu[:, g]
+        xtwx = np.empty((n_features, n_features))
         
         # Precompute gammaln(Y_g + 1) for this gene - reused in refinement
         gammaln_y_plus_1_sum = 0.0
@@ -453,25 +487,10 @@ def _nb_map_grid_search_with_refinement_numba(
         # Stage 1: Grid search
         for k in range(n_grid):
             log_alpha = log_alpha_grid[k]
-            r = r_grid[k]
-            log_r = log_r_grid[k]
-            gammaln_r = gammaln_r_grid[k]
-            
-            ll = 0.0
-            for i in range(n_cells):
-                y = Y_g[i]
-                mu_i = mu_g[i]
-                r_plus_mu = r + mu_i + 1e-12
-                ll += (
-                    math.lgamma(y + r)
-                    - gammaln_r
-                    + r * (log_r - math.log(r_plus_mu))
-                    + y * math.log(mu_i / r_plus_mu + 1e-12)
-                )
-            ll -= gammaln_y_plus_1_sum
-            
-            log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-            posterior = ll + log_prior
+            posterior = _nb_posterior_with_cache_numba(
+                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
+                x_indptr, x_indices, x_data, xtwx,
+            )
             
             if posterior > best_posterior:
                 best_posterior = posterior
@@ -490,11 +509,14 @@ def _nb_map_grid_search_with_refinement_numba(
                 # Use Brent's method for refinement (more accurate than golden section)
                 refined_log_alpha = _brent_minimize_numba(
                     Y_g, mu_g, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    a, b, tol=tol, max_iter=max_refine_iter
+                    x_indptr, x_indices, x_data, xtwx, a, b, tol=tol, max_iter=max_refine_iter
                 )
                 
                 # Final sanity check: ensure refinement is actually better than grid
-                refined_posterior = _nb_posterior_with_cache_numba(Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum)
+                refined_posterior = _nb_posterior_with_cache_numba(
+                    Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
+                    x_indptr, x_indices, x_data, xtwx,
+                )
                 if refined_posterior >= best_posterior:
                     best_log_alpha[g] = refined_log_alpha
                 else:
@@ -505,87 +527,6 @@ def _nb_map_grid_search_with_refinement_numba(
             best_log_alpha[g] = best_grid_log_alpha
     
     return best_log_alpha
-
-
-# =============================================================================
-# IRLS batch processing kernels
-# =============================================================================
-
-@nb.njit(cache=True)
-def _wls_solve_2x2_numba(
-    W: np.ndarray,
-    z: np.ndarray,
-    X: np.ndarray,
-    ridge: float,
-) -> tuple:
-    """Solve weighted least squares for 2-parameter model (intercept + perturbation).
-    
-    Optimized for the common case of [1, perturbation_indicator] design matrix.
-    Uses direct 2x2 matrix inversion which is faster than general solve.
-    
-    Parameters
-    ----------
-    W : (n_samples,)
-        IRLS weights for current gene.
-    z : (n_samples,)
-        Working response for current gene.
-    X : (n_samples, 2)
-        Design matrix [1, perturbation_indicator].
-    ridge : float
-        Ridge penalty for regularization.
-        
-    Returns
-    -------
-    beta : (2,)
-        Fitted coefficients [intercept, perturbation_effect].
-    se : (2,)
-        Standard errors.
-    """
-    n_samples = W.shape[0]
-    
-    # Compute X'WX elements directly (2x2 matrix)
-    xtwx_00 = 0.0  # sum(W)
-    xtwx_01 = 0.0  # sum(W * x1)
-    xtwx_11 = 0.0  # sum(W * x1^2)
-    xtwz_0 = 0.0   # sum(W * z)
-    xtwz_1 = 0.0   # sum(W * z * x1)
-    
-    for i in range(n_samples):
-        w_i = W[i]
-        z_i = z[i]
-        x1_i = X[i, 1]  # perturbation indicator
-        
-        xtwx_00 += w_i
-        xtwx_01 += w_i * x1_i
-        xtwx_11 += w_i * x1_i * x1_i
-        xtwz_0 += w_i * z_i
-        xtwz_1 += w_i * z_i * x1_i
-    
-    # Add ridge penalty
-    xtwx_00 += ridge
-    xtwx_11 += ridge
-    
-    # Direct 2x2 inverse
-    det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-    if abs(det) < 1e-12:
-        det = 1e-12
-    
-    inv_00 = xtwx_11 / det
-    inv_01 = -xtwx_01 / det
-    inv_11 = xtwx_00 / det
-    
-    # beta = inv(X'WX) @ X'Wz
-    beta_0 = inv_00 * xtwz_0 + inv_01 * xtwz_1
-    beta_1 = inv_01 * xtwz_0 + inv_11 * xtwz_1
-    
-    # SE = sqrt(diag(inv(X'WX)))
-    se_0 = np.sqrt(max(inv_00, 1e-12))
-    se_1 = np.sqrt(max(inv_11, 1e-12))
-    
-    beta = np.array([beta_0, beta_1])
-    se = np.array([se_0, se_1])
-    
-    return beta, se
 
 
 # =============================================================================
@@ -1329,8 +1270,8 @@ def _irls_batch_numba(
                 # Working response: z = eta + (y - mu) / mu
                 z_g[i] = eta_i + (Y[i, g] - mu_i) / max(mu_i, EPS_K) - offset[i]
             
-            # Solve WLS: beta_new = (X'WX + ridge*I)^{-1} X'Wz
-            # For 2-feature case, use direct formula
+            # Solve WLS: (X'WX + ridge*I) beta_new = X'Wz
+            # For 2-feature case, accumulate the 2x2 system directly
             if n_features == 2:
                 xtwx_00 = ridge
                 xtwx_01 = 0.0
@@ -1349,12 +1290,7 @@ def _irls_batch_numba(
                     xtwz_0 += w_i * z_i
                     xtwz_1 += w_i * z_i * x1_i
                 
-                det = xtwx_00 * xtwx_11 - xtwx_01 * xtwx_01
-                if abs(det) < 1e-12:
-                    det = 1e-12
-                
-                beta_new_0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-                beta_new_1 = (-xtwx_01 * xtwz_0 + xtwx_00 * xtwz_1) / det
+                beta_new_0, beta_new_1 = _solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
                 
                 # Check convergence
                 diff = max(abs(beta_new_0 - beta_g[0]), abs(beta_new_1 - beta_g[1]))

@@ -9,10 +9,12 @@ from __future__ import annotations
 import functools
 import logging
 import os
-import warnings
+import re
 from pathlib import Path
 
 import joblib
+
+from . import _messages
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,32 @@ def _page_cache_is_charged() -> bool:
     reads from cache).
     """
     return _cgroup_available_bytes() is not None or "SLURM_JOB_ID" in os.environ
+
+
+def _is_ram_backed(path: str | Path) -> bool:
+    """Whether ``path`` lies on a filesystem held in memory (``tmpfs``,
+    ``ramfs``) -- a common ``/tmp`` on cluster nodes and in containers --
+    where a file takes RAM, charged to the writer's memory cgroup. Read from
+    ``/proc/self/mounts``; ``False`` where that does not exist (macOS,
+    Windows), which keeps such files on disk.
+    """
+    try:
+        with open("/proc/self/mounts") as handle:
+            mounts = handle.read().splitlines()
+        target = os.path.realpath(path)
+    except OSError:
+        return False
+    best, fstype = "", ""
+    for line in mounts:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        # The kernel writes a space in a mount point as "\040".
+        point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
+        inside = target == point or target.startswith(point.rstrip("/") + "/")
+        if inside and len(point) >= len(best):
+            best, fstype = point, fields[2]
+    return fstype in ("tmpfs", "ramfs")
 
 
 def drop_file_cache(path: str | Path) -> None:
@@ -361,13 +389,12 @@ def _granted_bytes() -> float | None:
     allocation = _slurm_allocation_bytes()
     if allocation is None and "SLURM_JOB_ID" in os.environ and not _warned_unknown_slurm_limit:
         _warned_unknown_slurm_limit = True
-        warnings.warn(
+        _messages.emit(
             "crispyx: running in Slurm job "
             f"{os.environ['SLURM_JOB_ID']} but cannot see its memory limit (no cgroup "
             "limit is visible and SLURM_MEM_PER_NODE / SLURM_MEM_PER_CPU are unset); "
             "pass memory_limit_gb set to the job's --mem so crispyx does not size "
             "itself from the whole node's memory.",
-            stacklevel=3,
         )
     return allocation
 
