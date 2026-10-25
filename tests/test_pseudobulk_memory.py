@@ -186,8 +186,9 @@ def test_pseudobulk_outputs_are_written_in_blocks(tmp_path, monkeypatch):
     monkeypatch.setattr(_checkpoint, "_BLOCK_ELEMENTS", 2 * n_genes)  # 2 rows a block
     small_agg, small_eff = run("small_blocks")
     np.testing.assert_array_equal(agg.X, small_agg.X)
-    for a, b in [(eff.X, small_eff.X), *((eff.layers[k], small_eff.layers[k]) for k in eff.layers)]:
+    layers = sorted(k for k in eff.layers if k is not None)  # anndata >= 0.13 lists X as None
+    for a, b in [(eff.X, small_eff.X), *((eff.layers[k], small_eff.layers[k]) for k in layers)]:
         np.testing.assert_array_equal(a, b)
-    assert sorted(eff.layers) == ["reference_profile", "target_profile"]
+    assert layers == ["reference_profile", "target_profile"]
     with h5py.File(tmp_path / "one_block_eff.h5ad", "r") as f:
         assert f["X"].chunks[1] == n_genes  # one gene block: all 9 genes

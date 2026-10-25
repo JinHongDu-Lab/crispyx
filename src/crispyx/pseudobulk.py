@@ -580,7 +580,7 @@ def compute_normalized_effects(
         adata.uns["batch_column"] = batch_name
         adata.uns["batch_ids"] = np.asarray(result.batch_ids, dtype=object)
     _disk_estimate = warn_if_disk_space_low(
-        estimate_bytes(max(len(candidates), 1), n_genes, 1 + len(adata.layers), overhead=1.10),
+        estimate_bytes(max(len(candidates), 1), n_genes, 1 + sum(k is not None for k in adata.layers), overhead=1.10),
         resolved_output, context=log_name,
     )
     _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
@@ -818,7 +818,7 @@ def aggregate_pseudobulk(
             )
         if layer is not None and layer not in backed.layers:
             raise KeyError(
-                f"Layer '{layer}' was not found. Available layers: {list(backed.layers.keys())}"
+                f"Layer '{layer}' was not found. Available layers: {[k for k in backed.layers.keys() if k is not None]}"
             )
         matrix = backed.X if layer is None else backed.layers[layer]
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column).astype(str)

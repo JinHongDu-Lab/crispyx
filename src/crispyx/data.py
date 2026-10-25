@@ -790,7 +790,8 @@ def _anndata_nbytes(adata: ad.AnnData) -> int:
     if adata.raw is not None:
         matrices += [adata.raw.X, adata.raw.var]
     for slot in (adata.layers, adata.obsm, adata.varm, adata.obsp, adata.varp):
-        matrices += list(slot.values())
+        # anndata >= 0.13 also lists X under the key None in .layers.
+        matrices += [value for key, value in slot.items() if key is not None]
     return sum(nbytes(m) for m in matrices if m is not None)
 
 
