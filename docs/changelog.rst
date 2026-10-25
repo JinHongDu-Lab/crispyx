@@ -61,6 +61,12 @@ Version 0.2.2
   and ``check_full_rank`` reads dependent columns off one QR. On Adamson
   this moves results by rounding only (1e-10 relative; the per-comparison
   MAP dispersion, refined to a 1e-4 tolerance, by up to 5e-6).
+* **``crispyx.__version__`` is the running code's version.** It was read
+  from the installed distribution's metadata, so a source checkout run with
+  another crispyx installed reported -- and stamped into its outputs'
+  provenance -- the installed version. The version is now set once, in
+  ``crispyx/_version.py``, which the package and its build metadata both
+  read.
 * **Warnings point at the line that called crispyx.** Each warning named a
   fixed number of frames up, which a helper or the in-memory wrapper made
   land inside crispyx (with an absolute path to its source). Warnings are

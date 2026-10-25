@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.2.2"
+dynamic = ["version"]
 description = "Memory-efficient streaming analysis of large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -69,7 +69,6 @@ docs = [
     "sphinx-copybutton>=0.5",
     "nbsphinx>=0.9",
     "ipykernel>=6.0",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.urls]
@@ -77,6 +76,9 @@ Homepage = "https://github.com/jinhongdu-lab/crispyx"
 Documentation = "https://crispyx.readthedocs.io"
 Repository = "https://github.com/jinhongdu-lab/crispyx"
 "Bug Tracker" = "https://github.com/jinhongdu-lab/crispyx/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "crispyx._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

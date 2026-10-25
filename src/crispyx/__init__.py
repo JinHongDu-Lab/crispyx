@@ -15,12 +15,7 @@ import os
 # Override with NUMBA_THREADING_LAYER=omp if you manage the OMP conflict yourself.
 os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("crispyx")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev"
+from ._version import __version__
 
 # ---------------------------------------------------------------------------
 # Public API re-exports
