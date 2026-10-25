@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import anndata as ad
+import scipy.sparse as sp
 import statsmodels.api as sm
 
 try:  # Optional benchmark dependency for validation comparisons
@@ -1514,6 +1515,22 @@ def _dense_screen(path: Path, groups: list[str], seed: int = 0) -> tuple[Path, n
 
 _NB_KW = dict(perturbation_column="perturbation", control_label="ctrl", verbose=False, n_jobs=1,
               size_factor_method="deseq2")
+
+
+@pytest.mark.filterwarnings("ignore:The input file .* CSC format")
+@pytest.mark.parametrize("storage", ["dense", "csc"])
+def test_nb_glm_refuses_log_transformed_input(tmp_path, storage):
+    """Fitted to log1p values the model runs and returns plausible-looking
+    nonsense (LFC r 0.93 against the fit on the counts, half the spread of z),
+    so it must refuse them before doing any work."""
+    path, counts = _dense_screen(tmp_path / "counts.h5ad", ["ctrl"] * 40 + ["KO1"] * 40)
+    logged = np.log1p(counts)
+    matrix = sp.csc_matrix(logged) if storage == "csc" else logged
+    adata = ad.read_h5ad(path)
+    ad.AnnData(matrix, obs=adata.obs, var=adata.var).write(tmp_path / "log1p.h5ad")
+    with pytest.raises(ValueError, match="nb_glm_test needs raw counts"):
+        nb_glm_test(tmp_path / "log1p.h5ad", output_path=tmp_path / "out.h5ad", **_NB_KW)
+    assert not (tmp_path / "out.h5ad").exists()
 
 
 def test_per_comparison_size_factors_agree_with_global_for_a_single_comparison(tmp_path):

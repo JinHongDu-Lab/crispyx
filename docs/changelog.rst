@@ -1,6 +1,16 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* **``nb_glm_test`` refuses input that is not raw counts.** Given
+  normalised or log-transformed values it ran and returned results that
+  looked plausible but were not: on a log1p copy of 1,716 Adamson cells the
+  log fold changes correlated 0.93 with those from the counts, and the
+  z-scores had half their spread. It now raises before any work, after
+  reading one slice of the matrix.
+
 Version 0.2.2
 -------------
 

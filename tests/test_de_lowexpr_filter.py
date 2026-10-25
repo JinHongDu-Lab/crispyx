@@ -422,7 +422,7 @@ def test_asymmetric_thresholds_reach_nb_glm_test(tmp_path):
 # One meaning for "untested": NaN in every column derived from the comparison
 # ---------------------------------------------------------------------------
 
-def _make_dataset_partly_tested(tmp_path: Path):
+def _make_dataset_partly_tested(tmp_path: Path, *, log_normalise: bool = True):
     """A gene that ``min_cells_expressed`` excludes for KO1 but not for KO2.
 
     Two of the 80 control cells express it, so the control side is not "low"
@@ -446,9 +446,10 @@ def _make_dataset_partly_tested(tmp_path: Path):
     )
     var = pd.DataFrame(index=[f"gene{i}" for i in range(3)])
     adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
-    sc.pp.normalize_total(adata)
-    sc.pp.log1p(adata)
-    adata.X = sp.csr_matrix(adata.X)
+    if log_normalise:
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+        adata.X = sp.csr_matrix(adata.X)
     path = tmp_path / "partly_tested.h5ad"
     adata.write(path)
     return path
@@ -544,7 +545,7 @@ def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
 def test_n_genes_tested_counts_what_the_filters_kept(tmp_path, fn, memory_limit_gb):
     """obs["n_genes_tested"] is the number of finite p-values in each row,
     on every result path."""
-    path = _make_dataset_partly_tested(tmp_path)
+    path = _make_dataset_partly_tested(tmp_path, log_normalise=fn != "nb_glm_test")
     result = getattr(cx, fn)(
         path, output_dir=tmp_path, data_name=fn, memory_limit_gb=memory_limit_gb, **_UNTESTED_KW
     )

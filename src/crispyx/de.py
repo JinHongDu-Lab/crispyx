@@ -56,6 +56,7 @@ from .data import (
     _read_h5_1d,
     write_obs,
     _replace_on_success,
+    _validate_counts_chunk,
 )
 from .glm import (
     NBGLMFitter,
@@ -1837,6 +1838,16 @@ def nb_glm_test(
             "Use the CSR-format standardized file for much better performance.",
             UserWarning,
         )
+
+    # A negative binomial fit to normalised or log-transformed values runs and
+    # returns plausible-looking nonsense, so refuse it up front. Such data is
+    # non-integer throughout; a slice along the fast axis is enough to tell.
+    backed = read_backed(path)
+    try:
+        sample = backed.X[:, :256] if _storage_fmt == "csc" else backed.X[:1024]
+    finally:
+        backed.file.close()
+    _validate_counts_chunk(sample, context="nb_glm_test")
 
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
         # sort_by_perturbation reuses an existing sorted copy only when it
