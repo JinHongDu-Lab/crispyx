@@ -115,13 +115,13 @@ PCA visualization
 
    # Run PCA first (if not already done)
    cx.pp.pca(adata_norm, n_comps=50)
-   
+
    # Plot variance explained per component
    cx.pl.pca_variance_ratio(adata_norm, n_pcs=20)
-   
+
    # PCA scatter colored by perturbation
    cx.pl.pca(adata_norm, color='perturbation', components='1,2')
-   
+
    # Gene loadings for top components
    cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
 
@@ -171,42 +171,33 @@ NB-GLM options
 The negative binomial GLM (``method="nb_glm"``) supports several options:
 
 * **Adaptive chunk size** (default): When ``chunk_size=None`` (the default),
-  crispyx automatically calculates an optimal chunk size based on dataset
-  dimensions and ``memory_limit_gb``. Small/medium datasets use the maximum
-  chunk size (256) for speed, while large memory-constrained datasets use
-  smaller chunks to avoid OOM errors. You can still set ``chunk_size``
-  explicitly to override automatic selection.
+  crispyx calculates the number of cells read per block for the size factors
+  from the dataset's dimensions and ``memory_limit_gb``. You can still set
+  ``chunk_size`` explicitly to override automatic selection.
 
-* **Frozen control mode** (``freeze_control``): For datasets with large control
-  populations (>100K cells), the control matrix can consume 30+ GB of memory.
-  When ``freeze_control=True``, control statistics are pre-computed once and
-  shared across workers via memory-mapped files, reducing per-worker memory
-  from ~32 GB to <1 GB. This enables full parallelization on large datasets.
-  
-  **Auto-detection** (default): When ``freeze_control=None``, crispyx automatically
-  enables frozen control mode when:
-  
-  1. Control matrix exceeds 10 GB (control_n × n_genes × 8 bytes > 10 GB)
-  2. Standard mode would limit parallelization to <4 workers
-  
-  This means large datasets like Feng (110K control cells) automatically use
-  frozen control mode without user intervention, while smaller datasets maintain
-  full flexibility.
+* **Dispersions, per comparison**: each perturbation is tested against the
+  controls with DESeq2's estimator run on that comparison's cells, as
+  PyDESeq2 does when run per perturbation: gene-wise Cox-Reid dispersions, a
+  mean-dispersion trend, maximum a posteriori dispersions under a log-normal
+  prior around it (genes far above the trend keep their gene-wise value), then
+  the Wald test. Given the same size factors the statistics agree with
+  PyDESeq2's to about 0.001 in z. Cook's distance outlier replacement is not
+  done: on four Adamson perturbations against 7,629 controls, PyDESeq2's
+  replaced outliers in 4-15 of ~18,800 genes, moved z by more than 0.5 in
+  2-14 and changed the hits at q < 0.1 by 0-3. Without covariates the controls are summarised once, in one
+  streaming pass, so a comparison costs its own cells only (about half a
+  second on 32 cores for a genome-wide screen's perturbation) and controls of
+  any size fit. With ``covariates`` (or ``lfc_shrinkage_type="apeglm"``) each
+  comparison is fitted on all its cells, with the controls held in memory;
+  controls too large for that raise ``MemoryError``, and aggregating to
+  pseudo-bulk first (``cx.pb.aggregate``) is the way through. ``dispersion``
+  fixes one value for every gene; ``shrink_dispersion=False`` tests at the
+  gene-wise estimates.
 
-* **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior 
-  shrinkage to log-fold changes using ``shrink_lfc()`` after running 
-  ``nb_glm_test()``. This preserves large effects while shrinking 
+* **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior
+  shrinkage to log-fold changes using ``shrink_lfc()`` after running
+  ``nb_glm_test()``. This preserves large effects while shrinking
   small/uncertain effects toward zero.
-
-* **Dispersion scope** (``dispersion_scope``): ``"global"`` (the default)
-  estimates each gene's dispersion once and uses it in every comparison -- from
-  all cells without covariates, and from the control cells with the covariate
-  design when ``covariates`` are given. ``"per_comparison"`` runs DESeq2's
-  estimator on each comparison's cells (the controls and one perturbation), as
-  PyDESeq2 does when run per perturbation. Without covariates the controls are
-  summarised once, so a comparison costs its own cells only (about half a
-  second on 32 cores for a genome-wide screen's perturbation) and controls too
-  large for memory are streamed.
 
 * **Size factors** (``size_factor_method``, ``size_factors``): see
   :ref:`size-factors` below.
@@ -235,15 +226,15 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   ``output_path`` changes what an earlier result object returns; copy the
   values (``np.asarray``) first if you need both.
 
-* **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
-  ``uns["rank_genes_groups"]`` structure for interoperability with 
-  ``sc.get.rank_genes_groups_df()`` and similar utilities. This option is 
+* **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible
+  ``uns["rank_genes_groups"]`` structure for interoperability with
+  ``sc.get.rank_genes_groups_df()`` and similar utilities. This option is
   available for ``t_test()``, ``wilcoxon_test()``, and ``nb_glm_test()``.
   Default is ``False`` for performance.
 
 .. code-block:: python
 
-   # NB-GLM, one dispersion per gene shared by every comparison (the default)
+   # NB-GLM, DESeq2's dispersions estimated per comparison
    adata_de = cx.tl.rank_genes_groups(
        adata_ro,
        perturbation_column="perturbation",
@@ -356,7 +347,13 @@ override it; pass 0.5 to match a default PyDESeq2 or DESeq2 run.
   (``dds.obs["size_factors"]``, ``sizeFactors(dds) <- ...``) and the same
   floor (``min_mu`` / ``minmu``); a per-perturbation PyDESeq2 run otherwise
   recomputes the factors on each comparison's cells, and that difference,
-  not the estimator, then dominates the comparison.
+  not the estimator, then dominates the comparison. Set crispyx's
+  expression filters to 0 (``min_pct_ctrl``, ``min_pct_pert``,
+  ``min_mean_ctrl``, ``min_mean_pert``, ``min_cells_ctrl``,
+  ``min_cells_pert``, ``min_total_count``) so the same genes are tested, and
+  compare p-values: crispyx's ``pvalue_adj`` is Benjamini-Hochberg per
+  perturbation without DESeq2's independent filtering, and Cook's outliers
+  are not replaced (``refit_cooks=False``, ``cooks_filter=False``).
 
 The comparison uses two datasets' control cells and one seed; a benchmark
 across the real screens (and their pseudo-bulk forms) is planned.
@@ -375,7 +372,7 @@ best practices:
        adata_ro,
        perturbation_column="perturbation",
    )
-   
+
    # Step 2: Apply LFC shrinkage
    shrunk = cx.shrink_lfc(
        result.result_path,

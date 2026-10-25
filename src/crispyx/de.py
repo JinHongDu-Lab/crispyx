@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-from types import SimpleNamespace
 import dataclasses
 import logging
 import os
@@ -30,8 +29,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import h5py
-from scipy.linalg import cho_factor, cho_solve
-from scipy.stats import norm, rankdata, t as t_dist
+from scipy.stats import rankdata, t as t_dist
 
 from .data import (
     accepts_in_memory,
@@ -59,29 +57,15 @@ from .data import (
     _validate_counts_chunk,
 )
 from .glm import (
-    NBGLMFitter,
-    NBGLMBatchFitter,
-    ControlStatisticsCache,
     build_design_matrix,
     check_full_rank,
-    estimate_glm_map_dispersion,
-    fit_nb_glm_batch_auto,
+    fit_glm_deseq2,
     fit_two_group_deseq2,
     summarize_controls,
-    estimate_covariate_effects_streaming,
-    estimate_dispersion_map,
-    estimate_global_dispersion_streaming,
-    fit_dispersion_trend,
-    precompute_control_statistics,
-    precompute_control_statistics_streaming,
-    precompute_global_dispersion,
-    precompute_global_dispersion_from_path,
-    shrink_dispersions,
     shrink_lfc_apeglm,
     shrink_lfc_apeglm_from_stats,
     _estimate_apeglm_prior_scale,
     _apeglm_prior_scale_from_blocks,
-    _FROZEN_WORK_BYTES,
 )
 from ._kernels import (
     _presort_control_nonzeros,
@@ -114,8 +98,6 @@ from ._size_factors import (
 from ._statistics import (
     _tie_correction,
     _adjust_pvalue_matrix,
-    _compute_se_batched,
-    _compute_mom_dispersion_batched,
     _low_expr_in_both_mask,
     _nonestimable_glm_mask,
 )
@@ -502,7 +484,6 @@ def _uns_value(uns: h5py.Group, key: str, default=None):
 
 # Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
 # cannot estimate its dispersion for the shared, control-fitted value.
-_MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION = 10
 
 
 def _global_size_factors(
@@ -516,28 +497,6 @@ def _global_size_factors(
     if method == "deseq2":
         return _control_reference_size_factors(path, labels, control_label, chunk_size=chunk_size)
     raise ValueError(f"size_factor_method must be 'libsize', 'geomeans' or 'deseq2', not {method!r}")
-
-
-def _fit_at_global_dispersion(design, counts, global_dispersion, **fit_kwargs):
-    """:func:`fit_nb_glm_batch_auto` with each gene's dispersion held at
-    ``global_dispersion``; genes where it is NaN (too sparse among the
-    controls) have theirs estimated within this comparison instead."""
-    if global_dispersion is None or np.isfinite(global_dispersion).all():
-        return fit_nb_glm_batch_auto(design, counts, fixed_dispersion=global_dispersion, **fit_kwargs)
-    free = ~np.isfinite(global_dispersion)
-    n_genes, p = counts.shape[1], design.shape[1]
-    merged = SimpleNamespace(
-        coef=np.full((n_genes, p), np.nan), se=np.full((n_genes, p), np.nan),
-        converged=np.zeros(n_genes, dtype=bool), n_iter=np.zeros(n_genes, dtype=np.int64),
-        dispersion=np.full(n_genes, np.nan),
-    )
-    for columns, fixed in ((~free, global_dispersion[~free]), (free, None)):
-        if not columns.any():
-            continue
-        fit = fit_nb_glm_batch_auto(design, counts[:, columns], fixed_dispersion=fixed, **fit_kwargs)
-        for field in ("coef", "se", "converged", "n_iter", "dispersion"):
-            getattr(merged, field)[columns] = getattr(fit, field)
-    return merged
 
 
 def _resolve_candidates(
@@ -607,7 +566,7 @@ _OPERATIONAL_ARGS = frozenset({
     "data", "verbose", "resume", "checkpoint_interval", "n_jobs",
     "profiling", "force", "output_path", "output_dir", "data_name",
     "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
-    "cell_chunk_size", "chunk_size", "irls_batch_size",
+    "cell_chunk_size", "chunk_size",
 })
 
 
@@ -644,13 +603,13 @@ def _t_test_disk_bytes(n_groups: int, n_genes: int) -> float:
 
 
 def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
-    # partial: 10 f64 matrices + pts/iterations (4 B) + converged (1 B)
-    # output (upper bound): X, z, p, padj, intercept, se, 2 ln-scale, a raw
-    # LFC and 3 per-comparison dispersion layers (8 B) + pts (4 B) + 2 small
+    # partial and output alike (upper bound): X, z, p, padj, intercept, se,
+    # 2 ln-scale, a raw LFC and 3 dispersion layers (8 B) + pts (4 B) +
+    # converged (1 B)
     return (
-        estimate_bytes(n_groups, n_genes, itemsize=8) * 22
-        + estimate_bytes(n_groups, n_genes, itemsize=4) * 3
-        + estimate_bytes(n_groups, n_genes, itemsize=1) * 3
+        estimate_bytes(n_groups, n_genes, itemsize=8) * 24
+        + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+        + estimate_bytes(n_groups, n_genes, itemsize=1) * 2
     )
 
 
@@ -1445,18 +1404,13 @@ def nb_glm_test(
     size_factor_method: Literal["libsize", "geomeans", "deseq2"] = "libsize",
     # ---- Dispersion parameters ----
     dispersion: float | None = None,
-    dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
-    dispersion_scope: Literal["global", "per_comparison"] = "global",
-    use_map_dispersion: bool = True,
     shrink_dispersion: bool = True,
     # ---- Optimization parameters ----
-    optimization_method: Literal["irls", "lbfgsb"] = "lbfgsb",
-    max_iter: int = 25,
-    tol: float = 1e-6,
+    max_iter: int = 100,
+    tol: float = 1e-8,
     min_mu: float | None = None,
     poisson_init_iter: int = 5,
     chunk_size: int | None = None,
-    irls_batch_size: int | None = 128,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
@@ -1466,12 +1420,10 @@ def nb_glm_test(
     min_mean_ctrl: float = 0.05,
     min_mean_pert: float = 0.005,
     min_total_count: float = 1.0,
-    cook_filter: bool = False,
     # ---- Output parameters ----
     lfc_shrinkage_type: Literal["apeglm", "none"] = "none",
     lfc_base: Literal["log2", "ln"] = "log2",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
-    se_method: Literal["sandwich", "fisher"] = "sandwich",
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
@@ -1484,8 +1436,6 @@ def nb_glm_test(
     memory_limit_gb: float | None = None,
     max_dense_fraction: float = 0.3,
     n_jobs: int | None = None,
-    use_control_cache: bool = True,
-    freeze_control: bool | None = None,
     force: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform negative binomial GLM differential expression test.
@@ -1556,45 +1506,20 @@ def nb_glm_test(
         factor does not depend on the perturbations in the file or the one
         compared.
     dispersion
-        Fixed NB dispersion used for every gene and comparison. If None, it is
-        estimated (see ``dispersion_scope``).
-    dispersion_method
-        Method for estimating dispersion when ``dispersion`` is None.
-
-        - ``"moments"``: Method-of-moments (fast but less accurate).
-        - ``"cox-reid"``: Cox-Reid adjusted profile likelihood (slower but more
-          accurate, similar to DESeq2). This is the default.
-    dispersion_scope
-        Scope for dispersion estimation.
-
-        - ``"global"`` (default): Estimate each gene's dispersion once and use it in
-          every comparison. Without covariates it is estimated from all cells;
-          with covariates, from the control cells fitted with the covariates
-          (DESeq2's MAP step), and each comparison is then one fit at that fixed
-          dispersion. This is many times faster than per-comparison estimation and
-          suits CRISPR screens, where perturbation effects are small relative to
-          baseline expression. Per-comparison size factors keep per-comparison
-          dispersion.
-        - ``"per_comparison"``: Estimate dispersion separately for each control +
-          perturbation comparison. More accurate when perturbations cause large
-          changes in gene expression variance, but significantly slower.
-    use_map_dispersion
-        If True (default), use MAP dispersion estimation with mean-dispersion trend.
-        If False, use MLE dispersion without trend-based shrinkage.
+        Fixed NB dispersion used for every gene and comparison. If None (the
+        default), each comparison estimates its own as DESeq2 does on the
+        control and perturbed cells: gene-wise Cox-Reid dispersions, a
+        mean-dispersion trend, and maximum a posteriori dispersions under a
+        log-normal prior around it. Without covariates the controls enter
+        through a one-pass summary, so a comparison costs its own cells.
     shrink_dispersion
-        If True, fit a mean-dispersion trend and shrink gene-wise dispersions
-        toward the trend using an empirical Bayes prior.
-    optimization_method
-        Method for coefficient optimization.
-
-        - ``"lbfgsb"``: L-BFGS-B optimization (PyDESeq2 style, default). Directly
-          optimizes the negative binomial log-likelihood.
-        - ``"irls"``: Iteratively Reweighted Least Squares (Fisher scoring). The
-          classic GLM fitting approach.
-    max_iter
-        Maximum iterations for GLM fitting.
-    tol
-        Convergence tolerance for GLM fitting.
+        If True (default), test at the MAP dispersions (genes far above the
+        trend keep their gene-wise one, as in DESeq2); if False, at the
+        gene-wise ones.
+    max_iter, tol
+        IRLS iterations and convergence tolerance for designs with covariates
+        (PyDESeq2: 250 and 1e-8). Without covariates the two-group fit
+        converges to 1e-10 in at most 250 steps.
     min_mu
         Floor on fitted means: means are held at ``max(min_mu, mean)`` while
         fitting (DESeq2's ``minmu``). DESeq2 uses 0.5 for bulk counts and
@@ -1608,12 +1533,8 @@ def nb_glm_test(
     poisson_init_iter
         Initial Poisson iterations before switching to negative binomial.
     chunk_size
-        Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
+        Number of cells read per block when computing size factors. Smaller
         values stream more, reducing peak memory at the cost of additional I/O.
-    irls_batch_size
-        Maximum number of genes to densify per IRLS step. Keep this small to
-        limit per-iteration memory when working with large sparse matrices. Set
-        to ``None`` to process each chunk without additional batching.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
@@ -1650,8 +1571,6 @@ def nb_glm_test(
         95% of control cells is plainly visible there. ``lfc_shrinkage_type``
         does not change this: an excluded pair is dropped before any fit, so
         it stays ``NaN`` under ``"apeglm"`` as well.
-    cook_filter
-        Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
         Type of log-fold change shrinkage to apply.
 
@@ -1669,13 +1588,6 @@ def nb_glm_test(
         Wald statistics remain unchanged since both LFC and SE are scaled equally.
     corr_method
         Method for p-value correction: ``"benjamini-hochberg"`` or ``"bonferroni"``.
-    se_method
-        Method for computing standard errors.
-
-        - ``"sandwich"`` (default): Sandwich estimator SE = sqrt(c' @ H @ M @ H @ c).
-          More robust to model misspecification.
-        - ``"fisher"``: Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
-          Matches PyDESeq2's approach for better p-value parity.
     data_name
         Custom name for output file. If None, uses "nb_glm" suffix.
     output_path
@@ -1709,57 +1621,18 @@ def nb_glm_test(
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
         <1000, 50 for larger).
     memory_limit_gb
-        Optional memory limit in GB. If provided, this is used together with
-        available system memory to determine when to switch to streaming mode
-        for global dispersion estimation. The effective limit is
-        min(available_memory, memory_limit_gb). Default is None (use system memory only).
+        Memory limit in GB; the effective limit is
+        min(available memory, memory_limit_gb). Default None (system memory).
+        It sizes the parallel workers of a design with covariates, which hold
+        the control cells in memory.
     max_dense_fraction
-        Maximum fraction of available memory to use for dense matrix operations.
-        If the estimated memory for densifying the full cell×gene matrix exceeds
-        max_dense_fraction × min(available_memory, memory_limit_gb), the function
-        switches to streaming mode. Default is 0.3 (30% of available memory).
+        Largest share of the memory limit the dense control cells may take,
+        times four, in a design with covariates (or with apeGLM shrinkage);
+        beyond it ``MemoryError`` is raised. Default 0.3.
     n_jobs
-        Number of parallel workers for fitting GLMs across perturbations.
-        If None, uses all available cores. If 1, runs sequentially.
-        If -1, uses all available cores.
-    use_control_cache
-        If True (default), precompute control cell statistics (intercept, weights,
-        XᵀWX contributions) once and reuse them across all perturbation comparisons.
-        This can significantly reduce memory and computation time when there are
-        many perturbations and the control group is large. Only applies when
-        no covariates are specified.
-    freeze_control
-        Whether to use frozen control sufficient statistics instead of raw control
-        matrix for parallel fitting. This dramatically reduces per-worker memory
-        from ~5GB to ~1MB for large datasets, enabling more parallel workers.
-        
-        - None (default): Auto-detect based on dataset size. Frozen control is
-          enabled when control_matrix serialization would limit workers to <4,
-          AND the required settings (dispersion_scope='global', shrink_dispersion=True)
-          are met. For most large datasets (>500K cells), this auto-enables.
-        - True: Force frozen control mode. Raises ValueError if requirements not met.
-        - False: Disable frozen control (use raw control matrix).
-
-        The mode used is recorded in ``uns["frozen_control"]`` of the result.
-        With ``None``, an existing result is reused whichever mode the run
-        that wrote it chose; pass ``True`` or ``False`` to require one.
-        
-        Memory efficiency: Per-worker pickle size is reduced from (control_n × n_genes × 8)
-        bytes to just ~1MB of sufficient statistics (W_sum, Wz_sum arrays).
-        
-        Example: For Replogle-GW-k562 (75K control cells × 8K genes):
-        - Without freeze_control: ~4.7 GB per worker → 2 workers max @ 128GB
-        - With freeze_control: ~1 MB per worker → 32 workers @ 128GB
-        - Time reduction: ~300 hours → ~10 hours
-        
-        Requirements (enforced when True, auto-checked when None):
-        - dispersion_scope="global" (per-comparison dispersion needs raw matrix)
-        - shrink_dispersion=True (ensures global dispersion is computed)
-        - use_control_cache=True (required for caching)
-        
-        Technical note: The intercept (β₀) is frozen to the control-only estimate.
-        This is valid because control cells have perturbation indicator = 0, so
-        μ_control = exp(β₀ + offset) is independent of the perturbation effect.
+        Number of cores. Without covariates the comparisons run in turn, each
+        parallel over genes; with covariates, in parallel worker processes.
+        If None or -1, uses all available cores; 1 runs sequentially.
     force
         If True, rerun the analysis even when the output h5ad file already
         exists. If False (default), an existing result is loaded instead of
@@ -1777,16 +1650,31 @@ def nb_glm_test(
         The h5ad file holds one row per perturbation. ``X`` is the fold
         change in ``lfc_base`` (shrunk under ``lfc_shrinkage_type="apeglm"``).
         Layers: ``z_score``, ``pvalue``, ``pvalue_adj``, ``standard_error``,
-        ``intercept`` (ln scale), ``pts``, ``converged`` (bool) and
-        ``iterations`` (integer); ``logfoldchange_raw`` holds the MLE fold
-        change only when ``X`` is shrunk, and with a log2 base
-        ``logfoldchange_raw_ln`` / ``standard_error_ln`` keep the ln-scale
-        values :func:`shrink_lfc` needs. Per-gene quantities are ``var``
-        columns: ``pts_rest``, and, when a global dispersion is fitted,
-        ``dispersion`` and ``dispersion_trend``; a per-comparison dispersion
-        is stored as the layers ``dispersion``, ``dispersion_raw`` and
-        ``dispersion_trend`` instead. ``obs["n_genes_tested"]`` counts the
-        genes each perturbation was tested on, after the filters.
+        ``intercept`` (ln scale), ``pts``, ``converged`` (bool), and the
+        dispersions each comparison tested at (``dispersion``), its gene-wise
+        estimates (``dispersion_raw``) and trend (``dispersion_trend``);
+        ``logfoldchange_raw`` holds the MLE fold change only when ``X`` is
+        shrunk, and with a log2 base ``logfoldchange_raw_ln`` /
+        ``standard_error_ln`` keep the ln-scale values :func:`shrink_lfc`
+        needs. ``var["pts_rest"]`` is the controls' fraction of expressing
+        cells. ``obs["n_genes_tested"]`` counts the genes each perturbation
+        was tested on, after the filters.
+
+    Notes
+    -----
+    To reproduce PyDESeq2 (or DESeq2) run on one perturbation and the
+    controls with ``~ condition`` (or ``~ covariates + condition``): give
+    both the same size factors (``size_factors=`` here,
+    ``dds.obs["size_factors"]`` / ``sizeFactors(dds)`` there; DESeq2's own
+    are recomputed on each comparison's cells), the same mean floor
+    (``min_mu``; PyDESeq2's default is 0.5), and set the expression filters
+    to 0 (``min_pct_ctrl``, ``min_pct_pert``, ``min_mean_ctrl``,
+    ``min_mean_pert``, ``min_cells_ctrl``, ``min_cells_pert``,
+    ``min_total_count``) so the same genes are tested. Compare p-values
+    rather than ``pvalue_adj``: crispyx applies Benjamini-Hochberg per
+    perturbation without DESeq2's independent filtering, and it does not
+    replace Cook's distance outliers (``refit_cooks=False``,
+    ``cooks_filter=False`` there).
     """
     # A one-shot iterable would be fingerprinted by its repr and then used up.
     if perturbations is not None:
@@ -1942,16 +1830,8 @@ def nb_glm_test(
 
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
-    # =========================================================================
-    # Independent fitting mode: per-perturbation approach
-    # =========================================================================
-    beta_cov = None
-    beta_intercept = None
-    global_dispersion = None
-    global_dispersion_trend = None
-
     # -------------------------------------------------------------------------
-    # Worker function for parallel fitting of a single perturbation group
+    # One comparison with covariates (or apeGLM shrinkage), on its cells
     # -------------------------------------------------------------------------
     def _fit_perturbation_worker(
         group_idx: int,
@@ -1961,11 +1841,11 @@ def nb_glm_test(
         control_mask: np.ndarray,
         control_matrix: np.ndarray | sp.csr_matrix,
         control_expr_counts: np.ndarray,
+        control_total: np.ndarray,
         control_n: int,
         obs_df: pd.DataFrame,
         covariates: list[str],
         size_factors: np.ndarray,
-        offset: np.ndarray,
         n_genes: int,
         min_cells_expressed: int,
         min_pct_ctrl: float,
@@ -1979,107 +1859,50 @@ def nb_glm_test(
         tol: float,
         min_mu: float,
         poisson_init_iter: int,
-        dispersion_method: str,
-        global_dispersion: np.ndarray | None,
+        dispersion: float | None,
         shrink_dispersion: bool,
-        use_map_dispersion: bool,
         lfc_shrinkage_type: str,
-        pts_rest_shared: np.ndarray,
-        se_method: str = "sandwich",
     ) -> dict:
-        """Fit NB-GLM for a single perturbation group and return results."""
+        """One perturbation against the controls, fitted on their cells with the
+        design ``~ covariates + perturbation`` (glm.fit_glm_deseq2); the same
+        result as the two-group worker, natural-log LFC and SE."""
         group_mask = np.zeros(control_mask.shape[0], dtype=bool)
         group_mask[group_rows] = True
         subset_mask = control_mask | group_mask
-        subset_obs = obs_df.iloc[subset_mask]
-        indicator = group_mask[subset_mask].astype(np.float64)
-        
-        subset_size_factors = np.asarray(size_factors)[subset_mask]
-        subset_offset = offset[subset_mask] if offset is not None else np.log(np.clip(subset_size_factors, 1e-8, None))
-        
         design, design_columns = build_design_matrix(
-            subset_obs,
+            obs_df.iloc[subset_mask],
             covariate_columns=covariates,
-            perturbation_indicator=indicator,
+            perturbation_indicator=group_mask[subset_mask].astype(np.float64),
             intercept=True,
         )
         if covariates:
             check_full_rank(design, design_columns, f"nb_glm_test, comparison {label!r} vs control")
-        perturbation_column_index = design_columns.index("perturbation")
-        
-        control_subset_mask = control_mask[subset_mask]
-        group_subset_mask = group_mask[subset_mask]
-        group_n = int(group_subset_mask.sum())
-        subset_n = int(subset_mask.sum())
-        n_control = int(control_subset_mask.sum())
+        test_column = design_columns.index("perturbation")
+        subset_size_factors = np.asarray(size_factors)[subset_mask]
 
-        # Load perturbation group cells
-        # Use slice-based access if file is sorted, otherwise use mask
+        # A slice on a file sorted by perturbation (one contiguous read), else
+        # ascending row indices; either way in the subset's row order.
         backed = read_backed(path)
         try:
-            # A slice on a file sorted by perturbation (one contiguous read),
-            # else ascending row indices.
             group_matrix = backed.X[group_rows, :]
-            if sp.issparse(group_matrix):
-                group_matrix = sp.csr_matrix(group_matrix, dtype=np.float64)
-            else:
-                group_matrix = np.asarray(group_matrix, dtype=np.float64)
         finally:
             backed.file.close()
+        group = np.asarray(group_matrix.toarray() if sp.issparse(group_matrix) else group_matrix, dtype=np.float64)
+        counts = np.empty((int(subset_mask.sum()), n_genes), dtype=np.float64)
+        counts[control_mask[subset_mask]] = (
+            control_matrix.toarray() if sp.issparse(control_matrix) else control_matrix
+        )
+        counts[group_mask[subset_mask]] = group
 
-        # Combine control and group matrices
-        if sp.issparse(control_matrix) and sp.issparse(group_matrix):
-            stacked = sp.vstack([control_matrix, group_matrix])
-            reorder = np.empty(subset_n, dtype=np.int32)
-            reorder[np.where(control_subset_mask)[0]] = np.arange(n_control)
-            reorder[np.where(group_subset_mask)[0]] = np.arange(n_control, n_control + group_n)
-            subset_matrix = sp.csr_matrix(stacked[reorder, :])
-        else:
-            if sp.issparse(control_matrix):
-                ctrl = control_matrix.toarray()
-            else:
-                ctrl = control_matrix
-            if sp.issparse(group_matrix):
-                grp = group_matrix.toarray()
-            else:
-                grp = group_matrix
-            stacked = np.vstack([ctrl, grp])
-            reorder = np.empty(subset_n, dtype=np.int32)
-            reorder[np.where(control_subset_mask)[0]] = np.arange(n_control)
-            reorder[np.where(group_subset_mask)[0]] = np.arange(n_control, n_control + group_n)
-            subset_matrix = stacked[reorder, :]
-
-        # Compute expression counts
-        if sp.issparse(group_matrix):
-            group_expr_counts = np.asarray(group_matrix.getnnz(axis=0)).ravel()
-        else:
-            group_expr_counts = np.sum(group_matrix > 0, axis=0)
-
-        # Per-group means in size-factor-normalised count units. These feed
-        # both the per-condition low-expression filter and ``result["mean"]``
-        # below; computing them once avoids a duplicate matrix pass.
-        if sp.issparse(group_matrix):
-            group_mean = (
-                np.asarray(group_matrix.sum(axis=0)).ravel() / max(group_n, 1)
-            )
-        else:
-            group_mean = np.asarray(group_matrix.sum(axis=0)).ravel() / max(group_n, 1)
-
-        if sp.issparse(control_matrix):
-            control_mean_raw = (
-                np.asarray(control_matrix.sum(axis=0)).ravel() / max(control_n, 1)
-            )
-        else:
-            control_mean_raw = np.asarray(control_matrix.sum(axis=0)).ravel() / max(control_n, 1)
-
-        total_expr_counts = control_expr_counts + group_expr_counts
-        valid_mask = total_expr_counts >= min_cells_expressed
-        # Per-condition low-expression filter (jointly low in BOTH groups)
-        low_both = _low_expr_in_both_mask(
+        group_n = group.shape[0]
+        group_expr_counts = np.count_nonzero(group, axis=0)
+        group_total = group.sum(axis=0)
+        valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
+        valid &= ~_low_expr_in_both_mask(
             pert_expr_counts=group_expr_counts,
             control_expr_counts=control_expr_counts,
-            pert_mean=group_mean,
-            control_mean=control_mean_raw,
+            pert_mean=group_total / max(group_n, 1),
+            control_mean=control_total / max(control_n, 1),
             n_pert_cells=group_n,
             n_control_cells=control_n,
             min_pct_ctrl=min_pct_ctrl,
@@ -2087,702 +1910,63 @@ def nb_glm_test(
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
         )
-        valid_mask = valid_mask & ~low_both
         # A pair with no counts in one arm has no finite effect to estimate;
-        # see _nonestimable_glm_mask.  Excluded here rather than fitted, so it
+        # see _nonestimable_glm_mask. Excluded here rather than fitted, so it
         # is reported as untested instead of carrying a bound-determined
         # effect and an artefactual p-value into the FDR correction.
-        valid_mask = valid_mask & ~_nonestimable_glm_mask(
+        valid &= ~_nonestimable_glm_mask(
             pert_expr_counts=group_expr_counts,
             control_expr_counts=control_expr_counts,
             min_cells_ctrl=min_cells_ctrl,
             min_cells_pert=min_cells_pert,
         )
-        valid_indices = np.where(valid_mask)[0]
-
-        # Initialize result arrays
+        valid &= (control_total + group_total) >= min_total_count
+        fit = fit_glm_deseq2(
+            design, counts, subset_size_factors, test_column, np.flatnonzero(valid),
+            dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
+            max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter,
+        )
+        tested = fit.converged & np.isfinite(fit.statistic)
+        lfc = np.where(tested, fit.lfc, np.nan)
+        se = np.where(tested, fit.se, np.nan)
         result = {
             "group_idx": group_idx,
-            "n_tested": int(valid_mask.sum()),
-            "effect": np.full(n_genes, np.nan, dtype=np.float64),
-            "statistic": np.full(n_genes, np.nan, dtype=np.float64),
-            "pvalue": np.full(n_genes, np.nan, dtype=np.float64),
-            "logfc": np.full(n_genes, np.nan, dtype=np.float64),
-            "logfc_raw": np.full(n_genes, np.nan, dtype=np.float64),
-            "intercept": np.full(n_genes, np.nan, dtype=np.float64),  # MLE intercept for shrink_lfc
-            "se": np.full(n_genes, np.nan, dtype=np.float64),
-            "pts": np.zeros(n_genes, dtype=np.float32),
-            "pts_rest": np.zeros(n_genes, dtype=np.float32),
-            "dispersion": np.full(n_genes, np.nan, dtype=np.float64),
-            "dispersion_raw": np.full(n_genes, np.nan, dtype=np.float64),
-            "dispersion_trend": np.full(n_genes, np.nan, dtype=np.float64),
-            "mean": np.zeros(n_genes, dtype=np.float64),
-            "iterations": np.zeros(n_genes, dtype=np.int32),
-            "converged": np.zeros(n_genes, dtype=bool),
+            "n_tested": int(valid.sum()),
+            "statistic": np.where(tested, fit.statistic, np.nan),
+            "pvalue": np.where(tested, fit.pvalue, np.nan),
+            "logfc": lfc,
+            "logfc_raw": lfc.copy(),
+            "intercept": np.where(tested, fit.intercept, np.nan),
+            "se": se,
+            # Fractions of expressing cells describe the data, not a fit, so
+            # they are reported for every gene, the untested ones included: a
+            # pair expressed in 0% of perturbed and 95% of control cells is a
+            # complete knockdown whose effect is not estimable.
+            "pts": (group_expr_counts / max(group_n, 1)).astype(np.float32),
+            "dispersion": fit.dispersion,
+            "dispersion_raw": fit.genewise_dispersion,
+            "dispersion_trend": fit.trend,
+            "converged": fit.converged,
         }
-
-        # Compute pts
-        pts = np.divide(
-            group_expr_counts,
-            group_n,
-            out=np.zeros(n_genes, dtype=np.float32),
-            where=group_n > 0,
-        )
-        # Fractions of expressing cells are descriptions of the data, not
-        # inferences from a fit, so they are reported for every gene including
-        # the ones no effect is estimated for.  A pair expressed in 0% of
-        # perturbed and 95% of control cells is a complete knockdown whose
-        # effect is not estimable (see _nonestimable_glm_mask); zeroing these
-        # would leave nothing to see it by.
-        result["pts"] = pts.astype(np.float32)
-        result["pts_rest"] = pts_rest_shared.astype(np.float32)
-
-        # Compute mean expression
-        if sp.issparse(subset_matrix):
-            normalized = subset_matrix.multiply(1.0 / subset_size_factors[:, None])
-            mean_expr = np.asarray(normalized.sum(axis=0)).ravel() / subset_n
-        else:
-            normalized = subset_matrix / subset_size_factors[:, None]
-            mean_expr = normalized.sum(axis=0) / subset_n
-        result["mean"] = mean_expr
-
-        if not np.any(valid_mask):
-            return result
-
-        # Fit valid genes
-        fit_matrix = subset_matrix[:, valid_mask]
-        
-        # A categorical covariate (batch, donor, lane) is one-hot encoded into
-        # the design, which makes the per-gene Hessian arrowhead-structured.
-        # fit_nb_glm_batch_auto takes the structured path when the number of
-        # levels makes it worthwhile and the dense path otherwise; either way
-        # the result is in the column order of `design`.  The intercept and the
-        # perturbation column are protected from the group block because the
-        # perturbation coefficient is the quantity under test and must not be
-        # subject to the group-coefficient clip.
-        batch_result = _fit_at_global_dispersion(
-            design,
-            fit_matrix,
-            None if global_dispersion is None else global_dispersion[valid_mask],
-            offset=subset_offset,
-            protected_columns=(0, perturbation_column_index),
-            max_iter=max_iter,
-            tol=tol,
-            poisson_init_iter=poisson_init_iter,
-            dispersion_method=dispersion_method,
-            min_mu=min_mu,
-            min_total_count=min_total_count,
-        )
-
-        # Extract results
-        result["converged"][valid_indices] = batch_result.converged
-        result["iterations"][valid_indices] = batch_result.n_iter
-        result["dispersion_raw"][valid_indices] = batch_result.dispersion
-
-        coefs = batch_result.coef[:, perturbation_column_index]
-        ses = batch_result.se[:, perturbation_column_index]
-        intercepts = batch_result.coef[:, 0]  # Intercept is always first column
-
-        valid_results = (
-            batch_result.converged
-            & np.isfinite(coefs)
-            & np.isfinite(ses)
-            & (ses > 0)
-        )
-        
-        for local_idx, gene_idx in enumerate(valid_indices):
-            if not valid_results[local_idx]:
-                continue
-            coef = coefs[local_idx]
-            se = ses[local_idx]
-            statistic = coef / se
-            pvalue = float(2.0 * norm.sf(abs(statistic)))
-            result["statistic"][gene_idx] = statistic
-            result["pvalue"][gene_idx] = pvalue
-            result["logfc"][gene_idx] = coef
-            result["se"][gene_idx] = se
-            result["intercept"][gene_idx] = intercepts[local_idx]  # Store fitted intercept
-
-        # Handle dispersion
-        if global_dispersion is not None:
-            # genes the controls could not estimate keep this comparison's
-            used = np.where(np.isfinite(global_dispersion), global_dispersion, result["dispersion_raw"])
-            result["dispersion_raw"][:] = used
-            result["dispersion"][:] = used
-            result["dispersion_trend"][:] = used
-        elif shrink_dispersion:
-            trend = fit_dispersion_trend(result["mean"], result["dispersion_raw"])
-            result["dispersion_trend"] = trend
-            if use_map_dispersion:
-                # Use PyDESeq2-style MAP estimation with proper fitted values
-                # First, compute mu from the fitted model coefficients
-                if sp.issparse(subset_matrix):
-                    Y = np.asarray(subset_matrix.todense(), dtype=np.float64)
-                else:
-                    Y = np.asarray(subset_matrix, dtype=np.float64)
-                
-                # Get fitted values from the model: mu = exp(X @ beta + offset)
-                # batch_result.coef has shape (n_valid_genes, n_design_cols)
-                # design has shape (n_cells, n_design_cols)
-                n_subset = subset_n
-                mu = np.zeros((n_subset, n_genes), dtype=np.float64)
-                
-                # For valid genes, compute mu from fitted coefficients
-                for local_idx, gene_idx in enumerate(valid_indices):
-                    if batch_result.converged[local_idx]:
-                        # eta = X @ beta + offset
-                        eta = design @ batch_result.coef[local_idx, :] + subset_offset
-                        mu[:, gene_idx] = np.exp(np.clip(eta, -30, 30))
-                
-                # For invalid genes, use normalized counts as fallback
-                invalid_genes = ~np.isin(np.arange(n_genes), valid_indices[batch_result.converged])
-                if np.any(invalid_genes):
-                    mu[:, invalid_genes] = Y[:, invalid_genes] / subset_size_factors[:, None]
-                
-                mu = np.maximum(mu, 1e-10)
-                # Use PyDESeq2-style bounds: max(10, n_cells)
-                max_disp = max(10.0, float(n_subset))
-                disp_map = estimate_dispersion_map(
-                    Y, mu, trend, design=design, max_disp=max_disp
-                )
-                result["dispersion"] = disp_map
-                
-                # CRITICAL: Recompute SE using MAP dispersion (PyDESeq2 style)
-                # SE from IRLS was computed using MoM dispersion, but Wald test
-                # should use MAP dispersion for proper variance estimation
-                ridge = 1e-6
-                unit = np.zeros(design.shape[1])
-                unit[perturbation_column_index] = 1.0
-                for local_idx, gene_idx in enumerate(valid_indices):
-                    if not valid_results[local_idx]:
-                        continue
-                    # Compute weights with MAP dispersion: W = mu / (1 + mu * disp)
-                    mu_gene = mu[:, gene_idx]
-                    disp_gene = disp_map[gene_idx]
-                    W = mu_gene / (1.0 + mu_gene * disp_gene)
-                    # SE^2 = e_k' (X'WX + ridge*I)^-1 e_k, from a Cholesky factor
-                    XtWX = (design.T * W[None, :]) @ design
-                    XtWX[np.diag_indices_from(XtWX)] += ridge
-                    try:
-                        variance = cho_solve(cho_factor(XtWX, check_finite=False), unit, check_finite=False)
-                        se_new = np.sqrt(np.maximum(variance[perturbation_column_index], 1e-10))
-                    except np.linalg.LinAlgError:
-                        se_new = result["se"][gene_idx]  # Keep original SE on failure
-                    # Update SE, statistic, and p-value
-                    coef = result["logfc"][gene_idx]
-                    result["se"][gene_idx] = se_new
-                    statistic = coef / se_new
-                    result["statistic"][gene_idx] = statistic
-                    result["pvalue"][gene_idx] = float(2.0 * norm.sf(abs(statistic)))
-            else:
-                result["dispersion"] = shrink_dispersions(result["dispersion_raw"], trend)
-        else:
-            result["dispersion_trend"] = result["dispersion_raw"].copy()
-            result["dispersion"] = result["dispersion_raw"].copy()
-
-        result["logfc_raw"] = result["logfc"].copy()
         if lfc_shrinkage_type == "apeglm":
-            # Full NB-GLM re-fitting with Cauchy prior (matches PyDESeq2)
-            # Build mle_coef matrix (n_params, n_genes) from batch_result
-            n_params = design.shape[1]
-            mle_coef = np.full((n_params, n_genes), np.nan, dtype=np.float64)
-            for local_idx, gene_idx in enumerate(valid_indices):
-                if valid_results[local_idx]:
-                    mle_coef[:, gene_idx] = batch_result.coef[local_idx, :]
-            
-            # Densify the subset matrix if sparse
-            if sp.issparse(subset_matrix):
-                counts_dense = subset_matrix.toarray()
-            else:
-                counts_dense = np.asarray(subset_matrix, dtype=np.float64)
-            
-            # Call full apeGLM shrinkage with L-BFGS-B re-fitting
-            # NOTE: PyDESeq2's lfc_shrink does NOT use min_mu during shrinkage
-            shrunk_coef, shrunk_se_arr, shrink_converged = shrink_lfc_apeglm(
-                counts=counts_dense,
+            # apeGLM refits every coefficient under a Cauchy prior on the
+            # perturbation's, starting from the MLE; an untested gene has no
+            # start and stays NaN. PyDESeq2's lfc_shrink applies no mean floor.
+            shrunk_coef, shrunk_se, _ = shrink_lfc_apeglm(
+                counts=counts,
                 design_matrix=design,
                 size_factors=subset_size_factors,
-                dispersion=result["dispersion"],
-                mle_coef=mle_coef,
-                mle_se=result["se"],
-                shrink_index=perturbation_column_index,
-                prior_scale=None,  # Estimate globally from MLE LFC distribution
-                n_jobs=1,  # Single-threaded within worker (parallelism at perturbation level)
-                min_mu=0.0,  # No min_mu - match PyDESeq2's lfc_shrink behavior
+                dispersion=fit.dispersion,
+                mle_coef=np.where(tested[None, :], fit.coef.T, np.nan),
+                mle_se=se,
+                shrink_index=test_column,
+                prior_scale=None,  # from this comparison's MLE fold changes
+                n_jobs=1,  # parallel over comparisons instead
+                min_mu=0.0,
             )
-            # Extract shrunken LFC (perturbation coefficient)
-            result["logfc"] = shrunk_coef[perturbation_column_index, :]
-            result["effect"] = result["logfc"].copy()
-            result["se"] = shrunk_se_arr  # Posterior SE from inverse Hessian
-        else:
-            result["effect"] = result["logfc"].copy()
-
+            result["logfc"] = shrunk_coef[test_column, :]
+            result["se"] = shrunk_se
         return result
-    # -------------------------------------------------------------------------
-
-    # -------------------------------------------------------------------------
-    # Optimized worker using precomputed control cache
-    # -------------------------------------------------------------------------
-    def _fit_perturbation_worker_cached(
-        group_idx: int,
-        label: str,
-        path: str | Path,
-        group_rows: slice | np.ndarray,
-        control_cache: ControlStatisticsCache,
-        size_factors: np.ndarray,
-        n_genes: int,
-        min_cells_expressed: int,
-        min_pct_ctrl: float,
-        min_pct_pert: float,
-        min_mean_ctrl: float,
-        min_mean_pert: float,
-        min_cells_ctrl: int,
-        min_cells_pert: int,
-        min_total_count: float,
-        max_iter: int,
-        tol: float,
-        min_mu: float,
-        dispersion_method: str,
-        shrink_dispersion: bool,
-        use_map_dispersion: bool,
-        lfc_shrinkage_type: str,
-        se_method: str = "sandwich",
-    ) -> dict:
-        """Fit NB-GLM for a perturbation group using cached control statistics.
-        
-        This is an optimized version that reuses precomputed control cell
-        statistics (intercept, weights, XᵀWX contributions) to avoid redundant
-        computation across perturbation comparisons.
-        """
-        subset_size_factors_group = np.asarray(size_factors)[group_rows]
-        group_n = subset_size_factors_group.shape[0]
-        n_control = control_cache.control_n
-        subset_n = n_control + group_n
-        
-        # Initialize result arrays
-        result = {
-            "group_idx": group_idx,
-            "effect": np.full(n_genes, np.nan, dtype=np.float64),
-            "statistic": np.full(n_genes, np.nan, dtype=np.float64),
-            "pvalue": np.full(n_genes, np.nan, dtype=np.float64),
-            "logfc": np.full(n_genes, np.nan, dtype=np.float64),
-            "logfc_raw": np.full(n_genes, np.nan, dtype=np.float64),
-            "intercept": np.full(n_genes, np.nan, dtype=np.float64),  # MLE intercept for shrink_lfc
-            "se": np.full(n_genes, np.nan, dtype=np.float64),
-            "pts": np.zeros(n_genes, dtype=np.float32),
-            "pts_rest": control_cache.pts_rest.copy(),
-            "dispersion": np.full(n_genes, np.nan, dtype=np.float64),
-            "dispersion_raw": np.full(n_genes, np.nan, dtype=np.float64),
-            "dispersion_trend": np.full(n_genes, np.nan, dtype=np.float64),
-            "mean": np.zeros(n_genes, dtype=np.float64),
-            "iterations": np.zeros(n_genes, dtype=np.int32),
-            "converged": np.zeros(n_genes, dtype=bool),
-        }
-        
-        # Load perturbation group cells
-        # Use slice-based access if file is sorted, otherwise use mask
-        backed = read_backed(path)
-        try:
-            # A slice on a file sorted by perturbation (one contiguous read),
-            # else ascending row indices.
-            group_matrix = backed.X[group_rows, :]
-            if sp.issparse(group_matrix):
-                group_matrix = sp.csr_matrix(group_matrix, dtype=np.float64)
-            else:
-                group_matrix = np.asarray(group_matrix, dtype=np.float64)
-        finally:
-            backed.file.close()
-        
-        # Compute expression counts for perturbation cells
-        if sp.issparse(group_matrix):
-            group_expr_counts = np.asarray(group_matrix.getnnz(axis=0)).ravel()
-        else:
-            group_expr_counts = np.sum(group_matrix > 0, axis=0)
-        
-        # Valid genes mask
-        total_expr_counts = control_cache.control_expr_counts + group_expr_counts
-        valid_mask = total_expr_counts >= min_cells_expressed
-        
-        # Compute pts
-        pts = np.divide(
-            group_expr_counts,
-            group_n,
-            out=np.zeros(n_genes, dtype=np.float32),
-            where=group_n > 0,
-        )
-        # Reported for every gene; see the matching comment in the uncached
-        # path.
-        result["pts"] = pts.astype(np.float32)
-        
-        # Compute mean expression
-        if sp.issparse(group_matrix):
-            normalized_group = group_matrix.multiply(1.0 / subset_size_factors_group[:, None])
-            mean_group = np.asarray(normalized_group.sum(axis=0)).ravel()
-        else:
-            normalized_group = group_matrix / subset_size_factors_group[:, None]
-            mean_group = normalized_group.sum(axis=0)
-        
-        # Combined mean
-        result["mean"] = (control_cache.control_mean_expr * n_control + mean_group) / subset_n
-
-        # Per-condition low-expression filter (jointly low in BOTH groups).
-        # ``mean_group`` is the size-factor-normalised SUM; divide by group_n
-        # for the per-cell mean used by the filter.
-        group_mean_per_cell = (
-            mean_group / group_n if group_n > 0 else np.zeros_like(mean_group)
-        )
-        low_both = _low_expr_in_both_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_cache.control_expr_counts,
-            pert_mean=group_mean_per_cell,
-            control_mean=control_cache.control_mean_expr,
-            n_pert_cells=group_n,
-            n_control_cells=n_control,
-            min_pct_ctrl=min_pct_ctrl,
-            min_pct_pert=min_pct_pert,
-            min_mean_ctrl=min_mean_ctrl,
-            min_mean_pert=min_mean_pert,
-        )
-        valid_mask = valid_mask & ~low_both
-        # See the matching comment in the uncached path.
-        valid_mask = valid_mask & ~_nonestimable_glm_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_cache.control_expr_counts,
-            min_cells_ctrl=min_cells_ctrl,
-            min_cells_pert=min_cells_pert,
-        )
-        result["n_tested"] = int(valid_mask.sum())
-
-        if not np.any(valid_mask):
-            return result
-        
-        # Get perturbation offset
-        perturbation_offset = np.log(np.clip(subset_size_factors_group, 1e-8, None))
-        
-        # Create perturbation indicator for the combined design (control first, then perturbation)
-        perturbation_indicator = np.concatenate([
-            np.zeros(n_control, dtype=np.float64),
-            np.ones(group_n, dtype=np.float64)
-        ])
-        
-        # Check if using frozen control mode (memory-efficient parallel fitting)
-        if control_cache.use_frozen_control:
-            # FROZEN CONTROL PATH: Use sufficient statistics instead of raw matrix
-            # Per-worker memory: ~5GB → ~1MB (enables 32 workers instead of 2)
-            
-            # Create batch fitter with minimal design (only perturbation cells have data)
-            batch_fitter = NBGLMBatchFitter(
-                design=np.ones((group_n, 1)),  # Placeholder, not used in frozen mode
-                offset=perturbation_offset,  # Only perturbation offsets needed
-                max_iter=max_iter,
-                tol=tol,
-                dispersion_method=dispersion_method,
-                min_mu=min_mu,
-                min_total_count=min_total_count,
-            )
-            
-            batch_result = batch_fitter.fit_batch_with_frozen_control(
-                perturbation_matrix=group_matrix,
-                perturbation_offset=perturbation_offset,
-                control_cache=control_cache,
-                valid_mask=valid_mask,
-            )
-        else:
-            # STANDARD PATH: Full control_matrix available
-            # Fit using the batch fitter with control cache
-            batch_fitter = NBGLMBatchFitter(
-                design=np.column_stack([np.ones(subset_n), perturbation_indicator]),
-                offset=np.concatenate([control_cache.control_offset, perturbation_offset]),
-                max_iter=max_iter,
-                tol=tol,
-                dispersion_method=dispersion_method,
-                min_mu=min_mu,
-                min_total_count=min_total_count,
-            )
-            
-            batch_result = batch_fitter.fit_batch_with_control_cache(
-                perturbation_matrix=group_matrix,
-                perturbation_offset=perturbation_offset,
-                control_cache=control_cache,
-                perturbation_indicator=perturbation_indicator,
-                valid_mask=valid_mask,
-            )
-
-        
-        valid_indices = np.where(valid_mask)[0]
-        
-        # Extract results
-        result["converged"][valid_indices] = batch_result.converged[valid_indices]
-        result["iterations"][valid_indices] = batch_result.n_iter[valid_indices]
-        
-        # Perturbation coefficient is at index 1 - vectorized computation
-        coefs = batch_result.coef[:, 1]  # (n_genes,)
-        ses = batch_result.se[:, 1]  # (n_genes,)
-        
-        # Vectorized: compute statistics for all valid & converged genes at once
-        # Build mask for valid, converged genes with finite coef/se
-        valid_converged_mask = (
-            valid_mask & 
-            batch_result.converged &
-            np.isfinite(coefs) & 
-            np.isfinite(ses) & 
-            (ses > 0)
-        )
-        
-        # Compute Wald statistic and p-value vectorized
-        statistics = np.divide(
-            coefs, ses, 
-            out=np.full(n_genes, np.nan), 
-            where=valid_converged_mask
-        )
-        # Use norm.sf (survival function) to avoid underflow for large |z|
-        # Note: ndtr(x) = CDF, so 1-ndtr(x) underflows for large x; sf(x) = 1-CDF is stable
-        pvalues = np.where(
-            valid_converged_mask,
-            2.0 * norm.sf(np.abs(statistics)),  # 2-sided p-value
-            np.nan
-        )
-        
-        result["statistic"] = statistics
-        result["pvalue"] = pvalues
-        result["logfc"] = np.where(valid_converged_mask, coefs, np.nan)
-        result["se"] = np.where(valid_converged_mask, ses, np.nan)
-        result["intercept"] = np.where(valid_converged_mask, batch_result.coef[:, 0], np.nan)  # Store fitted intercept
-        
-        # Handle dispersion shrinkage
-        # A global dispersion in the cache is either the shrunk estimate or a
-        # fixed ``dispersion=``; the latter must apply without shrinkage too.
-        if shrink_dispersion or control_cache.global_dispersion is not None:
-            # ================================================================
-            # MEMORY-OPTIMIZED: Use batched computation for dispersion and SE
-            # ================================================================
-            # Instead of building full (n_control+n_group, n_genes) matrices,
-            # process genes in batches to reduce peak memory.
-            # ================================================================
-            
-            # Get coefficients (needed for SE recomputation)
-            beta0_all = batch_result.coef[:, 0]  # (n_genes,)
-            beta1_all = batch_result.coef[:, 1]  # (n_genes,)
-            
-            # ================================================================
-            # OPTIMIZATION: Check for global dispersion FIRST (before MoM/trend)
-            # When dispersion_scope='global', skip expensive per-comparison work
-            # ================================================================
-            if control_cache.global_dispersion is not None:
-                # FAST PATH: Use precomputed global dispersion
-                # Skip MoM dispersion computation entirely
-                # Skip trend fitting entirely
-                logger.debug(f"Using precomputed global dispersion for {label}")
-                result["dispersion"] = control_cache.global_dispersion.copy()
-                if control_cache.global_dispersion_trend is not None:
-                    result["dispersion_trend"] = control_cache.global_dispersion_trend.copy()
-                else:
-                    # Fallback: use global dispersion as trend proxy
-                    result["dispersion_trend"] = control_cache.global_dispersion.copy()
-                # dispersion_raw not computed in global mode - set to NaN or copy global
-                result["dispersion_raw"] = control_cache.global_dispersion.copy()
-                
-                # SE handling: frozen control vs standard
-                if control_cache.use_frozen_control:
-                    # FROZEN CONTROL PATH: Use SE from fit_batch_with_frozen_control directly
-                    # No SE recomputation needed since dispersion is global (pre-fitted)
-                    # The SE already uses the correct dispersion from control_cache
-                    pass  # SE already set from batch_result
-                else:
-                    # STANDARD PATH: Recompute SE with global dispersion
-                    n_control = control_cache.control_matrix.shape[0]
-                    n_group = group_matrix.shape[0]
-                    if sp.issparse(group_matrix):
-                        Y_pert_dense = group_matrix.toarray()
-                    else:
-                        Y_pert_dense = np.asarray(group_matrix, dtype=np.float64)
-                    
-                    final_disp = result["dispersion"]
-                    recomputed_se = _compute_se_batched(
-                        Y_control=control_cache.control_matrix,
-                        Y_pert=Y_pert_dense,
-                        control_offset=control_cache.control_offset,
-                        pert_offset=perturbation_offset,
-                        beta0=beta0_all,
-                        beta1=beta1_all,
-                        dispersion=final_disp,
-                        gene_batch_size=5000,
-                        se_method=se_method,
-                    )
-                    
-                    # Update result with recomputed SE
-                    result["se"] = np.where(valid_converged_mask, recomputed_se, np.nan)
-                    
-                    # Recompute Wald statistic and p-value with new SE
-                    coefs = batch_result.coef[:, 1]
-                    statistics = np.divide(
-                        coefs, recomputed_se, 
-                        out=np.full(n_genes, np.nan), 
-                        where=valid_converged_mask
-                    )
-                    pvalues = np.where(
-                        valid_converged_mask,
-                        2.0 * norm.sf(np.abs(statistics)),
-                        np.nan
-                    )
-                    result["statistic"] = statistics
-                    result["pvalue"] = pvalues
-            else:
-                # ============================================================
-                # STANDARD PATH: Per-comparison dispersion (MoM → trend → MAP)
-                # Requires control_matrix - not compatible with frozen control
-                # ============================================================
-                if control_cache.use_frozen_control:
-                    raise ValueError(
-                        "Frozen control mode requires global dispersion. "
-                        "Set dispersion_scope='global' and shrink_dispersion=True when using freeze_control=True."
-                    )
-                
-                # Prepare perturbation matrix as dense (needed for SE recomputation)
-                n_control = control_cache.control_matrix.shape[0]
-                n_group = group_matrix.shape[0]
-                if sp.issparse(group_matrix):
-                    Y_pert_dense = group_matrix.toarray()
-                else:
-                    Y_pert_dense = np.asarray(group_matrix, dtype=np.float64)
-                
-                # Compute MoM dispersion using batched processing
-                mom_disp = _compute_mom_dispersion_batched(
-                    Y_control=control_cache.control_matrix,
-                    Y_pert=Y_pert_dense,
-                    control_offset=control_cache.control_offset,
-                    pert_offset=perturbation_offset,
-                    beta0=beta0_all,
-                    beta1=beta1_all,
-                    converged=batch_result.converged,
-                    gene_batch_size=5000,
-                )
-                result["dispersion_raw"][valid_indices] = mom_disp[valid_indices]
-                
-                # Fit trend using corrected MoM dispersion
-                trend = fit_dispersion_trend(result["mean"], result["dispersion_raw"])
-                result["dispersion_trend"] = trend
-                
-                if use_map_dispersion:
-                    # For MAP dispersion, we still need full matrices (can optimize later)
-                    # Build combined Y and mu for estimate_dispersion_map
-                    Y = np.empty((n_control + n_group, n_genes), dtype=np.float64)
-                    Y[:n_control, :] = control_cache.control_matrix
-                    Y[n_control:, :] = Y_pert_dense
-                    
-                    # Compute full mu matrix for MAP
-                    offset_combined = np.concatenate([control_cache.control_offset, perturbation_offset])
-                    eta = (
-                        beta0_all[None, :] + 
-                        perturbation_indicator[:, None] * beta1_all[None, :] + 
-                        offset_combined[:, None]
-                    )
-                    np.clip(eta, -30, 30, out=eta)
-                    mu = np.exp(eta)
-                    del eta
-                    mu[:, ~batch_result.converged] = 1e-10
-                    np.maximum(mu, 1e-10, out=mu)
-                    
-                    max_disp = max(10.0, float(subset_n))
-                    design = np.column_stack([np.ones(subset_n), perturbation_indicator])
-                    result["dispersion"] = estimate_dispersion_map(
-                        Y, mu, trend, design=design, max_disp=max_disp
-                    )
-                    del Y, mu  # Free large matrices
-                else:
-                    result["dispersion"] = shrink_dispersions(result["dispersion_raw"], trend)
-                
-                # ================================================================
-                # Recompute SE using batched processing (memory-optimized)
-                # ================================================================
-                final_disp = result["dispersion"]
-                recomputed_se = _compute_se_batched(
-                    Y_control=control_cache.control_matrix,
-                    Y_pert=Y_pert_dense,
-                    control_offset=control_cache.control_offset,
-                    pert_offset=perturbation_offset,
-                    beta0=beta0_all,
-                    beta1=beta1_all,
-                    dispersion=final_disp,
-                    gene_batch_size=5000,
-                    se_method=se_method,
-                )
-                
-                # Update result with recomputed SE
-                result["se"] = np.where(valid_converged_mask, recomputed_se, np.nan)
-                
-                # Recompute Wald statistic and p-value with new SE
-                coefs = batch_result.coef[:, 1]
-                statistics = np.divide(
-                    coefs, recomputed_se, 
-                    out=np.full(n_genes, np.nan), 
-                    where=valid_converged_mask
-                )
-                pvalues = np.where(
-                    valid_converged_mask,
-                    2.0 * norm.sf(np.abs(statistics)),  # Use sf() for numerical stability
-                    np.nan
-                )
-                result["statistic"] = statistics
-                result["pvalue"] = pvalues
-        else:
-            result["dispersion_trend"] = result["dispersion_raw"].copy()
-            result["dispersion"] = result["dispersion_raw"].copy()
-        
-        result["logfc_raw"] = result["logfc"].copy()
-        if lfc_shrinkage_type == "apeglm":
-            # Full NB-GLM re-fitting with Cauchy prior (matches PyDESeq2)
-            # Build mle_coef matrix (n_params, n_genes) from batch_result
-            n_params = 2  # Intercept + perturbation
-            mle_coef = np.full((n_params, n_genes), np.nan, dtype=np.float64)
-            # Only the genes that were actually fitted have an MLE to shrink.
-            # ``batch_result.coef`` is zero-initialised, so handing it over
-            # whole would give apeGLM a finite starting point for a pair the
-            # filters excluded and return a finite effect for it; the NaN left
-            # here is what the rest of the result already reports for those.
-            mle_coef[0, valid_converged_mask] = batch_result.coef[valid_converged_mask, 0]
-            mle_coef[1, valid_converged_mask] = batch_result.coef[valid_converged_mask, 1]
-            
-            # Build combined count matrix (control + perturbation)
-            if sp.issparse(group_matrix):
-                Y_pert = group_matrix.toarray()
-            else:
-                Y_pert = np.asarray(group_matrix, dtype=np.float64)
-            counts_combined = np.vstack([control_cache.control_matrix, Y_pert])
-            
-            # Build combined size factors
-            sf_combined = np.concatenate([
-                np.exp(control_cache.control_offset),
-                subset_size_factors_group
-            ])
-            
-            # Build design matrix for combined data
-            design_combined = np.zeros((n_control + group_n, 2), dtype=np.float64)
-            design_combined[:, 0] = 1.0  # Intercept
-            design_combined[n_control:, 1] = 1.0  # Perturbation indicator
-            
-            # Call full apeGLM shrinkage
-            # NOTE: PyDESeq2's lfc_shrink does NOT use min_mu during shrinkage
-            shrunk_coef, shrunk_se_arr, shrink_converged = shrink_lfc_apeglm(
-                counts=counts_combined,
-                design_matrix=design_combined,
-                size_factors=sf_combined,
-                dispersion=result["dispersion"],
-                mle_coef=mle_coef,
-                mle_se=result["se"],
-                shrink_index=1,  # LFC is at index 1
-                prior_scale=None,
-                n_jobs=1,
-                min_mu=0.0,  # No min_mu - match PyDESeq2's lfc_shrink behavior
-            )
-            result["logfc"] = shrunk_coef[1, :]  # Shrunken LFC
-            result["effect"] = result["logfc"].copy()
-            result["se"] = shrunk_se_arr
-        else:
-            result["effect"] = result["logfc"].copy()
-        
-        return result
-    # -------------------------------------------------------------------------
 
     n_groups = len(candidates)
     
@@ -2803,33 +1987,22 @@ def nb_glm_test(
     # Create index mappings
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
-    # Load control cells matrix once (all genes)
-    # For very large control groups, skip loading and use streaming path
-    control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
+    # Each perturbation is tested against the controls with DESeq2's
+    # dispersions estimated on that comparison's cells. Without covariates
+    # every control term depends on the controls only, so they are summarised
+    # in one pass and a comparison costs its own cells
+    # (glm.fit_two_group_deseq2). With covariates, or apeGLM shrinkage (which
+    # refits on the cells), each comparison is fitted on its control and
+    # perturbed cells (glm.fit_glm_deseq2), with the controls held in memory.
+    two_group = not covariates and lfc_shrinkage_type == "none"
     # The memory this call may use: memory_limit_gb, capped by what the
     # process's cgroup will still grant (detected when None). Every size
     # chosen below is a share of it.
     budget_gb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e9
-    # Streaming threshold: control dense + 3 work arrays > 30% available memory
-    _ctrl_streaming_threshold = max_dense_fraction * budget_gb
-    use_streaming_control = (control_matrix_gb * 4) > _ctrl_streaming_threshold
-
-    # Each perturbation against the controls under ~ condition, with DESeq2's
-    # dispersions estimated per comparison: every control term depends on the
-    # controls only, so they are summarised in one pass and a comparison
-    # costs its own cells (glm.fit_two_group_deseq2).
-    two_group = (
-        not covariates
-        and dispersion_scope == "per_comparison"
-        and dispersion is None
-        and shrink_dispersion
-        and use_map_dispersion
-        and lfc_shrinkage_type == "none"
-    )
+    control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
     control_summary = None
+    control_matrix = None
     if two_group:
-        use_streaming_control = False
-        control_matrix = None
         control_rows = np.flatnonzero(control_mask)
         control_sf = np.asarray(size_factors, dtype=np.float64)[control_rows]
         backed = read_backed(path)
@@ -2844,30 +2017,17 @@ def nb_glm_test(
             backed.file.close()
         drop_file_cache(path)
         control_expr_counts = control_summary.nnz
-    elif use_streaming_control:
-        logger.info(
-            f"Large control group: {control_n:,} cells × {n_genes:,} genes = "
-            f"{control_matrix_gb:.1f} GB dense. Using streaming control statistics."
-        )
-        control_matrix = None  # Not loaded — streaming will read from disk
-        # Compute control_expr_counts via streaming
-        control_expr_counts = np.zeros(n_genes, dtype=np.int64)
-        backed = read_backed(path)
-        try:
-            ctrl_indices = np.where(control_mask)[0]
-            _chunk = 4096
-            for _start in range(0, control_n, _chunk):
-                _end = min(_start + _chunk, control_n)
-                _idx = ctrl_indices[_start:_end]
-                _blk = backed.X[_idx, :]
-                if sp.issparse(_blk):
-                    control_expr_counts += np.asarray(_blk.getnnz(axis=0)).ravel()
-                else:
-                    control_expr_counts += np.asarray((_blk > 0).sum(axis=0)).ravel()
-        finally:
-            backed.file.close()
-        drop_file_cache(path)  # Free page cache from streaming reads
+        control_total = control_summary.total
     else:
+        # A comparison densifies the controls with its own cells, and its
+        # dispersion steps hold a few matrices of that size.
+        if control_matrix_gb * 4 > max_dense_fraction * budget_gb:
+            raise MemoryError(
+                f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
+                "fit the memory budget; with covariates or lfc_shrinkage_type='apeglm' every comparison "
+                "is fitted on all of them. Raise memory_limit_gb, aggregate to pseudo-bulk first "
+                "(cx.pb.aggregate), or test without covariates and shrink afterwards with shrink_lfc."
+            )
         backed = read_backed(path)
         try:
             control_matrix = backed.X[control_mask, :]
@@ -2878,155 +2038,19 @@ def nb_glm_test(
         finally:
             backed.file.close()
         drop_file_cache(path)  # Free page cache from control matrix read
-        # Pre-compute control expression counts
         if sp.issparse(control_matrix):
             control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
         else:
             control_expr_counts = np.sum(control_matrix > 0, axis=0)
-        
-    # Compute pts_rest once (same for all perturbations)
-    pts_rest_shared = np.divide(
+        control_total = np.asarray(control_matrix.sum(axis=0), dtype=np.float64).ravel()
+
+    # pts_rest describes the control arm: the same vector for every row.
+    pts_rest = np.divide(
         control_expr_counts,
         control_n,
         out=np.zeros(n_genes, dtype=np.float32),
         where=control_n > 0,
-    )
-
-    # =====================================================================
-    # Parallel fitting of perturbation groups
-    # =====================================================================
-    # Determine number of parallel workers with memory-awareness
-    # For small n_groups, run sequentially to avoid joblib overhead
-    # (profiling shows joblib.sleep takes 24s for 2 perturbations)
-    effective_n_jobs = _resolve_n_jobs(n_jobs)
-        
-    # Save original requested workers for auto-detection logic
-    # (before memory-based reduction)
-    requested_n_jobs = effective_n_jobs
-        
-    # Memory-aware worker limiting: Adaptive estimation based on dataset statistics
-    # Compute group size statistics without loading the full matrix
-    # Use numpy unique with counts since labels is a numpy array
-    unique_labels, label_counts = np.unique(labels, return_counts=True)
-    with h5py.File(path, "r") as handle:
-        x_node = handle["X"]
-        nnz_per_cell = (
-            x_node["data"].shape[0] / max(n_cells_total, 1) if isinstance(x_node, h5py.Group) else n_genes
-        )
-    group_sizes = dict(zip(unique_labels, label_counts))
-    pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
-    max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
-    avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
-        
-    # Use p95 group size for realistic estimate (avoids over-conservative from outliers)
-    if len(pert_group_sizes) >= 10:
-        p95_group_size = int(np.percentile(pert_group_sizes, 95))
-        use_group_size = p95_group_size
-    else:
-        use_group_size = max_group_size
-        
-    # Decide early if we can use control cache (needed for memory estimation)
-    can_use_cache_early = (
-        use_control_cache and
-        len(covariates) == 0 and
-        not two_group
-    )
-        
-    # =====================================================================
-    # AUTO-DETECTION: Enable freeze_control for large datasets
-    # =====================================================================
-    # When freeze_control=None (default), auto-enable if:
-    # 1. Control matrix serialization would severely limit workers (<4)
-    # 2. Required settings are met (dispersion_scope='global', shrink_dispersion=True)
-    #
-    # This provides optimal parallelization without user intervention.
-        
-    if freeze_control is None:
-        # Check if settings are compatible with frozen control
-        settings_compatible = (
-            can_use_cache_early and
-            dispersion_scope == "global" and
-            shrink_dispersion
-        )
-            
-        if settings_compatible:
-            # Estimate per-worker memory in standard mode (matching actual formula below)
-            control_matrix_mb_est = control_n * n_genes * 8 / 1e6
-            control_matrix_gb_est = control_matrix_mb_est / 1000
-            labels_mb_est = n_cells_total * 50 / 1e6  # ~50 bytes per string
-            size_factors_mb_est = n_cells_total * 8 / 1e6
-            work_arrays_mb_est = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
-            serialized_args_mb_est = (control_matrix_mb_est + labels_mb_est + size_factors_mb_est) * 2.5
-            per_worker_standard_mb = serialized_args_mb_est + work_arrays_mb_est + 2000
-                
-            available_mb = budget_gb * 1000
-
-            # ================================================================
-            # AUTO-ENABLE CONDITION 1: Large control matrix (>10 GB)
-            # For datasets like Feng (110K control × 36K genes = 32 GB),
-            # freeze_control significantly reduces per-worker memory.
-            # ================================================================
-            if control_matrix_gb_est > 10.0:
-                freeze_control = True
-                logger.info(
-                    f"Auto-enabling freeze_control: large control matrix "
-                    f"({control_n:,} cells × {n_genes:,} genes = {control_matrix_gb_est:.1f} GB > 10 GB threshold)"
-                )
-            else:
-                # ================================================================
-                # AUTO-ENABLE CONDITION 2: Worker count limitation (<4 workers)
-                # Original logic: enable if parallelization would be severely limited
-                # ================================================================
-                base_memory_mb_est = control_matrix_mb_est + 1000
-                usable_mb = available_mb * 0.8
-                remaining_mb = max(usable_mb - base_memory_mb_est, per_worker_standard_mb)
-                max_workers_standard = max(1, int(remaining_mb / per_worker_standard_mb))
-                    
-                if max_workers_standard < 4 and requested_n_jobs >= 4:
-                    freeze_control = True
-                    logger.info(
-                        f"Auto-enabling freeze_control: standard mode would limit to {max_workers_standard} workers "
-                        f"(control: {control_n:,} cells × {n_genes:,} genes = {control_matrix_mb_est:.0f} MB, "
-                        f"per_worker: {per_worker_standard_mb:.0f} MB). "
-                        f"Frozen control enables ~{requested_n_jobs} workers."
-                    )
-                else:
-                    freeze_control = False
-        else:
-            freeze_control = False
-        
-    # Check if frozen control mode is valid (after auto-detection)
-    can_use_frozen_control = (
-        freeze_control and 
-        can_use_cache_early and 
-        dispersion_scope == "global" and
-        shrink_dispersion
-    )
-    # Only the control cache can stream the controls from disk; every other
-    # path fits them in memory and would get no control matrix at all.
-    if use_streaming_control and not (
-        can_use_cache_early and dispersion_scope == "global" and shrink_dispersion
-    ):
-        raise MemoryError(
-            f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
-            "fit the memory budget, and only covariates=None with "
-            "dispersion_scope='global' and shrink_dispersion=True streams them from disk. Raise "
-            "memory_limit_gb, aggregate to pseudo-bulk first (cx.pb.aggregate), or use those settings."
-        )
-
-    # When frozen control is enabled but streaming was not, retroactively
-    # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
-    # streaming avoids that by processing chunks.  The loaded control
-    # matrix is freed because frozen stats replace it.
-    if can_use_frozen_control and not use_streaming_control and control_matrix is not None:
-        use_streaming_control = True
-        del control_matrix
-        control_matrix = None
-        gc.collect()
-        logger.info(
-            "Switching to streaming control statistics for frozen control mode "
-            f"(avoids {control_matrix_gb * 4:.1f} GB dense IRLS peak)."
-        )
+    ).astype(np.float32)
 
     shape = (n_groups, n_genes)
     _nb_glm_disk_estimate = warn_if_disk_space_low(
@@ -3035,216 +2059,14 @@ def nb_glm_test(
         context="nb_glm_test",
     )
     _messages.print_disk_estimate(verbose, "nb_glm_test", _nb_glm_disk_estimate)
-    # freeze_control=None is resolved from free memory above, so it is not
-    # part of the result's identity (an identical call would otherwise be
-    # recomputed whenever free memory shifted); the result records the mode
-    # used instead. A resume, though, must fit the remaining rows with the
-    # same model as the saved ones.
-    frozen_control = bool(can_use_frozen_control or (can_use_cache_early and use_streaming_control))
-        
-    # Decide whether to use control cache optimization
-    # Control cache is used when: no covariates, use_control_cache=True, global SF
-    # Per-comparison size factors require fresh computation per comparison
-    can_use_cache = (
-        use_control_cache and
-        len(covariates) == 0 and
-        not two_group
-    )
 
-    # Without the control cache (covariates, or use_control_cache=False) the
-    # global dispersion is estimated here instead: once per gene, by DESeq2's
-    # MAP step on the control cells with the covariate design, then held fixed
-    # in every comparison -- one IRLS fit per comparison instead of a
-    # dispersion search per comparison.
-    if dispersion is not None:
-        global_dispersion = np.full(n_genes, float(dispersion))
-        global_dispersion_trend = global_dispersion
-    elif (
-        not can_use_cache
-        and dispersion_scope == "global"
-        and shrink_dispersion
-        and use_map_dispersion
-        and control_matrix is not None
-    ):
-        logger.info("Estimating each gene's dispersion once, on the control cells (dispersion_scope='global')...")
-        control_design, control_columns = build_design_matrix(
-            obs_df.iloc[control_mask],
-            covariate_columns=covariates,
-            perturbation_indicator=np.zeros(control_n),
-            intercept=True,
-        )
-        control_design = np.delete(control_design, 1, axis=1)  # drop the all-zero perturbation column
-        del control_columns[1]
-        check_full_rank(control_design, control_columns, "nb_glm_test, dispersion on the control cells")
-        global_dispersion, global_dispersion_trend = estimate_glm_map_dispersion(
-            control_design,
-            control_matrix,
-            offset=offset[control_mask],
-            size_factors=np.asarray(size_factors)[control_mask],
-            max_iter=max_iter,
-            tol=tol,
-            poisson_init_iter=poisson_init_iter,
-            dispersion_method=dispersion_method,
-            min_mu=min_mu,
-            min_total_count=min_total_count,
-        )
-        # A gene nearly absent among the controls (one a perturbation
-        # switches on) has no dispersion the controls can estimate; the trend
-        # extrapolated to its tiny mean would swamp it. Leave it NaN so each
-        # comparison estimates it from its own cells.
-        sparse_in_controls = (
-            np.asarray(control_matrix.sum(axis=0)).ravel() < _MIN_CONTROL_COUNT_FOR_GLOBAL_DISPERSION
-        )
-        global_dispersion[sparse_in_controls] = np.nan
-        global_dispersion_trend[sparse_in_controls] = np.nan
-        
-    # =====================================================================
-    # Early memory check: determine if we need streaming mode
-    # =====================================================================
-    # For very large datasets (e.g., Replogle-GW-k562: 2M cells × 8K genes),
-    # loading the full matrix would exceed memory. Check this ONCE before
-    # any full matrix loads (all_cell_matrix for global dispersion).
-    estimated_matrix_gb = n_cells_total * n_genes * 8 / 1e9  # float64
-    memory_budget_gb = max_dense_fraction * budget_gb
-    use_streaming_mode = estimated_matrix_gb > memory_budget_gb
-        
-    if use_streaming_mode:
-        logger.info(
-            f"Large dataset detected: {n_cells_total:,} cells × {n_genes:,} genes = "
-            f"{estimated_matrix_gb:.1f} GB > {memory_budget_gb:.1f} GB budget. "
-            f"Using streaming mode for memory efficiency."
-        )
-        
-    # Precompute control statistics once if using cache
-    control_cache = None
-    if can_use_cache:
-        # Validate freeze_control requirements (for explicit freeze_control=True)
-        if freeze_control:
-            if dispersion_scope != "global":
-                raise ValueError(
-                    "freeze_control=True requires dispersion_scope='global'. "
-                    "Per-comparison dispersion needs raw control matrix."
-                )
-            if not shrink_dispersion:
-                raise ValueError(
-                    "freeze_control=True requires shrink_dispersion=True. "
-                    "Global dispersion must be computed for frozen control mode."
-                )
-            # Note: Auto-detected freeze_control already logged in auto-detection block
-            
-        logger.info("Precomputing control cell statistics for cache optimization...")
-        control_offset_arr = offset[control_mask]
-        if use_streaming_control:
-            # Streaming path: read control cells from disk in chunks
-            # Forces freeze_control=True (raw matrix never materialised)
-            if not freeze_control:
-                logger.info(
-                    "Forcing freeze_control=True for streaming control statistics "
-                    "(raw control matrix too large to fit in memory)."
-                )
-                freeze_control = True
-            control_cache = precompute_control_statistics_streaming(
-                path=path,
-                control_mask=control_mask,
-                control_offset=control_offset_arr,
-                max_iter=max_iter,
-                tol=tol,
-                min_mu=min_mu,
-                global_size_factors=size_factors,
-                freeze_control=True,
-            )
-            drop_file_cache(path)  # Free page cache from streaming IRLS
-        else:
-            control_cache = precompute_control_statistics(
-                control_matrix=control_matrix,
-                control_offset=control_offset_arr,
-                max_iter=max_iter,
-                tol=tol,
-                min_mu=min_mu,
-                dispersion_method="moments",  # Fast initial estimate
-                global_size_factors=size_factors,  # Store global SF in cache
-                freeze_control=freeze_control,  # Enable frozen control mode
-            )
-            # If frozen control, the cache holds sufficient statistics —
-            # the raw control_matrix is no longer needed.
-            if freeze_control and control_matrix is not None:
-                del control_matrix
-                control_matrix = None
-                gc.collect()
-            
-        # A fixed dispersion replaces the precomputed global one
-        if global_dispersion is not None:
-            control_cache.global_dispersion = global_dispersion
-            control_cache.global_dispersion_trend = global_dispersion_trend
-        # Precompute global dispersion if dispersion_scope='global'
-        elif dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
-            logger.info("Precomputing global dispersion trend (dispersion_scope='global')...")
-                
-            if use_streaming_mode:
-                # Use path-based streaming for large datasets
-                # Reads chunks from disk, never loads full matrix
-                control_cache = precompute_global_dispersion_from_path(
-                    path=path,
-                    control_cache=control_cache,
-                    all_cell_offset=offset,
-                    fit_type="parametric",
-                )
-                drop_file_cache(path)  # Free page cache from streaming reads
-            else:
-                # Load all cells for global dispersion estimation
-                backed = read_backed(path)
-                try:
-                    all_cell_matrix = backed.X[:]
-                    if sp.issparse(all_cell_matrix):
-                        all_cell_matrix = sp.csr_matrix(all_cell_matrix, dtype=np.float64)
-                    else:
-                        all_cell_matrix = np.asarray(all_cell_matrix, dtype=np.float64)
-                finally:
-                    backed.file.close()
-                    
-                # Compute global dispersion using all cells
-                # Use fast_mode=True for speed (MoM + trend shrinkage instead of MAP)
-                # Memory-adaptive: switches to streaming if matrix too large
-                control_cache = precompute_global_dispersion(
-                    control_cache=control_cache,
-                    all_cell_matrix=all_cell_matrix,
-                    all_cell_offset=offset,
-                    n_grid=25,
-                    fit_type="parametric",
-                    fast_mode=True,  # ~50× faster than full MAP
-                    max_dense_fraction=max_dense_fraction,
-                    memory_limit_gb=memory_limit_gb,
-                )
-                del all_cell_matrix  # Free memory
-                gc.collect()  # Force garbage collection before spawning workers
-                drop_file_cache(path)  # Free page cache from full matrix read
-                
-            logger.info(f"Global dispersion precomputed: prior_var={control_cache.global_disp_prior_var:.4f}")
-        
     # =====================================================================
     # The result file: one row per perturbation, written as each is fitted
     # =====================================================================
-    # A precomputed global dispersion is one value per gene, the same in
-    # every row; it is stored once, in var. Otherwise dispersion is estimated
-    # per comparison and stays a matrix.
-    if control_cache is not None and control_cache.global_dispersion is not None:
-        global_dispersion = control_cache.global_dispersion
-        global_dispersion_trend = control_cache.global_dispersion_trend
-    # NaN marks genes estimated per comparison; their values are in the matrices
-    global_dispersion_fit = global_dispersion is not None and bool(np.isfinite(global_dispersion).all())
     shrunk = lfc_shrinkage_type == "apeglm"
-    # pts_rest describes the control arm: the same vector for every row.
-    pts_rest_vector = (
-        control_cache.pts_rest if control_cache is not None else pts_rest_shared
-    ).astype(np.float32)
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    var = pd.DataFrame({"pts_rest": pts_rest_vector}, index=pd.Index(gene_symbols).astype(str))
-    if global_dispersion_fit:
-        var["dispersion"] = global_dispersion
-        var["dispersion_trend"] = (
-            global_dispersion_trend if global_dispersion_trend is not None else global_dispersion
-        )
+    var = pd.DataFrame({"pts_rest": pts_rest}, index=pd.Index(gene_symbols).astype(str))
     # X holds the LFC (shrunk or not), in lfc_base. shrink_lfc needs the
     # ln-scale MLE values; with a log2 base they are kept as separate *_ln
     # layers, with an ln base the main layers already are.
@@ -3256,21 +2078,13 @@ def nb_glm_test(
     if lfc_base == "log2":
         layers["logfoldchange_raw_ln"] = np.float64
         layers["standard_error_ln"] = np.float64
-    if not global_dispersion_fit:
-        layers.update(dispersion=np.float64, dispersion_raw=np.float64, dispersion_trend=np.float64)
+    layers.update(dispersion=np.float64, dispersion_raw=np.float64, dispersion_trend=np.float64)
     layers["converged"] = np.bool_
-    # An iteration count is at most two IRLS passes of max_iter; the
-    # narrowest integer type holding that stores every count exactly.
-    layers["iterations"] = np.min_scalar_type(2 * max_iter)
     layers["pts"] = np.float32
     run = _resumable_result(
         output_path,
         checkpoint_path,
-        fingerprint=_checkpoint_fingerprint(
-            fingerprint,
-            frozen_control=frozen_control,
-            streaming_control=bool(use_streaming_control),
-        ),
+        fingerprint=_checkpoint_fingerprint(fingerprint),
         resume=resume,
         obs=obs,
         var=var,
@@ -3286,8 +2100,6 @@ def nb_glm_test(
             "original_dataset_path": str(path),  # For shrink_lfc to reload data
             "size_factor_method": size_factor_method,
             "min_mu": float(min_mu),
-            "dispersion_scope": dispersion_scope,
-            "frozen_control": frozen_control,
             "de_filter": {
                 "min_cells_expressed": int(min_cells_expressed),
                 "min_pct_ctrl": float(min_pct_ctrl),
@@ -3318,86 +2130,77 @@ def nb_glm_test(
     # =====================================================================
     # Workers: as many as the budget holds
     # =====================================================================
-    # Each loky worker is a process of its own. Its arguments are pickled
-    # per task, except numeric arrays over 1 MB (the control matrix, size
-    # factors, a control cache's vectors), which joblib writes once to its
-    # temp folder and every worker maps.
-    #
-    # What each worker allocates during execution:
-    # 1. group_matrix (loaded from disk, small: ~200 cells × n_genes)
-    # 2. Intermediate arrays for SE recomputation, mu, etc.
-    # 3. When dispersion_scope='per_comparison': full Y and mu matrices
-    if can_use_frozen_control:
-        # Frozen stats (W_sum, Wz_sum, ...) and cache metadata, n_genes each,
-        # and the size factors.
-        serialized_args_mb = (n_genes * 8 * 11 + n_groups * 50 + n_cells_total * 8) * 2.0 / 1e6
-        # Work arrays: mu, W, z for the perturbation's cells only, a block of
-        # genes at a time (at most _FROZEN_WORK_BYTES however large the group).
-        work_arrays_mb = min(use_group_size * n_genes * 8 * 5, _FROZEN_WORK_BYTES) / 1e6
-        # The worker's result row (~12 fields of n_genes).
-        result_arrays_mb = n_genes * 8 * 12 / 1e6
-        python_overhead_mb = 500
-        per_worker_mb = serialized_args_mb + work_arrays_mb + result_arrays_mb + python_overhead_mb
-        logger.debug(
-            f"Frozen control memory estimate: serialized={serialized_args_mb:.1f}MB, "
-            f"work_arrays={work_arrays_mb:.1f}MB, per_worker={per_worker_mb:.1f}MB"
+    # The two-group path runs the comparisons in turn, each parallel over
+    # genes in threads that share the one control summary: it uses the cores
+    # asked for. Otherwise each comparison is a loky worker process. Its
+    # arguments are pickled per task, except numeric arrays over 1 MB (the
+    # control matrix, the size factors), which joblib writes once to its
+    # temp folder and every worker maps; it holds its comparison's counts and
+    # means densely.
+    effective_n_jobs = _resolve_n_jobs(n_jobs)
+    requested_n_jobs = effective_n_jobs
+    n_to_run = len(candidates_to_run)
+    if not two_group:
+        unique_labels, label_counts = np.unique(labels, return_counts=True)
+        with h5py.File(path, "r") as handle:
+            x_node = handle["X"]
+            nnz_per_cell = (
+                x_node["data"].shape[0] / max(n_cells_total, 1) if isinstance(x_node, h5py.Group) else n_genes
+            )
+        group_sizes = dict(zip(unique_labels, label_counts))
+        pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
+        max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
+        avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
+        # The p95 group size, so a few outliers do not size every worker.
+        use_group_size = (
+            int(np.percentile(pert_group_sizes, 95)) if len(pert_group_sizes) >= 10 else max_group_size
         )
-    else:
-        control_matrix_mb_for_pickle = control_n * n_genes * 8 / 1e6  # float64
-        # Context-aware work arrays based on dispersion mode
-        if can_use_cache_early and dispersion_scope == "global":
-            # Global dispersion: skip MoM/trend, but still need SE recomputation arrays
-            work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
-        else:
-            # Per-comparison: need full Y and mu matrices for MAP dispersion
-            work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 6 / 1e6
-        serialized_args_mb = (control_matrix_mb_for_pickle + n_cells_total * 8 * 3 / 1e6) * 2.5
+        control_matrix_mb = control_n * n_genes * 8 / 1e6
+        # Counts, means and the IRLS work arrays of the comparison's cells.
+        work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 6 / 1e6
+        serialized_args_mb = (control_matrix_mb + n_cells_total * 8 * 3 / 1e6) * 2.5
         per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
 
-    # The parent holds one copy of the control matrix plus its own arrays.
-    # The largest perturbation is sized on its own rather than by the p95
-    # group above: its worker holds its counts (float64 CSR, and a
-    # normalised copy) however many cells it has -- a 165k-cell
-    # non-targeting group fitted as a perturbation is ~20 GB of them.
-    control_matrix_mb = control_n * n_genes * 8 / 1e6
-    largest_group_mb = max_group_size * nnz_per_cell * 12 * 2 / 1e6
-    base_memory_mb = control_matrix_mb + largest_group_mb + 1000
-    available_mb = budget_gb * 1000
-    # Reserve 20% headroom for safety
-    usable_mb = available_mb * 0.8
-    remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
-    max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
+        # The parent holds one copy of the control matrix plus its own arrays.
+        # The largest perturbation is sized on its own rather than by the p95
+        # group above: its worker holds its counts however many cells it has
+        # -- a 165k-cell non-targeting group fitted as a perturbation is
+        # ~20 GB of them.
+        largest_group_mb = max_group_size * nnz_per_cell * 12 * 2 / 1e6
+        base_memory_mb = control_matrix_mb + largest_group_mb + 1000
+        available_mb = budget_gb * 1000
+        # Reserve 20% headroom for safety
+        usable_mb = available_mb * 0.8
+        remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
+        max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
 
-    # Dataset-size-aware caps
-    full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
-    if full_matrix_gb < 1.0:
-        # Tiny dataset: cap workers to reduce parallelization overhead
-        max_workers_by_size = max(4, n_groups // 2)
-    else:
-        max_workers_by_size = n_groups
-
-    # Use candidates_to_run (not n_groups) for worker limit since that's what we're actually running
-    n_to_run = len(candidates_to_run)
-    memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
-    if memory_limited_workers < effective_n_jobs:
-        if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
-            limit_reason = "perturbation_count"
-        elif memory_limited_workers == max_workers_by_memory:
-            limit_reason = "memory"
-        elif memory_limited_workers == max_workers_by_size:
-            limit_reason = "small_dataset"
+        # Dataset-size-aware caps
+        full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
+        if full_matrix_gb < 1.0:
+            # Tiny dataset: cap workers to reduce parallelization overhead
+            max_workers_by_size = max(4, n_groups // 2)
         else:
-            limit_reason = "perturbation_count"
-        logger.info(
-            f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
-            f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
-            f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
-        )
-        effective_n_jobs = memory_limited_workers
+            max_workers_by_size = n_groups
+
+        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
+        if memory_limited_workers < effective_n_jobs:
+            if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
+                limit_reason = "perturbation_count"
+            elif memory_limited_workers == max_workers_by_memory:
+                limit_reason = "memory"
+            elif memory_limited_workers == max_workers_by_size:
+                limit_reason = "small_dataset"
+            else:
+                limit_reason = "perturbation_count"
+            logger.info(
+                f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
+                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
+                f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
+            )
+            effective_n_jobs = memory_limited_workers
     effective_n_jobs = max(1, effective_n_jobs)
 
     # For small number of perturbations to run, run sequentially to avoid overhead.
-    # The two-group path runs comparisons in turn, each parallel over genes.
     use_parallel = n_to_run >= 4 and effective_n_jobs > 1 and not two_group
 
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
@@ -3414,7 +2217,7 @@ def nb_glm_test(
             pert_expr_counts=group_expr_counts,
             control_expr_counts=control_expr_counts,
             pert_mean=group_total / max(group_n, 1),
-            control_mean=control_summary.total / max(control_n, 1),
+            control_mean=control_total / max(control_n, 1),
             n_pert_cells=group_n,
             n_control_cells=control_n,
             min_pct_ctrl=min_pct_ctrl,
@@ -3428,14 +2231,16 @@ def nb_glm_test(
             min_cells_ctrl=min_cells_ctrl,
             min_cells_pert=min_cells_pert,
         )
-        valid &= (control_summary.total + group_total) >= min_total_count
-        fit = fit_two_group_deseq2(control_summary, y, s_t, np.flatnonzero(valid), min_mu=min_mu)
+        valid &= (control_total + group_total) >= min_total_count
+        fit = fit_two_group_deseq2(
+            control_summary, y, s_t, np.flatnonzero(valid),
+            dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
+        )
         tested = fit.converged & np.isfinite(fit.statistic)
         lfc = np.where(tested, fit.lfc, np.nan)
         return {
             "group_idx": group_idx,
             "n_tested": int(valid.sum()),
-            "effect": lfc,
             "statistic": np.where(tested, fit.statistic, np.nan),
             "pvalue": np.where(tested, fit.pvalue, np.nan),
             "logfc": lfc,
@@ -3443,12 +2248,9 @@ def nb_glm_test(
             "intercept": np.where(tested, fit.intercept, np.nan),
             "se": np.where(tested, fit.se, np.nan),
             "pts": (group_expr_counts / max(group_n, 1)).astype(np.float32),
-            "pts_rest": pts_rest_shared.astype(np.float32),
             "dispersion": fit.dispersion,
             "dispersion_raw": fit.genewise_dispersion,
             "dispersion_trend": fit.trend,
-            "mean": fit.base_mean,
-            "iterations": np.zeros(n_genes, dtype=np.int32),
             "converged": fit.converged,
         }
 
@@ -3461,7 +2263,6 @@ def nb_glm_test(
     # Track completed labels during this run
     newly_completed = list(completed_labels)  # Start with already completed
     newly_failed: list[str] = []
-    n_processed = 0
         
     # A fitted row goes straight into the result file, in its final units.
     out = {key: run.file[key] for key in ["X", *(f"layers/{name}" for name in layers)]}
@@ -3479,12 +2280,10 @@ def nb_glm_test(
         if lfc_base == "log2":
             out["layers/logfoldchange_raw_ln"][idx] = res["logfc_raw"]
             out["layers/standard_error_ln"][idx] = res["se"]
-        if not global_dispersion_fit:
-            out["layers/dispersion"][idx] = res["dispersion"]
-            out["layers/dispersion_raw"][idx] = res["dispersion_raw"]
-            out["layers/dispersion_trend"][idx] = res["dispersion_trend"]
+        out["layers/dispersion"][idx] = res["dispersion"]
+        out["layers/dispersion_raw"][idx] = res["dispersion_raw"]
+        out["layers/dispersion_trend"][idx] = res["dispersion_trend"]
         out["layers/converged"][idx] = res["converged"]
-        out["layers/iterations"][idx] = res["iterations"]
         out["layers/pts"][idx] = res["pts"]
 
     def _write_failed_row(label: str) -> None:
@@ -3507,220 +2306,61 @@ def nb_glm_test(
     # Run fitting with progress tracking
     n_tested_list: list[int] = []
     with _create_progress_context(n_to_run, "NB-GLM DE", verbose) as pbar:
-        if use_parallel:
-            # Use joblib.Parallel with loky backend for true process-based parallelism
-            # This avoids GIL contention that limits ThreadPoolExecutor performance
-            if can_use_cache:
-                results = Parallel(
-                    n_jobs=effective_n_jobs,
-                    backend="loky",
-                    prefer="processes",
-                    # Each row is written as soon as it is fitted, rather than
-                    # held until every earlier one is.
-                    return_as="generator_unordered",
-                )(
-                    delayed(_fit_perturbation_worker_cached)(
-                        group_idx=candidate_to_idx[label],
-                        label=label,
-                        path=path,
-                        group_rows=group_rows[label],
-                        control_cache=control_cache,
-                        size_factors=size_factors,
-                        n_genes=n_genes,
-                        min_cells_expressed=min_cells_expressed,
-                        min_pct_ctrl=min_pct_ctrl,
-                        min_pct_pert=min_pct_pert,
-                        min_mean_ctrl=min_mean_ctrl,
-                        min_mean_pert=min_mean_pert,
-                        min_cells_ctrl=min_cells_ctrl,
-                        min_cells_pert=min_cells_pert,
-                        min_total_count=min_total_count,
-                        max_iter=max_iter,
-                        tol=tol,
-                        min_mu=min_mu,
-                        dispersion_method=dispersion_method,
-                        shrink_dispersion=shrink_dispersion,
-                        use_map_dispersion=use_map_dispersion,
-                        lfc_shrinkage_type=lfc_shrinkage_type,
-                        se_method=se_method,
-                    )
-                    for label in candidates_to_run
-                )
-            else:
-                results = Parallel(
-                    n_jobs=effective_n_jobs,
-                    backend="loky",
-                    prefer="processes",
-                    return_as="generator_unordered",
-                )(
-                    delayed(_fit_perturbation_worker)(
-                        group_idx=candidate_to_idx[label],
-                        label=label,
-                        path=path,
-                        group_rows=group_rows[label],
-                        control_mask=control_mask,
-                        control_matrix=control_matrix,
-                        control_expr_counts=control_expr_counts,
-                        control_n=control_n,
-                        obs_df=obs_df,
-                        covariates=covariates,
-                        size_factors=size_factors,
-                        offset=offset,
-                        n_genes=n_genes,
-                        min_cells_expressed=min_cells_expressed,
-                        min_pct_ctrl=min_pct_ctrl,
-                        min_pct_pert=min_pct_pert,
-                        min_mean_ctrl=min_mean_ctrl,
-                        min_mean_pert=min_mean_pert,
-                        min_cells_ctrl=min_cells_ctrl,
-                        min_cells_pert=min_cells_pert,
-                        min_total_count=min_total_count,
-                        max_iter=max_iter,
-                        tol=tol,
-                        min_mu=min_mu,
-                        poisson_init_iter=poisson_init_iter,
-                        dispersion_method=dispersion_method,
-                        global_dispersion=global_dispersion,
-                        shrink_dispersion=shrink_dispersion,
-                        use_map_dispersion=use_map_dispersion,
-                        lfc_shrinkage_type=lfc_shrinkage_type,
-                        pts_rest_shared=pts_rest_shared,
-                        se_method=se_method,
-                    )
-                    for label in candidates_to_run
-                )
-                
-            # Process results as they stream in
-            for res in results:
-                label = candidates[res["group_idx"]]
-                try:
-                    _write_result_row(res, label)
-                    newly_completed.append(label)
-                    n_tested_list.append(res.get("n_tested", 0))
-                    _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
-                    logger.debug(f"Completed perturbation: {label}")
-                except Exception as e:
-                    logger.error(f"Failed perturbation {label}: {e}")
-                    newly_failed.append(label)
-                    _write_failed_row(label)
-                    
-                n_processed += 1
-                pbar.update(1)
-                    
-                # Save checkpoint periodically
-                if n_processed % eff_checkpoint_interval == 0:
-                    _save_checkpoint()
-        elif two_group:
+
+        def _record(label: str, compute) -> None:
+            try:
+                res = compute()
+                _write_result_row(res, label)
+                newly_completed.append(label)
+                n_tested_list.append(res["n_tested"])
+                _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
+                logger.debug(f"Completed perturbation: {label}")
+            except Exception as e:
+                logger.error(f"Failed perturbation {label}: {e}")
+                newly_failed.append(label)
+                _write_failed_row(label)
+            pbar.update(1)
+            if (len(newly_completed) - len(completed_labels) + len(newly_failed)) % eff_checkpoint_interval == 0:
+                _save_checkpoint()
+
+        def _worker_args(label: str) -> dict:
+            return dict(
+                group_idx=candidate_to_idx[label], label=label, path=path, group_rows=group_rows[label],
+                control_mask=control_mask, control_matrix=control_matrix,
+                control_expr_counts=control_expr_counts, control_total=control_total, control_n=control_n,
+                obs_df=obs_df, covariates=covariates, size_factors=size_factors, n_genes=n_genes,
+                min_cells_expressed=min_cells_expressed, min_pct_ctrl=min_pct_ctrl, min_pct_pert=min_pct_pert,
+                min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert, min_cells_ctrl=min_cells_ctrl,
+                min_cells_pert=min_cells_pert, min_total_count=min_total_count, max_iter=max_iter, tol=tol,
+                min_mu=min_mu, poisson_init_iter=poisson_init_iter, dispersion=dispersion,
+                shrink_dispersion=shrink_dispersion, lfc_shrinkage_type=lfc_shrinkage_type,
+            )
+
+        if two_group:
             import numba
 
-            # Threads share the one control summary, so the per-worker memory
-            # limit above (sized for processes that each hold the controls)
-            # does not apply: use the cores asked for.
             threads = numba.get_num_threads()
             numba.set_num_threads(min(requested_n_jobs, numba.config.NUMBA_NUM_THREADS))
             backed = read_backed(path)
             try:
                 for label in candidates_to_run:
-                    try:
-                        res = _fit_two_group_worker(candidate_to_idx[label], label, backed.X, group_rows[label])
-                        _write_result_row(res, label)
-                        newly_completed.append(label)
-                        n_tested_list.append(res["n_tested"])
-                        _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
-                    except Exception as e:
-                        logger.error(f"Failed perturbation {label}: {e}")
-                        newly_failed.append(label)
-                        _write_failed_row(label)
-                    n_processed += 1
-                    pbar.update(1)
-                    if n_processed % eff_checkpoint_interval == 0:
-                        _save_checkpoint()
+                    _record(label, lambda label=label: _fit_two_group_worker(
+                        candidate_to_idx[label], label, backed.X, group_rows[label]))
             finally:
                 backed.file.close()
                 numba.set_num_threads(threads)
+        elif use_parallel:
+            # Each row is written as soon as it is fitted, rather than held
+            # until every earlier one is.
+            results = Parallel(
+                n_jobs=effective_n_jobs, backend="loky", prefer="processes", return_as="generator_unordered",
+            )(delayed(_fit_perturbation_worker)(**_worker_args(label)) for label in candidates_to_run)
+            for res in results:
+                _record(candidates[res["group_idx"]], lambda res=res: res)
         else:
-            # Run sequentially
             for label in candidates_to_run:
-                group_idx = candidate_to_idx[label]
-                try:
-                    if can_use_cache:
-                        res = _fit_perturbation_worker_cached(
-                            group_idx=group_idx,
-                            label=label,
-                            path=path,
-                            group_rows=group_rows[label],
-                            control_cache=control_cache,
-                            size_factors=size_factors,
-                            n_genes=n_genes,
-                            min_cells_expressed=min_cells_expressed,
-                            min_pct_ctrl=min_pct_ctrl,
-                            min_pct_pert=min_pct_pert,
-                            min_mean_ctrl=min_mean_ctrl,
-                            min_mean_pert=min_mean_pert,
-                            min_cells_ctrl=min_cells_ctrl,
-                            min_cells_pert=min_cells_pert,
-                            min_total_count=min_total_count,
-                            max_iter=max_iter,
-                            tol=tol,
-                            min_mu=min_mu,
-                            dispersion_method=dispersion_method,
-                            shrink_dispersion=shrink_dispersion,
-                            use_map_dispersion=use_map_dispersion,
-                            lfc_shrinkage_type=lfc_shrinkage_type,
-                            se_method=se_method,
-                            )
-                    else:
-                        res = _fit_perturbation_worker(
-                            group_idx=group_idx,
-                            label=label,
-                            path=path,
-                            group_rows=group_rows[label],
-                            control_mask=control_mask,
-                            control_matrix=control_matrix,
-                            control_expr_counts=control_expr_counts,
-                            control_n=control_n,
-                            obs_df=obs_df,
-                            covariates=covariates,
-                            size_factors=size_factors,
-                            offset=offset,
-                            n_genes=n_genes,
-                            min_cells_expressed=min_cells_expressed,
-                            min_pct_ctrl=min_pct_ctrl,
-                            min_pct_pert=min_pct_pert,
-                            min_mean_ctrl=min_mean_ctrl,
-                            min_mean_pert=min_mean_pert,
-                            min_cells_ctrl=min_cells_ctrl,
-                            min_cells_pert=min_cells_pert,
-                            min_total_count=min_total_count,
-                            max_iter=max_iter,
-                            tol=tol,
-                            min_mu=min_mu,
-                            poisson_init_iter=poisson_init_iter,
-                            dispersion_method=dispersion_method,
-                            global_dispersion=global_dispersion,
-                            shrink_dispersion=shrink_dispersion,
-                            use_map_dispersion=use_map_dispersion,
-                            lfc_shrinkage_type=lfc_shrinkage_type,
-                            pts_rest_shared=pts_rest_shared,
-                            se_method=se_method,
-                            )
-                    _write_result_row(res, label)
-                    newly_completed.append(label)
-                    n_tested_list.append(res.get("n_tested", 0))
-                    _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
-                    logger.debug(f"Completed perturbation: {label}")
-                except Exception as e:
-                    logger.error(f"Failed perturbation {label}: {e}")
-                    newly_failed.append(label)
-                    _write_failed_row(label)
-                    
-                n_processed += 1
-                pbar.update(1)
-                    
-                # Save checkpoint periodically
-                if n_processed % eff_checkpoint_interval == 0:
-                    _save_checkpoint()
-        
+                _record(label, lambda label=label: _fit_perturbation_worker(**_worker_args(label)))
+
     # Final checkpoint save
     _save_checkpoint()
     logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
@@ -5156,11 +3796,6 @@ def shrink_lfc(
         original_dataset_path = _uns_value(uns, "original_dataset_path")
         candidates = [str(g) for g in _h5_index(handle["obs"])]
         gene_symbols = pd.Index([str(g) for g in _h5_index(handle["var"])])
-        # A global dispersion is stored once per gene in var; a
-        # per-comparison one is a layer.
-        global_dispersion = (
-            np.asarray(handle["var/dispersion"][()], dtype=np.float64) if "dispersion" in handle["var"] else None
-        )
         n_groups, n_genes = handle["X"].shape
     if "intercept" not in layer_names:
         raise ValueError(
@@ -5194,10 +3829,7 @@ def shrink_lfc(
             "mle": handle[mle_key][sl], "raw": handle[raw_key][sl], "se": handle[se_key][sl],
             "intercept": handle["layers/intercept"][sl],
         }
-        rows["dispersion"] = (
-            np.broadcast_to(global_dispersion, rows["raw"].shape) if global_dispersion is not None
-            else handle["layers/dispersion"][sl]
-        )
+        rows["dispersion"] = handle["layers/dispersion"][sl]
         return rows
 
     # Global prior scale from ALL perturbations' MLE LFCs: read once when the

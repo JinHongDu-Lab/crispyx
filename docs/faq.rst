@@ -22,7 +22,9 @@ For very large datasets, consider:
 
 * Converting to CSC before Wilcoxon or ``batch_process`` (see :doc:`large_data`).
 * Converting to CSR before NB-GLM.
-* Using ``freeze_control=True`` for datasets with >100K control cells.
+* With covariates and >100K control cells, aggregating to pseudo-bulk
+  (``cx.pb.aggregate``) before NB-GLM; without covariates the controls are
+  streamed once and their number does not matter.
 
 When should I use CSC vs CSR format, and how do I control the streaming order?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -361,8 +363,6 @@ Performance tips
 * **Pre-convert matrix formats** before DE: CSC for Wilcoxon and
   ``batch_process``, CSR for NB-GLM. This avoids O(total_nnz × n_chunks)
   scans.
-* **Use ``freeze_control=True``** for datasets with >100K control cells to
-  reduce per-worker memory from ~32 GB to <1 GB.
 * **Increase ``n_jobs``** for multi-core NB-GLM on machines with sufficient
   RAM.
 * **Use adaptive chunk sizes** (the default): let crispyx calculate optimal

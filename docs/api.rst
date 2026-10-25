@@ -136,6 +136,10 @@ Batched IRLS for negative binomial and Poisson GLMs.
 a ``[covariates | one-hot groups]`` design, which is the shape of every
 perturbation screen and of any design carrying a many-level categorical
 covariate.  :func:`~crispyx.glm.fit_nb_glm_batch_auto` chooses between them.
+DESeq2's Wald test of one perturbation against the controls, as ``nb_glm_test``
+runs it, is :func:`~crispyx.glm.fit_two_group_deseq2` (against a
+:func:`~crispyx.glm.summarize_controls` summary) and
+:func:`~crispyx.glm.fit_glm_deseq2` (any design, on the cells).
 
 .. automodule:: crispyx.glm
    :members:

@@ -38,22 +38,40 @@ Unreleased
   (DESeq2's bulk default) makes single-cell tests conservative and biases
   low-count genes under depth differences, which ``min_mu=1e-6`` removes.
   NB-GLM results computed with default size factors change.
-* **Per-comparison NB-GLM runs at the scale of a genome-wide screen, as
-  DESeq2 would.** Without covariates, ``dispersion_scope="per_comparison"``
-  (without in-call shrinkage) now summarises the
-  controls once -- a count histogram per gene and size-factor-binned
-  moments -- and fits each perturbation from that summary and its own
-  cells, following PyDESeq2's steps (linear-model means, gene-wise Cox-Reid
-  dispersions, parametric trend, prior variance, MAP, outlier rule, IRLS
-  with the mean floor and ridge, Wald test). Given the same size factors it
-  matches PyDESeq2 to a median 1e-3 in z (z r >= 0.9999 on Adamson and
-  Tian). On 20,000 Huang-HCT116 controls
-  and 20 perturbations it takes 16 s and 3.4 GB on a 32-core Mac, against
-  14 min per perturbation for the previous per-comparison code and 300 s
-  and 58 GB for ``dispersion_scope="global"``; controls too large for
-  memory are streamed. Standard errors no longer come out about 5 % small
-  (they were computed at a gene-wise dispersion the LFC was not refitted
-  at). Results with ``dispersion_scope="per_comparison"`` change.
+* **NB-GLM estimates dispersions per comparison, as DESeq2 does, and at
+  the scale of a genome-wide screen; the global dispersion is removed.**
+  Each perturbation is tested against the controls with PyDESeq2's steps
+  on that comparison's cells: gene-wise Cox-Reid dispersions, the
+  parametric trend, the prior variance, MAP dispersions, the outlier rule
+  (genes far above the trend keep their gene-wise value), IRLS with the
+  mean floor and ridge, and the Wald test. Without covariates the controls
+  are summarised once -- a count histogram per gene and size-factor-binned
+  moments -- and each perturbation is fitted from that summary and its own
+  cells; controls of any size are streamed. On 20,000 Huang-HCT116 controls
+  and 20 perturbations this takes 16 s and 3.4 GB on a 32-core Mac, against
+  300 s and 58 GB for the former global dispersion. With covariates each
+  comparison is fitted on its cells with the full design: means by IRLS at
+  PyDESeq2's starting dispersions, then the same dispersion steps, with the
+  gene-wise search refined (Brent) instead of a 10-point grid, and the
+  coefficients refitted at the final dispersions instead of keeping the
+  grid's. Given the same size factors both agree with PyDESeq2 to a median
+  1e-3 in z (at most 0.05), with and without a batch covariate. Where
+  PyDESeq2's gene-wise optimiser stops at its lower bound, crispyx finds a
+  higher likelihood; those genes are what keep the trends about 5 % apart.
+  ``dispersion_scope``, ``dispersion_method``, ``use_map_dispersion``,
+  ``freeze_control``, ``use_control_cache``, ``se_method``,
+  ``optimization_method``, ``irls_batch_size`` and ``cook_filter`` (which
+  did nothing) are removed, as are the
+  control cache, frozen-control and streaming global-dispersion code and
+  ``glm.NBGLMFitter``; ``dispersion`` (a fixed value) and
+  ``shrink_dispersion=False`` (test at the gene-wise dispersions) remain.
+  ``max_iter`` and ``tol`` (IRLS with covariates) default to 100 and 1e-8.
+  Results always store the dispersions as layers (``dispersion``,
+  ``dispersion_raw``, ``dispersion_trend``); ``var["dispersion"]`` and the
+  ``iterations`` layer are gone. NB-GLM results change. Cook's distance
+  outlier replacement stays out: on four Adamson perturbations against
+  7,629 controls PyDESeq2's ``refit_cooks`` replaced outliers in 4-15 of
+  ~18,800 genes and changed the hits at q < 0.1 by 0-3.
 * **The mean floor follows the counts.** ``min_mu`` (fitted means are held
   at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting
   for single cells, when at least half of a sample of the counts are zero,

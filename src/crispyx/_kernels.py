@@ -22,7 +22,6 @@ _solve_spd_2x2 = nb.njit(cache=True)(solve_spd_2x2)
 # Numba-accelerated gammaln using scipy's cython implementation
 # =============================================================================
 
-_PTR = ctypes.POINTER
 _dble = ctypes.c_double
 _addr = get_cython_function_address("scipy.special.cython_special", "gammaln")
 _functype = ctypes.CFUNCTYPE(_dble, _dble)
@@ -90,58 +89,6 @@ def _nb_loglik_grid_numba(
 # Dispersion estimation kernels
 # =============================================================================
 
-@nb.njit(cache=True)
-def _nb_ll_for_alpha(Y_g, mu_g, alpha):
-    """Compute NB log-likelihood for a single gene at a given alpha.
-    
-    Vectorized across cells using Numba-compatible operations.
-    """
-    r = 1.0 / alpha
-    log_r = np.log(r)
-    gammaln_r = math.lgamma(r)
-    n_cells = Y_g.shape[0]
-    
-    ll = 0.0
-    for i in range(n_cells):
-        y = Y_g[i]
-        mu = mu_g[i]
-        ll += (
-            math.lgamma(y + r)
-            - gammaln_r
-            - math.lgamma(y + 1.0)
-            + r * (log_r - np.log(r + mu + 1e-12))
-            + y * np.log(mu / (r + mu + 1e-12) + 1e-12)
-        )
-    return ll
-
-
-@nb.njit(parallel=True, cache=True)
-def _compute_mle_dispersion_numba(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    dof: float,
-) -> np.ndarray:
-    """Compute MLE dispersion per gene without large intermediate arrays.
-    
-    Memory-optimized: computes per-gene without creating (n_cells, n_genes) intermediates.
-    Uses Numba parallel for speed.
-    """
-    n_cells, n_genes = Y.shape
-    alpha_mle = np.zeros(n_genes, dtype=np.float64)
-    
-    for g in nb.prange(n_genes):
-        acc = 0.0
-        for i in range(n_cells):
-            y_val = Y[i, g]
-            mu_val = mu[i, g]
-            resid = y_val - mu_val
-            variance = resid * resid - y_val
-            denom = max(mu_val * mu_val, 1e-10)
-            acc += variance / denom
-        alpha_mle[g] = acc / dof
-    
-    return alpha_mle
-
 
 @nb.njit(cache=True)
 def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
@@ -166,87 +113,6 @@ def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
                 v -= xtwx[i, k] * xtwx[j, k]
             xtwx[i, j] = v / ljj
     return -log_det  # -0.5 * (2 * sum(log diag(L)))
-
-
-@nb.njit(parallel=True, cache=True)
-def _nb_map_grid_search_numba(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    log_trend: np.ndarray,
-    log_alpha_grid: np.ndarray,
-    prior_var: float,
-    x_indptr: np.ndarray,
-    x_indices: np.ndarray,
-    x_data: np.ndarray,
-    n_features: int,
-) -> tuple:
-    """Vectorized grid search for MAP dispersion across all genes.
-    
-    For each gene, evaluates the posterior (log-likelihood + log-prior) at each
-    grid point and finds the best grid point. Returns the best log-alpha and
-    the indices of adjacent grid points for refinement.
-    
-    Memory optimization: computes gammaln(Y + 1) once per gene instead of
-    n_grid times, saving significant computation time.
-    
-    Parameters
-    ----------
-    Y : (n_cells, n_genes)
-        Count matrix.
-    mu : (n_cells, n_genes)
-        Fitted mean matrix.
-    log_trend : (n_genes,)
-        Log of dispersion trend values.
-    log_alpha_grid : (n_grid,)
-        Grid of log-dispersion values to search.
-    prior_var : float
-        Variance of log-normal prior.
-    x_indptr, x_indices, x_data, n_features
-        The design matrix in CSR form, for the Cox-Reid adjustment
-        (``n_features=0`` for none).
-        
-    Returns
-    -------
-    best_log_alpha : (n_genes,)
-        Best log-alpha value for each gene.
-    best_idx : (n_genes,)
-        Index of best grid point.
-    """
-    n_cells, n_genes = Y.shape
-    n_grid = log_alpha_grid.shape[0]
-    
-    best_log_alpha = np.zeros(n_genes, dtype=np.float64)
-    best_idx = np.zeros(n_genes, dtype=np.int64)
-    
-    # Parallelize over genes
-    for g in nb.prange(n_genes):
-        best_posterior = -np.inf
-        best_k = 0
-        log_trend_g = log_trend[g]
-        Y_g = Y[:, g]
-        mu_g = mu[:, g]
-        xtwx = np.empty((n_features, n_features))
-        
-        # Precompute gammaln(Y_g + 1) for this gene - only done once, not n_grid times!
-        gammaln_y_plus_1 = 0.0
-        for i in range(n_cells):
-            gammaln_y_plus_1 += math.lgamma(Y_g[i] + 1.0)
-        
-        for k in range(n_grid):
-            log_alpha = log_alpha_grid[k]
-            posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1,
-                x_indptr, x_indices, x_data, xtwx,
-            )
-            
-            if posterior > best_posterior:
-                best_posterior = posterior
-                best_k = k
-                best_log_alpha[g] = log_alpha
-        
-        best_idx[g] = best_k
-    
-    return best_log_alpha, best_idx
 
 
 @nb.njit(cache=True)

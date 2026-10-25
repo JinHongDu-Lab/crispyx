@@ -1,18 +1,20 @@
-"""DESeq2 on one perturbation against a control summary (glm.fit_two_group_deseq2)."""
+"""DESeq2 on one perturbation against the controls: against a control summary
+(glm.fit_two_group_deseq2), and with covariates on the cells (glm.fit_glm_deseq2)."""
 
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from crispyx.glm import fit_two_group_deseq2, summarize_controls
+from crispyx.glm import build_design_matrix, fit_glm_deseq2, fit_two_group_deseq2, summarize_controls
 
 pydeseq2 = pytest.importorskip("pydeseq2")
 
 
-def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300):
+def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300, batch_sd=0.0):
     """Controls and one perturbation; 0.3 to 30 counts per cell, dispersions
-    scattered around a DESeq2-shaped trend, 30 genes moved."""
+    scattered around a DESeq2-shaped trend, 30 genes moved. Each cell is in
+    one of three batches, with gene effects of SD ``batch_sd`` (log scale)."""
     rng = np.random.default_rng(seed)
     labels = np.array(["ctrl"] * n_ctrl + ["KO1"] * n_pert)
     mu = rng.lognormal(np.log(3), 1.2, n_genes)
@@ -20,21 +22,28 @@ def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300):
     lfc = np.zeros(n_genes)
     lfc[rng.choice(n_genes, 30, replace=False)] = rng.normal(0, 1, 30)
     sf = rng.lognormal(0, 0.3, labels.size)
-    mean = mu[None, :] * sf[:, None]
+    batch = rng.integers(0, 3, labels.size)
+    mean = mu[None, :] * sf[:, None] * np.exp(rng.normal(0, batch_sd, (3, n_genes)))[batch]
     mean[labels == "KO1"] *= np.exp(lfc)
     counts = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mean)).astype(np.float64)
+    if batch_sd:
+        return counts, labels, sf, np.array([f"b{b}" for b in batch])
     return counts, labels, sf
 
 
-def _pydeseq2(counts, labels, sf):
+def _pydeseq2(counts, labels, sf, batch=None):
     """PyDESeq2's steps on control + KO1 with the given size factors (no
-    Cook's refit or filtering, which fit_two_group_deseq2 does not do)."""
+    Cook's refit or filtering, which crispyx does not do), on ``~ condition``
+    or, given batches, ``~ batch + condition``."""
     from pydeseq2.dds import DeseqDataSet
     from pydeseq2.ds import DeseqStats
 
     df = pd.DataFrame(counts.astype(int), columns=[f"g{i}" for i in range(counts.shape[1])])
-    dds = DeseqDataSet(counts=df, metadata=pd.DataFrame({"condition": labels}, index=df.index),
-                       design="~condition", refit_cooks=False, quiet=True)
+    meta = pd.DataFrame({"condition": labels}, index=df.index)
+    if batch is not None:
+        meta["batch"] = batch
+    dds = DeseqDataSet(counts=df, metadata=meta, design="~condition" if batch is None else "~batch + condition",
+                       refit_cooks=False, quiet=True)
     dds.obs["size_factors"] = sf
     dds.layers["normed_counts"] = dds.X / sf[:, None]
     dds.var["_normed_means"] = dds.layers["normed_counts"].mean(0)
@@ -93,6 +102,84 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
     assert res.converged.all()
 
 
+def _bound_losses_are_lower(res, dds, counts, design, sf):
+    """Where PyDESeq2's gene-wise optimiser stops at min_disp, our estimate has
+    the lower Cox-Reid loss at PyDESeq2's own means."""
+    from pydeseq2.utils import nb_nll
+
+    theirs = dds.var["genewise_dispersions"].to_numpy()
+    at_bound = theirs <= 1e-8 * 1.0001
+    assert at_bound.sum() < 0.1 * at_bound.size
+    for g in np.flatnonzero(at_bound):
+        y, mu = counts[:, g], dds.layers["_mu_hat"][:, g]
+
+        def loss(a):
+            w = mu / (1 + mu * a)
+            return nb_nll(y, mu, a) + 0.5 * np.linalg.slogdet((design.T * w) @ design)[1]
+
+        assert loss(res.genewise_dispersion[g]) <= loss(theirs[g])
+    return at_bound
+
+
+def test_glm_with_a_covariate_matches_pydeseq2_given_the_same_size_factors():
+    """fit_glm_deseq2 on ~ batch + condition agrees with PyDESeq2 step by step:
+    gene-wise dispersions to 1e-3 (where PyDESeq2's optimiser does not stop at
+    min_disp), the trend fitted to the same gene-wise values, and the Wald
+    statistics. The MAP and final dispersions differ by the trend those
+    min_disp genes move (about 5 % here), which moves z by at most 0.05."""
+    from crispyx.glm import fit_dispersion_trend
+
+    counts, labels, sf, batch = _screen(seed=2, batch_sd=0.3)
+    dds, ref = _pydeseq2(counts, labels, sf, batch)
+    design, columns = build_design_matrix(
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"],
+        perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
+    )
+    res = fit_glm_deseq2(design, counts, sf, columns.index("perturbation"))
+    at_bound = _bound_losses_are_lower(res, dds, counts, design, sf)
+    theirs = dds.var["genewise_dispersions"].to_numpy()
+    np.testing.assert_allclose(res.genewise_dispersion[~at_bound], theirs[~at_bound], rtol=1e-3)
+    np.testing.assert_allclose(
+        fit_dispersion_trend(dds.var["_normed_means"].to_numpy(), theirs), dds.var["fitted_dispersions"], rtol=1e-4,
+    )
+    np.testing.assert_allclose(res.map_dispersion, dds.var["MAP_dispersions"], rtol=0.1)
+    np.testing.assert_allclose(res.lfc, ref["log2FoldChange"] * np.log(2), atol=1e-3)
+    dz = np.abs(res.statistic - ref["stat"].to_numpy())
+    assert np.median(dz) < 1e-3 and dz.max() < 0.05
+    assert res.converged.all()
+    assert res.coef.shape == (counts.shape[1], design.shape[1])
+    np.testing.assert_array_equal(res.coef[:, columns.index("perturbation")], res.lfc)
+
+
+@pytest.mark.parametrize("fit", ["two_group", "glm"])
+def test_a_given_dispersion_is_tested_at_and_genewise_ones_without_shrinkage(screen_and_reference, fit):
+    """dispersion= holds every gene at that value; shrink=False tests at the
+    gene-wise estimates. Both engines, the same answers."""
+    counts, labels, sf, _ = screen_and_reference
+    ctrl = labels == "ctrl"
+    if fit == "two_group":
+        summary = summarize_controls([(np.arange(ctrl.sum()), sp.csr_matrix(counts[ctrl]))], sf[ctrl],
+                                     counts.shape[1])
+
+        def run(**kw):
+            return fit_two_group_deseq2(summary, counts[~ctrl], sf[~ctrl], **kw)
+    else:
+        design = np.column_stack([np.ones(labels.size), (~ctrl).astype(float)])
+
+        def run(**kw):
+            return fit_glm_deseq2(design, counts, sf, 1, **kw)
+
+    fixed = run(dispersion=0.2)
+    np.testing.assert_array_equal(fixed.dispersion, 0.2)
+    assert np.isnan(fixed.genewise_dispersion).all() and np.isnan(fixed.prior_var)
+    genewise = run(shrink=False)
+    np.testing.assert_array_equal(genewise.dispersion, genewise.genewise_dispersion)
+    assert np.isnan(genewise.map_dispersion).all()
+    shrunk = run()
+    np.testing.assert_allclose(genewise.genewise_dispersion, shrunk.genewise_dispersion)
+    assert not np.allclose(genewise.statistic, shrunk.statistic)
+
+
 def test_binned_controls_match_the_exact_summary(screen_and_reference):
     """Size-factor bins of the default width give what one bin per distinct
     size factor (exact) gives. The largest gaps are low-count genes whose mean
@@ -106,29 +193,29 @@ def test_binned_controls_match_the_exact_summary(screen_and_reference):
     np.testing.assert_allclose(binned.lfc, exact.lfc, atol=1e-4)
 
 
-@pytest.mark.parametrize("size_factor_method, scope", [
-    ("libsize", "per_comparison"),
-    ("deseq2", "per_comparison"),
-    pytest.param("libsize", "global", marks=pytest.mark.xfail(
-        strict=True, reason="global moments dispersion halfway to the trend; the global scope is to be removed")),
+@pytest.mark.parametrize("size_factor_method, covariates", [
+    ("libsize", False),
+    ("deseq2", False),
+    ("libsize", True),
 ])
-def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size_factor_method, scope):
-    """End to end: nb_glm_test with per-comparison dispersions (the control
-    summary path) agrees with PyDESeq2 on each perturbation's cells, given
-    the size factors nb_glm_test computes. The global scope does not."""
+def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size_factor_method, covariates):
+    """End to end: nb_glm_test agrees with PyDESeq2 on each perturbation's
+    cells, given the size factors nb_glm_test computes; without covariates
+    through the control summary, with a batch covariate on the cells."""
     import anndata as ad
 
     from crispyx.de import _global_size_factors, nb_glm_test
 
     rng = np.random.default_rng(1)
-    counts, labels, _ = _screen(seed=1, n_pert=300)
+    counts, labels, _, batch = _screen(seed=1, n_pert=300, batch_sd=0.3 if covariates else 1e-12)
     labels = labels.copy()
     labels[labels == "KO1"] = np.where(rng.random((labels == "KO1").sum()) < 0.5, "KO1", "KO2")
     path = tmp_path / "screen.h5ad"
-    ad.AnnData(counts.astype(np.float32), obs=pd.DataFrame({"perturbation": labels})).write(path)
+    obs = pd.DataFrame({"perturbation": labels, "batch": batch})
+    ad.AnnData(counts.astype(np.float32), obs=obs).write(path)
     result = nb_glm_test(
         path, perturbation_column="perturbation", control_label="ctrl", size_factor_method=size_factor_method,
-        dispersion_scope=scope, n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad",
+        covariates=["batch"] if covariates else None, n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad",
         min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_cells_ctrl=0,
         min_cells_pert=0, min_total_count=0,
     )
@@ -137,7 +224,7 @@ def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size
         keep = np.isin(labels, ["ctrl", name])
         sub = labels[keep].copy()
         sub[sub == name] = "KO1"
-        _, ref = _pydeseq2(counts[keep], sub, sf[keep])
+        _, ref = _pydeseq2(counts[keep], sub, sf[keep], batch[keep] if covariates else None)
         z = result[name].statistic
         dz = np.abs(z - ref["stat"].to_numpy())
         assert np.median(dz) < 1e-3 and dz.max() < 0.05, (name, np.median(dz), dz.max())

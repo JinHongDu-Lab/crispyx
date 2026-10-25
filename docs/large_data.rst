@@ -83,12 +83,12 @@ before running NB-GLM:
 
 The function uses format-aware streaming: CSC sources are read in
 column-chunks (axis=1) and scattered into CSR buffers; dense sources are
-read in row-chunks (axis=0). For large datasets, the streaming control
-statistics function automatically activates — fitting the intercept-only
-model in chunks of 4,096 control cells instead of densifying the full
-control matrix. This keeps peak memory at O(chunk_size × n_genes) rather
-than O(n_control × n_genes). When ``freeze_control`` is auto-enabled,
-streaming is used unconditionally. Size factors are computed in one pass
+read in row-chunks (axis=0). Without covariates, NB-GLM summarises the
+control cells in one streaming pass, in chunks of 4,096 cells (each gene's
+count histogram and size-factor-binned moments), and fits every comparison
+against that summary, so the control matrix is never densified and peak
+memory stays at O(chunk_size × n_genes) rather than O(n_control × n_genes).
+With covariates the controls are held in memory. Size factors are computed in one pass
 over the rows (``"libsize"``) or two (``"geomeans"``, ``"deseq2"``: the
 controls' geometric means, then each cell's median ratio), never holding
 the matrix. After each streaming phase,
