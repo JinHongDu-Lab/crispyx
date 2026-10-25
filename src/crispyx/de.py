@@ -1453,7 +1453,7 @@ def nb_glm_test(
     optimization_method: Literal["irls", "lbfgsb"] = "lbfgsb",
     max_iter: int = 25,
     tol: float = 1e-6,
-    min_mu: float = 0.5,
+    min_mu: float | None = None,
     poisson_init_iter: int = 5,
     chunk_size: int | None = None,
     irls_batch_size: int | None = 128,
@@ -1596,10 +1596,15 @@ def nb_glm_test(
     tol
         Convergence tolerance for GLM fitting.
     min_mu
-        Minimum mean threshold for IRLS numerical stability. Predicted means
-        are clamped to max(min_mu, predicted) during fitting to prevent
-        numerical instability from very small means. Default: 0.5, matching
-        PyDESeq2's default. Set to 0.0 to disable clamping.
+        Floor on fitted means: means are held at ``max(min_mu, mean)`` while
+        fitting (DESeq2's ``minmu``). DESeq2 uses 0.5 for bulk counts and
+        recommends 1e-6 for single cells, where many genes have means below
+        one count and a floor of 0.5 binds unevenly between the groups
+        compared: tests become conservative, and low-count genes are biased
+        when the groups differ in depth (see :ref:`size-factors`). None (the
+        default) chooses from the input: 1e-6 when at least half of a sample
+        of the counts are zero (single cells), 0.5 otherwise (pseudo-bulk,
+        bulk). The value used is in ``uns["min_mu"]``.
     poisson_init_iter
         Initial Poisson iterations before switching to negative binomial.
     chunk_size
@@ -1797,7 +1802,7 @@ def nb_glm_test(
     )
 
     # Validate min_mu parameter
-    if min_mu < 0:
+    if min_mu is not None and min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
 
     # Initialize profiler if enabled (timing + memory sampling)
@@ -1854,6 +1859,22 @@ def nb_glm_test(
     finally:
         backed.file.close()
     _validate_counts_chunk(sample, context="nb_glm_test")
+    # DESeq2's floor of 0.5 on fitted means is a bulk-count setting. In sparse
+    # single-cell counts many genes have means below one; the floor then binds
+    # more often in the shallower group, which makes tests conservative and
+    # biases low-count genes when groups differ in depth (semi-synthetic
+    # screens in docs/notebooks/size_factor_comparison.ipynb). DESeq2 uses
+    # 1e-6 for single cells. The share of zero counts tells the two apart
+    # without a new knob: pseudo-bulk and bulk counts are mostly non-zero,
+    # single cells mostly zero.
+    if min_mu is None:
+        n_values = sample.shape[0] * sample.shape[1]
+        nonzero = sample.nnz if sp.issparse(sample) else np.count_nonzero(sample)
+        zero_share = 1.0 - nonzero / max(n_values, 1)
+        min_mu = 1e-6 if zero_share >= 0.5 else 0.5
+        _messages.vprint(
+            verbose, "nb_glm_test", f"min_mu={min_mu:g} ({zero_share:.0%} of a sample of the counts are zero)"
+        )
 
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
         # sort_by_perturbation reuses an existing sorted copy only when it
@@ -3264,6 +3285,7 @@ def nb_glm_test(
             "size_factors": size_factors,
             "original_dataset_path": str(path),  # For shrink_lfc to reload data
             "size_factor_method": size_factor_method,
+            "min_mu": float(min_mu),
             "dispersion_scope": dispersion_scope,
             "frozen_control": frozen_control,
             "de_filter": {

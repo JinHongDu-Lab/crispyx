@@ -298,112 +298,52 @@ reported at geometric mean 1.
 Pass ``size_factors`` to use your own (scran's, or another tool's to compare
 like with like) instead.
 
-**How they behave: semi-synthetic screens with known truth.** Fake
-perturbations are random groups of 150 real control cells (from Adamson, and
-from 20,000 controls of Huang-HCT116), changed in known ways; every other
-(perturbation, gene) pair is a true null:
+**How they behave.** :doc:`notebooks/size_factor_comparison` compares the
+three on semi-synthetic screens with known truth -- fake perturbations of
+real control cells from Adamson and Huang-HCT116, changed by depth thinning,
+weakly (30 genes), or by a strong composition shift (300 highly expressed
+genes 3-fold up or down) -- in single cells and in pseudo-bulk units of 25
+cells, and on real-cell fake perturbations. The false-positive rate is the
+share of null (perturbation, gene) pairs with p < 0.05; the evidence came
+from single cells first, and pseudo-bulk was compared after. In short:
 
-* **depth** -- every count of the group thinned to 60 %: a pure difference in
-  sequencing depth, no gene changed;
-* **weak** -- 30 genes changed 1.4-2-fold, half up and half down;
-* **strong up / strong down** -- 300 of the 1,000 most expressed genes up or
-  down 3-fold, which changes the cells' total RNA (a composition shift).
-
-Each method ran per-comparison NB-GLM with default settings on the single
-cells, and on pseudo-bulk units of 25 cells of one label (6 units per
-perturbation, 185 and 680 control units). The false-positive rate is the share
-of null pairs with p < 0.05 (5 % expected); Adamson / Huang:
-
-.. list-table:: False-positive rate (%), single cells
-   :header-rows: 1
-
-   * - scenario
-     - ``"libsize"``
-     - ``"geomeans"``
-     - ``"deseq2"``
-   * - depth
-     - 4.9 / 4.0
-     - 3.6 / 3.8 (dense genes 14 / 15)
-     - 5.6 / 3.9
-   * - weak
-     - 1.7 / 1.3
-     - 1.7 / 1.3
-     - 1.7 / 1.2
-   * - strong up
-     - **40.7 / 39.7**
-     - 15.9 / 11.6
-     - 6.9 / 20.8
-   * - strong down
-     - 16.4 / 12.5
-     - 15.4 / 13.4
-     - 11.9 / 27.0
-
-.. list-table:: False-positive rate (%), pseudo-bulk
-   :header-rows: 1
-
-   * - scenario
-     - ``"libsize"``
-     - ``"geomeans"``
-     - ``"deseq2"``
-   * - depth
-     - 3.6 / 3.8
-     - 3.6 / 3.8
-     - 3.7 / 3.8
-   * - weak
-     - 3.4 / 3.0
-     - 3.4 / 3.0
-     - 3.4 / 3.0
-   * - strong up
-     - **45.5 / 43.2**
-     - 3.3 / 3.3
-     - 3.3 / 3.3
-   * - strong down
-     - **20.8 / 16.0**
-     - 3.3 / 3.3
-     - 3.4 / 3.3
-
-What each method is good for:
-
-* **Library size** follows depth best: under pure depth thinning its tests on
-  well-counted genes (control mean >= 1) are calibrated in single cells (5 %
-  of null pairs at p < 0.05) where ``"geomeans"`` reaches 14-15 %: a median
-  of ratios over a cell's non-zero counts is pushed up when thinning turns
-  counts into zeros. It fails under composition shifts, in single cells and
-  pseudo-bulk alike: up to 46 % of null pairs and 1,100-7,700 false hits
-  (q < 0.1) per perturbation, because the total moves with the changed genes.
+* **Library size** follows depth best: under pure depth thinning its tests
+  are calibrated in single cells (5-6 %), where ``"geomeans"`` reaches
+  14-16 % on well-counted genes. It fails under composition shifts, in single
+  cells and pseudo-bulk alike (up to 47 % of null pairs), because the total
+  moves with the changed genes.
 * **Geometric means** and **DESeq2's ratio** resist composition shifts on
-  pseudo-bulk completely (3.3 % of null pairs, ~25 false hits per perturbation
-  against 300 changed genes, all of which are found): pseudo-bulk counts are
-  large, so a median of ratios is both depth-accurate and robust.
+  pseudo-bulk completely (3-5 % of null pairs, every changed gene found):
+  pseudo-bulk counts are large, so a median of ratios is both depth-accurate
+  and robust.
 * In **single cells no method stays calibrated under a strong composition
-  shift** (well-counted genes: 31-100 % of null pairs at p < 0.05): a median
-  over counts of 1-5 resists a shift far less than over pseudo-bulk counts.
-  The ratio method is the least affected when many genes are counted in every
-  control (Adamson, 29 genes) and the most when few are (Huang, 6 genes,
-  some of them among the changed ones).
+  shift**: a median over counts of 1-5 resists a shift far less than over
+  pseudo-bulk counts.
 * Under **weak perturbations** all three agree, at both levels.
+* A median of ratios over every expressed gene (``"sparse"`` before 0.2.3,
+  and DESeq2's ``poscounts``) mistakes depth for effect: fake perturbations of
+  the deepest controls get thousands of false hits each.
 
-**On real cells.** Fake perturbations drawn from the deepest 30 % of
-Huang-HCT116 and Adamson controls (a real depth difference, which also brings
-some biology along) tell the same story for depth: mean null z on
-well-counted genes +0.11 / -0.08 with library size, +0.97 / +0.29 with
-``"geomeans"``, +0.94 / -0.48 with ``"deseq2"``, and +5.6 / +5.3 with a median
-of ratios over every expressed gene (``"sparse"`` before 0.2.3, removed:
-6,578 false hits per fake perturbation on Huang, against 22 with library
-size).
-
-**The mean floor matters for single cells.** ``nb_glm_test`` floors fitted
-means at ``min_mu=0.5``, DESeq2's default for bulk counts. On single cells
-that makes tests conservative (1.2-1.7 % of null pairs at p < 0.05 for weak
-perturbations, power 0.42-0.44) and biases genes with means below about one
-count when groups differ in depth (mean null z +1.2 on Adamson). With
-``min_mu=1e-6``, DESeq2's own setting for single-cell counts, the weak
-scenario is calibrated (4.5-5.1 %, power 0.51-0.53) and the depth bias goes;
-the comparisons between size factors are unchanged.
+**The mean floor** (``min_mu``). NB-GLM holds fitted means at least ``min_mu``
+while fitting, as DESeq2 does. DESeq2's 0.5 suits bulk counts; on sparse
+counts many genes have means below one, the floor binds more often in the
+shallower group, and tests become conservative and biased for those genes when
+groups differ in depth. In the notebook's single-cell screens, 0.5 holds weak
+perturbations' tests at 1.2-1.7 % of null pairs (power 0.42-0.44) and biases
+moderately expressed genes under depth thinning; 1e-6, DESeq2's own
+single-cell setting, gives 4.5-5.1 % (power 0.51-0.53) and no depth bias. The
+default, ``min_mu=None``, therefore chooses from the counts themselves: **1e-6
+when at least half of the counts are zero, 0.5 otherwise** (the value used is
+in ``uns["min_mu"]``). The rule is about sparsity, not the kind of data:
+Adamson's 25-cell pseudo-bulk units get 0.5, but Huang-HCT116's, whose 36,000
+genes are mostly very sparse, are still more than half zeros and get 1e-6 --
+appropriately, as their tests are then closer to 5 %. Pass a number to
+override it; pass 0.5 to match a default PyDESeq2 or DESeq2 run.
 
 **In practice:**
 
-* single cells: keep the default (``"libsize"``); consider ``min_mu=1e-6``;
+* single cells: keep the defaults (``"libsize"``, the floor chosen from the
+  counts);
 * pseudo-bulk and bulk: use ``"geomeans"`` or ``"deseq2"``;
 * perturbations with large effects on highly expressed genes (strong
   activation, fitness genes): no single-cell size factor is reliable for
@@ -413,13 +353,13 @@ the comparisons between size factors are unchanged.
   whole-perturbation shift with ``"libsize"`` that ``"geomeans"`` does not
   show is a composition shift;
 * to compare with PyDESeq2 or DESeq2, give them the same size factors
-  (``dds.obs["size_factors"]``, ``sizeFactors(dds) <- ...``); a
-  per-perturbation PyDESeq2 run otherwise recomputes them on each
-  comparison's cells, and that difference, not the estimator, then
-  dominates the comparison.
+  (``dds.obs["size_factors"]``, ``sizeFactors(dds) <- ...``) and the same
+  floor (``min_mu`` / ``minmu``); a per-perturbation PyDESeq2 run otherwise
+  recomputes the factors on each comparison's cells, and that difference,
+  not the estimator, then dominates the comparison.
 
-These are semi-synthetic screens built from two datasets' control cells; a
-benchmark across the real screens (and their pseudo-bulk forms) is planned.
+The comparison uses two datasets' control cells and one seed; a benchmark
+across the real screens (and their pseudo-bulk forms) is planned.
 
 LFC shrinkage
 -------------

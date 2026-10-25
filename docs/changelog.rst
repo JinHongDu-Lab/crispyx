@@ -54,6 +54,17 @@ Unreleased
   memory are streamed. Standard errors no longer come out about 5 % small
   (they were computed at a gene-wise dispersion the LFC was not refitted
   at). Results with ``dispersion_scope="per_comparison"`` change.
+* **The mean floor follows the counts.** ``min_mu`` (fitted means are held
+  at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting
+  for single cells, when at least half of a sample of the counts are zero,
+  else 0.5, DESeq2's bulk default; the value used is in ``uns["min_mu"]``.
+  On sparse counts 0.5 made tests conservative (1.2-1.7 % of null pairs at
+  p < 0.05 for weak perturbations on semi-synthetic Adamson and Huang
+  screens, power 0.42-0.44) and biased genes below about one count when
+  groups differ in depth; with 1e-6, 4.5-5.1 % and power 0.51-0.53. Single-
+  cell results change; pass ``min_mu=0.5`` for the previous behaviour or to
+  match a default PyDESeq2 run. The comparisons are in the new notebook
+  ``docs/notebooks/size_factor_comparison.ipynb``.
 * The dispersion trend falls back, as PyDESeq2's does, to the trimmed mean
   of the gene-wise dispersions when the parametric fit fails, instead of
   keeping a near-zero coefficient or fitting a polynomial.

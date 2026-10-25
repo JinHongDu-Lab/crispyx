@@ -60,6 +60,7 @@ Key features
    quality_control
    pseudobulk
    differential_expression
+   notebooks/size_factor_comparison
    covariate_adjustment
    notebooks/batch_statistics_tutorial
    large_data

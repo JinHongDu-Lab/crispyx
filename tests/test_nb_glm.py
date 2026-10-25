@@ -1513,6 +1513,24 @@ _NB_KW = dict(perturbation_column="perturbation", control_label="ctrl", verbose=
               size_factor_method="deseq2")
 
 
+@pytest.mark.parametrize("lam, given, expected", [
+    (0.3, None, 1e-6),   # mostly zeros: single cells
+    (20.0, None, 0.5),   # mostly non-zero: pseudo-bulk / bulk
+    (0.3, 0.25, 0.25),   # an explicit floor is used as given
+])
+def test_nb_glm_mean_floor_follows_the_sparsity_of_the_counts(tmp_path, lam, given, expected):
+    """min_mu=None takes DESeq2's single-cell floor (1e-6) when at least half
+    the counts are zero and its bulk floor (0.5) otherwise; uns records it."""
+    rng = np.random.default_rng(0)
+    labels = np.array(["ctrl"] * 60 + ["KO1"] * 30)
+    counts = rng.poisson(lam, size=(labels.size, 40)).astype(np.float32)
+    counts[:, :5] += 1  # a few genes counted everywhere
+    path = tmp_path / "counts.h5ad"
+    ad.AnnData(counts, obs=pd.DataFrame({"perturbation": labels})).write(path)
+    result = nb_glm_test(path, output_path=tmp_path / "de.h5ad", min_mu=given, **_NB_KW)
+    assert ad.read_h5ad(result.result_path, backed="r").uns["min_mu"] == expected
+
+
 @pytest.mark.filterwarnings("ignore:The input file .* CSC format")
 @pytest.mark.parametrize("storage", ["dense", "csc"])
 def test_nb_glm_refuses_log_transformed_input(tmp_path, storage):
