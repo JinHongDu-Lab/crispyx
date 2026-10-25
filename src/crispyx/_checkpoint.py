@@ -364,7 +364,7 @@ def _column_block_chunks(n_groups: int, n_genes: int, chunk_size: int) -> tuple[
     In a row-major contiguous dataset a gene chunk is one small write per
     group row (10,922 x 4.6 KB per layer on a genome-wide screen), each
     straddling partial pages that the filesystem must read before writing.
-    On a network filesystem that read is a round trip: on HPC2021 Lustre a
+    On a network filesystem that read is a round trip: on Lustre a
     gene chunk took 219 s to write contiguously even with its pages cached,
     and 918 s when they were evicted between chunks, against 22 s in these
     chunks. On a local disk the two layouts write alike (the chunked one

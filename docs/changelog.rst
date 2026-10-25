@@ -32,8 +32,8 @@ Version 0.2.2
   instead when it has room and, on the source's filesystem, only where the
   spill's write and read cost less than the re-reads; otherwise the
   re-reads stay. The soft open-file limit is raised toward the hard one
-  when the bands need it. On HPC2021 (source on Lustre, spill on node-local
-  ``/tmp``), a 17.6 GB, 429,000-cell file converts in 5 bands in 330-400 s,
+  when the bands need it. On a Slurm-based HPC cluster (source on Lustre,
+  spill on node-local ``/tmp``), a 17.6 GB, 429,000-cell file converts in 5 bands in 330-400 s,
   against 600-720 s re-reading and 711 s for 0.2.1, and in 1 band in
   ~240 s. The full Huang-HCT116 screen (206 GB, 3.4 million cells, 3 bands,
   110 GB spilled) converts in 8,144-8,350 s, against 21,542 s for 0.2.1.
@@ -130,7 +130,7 @@ Version 0.2.1
 * **``wilcoxon_test`` writes its results in column blocks.** Each gene chunk
   of results was one small write per perturbation into a row-major file,
   each needing a page read before the write; on a network filesystem that
-  is a round trip per perturbation per chunk (HPC2021 Lustre: 219 s a gene
+  is a round trip per perturbation per chunk (on Lustre: 219 s a gene
   chunk with the pages cached, 918 s when evicted, against 22 s now on the
   same node and load). The result's layers are HDF5-chunked as
   (rows, gene chunk width), ~1 MiB each, on every machine (on a local disk
