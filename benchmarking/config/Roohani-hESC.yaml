@@ -1,7 +1,11 @@
-# Benchmark Configuration for VCC
+# Benchmark Configuration for Roohani-hESC
+#
+# Virtual Cell Challenge H1 hESC CRISPRi screen (Roohani et al., Cell 2025),
+# named by first author like the other datasets; formerly "VCC".
+# data/origin/Roohani-hESC.h5ad links to data/origin/VCC.h5ad.
 
-dataset_path: "/data/origin/VCC.h5ad"
-output_dir: "benchmarking/results/VCC"
+dataset_path: "data/origin/Roohani-hESC.h5ad"  # relative to the repo, so standardized links resolve inside and outside the container
+output_dir: "benchmarking/results/Roohani-hESC"
 
 # Dataset column configuration
 perturbation_column: "perturbation"

@@ -800,6 +800,7 @@ def run_edger_de(
     subset_seed: int = 0,
     max_control_cells: int | None = None,
     output_name: str = "edger_de_glm",
+    size_factor_method: str | None = None,
 ) -> Dict[str, Any]:
     """Run edgeR DE on filtered dataset.
 
@@ -868,11 +869,14 @@ def run_edger_de(
         ro.globalenv['counts'] = counts
         ro.globalenv['groups'] = ro.StrVector(groups)
         ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
+        ro.globalenv['use_libsize'] = ro.BoolVector([size_factor_method == "libsize"])
         
         ro.r('''
         rownames(counts) <- gene_names
         y <- DGEList(counts=counts, group=groups)
-        y <- calcNormFactors(y)
+        # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
+        # i.e. crispyx's library-size factors; otherwise TMM.
+        if (!use_libsize) y <- calcNormFactors(y)
         design <- model.matrix(~0 + groups)
         colnames(design) <- gsub("groups", "", colnames(design))
         y <- estimateDisp(y, design)
@@ -928,6 +932,7 @@ def run_edger_de(
         "save_seconds": t_save_end - t_save_start,
         "subsampled": max_perturbations is not None,
         "control_cells": int((groups == control_label).sum()),
+        "size_factor_method": size_factor_method or "edgeR default (TMM)",
     }
 
 def run_pertpy_de(
@@ -1490,6 +1495,27 @@ def _load_perturbation_subset(path: Path, perturbation_column: str, control_labe
     return adata, perturbations
 
 
+def _use_library_size_factors(dds) -> None:
+    """Make PyDESeq2 (0.5.x) use library-size factors: each cell's total count,
+    scaled to geometric mean 1 -- crispyx's ``size_factor_method="libsize"``.
+
+    ``DeseqDataSet.deseq2()`` always calls ``fit_size_factors()``; replacing it
+    on the instance sets the same three fields the median-of-ratios fit sets.
+    With the same counts (QC-filtered) crispyx, PyDESeq2 and edgeR then share
+    size factors up to a constant, which cancels in fold changes and tests.
+    """
+    import numpy as np
+
+    def fit_size_factors(*args, **kwargs):
+        totals = np.asarray(dds.X.sum(axis=1), dtype=float).ravel()
+        sf = totals / np.exp(np.mean(np.log(totals)))
+        dds.obs["size_factors"] = sf
+        dds.layers["normed_counts"] = dds.X / sf[:, None]
+        dds.var["_normed_means"] = dds.layers["normed_counts"].mean(axis=0)
+
+    dds.fit_size_factors = fit_size_factors
+
+
 def _make_var_names_unique_for_pydeseq2(adata) -> Dict[str, str]:
     """Give ``adata`` unique var names in place; return ``{unique: original}``.
 
@@ -1517,6 +1543,7 @@ def run_pydeseq2_base(
     subset_seed: int = 0,
     max_control_cells: int | None = None,
     output_name: str = "pertpy_de_pydeseq2",
+    size_factor_method: str | None = None,
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
@@ -1590,6 +1617,10 @@ def run_pydeseq2_base(
                     refit_cooks=True,
                     n_cpus=n_jobs or 1,
                 )
+                if size_factor_method == "libsize":
+                    _use_library_size_factors(dds)
+                elif size_factor_method is not None:
+                    raise ValueError(f"size_factor_method must be None or 'libsize', not {size_factor_method!r}")
                 dds.deseq2()
                 
                 stat_res = DeseqStats(
@@ -1660,6 +1691,7 @@ def run_pydeseq2_base(
         "failed_groups": n_failed,
         "subsampled": max_perturbations is not None,
         "control_cells": n_control_cells,
+        "size_factor_method": size_factor_method or "pydeseq2 default (median of ratios)",
     }
 
 
@@ -5218,6 +5250,9 @@ def _accuracy_subset_methods(
                 continue
             kwargs = dict(ref.kwargs, max_perturbations=n, subset_seed=seed,
                           max_control_cells=control_cap, output_name=base + suffix)
+            if base in ("pertpy_de_pydeseq2", "edger_de_glm"):
+                # NB-GLM references share crispyx's size factors (plan §4).
+                kwargs["size_factor_method"] = spec.get("size_factors", "libsize")
             depends_on = ref.depends_on
             if base == "edger_de_glm":
                 # Same perturbation universe as the other references (QC-filtered counts).

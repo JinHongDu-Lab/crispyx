@@ -1186,13 +1186,13 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     # - lfcShrink crispyx also vs edgeR (as a reference baseline)
     comparisons = [
         ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
-        # DE GLM - base NB-GLM vs external tools (base LFCs)
-        ("crispyx_de_nb_glm", "edger_de_glm", "de"),
-        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
+        # DE GLM: NB-GLM accuracy uses only the *_subset reruns below, which
+        # share crispyx's size factors (plan 2026-10-25 §4); the full-data
+        # PyDESeq2/edgeR runs (their own size factors) are performance rows.
         # DE GLM - standalone lfcShrink vs PyDESeq2 lfcShrink
         ("crispyx_de_lfcshrink", "pertpy_de_lfcshrink", "de_lfcshrink"),
-        # DE GLM - external tool comparison (base)
-        ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
+        # DE GLM - external tool comparison, same size factors
+        ("edger_de_glm_subset", "pertpy_de_pydeseq2_subset", "de"),
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
