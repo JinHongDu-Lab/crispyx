@@ -30,7 +30,13 @@ Unreleased
   (``size_factor_scope``) recomputed every control's factor in each
   comparison, rested on the handful of genes counted in every cell compared,
   and could not run at scale; ``scale_size_factors`` changed no test. The user
-  guide compares the methods (single-cell data; pseudo-bulk not yet).
+  guide compares the methods on semi-synthetic screens with known truth,
+  single-cell and pseudo-bulk: library size follows depth best in single
+  cells but fails under composition shifts (up to 46 % of null pairs at
+  p < 0.05); on pseudo-bulk ``"geomeans"`` and ``"deseq2"`` stay calibrated
+  in every scenario. It also shows that the mean floor ``min_mu=0.5``
+  (DESeq2's bulk default) makes single-cell tests conservative and biases
+  low-count genes under depth differences, which ``min_mu=1e-6`` removes.
   NB-GLM results computed with default size factors change.
 * **Per-comparison NB-GLM runs at the scale of a genome-wide screen, as
   DESeq2 would.** Without covariates, ``dispersion_scope="per_comparison"``
