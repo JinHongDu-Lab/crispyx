@@ -1061,6 +1061,38 @@ def _generate_improved_markdown(
 # Main Evaluation Function
 # ============================================================================
 
+ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
+
+
+def _accuracy_perturbations(output_dir: Path) -> Optional[set]:
+    """The dataset's accuracy subset (plan 2026-10-25 §3.2), or None.
+
+    Drawn exactly as the reference reruns draw theirs: the runner's
+    ``_seeded_perturbation_subset`` over the QC-filtered perturbations.
+    Recorded in ``.accuracy_perturbations.json``.
+    """
+    spec_path = output_dir / ".accuracy_subset.json"
+    qc_path = output_dir / "preprocessing" / "crispyx_qc_filtered.h5ad"
+    if not spec_path.exists() or not qc_path.exists():
+        return None
+    import anndata as ad
+    from .run_benchmarks import _seeded_perturbation_subset
+
+    spec = json.loads(spec_path.read_text())
+    backed = ad.read_h5ad(str(qc_path), backed="r")
+    try:
+        labels = backed.obs["perturbation"].astype(str).unique()
+    finally:
+        backed.file.close()
+    chosen = _seeded_perturbation_subset(
+        labels, "control", int(spec.get("n_perturbations", 50)), int(spec.get("seed", 0))
+    )
+    (output_dir / ".accuracy_perturbations.json").write_text(
+        json.dumps({**spec, "perturbations": chosen}, indent=1)
+    )
+    return set(chosen)
+
+
 def evaluate_benchmarks(output_dir: Path) -> None:
     """Evaluate benchmark results and generate report.
     
@@ -1110,8 +1142,12 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         "cells_kept", "genes_kept", "groups"
     ]
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
+    # Accuracy reruns of references (*_subset, *_subset_ctrl) are not performance rows.
+    accuracy_rerun_df = pd.DataFrame()
     if "method" in perf_df.columns:
-        perf_df = perf_df.sort_values("method")
+        is_rerun = perf_df["method"].astype(str).str.endswith(ACCURACY_SUBSET_SUFFIXES)
+        accuracy_rerun_df = perf_df[is_rerun].copy()
+        perf_df = perf_df[~is_rerun].sort_values("method")
     
     # Load reference extraction marker to annotate rerun data
     marker_path = output_dir / ".reference_extracted"
@@ -1160,6 +1196,18 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
+        # Accuracy reruns of references that failed on the full data
+        # (plan 2026-10-25 §3.2). "_subset": the accuracy subset against the
+        # full control, so crispyx's full-data result is compared directly.
+        ("crispyx_de_t_test", "scanpy_de_t_test_subset", "de"),
+        ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon_subset", "de"),
+        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2_subset", "de"),
+        ("crispyx_de_nb_glm", "edger_de_glm_subset", "de"),
+        # "_subset_ctrl": control capped; crispyx rerun on the same cells.
+        ("crispyx_de_t_test_subset_ctrl", "scanpy_de_t_test_subset_ctrl", "de"),
+        ("crispyx_de_wilcoxon_subset_ctrl", "scanpy_de_wilcoxon_subset_ctrl", "de"),
+        ("crispyx_de_nb_glm_subset_ctrl", "pertpy_de_pydeseq2_subset_ctrl", "de"),
+        ("crispyx_de_nb_glm_subset_ctrl", "edger_de_glm_subset_ctrl", "de"),
     ]
     
     # Add conditional comparisons for optional PyDESeq2-parity lfcShrink method (only if it was run)
@@ -1175,6 +1223,8 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 ("crispyx_de_lfcshrink", "crispyx_de_lfcshrink_pydeseq2", "de_lfcshrink"),
             ])
     
+    accuracy_perts = _accuracy_perturbations(output_dir)
+
     def _load_de_result(method_name: str, result_path_val: Optional[str], use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
         """Load and standardize a DE result from file.
         
@@ -1188,15 +1238,26 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         try:
             if str(result_path).endswith('.h5ad'):
                 import anndata as ad
-                adata = ad.read_h5ad(str(result_path))
+                if accuracy_perts is not None:
+                    # Read only the accuracy subset's rows.
+                    backed = ad.read_h5ad(str(result_path), backed="r")
+                    try:
+                        keep = backed.obs["perturbation"].astype(str).isin(accuracy_perts).to_numpy()
+                        adata = backed[np.flatnonzero(keep)].to_memory()
+                    finally:
+                        backed.file.close()
+                else:
+                    adata = ad.read_h5ad(str(result_path))
                 if use_raw_lfc:
                     result_dict = _anndata_to_de_dict_raw(adata)
                 else:
                     result_dict = _anndata_to_de_dict(adata)
                 return _streaming_de_to_frame(result_dict)
             else:
-                result_df = pd.read_csv(result_path)
-                return standardise_de_dataframe(result_df)
+                result_df = standardise_de_dataframe(pd.read_csv(result_path))
+                if accuracy_perts is not None and "perturbation" in result_df.columns:
+                    result_df = result_df[result_df["perturbation"].astype(str).isin(accuracy_perts)]
+                return result_df
         except Exception as e:
             print(f"Warning: Could not load DE result for {method_name}: {e}")
             return None
@@ -1486,9 +1547,33 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         shrinkage_quality,
         skipped_comparisons,
     )
-        
+    md += _accuracy_subset_markdown(accuracy_rerun_df, accuracy_perts, output_dir)
+    if not accuracy_rerun_df.empty:
+        accuracy_rerun_df.to_csv(output_dir / "benchmark_accuracy_reruns.csv", index=False)
+
     with open(output_dir / "benchmark_report.md", "w") as f:
         f.write(md)
+
+
+def _accuracy_subset_markdown(rerun_df: pd.DataFrame, accuracy_perts: Optional[set], output_dir: Path) -> str:
+    """Report section: the accuracy subset and the reference reruns made on it."""
+    if accuracy_perts is None and rerun_df.empty:
+        return ""
+    md = "\n## Accuracy subset\n\n"
+    if accuracy_perts is not None:
+        spec = json.loads((output_dir / ".accuracy_subset.json").read_text())
+        md += (f"Accuracy metrics use the same {len(accuracy_perts)} seeded perturbations "
+               f"(seed {spec.get('seed', 0)}) for every method; the list is in "
+               "`.accuracy_perturbations.json`.\n\n")
+    if not rerun_df.empty:
+        md += ("Reference reruns on that subset, for references that failed on the full data. "
+               "These are accuracy runs with relaxed limits, not performance rows. "
+               "`_subset` = full control; `_subset_ctrl` = control capped, crispyx rerun on the same cells.\n\n")
+        md += "| method | status | time (s) | peak memory (MB) | groups |\n| --- | --- | --- | --- | --- |\n"
+        for _, row in rerun_df.sort_values("method").iterrows():
+            md += (f"| {row['method']} | {row.get('status', '')} | {row.get('elapsed_seconds', float('nan')):.0f} | "
+                   f"{row.get('peak_memory_mb', float('nan')):.0f} | {row.get('groups', '')} |\n")
+    return md
 
 
 # ============================================================================

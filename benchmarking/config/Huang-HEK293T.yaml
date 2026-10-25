@@ -28,42 +28,26 @@ resource_limits:
 parallel_config:
   n_cores: 32  # 128 GB, 32 cores for all datasets
 
-
-# Accuracy references on a seeded random subset of perturbations (each vs
-# the full control): Scanpy runs out of memory at 128 GB on the full data and
-# PyDESeq2 cannot load it. The same size and seed give Scanpy and PyDESeq2
-# the same 50 perturbations (200 was too slow: Scanpy
-# Wilcoxon >9.7 h unfinished). Relaxed limits apply to these accuracy runs
-# only; the full-data Scanpy memory_limit results are the performance record
-# (kept in .benchmark_cache_full/).
-pydeseq2_max_perturbations: 50
-pydeseq2_subset_seed: 0
-# PyDESeq2 fits each perturbation against a seeded random sample of 20,000
-# control cells (the same cells for every perturbation): with the full
-# ~166,000-cell control each fit holds a 43 GiB dense matrix and the run
-# failed at 480 GB. crispyx and Scanpy use the full control.
-pydeseq2_max_control_cells: 20000
-scanpy_max_perturbations:
-  t-test: 50
-  wilcoxon: 50
-scanpy_subset_seed: 0
-method_resource_limits:
-  scanpy_de_t_test:
-    memory_limit: 240.0
-    time_limit: 259200
-  scanpy_de_wilcoxon:
-    memory_limit: 240.0
-    time_limit: 259200
-  pertpy_de_pydeseq2:
-    memory_limit: 240.0
-    time_limit: 259200
+# Accuracy reruns of reference methods that fail on the full data
+# (plan/2026-10-25_benchmark_rerun_plan.md §3.2). The same seeded
+# perturbations score every method; <reference>_subset reruns a reference on
+# them against the full control, <reference>_subset_ctrl against a seeded
+# sample of control cells. The limits below apply to these reruns only;
+# every full-data run keeps resource_limits.
+accuracy_subset:
+  n_perturbations: 50
+  seed: 0
+  max_control_cells: 20000
+  memory_limit: 240.0
+  time_limit: 259200  # 72 h
 
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files
 adaptive_qc_mode: conservative  # or 'aggressive'
 
 # Methods to run (null = run all available methods)
-# PyDESeq2 and Scanpy DE on a perturbation subset (see above); no edgeR
+# Full-data references give the performance rows; those that fail are rerun
+# on the accuracy subset (accuracy_subset above, *_subset method names).
 methods_to_run:
   - crispyx_qc_filtered
   - crispyx_pb_avg_log

@@ -1,5 +1,9 @@
 # Benchmark Configuration for Marson-CD4T
 
+# NOT IN THE MAIN BENCHMARK (decision 2026-10-25): Marson CD4+ T cells are a
+# case study for crispyx's residual effects, on the full 4-donor file; its
+# existing results here are kept but not rerun.
+#
 # NOTE: single-donor subset. This file holds donor D4 only, all in the
 # Rest condition (1,749,091 cells; 1,737,645 after QC). The full Marson
 # CD4+ T-cell screen has 4 donors (D1-D4, 7,386,295 cells, all Rest); the

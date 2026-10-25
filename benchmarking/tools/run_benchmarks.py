@@ -709,6 +709,8 @@ def run_scanpy_de(
     preprocess: bool = True,
     max_perturbations: int | None = None,
     subset_seed: int = 0,
+    max_control_cells: int | None = None,
+    output_name: str | None = None,
 ) -> Dict[str, Any]:
     """Run Scanpy DE on filtered dataset.
 
@@ -736,7 +738,8 @@ def run_scanpy_de(
             # it sees, so a subset would not reproduce the full run.
             raise ValueError("max_perturbations requires preprocess=False (pre-normalized input)")
         adata, groups = _load_perturbation_subset(
-            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
         )
     t_load_end = time.perf_counter()
     gc.collect()
@@ -771,7 +774,7 @@ def run_scanpy_de(
         
     # Phase 3: Save result
     t_save_start = time.perf_counter()
-    output_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
+    output_path = output_dir / f"{output_name or 'scanpy_de_' + method.replace('-', '_')}.csv"
     df.to_csv(output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -783,6 +786,7 @@ def run_scanpy_de(
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
         "subsampled": max_perturbations is not None,
+        "control_cells": int((adata.obs[perturbation_column].astype(str) == control_label).sum()),
     }
 
 def run_edger_de(
@@ -792,8 +796,17 @@ def run_edger_de(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
+    max_control_cells: int | None = None,
+    output_name: str = "edger_de_glm",
 ) -> Dict[str, Any]:
-    """Run edgeR DE on filtered dataset."""
+    """Run edgeR DE on filtered dataset.
+
+    With ``max_perturbations``, only control and a seeded perturbation subset
+    are read (optionally with a seeded control sample), and the joint model is
+    fitted on those cells.
+    """
     import gc
     import os
     import time
@@ -816,7 +829,13 @@ def run_edger_de(
     
     # Phase 1: Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+    else:
+        adata, _ = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
+        )
     t_load_end = time.perf_counter()
     gc.collect()
     
@@ -896,7 +915,7 @@ def run_edger_de(
     
     # Phase 3: Save result
     t_save_start = time.perf_counter()
-    output_path = output_dir / "edger_de_glm.csv"
+    output_path = output_dir / f"{output_name}.csv"
     final_results.to_csv(output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -907,6 +926,8 @@ def run_edger_de(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
+        "control_cells": int((groups == control_label).sum()),
     }
 
 def run_pertpy_de(
@@ -1495,6 +1516,7 @@ def run_pydeseq2_base(
     max_perturbations: int | None = None,
     subset_seed: int = 0,
     max_control_cells: int | None = None,
+    output_name: str = "pertpy_de_pydeseq2",
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
@@ -1622,7 +1644,7 @@ def run_pydeseq2_base(
         base_df = pd.DataFrame()
     
     t_save_start = time.perf_counter()
-    base_output_path = output_dir / "pertpy_de_pydeseq2.csv"
+    base_output_path = output_dir / f"{output_name}.csv"
     base_df.to_csv(base_output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -1862,6 +1884,13 @@ class BenchmarkConfig:
     # {"scanpy_de_wilcoxon": {"memory_limit": 240}}; unset keys fall back
     # to resource_limits.
     method_resource_limits: Optional[Dict[str, Dict[str, float]]] = None
+    # Accuracy reruns of reference methods (plan 2026-10-25 §3.2), e.g.
+    # {"n_perturbations": 50, "seed": 0, "max_control_cells": 20000,
+    #  "memory_limit": 240, "time_limit": 259200} (limits for these reruns only).
+    # Registers <reference>_subset (seeded perturbation subset, full control)
+    # and <reference>_subset_ctrl (same subset, control capped at
+    # max_control_cells); both run only when requested by name.
+    accuracy_subset: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_dict(
@@ -1953,6 +1982,7 @@ class BenchmarkConfig:
             scanpy_max_perturbations=data.get("scanpy_max_perturbations"),
             scanpy_subset_seed=data.get("scanpy_subset_seed", 0),
             method_resource_limits=data.get("method_resource_limits"),
+            accuracy_subset=data.get("accuracy_subset"),
         )
 
     @classmethod
@@ -4780,6 +4810,7 @@ def create_benchmark_suite(
     scanpy_max_perturbations: Dict[str, int] | None = None,
     scanpy_subset_seed: int = 0,
     pydeseq2_max_control_cells: int | None = None,
+    accuracy_subset: Dict[str, Any] | None = None,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -5147,7 +5178,61 @@ def create_benchmark_suite(
         ),
     }
 
+    if accuracy_subset:
+        methods.update(_accuracy_subset_methods(methods, accuracy_subset, qc_filtered_path))
     return methods
+
+
+def _write_accuracy_subset_spec(config: "BenchmarkConfig") -> None:
+    """Record the accuracy subset for the report, which scores every
+    comparison on this dataset's seeded perturbations."""
+    path = config.output_dir / ".accuracy_subset.json"
+    if config.accuracy_subset:
+        path.write_text(json.dumps(config.accuracy_subset, sort_keys=True))
+    elif path.exists():
+        path.unlink()
+
+
+# Reference methods that get accuracy-rerun variants, and the suffixes of
+# those variants (plan 2026-10-25 §3.2): "_subset" = seeded perturbation
+# subset against the full control; "_subset_ctrl" = the same perturbations
+# against a seeded sample of control cells.
+ACCURACY_SUBSET_REFERENCES = ("scanpy_de_t_test", "scanpy_de_wilcoxon", "pertpy_de_pydeseq2", "edger_de_glm")
+ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
+
+
+def _accuracy_subset_methods(
+    methods: Dict[str, BenchmarkMethod], spec: Dict[str, Any], qc_filtered_path: Path
+) -> Dict[str, BenchmarkMethod]:
+    """``<reference>_subset`` and ``<reference>_subset_ctrl`` variants."""
+    n = int(spec.get("n_perturbations", 50))
+    seed = int(spec.get("seed", 0))
+    cap = spec.get("max_control_cells")
+    variants: Dict[str, BenchmarkMethod] = {}
+    for base in ACCURACY_SUBSET_REFERENCES:
+        if base not in methods:
+            continue
+        ref = methods[base]
+        for suffix, control_cap in (("_subset", None), ("_subset_ctrl", cap)):
+            if suffix == "_subset_ctrl" and control_cap is None:
+                continue
+            kwargs = dict(ref.kwargs, max_perturbations=n, subset_seed=seed,
+                          max_control_cells=control_cap, output_name=base + suffix)
+            depends_on = ref.depends_on
+            if base == "edger_de_glm":
+                # Same perturbation universe as the other references (QC-filtered counts).
+                kwargs["dataset_path"] = qc_filtered_path
+                depends_on = "crispyx_qc_filtered"
+            label = f"{n} seeded perturbations" + (f", {int(control_cap):,} control cells" if control_cap else "")
+            variants[base + suffix] = BenchmarkMethod(
+                name=base + suffix,
+                description=f"{ref.description} [accuracy rerun: {label}]",
+                function=ref.function,
+                kwargs=kwargs,
+                summary=ref.summary,
+                depends_on=depends_on,
+            )
+    return variants
 
 
 def parse_args() -> argparse.Namespace:
@@ -5639,6 +5724,7 @@ def _run_single_benchmark(
     
     # Save current config to cache
     save_cache_config(config.output_dir, qc_params_used, str(standardized_path))
+    _write_accuracy_subset_spec(config)
 
     available_methods = create_benchmark_suite(
         dataset_path=standardized_csr_path,
@@ -5652,6 +5738,7 @@ def _run_single_benchmark(
         memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
         pydeseq2_max_perturbations=config.pydeseq2_max_perturbations,
         pydeseq2_max_control_cells=config.pydeseq2_max_control_cells,
+        accuracy_subset=config.accuracy_subset,
         pydeseq2_subset_seed=config.pydeseq2_subset_seed,
         scanpy_max_perturbations=config.scanpy_max_perturbations,
         scanpy_subset_seed=config.scanpy_subset_seed,
@@ -5679,10 +5766,12 @@ def _run_single_benchmark(
                 continue
 
             # Allow shorthand prefixes (e.g., "scanpy" -> all scanpy_* methods)
+            # Accuracy reruns (*_subset, *_subset_ctrl) run only when named.
             prefix_matches = [
                 method_name
                 for method_name in available_methods
                 if method_name.startswith(f"{name}_")
+                and not method_name.endswith(ACCURACY_SUBSET_SUFFIXES)
             ]
 
             if prefix_matches:
@@ -5698,6 +5787,7 @@ def _run_single_benchmark(
         selected_names = [
             method.name for method in ordered_methods
             if method.name not in OPTIONAL_METHODS
+            and not method.name.endswith(ACCURACY_SUBSET_SUFFIXES)
         ]
         
         # Add optional methods if explicitly enabled in config
@@ -5946,7 +6036,12 @@ def _run_single_benchmark(
         
         method_memory_limit_bytes = memory_limit_bytes
         method_time_limit = config.resource_limits.time_limit
-        override = (config.method_resource_limits or {}).get(method.name, {})
+        override = {}
+        if method.name.endswith(ACCURACY_SUBSET_SUFFIXES) and config.accuracy_subset:
+            # Accuracy reruns: the relaxed limits from the accuracy_subset block.
+            override = {k: config.accuracy_subset[k] for k in ("memory_limit", "time_limit")
+                        if k in config.accuracy_subset}
+        override = {**override, **(config.method_resource_limits or {}).get(method.name, {})}
         if "memory_limit" in override:
             method_memory_limit_bytes = (
                 int(override["memory_limit"] * 1024 * 1024 * 1024) if override["memory_limit"] > 0 else None
@@ -6199,6 +6294,7 @@ def main() -> None:
                 continue
             
             print(f"Regenerating reports from cache: {config.output_dir}")
+            _write_accuracy_subset_spec(config)
             evaluate_benchmarks(config.output_dir)
             print(f"  Report: {config.output_dir / 'benchmark_report.md'}")
         return

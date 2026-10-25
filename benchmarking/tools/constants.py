@@ -168,6 +168,14 @@ METHOD_DISPLAY_NAMES: Dict[str, str] = {
     "crispyx_pb_pseudobulk": "pseudobulk",
 }
 
+# Accuracy reruns of references on the accuracy subset (plan 2026-10-25 §3.2),
+# and crispyx's reruns on a control-capped subset.
+for _base in ("scanpy_de_t_test", "scanpy_de_wilcoxon", "pertpy_de_pydeseq2", "edger_de_glm",
+              "crispyx_de_t_test", "crispyx_de_wilcoxon", "crispyx_de_nb_glm"):
+    METHOD_DISPLAY_NAMES[f"{_base}_subset"] = f"{METHOD_DISPLAY_NAMES[_base]} (subset)"
+    METHOD_DISPLAY_NAMES[f"{_base}_subset_ctrl"] = f"{METHOD_DISPLAY_NAMES[_base]} (subset, capped control)"
+del _base
+
 # Order for DE method display in tables: t-test, Wilcoxon, NB-GLM
 DE_METHOD_DISPLAY_ORDER = [
     "t-test",
