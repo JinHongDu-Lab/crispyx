@@ -382,6 +382,13 @@ override it; pass 0.5 to match a default PyDESeq2 or DESeq2 run.
   compare p-values: crispyx's ``pvalue_adj`` is Benjamini-Hochberg per
   perturbation without DESeq2's independent filtering, and Cook's outliers
   are not replaced (``refit_cooks=False``, ``cooks_filter=False``).
+  Gene-wise dispersions can still differ on sparse genes, most often in
+  pseudo-bulk: where the likelihood has a second mode at the lower bound
+  (1e-8), DESeq2's local search can stay there, while crispyx reports the
+  higher-likelihood dispersion. The dispersion trends then differ, but the
+  tests hardly do: on Tian pseudo-bulk the median z difference was
+  0.001-0.015, the hits differed by a few genes (13 against 16 for SPAST),
+  and fake targets got the same false hits as with PyDESeq2.
 
 The comparison uses two datasets' control cells and one seed; a benchmark
 across the real screens (and their pseudo-bulk forms) is planned.

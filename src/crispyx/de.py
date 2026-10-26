@@ -1674,7 +1674,13 @@ def nb_glm_test(
     rather than ``pvalue_adj``: crispyx applies Benjamini-Hochberg per
     perturbation without DESeq2's independent filtering, and it does not
     replace Cook's distance outliers (``refit_cooks=False``,
-    ``cooks_filter=False`` there).
+    ``cooks_filter=False`` there). Gene-wise dispersions can differ on
+    sparse genes, most often in pseudo-bulk: where the likelihood has a
+    second mode at the lower bound (1e-8), DESeq2's local search can stay
+    there, while crispyx reports the higher-likelihood dispersion. The
+    trends then differ, but the tests hardly do (Tian pseudo-bulk: median
+    z difference 0.001-0.015; hits within a few genes, e.g. 13 against 16
+    for SPAST).
     """
     # A one-shot iterable would be fingerprinted by its repr and then used up.
     if perturbations is not None:
