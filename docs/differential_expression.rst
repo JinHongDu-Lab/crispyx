@@ -180,8 +180,11 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   PyDESeq2 does when run per perturbation: gene-wise Cox-Reid dispersions, a
   mean-dispersion trend, maximum a posteriori dispersions under a log-normal
   prior around it (genes far above the trend keep their gene-wise value), then
-  the Wald test. Given the same size factors the statistics agree with
-  PyDESeq2's to about 0.001 in z. Cook's distance outlier replacement is not
+  the Wald test. Given the same size factors and mean floor (``min_mu``) the
+  statistics agree with PyDESeq2's: median difference in z 0.002-0.004 on
+  Adamson and both Tian screens (r >= 0.999), about 0.001 on simulated data;
+  with the floors left at their defaults (crispyx chooses 1e-6 for single
+  cells, PyDESeq2 uses 0.5) the median difference is 0.3-0.4. Cook's distance outlier replacement is not
   done: on four Adamson perturbations against 7,629 controls, PyDESeq2's
   replaced outliers in 4-15 of ~18,800 genes, moved z by more than 0.5 in
   2-14 and changed the hits at q < 0.1 by 0-3. Without covariates the controls are summarised once, in one
@@ -209,29 +212,40 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   not independent replicates, which is why pseudo-bulk analysis (counts
   summed per guide x batch or donor with ``cx.pb.aggregate(method="sum")``,
   then ``nb_glm_test`` with ``size_factor_method="deseq2"``) is the usual
-  recommendation when replicate units exist. On two Tian iPSC-neuron screens
-  (CRISPRi and CRISPRa) we compared the two levels directly:
+  recommendation when replicate units exist. We compared the two levels on
+  fake targets made of control guides (no knockdown, but the differences
+  between guides and replicate units real targets have) in six screens
+  (Tian CRISPRi and CRISPRa, Replogle K562 and RPE1 essential, Nadig Jurkat,
+  Frangieh):
 
-  - Cell-level NB-GLM stayed calibrated against fake targets made from
-    control guides (each non-targeting guide tested against the others):
-    0.12-0.25 % of null pairs at \|z\| > 3, against 0.27 % expected.
-  - It found far more hits than pseudo-bulk with 4 units per perturbation
-    (2 guides x 2 batches), e.g. 118 against 19 genes for SPAST. The
-    pseudo-bulk fold changes agreed with the cell-level ones (r 0.97-0.99);
-    pseudo-bulk loses power through wider standard errors when units are
-    few, and by counting the differences between a perturbation's guides as
-    noise. crispyx, PyDESeq2 and R DESeq2 called the same pseudo-bulk hits.
-  - The fake-target check cannot show whether cell level's extra hits rely
-    on a perturbation's guides agreeing (control guides have no knockdown
-    to differ in), and on several Tian targets the two guides' fold changes
-    at the cell-level hits agreed poorly.
+  - Cell-level NB-GLM can be miscalibrated. On Frangieh every fake target
+    got hits (median 204), with 10 % of null p-values below 0.05 and 2 % of
+    null pairs at \|z\| > 3 (0.27 % expected); its pseudo-bulk stayed
+    calibrated (3.2 %, 0.16 %). On the Replogle and Nadig screens cell level
+    was close per pair (0.31-0.40 % at \|z\| > 3) but about half of the
+    fake targets got a few hits; on Tian it was calibrated (0.16-0.17 %).
+    Guides that differ from one another for reasons other than the
+    knockdown are counted as signal at cell level; replicate units absorb
+    them.
+  - Pseudo-bulk stayed close to calibrated per pair in every screen
+    (0.07-0.33 % at \|z\| > 3), and was most conservative with the
+    replicate unit as a covariate (fake targets with any hit: 6-20 %).
+  - Where both are calibrated, cell level is the more powerful. On Tian it
+    found far more hits than pseudo-bulk with 4 units per perturbation
+    (2 guides x 2 batches), e.g. 118 against 19 genes for SPAST, with the
+    same fold changes (r 0.97-0.99): pseudo-bulk loses power through wider
+    standard errors when units are few.
+  - With covariates, cell-level NB-GLM holds every control cell in memory
+    (dense) in each fit: a few hundred thousand control cells need terabytes,
+    and ``nb_glm_test`` raises ``MemoryError`` instead. Pseudo-bulk with the
+    covariates is the way through there.
 
-  In practice: test at cell level by default; aggregate to pseudo-bulk when
-  each perturbation has several replicate units, or to check that a hit
-  holds across guides and donors; and run a fake-target check (control
-  guides relabelled as targets) on your own screen either way. These are two
-  screens and ten perturbations each; a comparison across screens is
-  planned.
+  In practice: run a fake-target check on your own screen (control guides
+  relabelled as targets, as in the :doc:`notebooks/residual_effects_tutorial`).
+  Use pseudo-bulk with the replicate unit as a covariate when the screen has
+  replicate units and cell level fails the check, or when its controls are
+  too many for cell level with covariates; use cell level when it passes
+  and power matters, and check that a hit holds across guides.
 
 * **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior
   shrinkage to log-fold changes using ``shrink_lfc()`` after running

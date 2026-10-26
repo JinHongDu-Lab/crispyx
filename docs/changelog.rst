@@ -56,8 +56,11 @@ Version 0.2.3
   PyDESeq2's starting dispersions, then the same dispersion steps, with the
   gene-wise search refined (Brent) instead of a 10-point grid, and the
   coefficients refitted at the final dispersions instead of keeping the
-  grid's. Given the same size factors both agree with PyDESeq2 to a median
-  1e-3 in z (at most 0.05), with and without a batch covariate. Where
+  grid's. Given the same size factors and mean floor both agree with
+  PyDESeq2: a median 1e-3 in z (at most 0.05) on simulated data, with and
+  without a batch covariate, and 2-4e-3 (r >= 0.999) on Adamson and both
+  Tian screens; at the default floors (1e-6 here on single cells, 0.5 in
+  PyDESeq2) the median difference is 0.3-0.4. Where
   PyDESeq2's gene-wise optimiser stops at its lower bound, crispyx finds a
   higher likelihood; those genes are what keep the trends about 5 % apart.
   ``dispersion_scope``, ``dispersion_method``, ``use_map_dispersion``,
@@ -70,7 +73,10 @@ Version 0.2.3
   ``max_iter`` and ``tol`` (IRLS with covariates) default to 100 and 1e-8.
   Results always store the dispersions as layers (``dispersion``,
   ``dispersion_raw``, ``dispersion_trend``); ``var["dispersion"]`` and the
-  ``iterations`` layer are gone. NB-GLM results change. Cook's distance
+  ``iterations`` layer are gone. A perturbation confounded with a covariate
+  (e.g. all its cells in a batch without controls) fails on its own, with
+  the reason logged, in worker processes and in fits of several
+  perturbations too. NB-GLM results change. Cook's distance
   outlier replacement stays out: on four Adamson perturbations against
   7,629 controls PyDESeq2's ``refit_cooks`` replaced outliers in 4-15 of
   ~18,800 genes and changed the hits at q < 0.1 by 0-3.
@@ -80,7 +86,8 @@ Version 0.2.3
   indicator column per perturbation, as a pseudo-bulk analysis that treats
   the perturbation as one factor does: dispersions are estimated once per
   model, mostly from the controls, and each perturbation is tested on its
-  own column. It matches PyDESeq2 fitted the same way (median 1e-3 in z),
+  own column. It matches PyDESeq2 fitted the same way (median 1e-3 in z,
+  same size factors and floor),
   and reproduces analyses run that way, such as the genome-wide CD4+ T-cell
   screen of Zhu *et al.* (PyDESeq2, 50 targets per model): on its
   guide x donor pseudo-bulk (3,387 control units; log10 cells and donor)
