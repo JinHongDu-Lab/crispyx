@@ -51,15 +51,17 @@ Version 0.2.3
   moments -- and each perturbation is fitted from that summary and its own
   cells; controls of any size are streamed. On 20,000 Huang-HCT116 controls
   and 20 perturbations this takes 16 s and 3.4 GB on a 32-core Mac, against
-  300 s and 58 GB for the former global dispersion. With covariates each
+  300 s and 58 GB for the former global dispersion; all 18,293 perturbations
+  of Huang-HCT116 (3.4 million cells, 166,000 controls) take 6.3 h and
+  2.8 GB on a 32-core node of a Slurm-based HPC cluster. With covariates each
   comparison is fitted on its cells with the full design: means by IRLS at
   PyDESeq2's starting dispersions, then the same dispersion steps, with the
   gene-wise search refined (Brent) instead of a 10-point grid, and the
   coefficients refitted at the final dispersions instead of keeping the
   grid's. Given the same size factors and mean floor both agree with
   PyDESeq2: a median 1e-3 in z (at most 0.05) on simulated data, with and
-  without a batch covariate, and 2-4e-3 (r >= 0.999) on Adamson and both
-  Tian screens; at the default floors (1e-6 here on single cells, 0.5 in
+  without a batch covariate, and 4e-4 to 4e-3 (r >= 0.999) on Adamson, both
+  Tian screens and Frangieh; at the default floors (1e-6 here on single cells, 0.5 in
   PyDESeq2) the median difference is 0.3-0.4. Where
   PyDESeq2's gene-wise optimiser stops at its lower bound, crispyx finds a
   higher likelihood; those genes are what keep the trends about 5 % apart.
