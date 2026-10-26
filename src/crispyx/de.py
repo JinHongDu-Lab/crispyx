@@ -1910,6 +1910,30 @@ def nb_glm_test(
             mask = np.zeros(control_mask.shape[0], dtype=bool)
             mask[rows] = True
             masks.append(mask)
+        # A perturbation confounded with a covariate (e.g. all its cells in a
+        # batch with no controls) has no estimable effect: it fails with the
+        # reason, and the others are fitted without it.
+        failed = []
+        if covariates:
+            kept = []
+            for k, (label, mask) in enumerate(zip(labels_in_fit, masks)):
+                alone = control_mask | mask
+                design_k, columns_k = build_design_matrix(
+                    obs_df.iloc[alone], covariate_columns=covariates,
+                    perturbation_indicator=mask[alone].astype(np.float64), intercept=True,
+                )
+                try:
+                    check_full_rank(design_k, columns_k, f"nb_glm_test, comparison {label!r} vs control")
+                except ValueError as exc:
+                    failed.append({"group_idx": group_idxs[k], "error": str(exc)})
+                    continue
+                kept.append(k)
+            if not kept:
+                return failed
+            labels_in_fit = [labels_in_fit[k] for k in kept]
+            group_idxs = [group_idxs[k] for k in kept]
+            rows_in_fit = [rows_in_fit[k] for k in kept]
+            masks = [masks[k] for k in kept]
         subset_mask = control_mask | np.logical_or.reduce(masks)
         design, design_columns = build_design_matrix(
             obs_df.iloc[subset_mask],
@@ -1923,10 +1947,12 @@ def nb_glm_test(
             design = np.column_stack([design, mask[subset_mask].astype(np.float64)])
             test_columns.append(design.shape[1] - 1)
             design_columns.append(f"perturbation {label!r}")
-        if covariates:
-            what = "comparison" if len(labels_in_fit) == 1 else "perturbations"
-            check_full_rank(design, design_columns,
-                            f"nb_glm_test, {what} {', '.join(map(repr, labels_in_fit))} vs control")
+        if covariates and len(labels_in_fit) > 1:
+            try:
+                check_full_rank(design, design_columns,
+                                f"nb_glm_test, perturbations {', '.join(map(repr, labels_in_fit))} vs control")
+            except ValueError as exc:
+                return failed + [{"group_idx": i, "error": str(exc)} for i in group_idxs]
         subset_size_factors = np.asarray(size_factors)[subset_mask]
 
         counts = np.empty((int(subset_mask.sum()), n_genes), dtype=np.float64)
@@ -2029,7 +2055,7 @@ def nb_glm_test(
                 result["logfc"] = shrunk_coef[column, :]
                 result["se"] = shrunk_se
             results.append(result)
-        return results
+        return failed + results
 
     n_groups = len(candidates)
     
@@ -2400,6 +2426,8 @@ def nb_glm_test(
             def fitted(label: str) -> dict:
                 if error is not None:
                     raise error
+                if "error" in by_label[label]:
+                    raise ValueError(by_label[label]["error"])
                 return by_label[label]
 
             try:
@@ -2409,6 +2437,12 @@ def nb_glm_test(
             for label in labels_in_fit:
                 if label in unfinished:
                     _record(label, lambda label=label: fitted(label))
+
+        def _fit_or_fail(**kwargs) -> list[dict]:
+            try:
+                return _fit_perturbation_worker(**kwargs)
+            except Exception as exc:
+                return [{"group_idx": i, "error": f"{type(exc).__name__}: {exc}"} for i in kwargs["group_idxs"]]
 
         def _worker_args(labels_in_fit: list[str]) -> dict:
             return dict(
@@ -2443,14 +2477,14 @@ def nb_glm_test(
             # held until every earlier one is.
             results = Parallel(
                 n_jobs=effective_n_jobs, backend="loky", prefer="processes", return_as="generator_unordered",
-            )(delayed(_fit_perturbation_worker)(**_worker_args(labels_in_fit)) for labels_in_fit in fits)
+            )(delayed(_fit_or_fail)(**_worker_args(labels_in_fit)) for labels_in_fit in fits)
             for fit_results in results:
                 labels_in_fit = [candidates[r["group_idx"]] for r in fit_results]
                 _record_fit(labels_in_fit, lambda fit_results=fit_results: fit_results)
         else:
             for labels_in_fit in fits:
                 _record_fit(labels_in_fit,
-                            lambda labels_in_fit=labels_in_fit: _fit_perturbation_worker(**_worker_args(labels_in_fit)))
+                            lambda labels_in_fit=labels_in_fit: _fit_or_fail(**_worker_args(labels_in_fit)))
 
     # Final checkpoint save
     _save_checkpoint()

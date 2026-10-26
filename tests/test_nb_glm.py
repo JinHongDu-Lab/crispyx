@@ -1117,21 +1117,46 @@ def _batched_bulk(tmp_path, batches, categorical=False):
     return path
 
 
-def test_nb_glm_names_a_batch_confounded_with_a_perturbation(tmp_path, caplog):
+@pytest.mark.parametrize("targets_per_fit", [1, 2])
+def test_nb_glm_names_a_batch_confounded_with_a_perturbation(tmp_path, caplog, targets_per_fit):
     """Every KD2 sample is in batch b1, which has no controls, so the batch
     and perturbation columns of KD2's comparison are the same column: KD2
-    fails with the reason logged, and the rest of the run goes on."""
+    fails with the reason logged, and the rest of the run goes on -- also
+    KD1 when the two are fitted in one model."""
     batches = ["b0", "b0", "b0", "b0", "b1", "b1"] * 2
     path = _batched_bulk(tmp_path, batches)
     with pytest.warns(UserWarning, match=r"failed and are NaN.*'KD2'"):
         result = nb_glm_test(
             path, perturbation_column="perturbation", control_label="control", covariates=["batch"],
-            min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0,
+            min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, targets_per_fit=targets_per_fit,
             output_path=tmp_path / "de.h5ad", n_jobs=1, verbose=False,
         )
     assert "rank-deficient; 'batch_b1'" in caplog.text
     assert np.all(np.isnan(result["KD2"].statistic))
     assert np.all(np.isfinite(result["KD1"].statistic))
+
+
+def test_a_confounded_perturbation_does_not_stop_a_parallel_run(tmp_path, caplog):
+    """In worker processes too, a perturbation confounded with a batch (KD5:
+    all its samples in a batch without controls) fails on its own; the
+    others are tested."""
+    rng = np.random.default_rng(2)
+    labels = np.array(["control"] * 6 + [f"KD{k}" for k in range(1, 6) for _ in range(3)])
+    batch = np.array(["b0", "b1"] * 3 + ["b0", "b1", "b0"] * 4 + ["b2"] * 3)
+    counts = rng.negative_binomial(5, 5 / 105, (len(labels), 30)).astype(np.float32)
+    path = tmp_path / "bulk.h5ad"
+    ad.AnnData(counts, obs=pd.DataFrame({"perturbation": labels, "batch": batch}),
+               var=pd.DataFrame(index=[f"gene{i}" for i in range(30)])).write(path)
+    with pytest.warns(UserWarning, match=r"failed and are NaN.*'KD5'"):
+        result = nb_glm_test(
+            path, perturbation_column="perturbation", control_label="control", covariates=["batch"],
+            min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0,
+            output_path=tmp_path / "de.h5ad", n_jobs=2, verbose=False,
+        )
+    assert "rank-deficient; 'batch_b2'" in caplog.text
+    assert np.all(np.isnan(result["KD5"].statistic))
+    for k in range(1, 5):
+        assert np.isfinite(result[f"KD{k}"].statistic).any()
 
 
 def test_build_design_matrix_drops_levels_absent_from_the_subset():
