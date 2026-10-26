@@ -60,5 +60,6 @@ for d in sys.argv[1:]:
         print(f"{d}: {cx_m} vs {ref_m}: {m['perturbation'].nunique()} perts, {len(m):,} pairs; "
               f"median |dz| {dz.median():.2e} (90% {dz.quantile(0.9):.2e}); r LFC {corr(m['lfc'], m['log_fc']):.4f}, "
               f"z {corr(m['z'], m['statistic']):.4f}, -log10p {corr(lp(m['p']), lp(m['pvalue'])):.4f}, "
-              f"SE {corr(m['se'], m['log_fc_se']):.4f}, log disp {disp:.4f}; "
+              f"SE {corr(m['se'], m['log_fc_se']):.4f} (Spearman {m['se'].corr(m['log_fc_se'], method='spearman'):.4f}; "
+              f"baseMean>=1: {corr(m.loc[m['baseMean'] >= 1, 'se'], m.loc[m['baseMean'] >= 1, 'log_fc_se']):.4f}), log disp {disp:.4f}; "
               f"size factors {ref_r.get('size_factor_method')}, crispyx {cx_r.get('crispyx_version')}")
