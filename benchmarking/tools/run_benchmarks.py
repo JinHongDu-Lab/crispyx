@@ -867,7 +867,11 @@ def run_edger_de(
         
     with localconverter(ro.default_converter + numpy2ri.converter):
         ro.globalenv['counts'] = counts
-        ro.globalenv['groups'] = ro.StrVector(groups)
+        # R needs syntactically valid level names for makeContrasts (e.g.
+        # "NKX2-3" is not), so groups enter R as g0, g1, ... and results are
+        # labelled with the original names.
+        safe_name = {g: f"g{i}" for i, g in enumerate(np.unique(groups))}
+        ro.globalenv['groups'] = ro.StrVector([safe_name[g] for g in groups])
         ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
         ro.globalenv['use_libsize'] = ro.BoolVector([size_factor_method == "libsize"])
         
@@ -885,8 +889,8 @@ def run_edger_de(
         
         all_results = []
         for group in unique_groups:
-            ro.globalenv['target_group'] = group
-            ro.globalenv['control'] = control_label
+            ro.globalenv['target_group'] = safe_name[group]
+            ro.globalenv['control'] = safe_name[control_label]
             
             ro.r('''
             contrast_vec <- makeContrasts(
