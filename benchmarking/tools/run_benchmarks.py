@@ -1230,13 +1230,8 @@ def run_nb_glm_base(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
-    size_factor_method: str = "sparse",
-    scale_size_factors: bool = False,
+    size_factor_method: str = "libsize",
     gene_name_column: str | None = None,
-    use_control_cache: bool = True,
-    size_factor_scope: str = "global",
-    se_method: str = "sandwich",
-    dispersion_scope: str = "global",
     data_name: str = "de_nb_glm",
     profiling: bool = True,
     memory_limit_gb: float | None = None,
@@ -1260,34 +1255,21 @@ def run_nb_glm_base(
     n_jobs
         Number of parallel jobs
     size_factor_method
-        Method for size factor calculation. Default "sparse" is optimal for
-        single-cell data. The "deseq2" method (genes expressed in ALL cells)
-        provides no benefit for sparse scRNA-seq since it falls back to "sparse"
-        when too few genes qualify.
-    scale_size_factors
-        Whether to scale size factors
+        crispyx's size factors: "libsize" (default), "geomeans" or "deseq2"
+        (median of ratios against the controls; falls back to "geomeans"
+        on single cells). Dispersions are estimated per comparison, as
+        DESeq2 does (crispyx 0.2.3).
     gene_name_column
         Column name for gene names (passed to nb_glm_test)
-    use_control_cache
-        If True, precompute control cell statistics once and reuse across
-        all perturbation comparisons.
-    size_factor_scope
-        Scope for size factor computation: "global" or "per_comparison".
-    se_method
-        Method for SE computation: "sandwich" (robust) or "fisher" (PyDESeq2 parity).
-    dispersion_scope
-        Scope for dispersion estimation: "global" or "per_comparison".
     data_name
         Base name for output files (e.g., "de_nb_glm" -> crispyx_de_nb_glm.h5ad).
     profiling
         If True, enable profiling in nb_glm_test.
     memory_limit_gb
-        Optional memory limit in GB. Used for adaptive memory management:
-        - Triggers streaming mode for global dispersion if matrix too large
-        - Limits parallel worker count based on estimated memory per worker
+        Optional memory limit in GB (sizes crispyx's workers).
     max_dense_fraction
-        Maximum fraction of available memory to use for dense matrices.
-        Default is 0.3 (30%). Reduces risk of OOM during global dispersion.
+        Passed to nb_glm_test (with covariates only: the share of memory the
+        dense controls may take).
         
     Returns
     -------
@@ -1297,10 +1279,7 @@ def run_nb_glm_base(
     from typing import Literal, cast
     
     # Cast string parameters to their literal types
-    size_factor_method_lit = cast(Literal["sparse", "deseq2"], size_factor_method)
-    size_factor_scope_lit = cast(Literal["global", "per_comparison"], size_factor_scope)
-    se_method_lit = cast(Literal["sandwich", "fisher"], se_method)
-    dispersion_scope_lit = cast(Literal["global", "per_comparison"], dispersion_scope)
+    size_factor_method_lit = cast(Literal["libsize", "geomeans", "deseq2"], size_factor_method)
     
     # Run NB-GLM base fitting with profiling (no shrinkage)
     t_base_start = time.perf_counter()
@@ -1308,17 +1287,11 @@ def run_nb_glm_base(
         data=path,
         perturbation_column=perturbation_column,
         control_label=control_label,
-        output_dir=output_dir,
-        data_name=data_name,
+        output_path=output_dir / f"crispyx_{data_name}.h5ad",
         n_jobs=n_jobs,
         lfc_shrinkage_type="none",  # No shrinkage - handled by separate step
         size_factor_method=size_factor_method_lit,
-        scale_size_factors=scale_size_factors,
         gene_name_column=gene_name_column,
-        use_control_cache=use_control_cache,
-        size_factor_scope=size_factor_scope_lit,
-        se_method=se_method_lit,
-        dispersion_scope=dispersion_scope_lit,
         profiling=profiling,
         memory_limit_gb=memory_limit_gb,
         max_dense_fraction=max_dense_fraction,
@@ -1640,6 +1613,8 @@ def run_pydeseq2_base(
                 base_results_df["log2FoldChange"] = -base_results_df["log2FoldChange"]
                 if "stat" in base_results_df.columns:
                     base_results_df["stat"] = -base_results_df["stat"]
+                # Fitted (MAP) dispersions, for comparison with crispyx's
+                base_results_df["dispersion"] = dds.var["dispersions"].reindex(base_results_df.index).to_numpy()
                 base_results_df["gene"] = base_results_df.index.map(gene_name_map)
                 base_results_df[perturbation_column] = pert
                 # Store dds and stat_res references for lfcShrink step
@@ -5053,41 +5028,33 @@ def create_benchmark_suite(
             description="NB-GLM base fitting (no shrinkage)",
             function=run_nb_glm_base,
             kwargs={
-                "path": standardized_csr_path,
+                "path": qc_filtered_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
-                "size_factor_method": "deseq2",
-                "scale_size_factors": False,
-                "use_control_cache": True,
-                "size_factor_scope": "global",
+                "size_factor_method": "libsize",
                 "data_name": "de_nb_glm",
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
-            depends_on="crispyx_standardize_csr",
+            depends_on="crispyx_qc_filtered",  # the same QC-filtered counts the references read
         ),
         # NB-GLM with PyDESeq2-parity configuration (for benchmarking parity)
         "crispyx_de_nb_glm_pydeseq2": BenchmarkMethod(
             name="crispyx_de_nb_glm_pydeseq2",
-            description="NB-GLM with PyDESeq2-parity settings (fisher SE, per-comparison SF/disp)",
+            description="NB-GLM, DESeq2's median-of-ratios size factors (against the controls)",
             function=run_nb_glm_base,
             kwargs={
-                "path": standardized_csr_path,
+                "path": qc_filtered_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
                 "size_factor_method": "deseq2",
-                "scale_size_factors": False,
-                "use_control_cache": False,  # per-comparison requires fresh computation
-                "size_factor_scope": "per_comparison",
-                "se_method": "fisher",
-                "dispersion_scope": "per_comparison",
                 "data_name": "de_nb_glm_pydeseq2_nb_glm",  # End with _nb_glm to prevent suffix duplication
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
-            depends_on="crispyx_standardize_csr",
+            depends_on="crispyx_qc_filtered",  # the same QC-filtered counts the references read
         ),
         # lfcShrink with global prior scale (faster)
         "crispyx_de_lfcshrink": BenchmarkMethod(
@@ -5237,6 +5204,52 @@ ACCURACY_SUBSET_REFERENCES = ("scanpy_de_t_test", "scanpy_de_wilcoxon", "pertpy_
 ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
 
 
+def _crispyx_version() -> str:
+    """The crispyx version under test, recorded with every crispyx result."""
+    import crispyx
+
+    return getattr(crispyx, "__version__", "unknown")
+
+
+def run_on_accuracy_subset(
+    *,
+    function: Callable[..., Any],
+    function_kwargs: Dict[str, Any],
+    path_key: str,
+    perturbation_column: str,
+    control_label: str,
+    max_perturbations: int,
+    subset_seed: int,
+    max_control_cells: int | None,
+    output_suffix: str,
+) -> Any:
+    """Run a crispyx method on the accuracy subset's exact cells (plan
+    2026-10-25 §3.2 rule 4): the seeded perturbations against the same seeded
+    control sample the capped references use. The subset is written to a
+    scratch file next to the outputs and removed afterwards."""
+    import shutil
+
+    source = Path(function_kwargs[path_key])
+    adata, _ = _load_perturbation_subset(
+        source, perturbation_column, control_label, max_perturbations, subset_seed,
+        max_control_cells=max_control_cells,
+    )
+    out_dir = Path(function_kwargs["output_dir"])
+    scratch = out_dir / f".accuracy_subset{output_suffix}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        subset_path = scratch / source.name
+        adata.write_h5ad(subset_path)
+        del adata
+        kwargs = dict(function_kwargs, **{path_key: subset_path})
+        if "csc_path" in kwargs:
+            kwargs["csc_path"] = scratch / f"csc_{source.name}"
+        kwargs["data_name"] = kwargs.get("data_name", "") + output_suffix
+        return function(**kwargs)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def _accuracy_subset_methods(
     methods: Dict[str, BenchmarkMethod], spec: Dict[str, Any], qc_filtered_path: Path
 ) -> Dict[str, BenchmarkMethod]:
@@ -5245,6 +5258,28 @@ def _accuracy_subset_methods(
     seed = int(spec.get("seed", 0))
     cap = spec.get("max_control_cells")
     variants: Dict[str, BenchmarkMethod] = {}
+    # crispyx on the capped references' exact cells (rule 4); only the capped
+    # variant, since crispyx's full-data result already holds the
+    # uncapped comparisons.
+    if cap is not None:
+        for base, path_key in (("crispyx_de_t_test", "data"), ("crispyx_de_wilcoxon", "input_path"),
+                               ("crispyx_de_nb_glm", "path")):
+            if base not in methods:
+                continue
+            ref = methods[base]
+            variants[base + "_subset_ctrl"] = BenchmarkMethod(
+                name=base + "_subset_ctrl",
+                description=f"{ref.description} [accuracy rerun: {n} seeded perturbations, {int(cap):,} control cells]",
+                function=run_on_accuracy_subset,
+                kwargs=dict(
+                    function=ref.function, function_kwargs=ref.kwargs, path_key=path_key,
+                    perturbation_column=ref.kwargs["perturbation_column"],
+                    control_label=ref.kwargs["control_label"], max_perturbations=n,
+                    subset_seed=seed, max_control_cells=cap, output_suffix="_subset_ctrl",
+                ),
+                summary=ref.summary,
+                depends_on=ref.depends_on,
+            )
     for base in ACCURACY_SUBSET_REFERENCES:
         if base not in methods:
             continue
@@ -5964,8 +5999,17 @@ def _run_single_benchmark(
             raise ValueError(f"Unknown method '{name}'. Available methods: {sorted(available_methods)}")
         method = available_methods[name]
         
+        # A crispyx method named explicitly is rerun when its cached result is
+        # from another crispyx version (dependencies keep their cached results).
+        stale_version = None
+        if method.name.startswith("crispyx_") and method.name in (config.methods_to_run or []):
+            cached = load_method_result(method.name, config.output_dir)
+            if cached is not None and cached.get("crispyx_version") != _crispyx_version():
+                stale_version = cached.get("crispyx_version", "unrecorded")
+                if not config.quiet:
+                    print(f"  Rerunning {method.name}: cached with crispyx {stale_version}, now {_crispyx_version()}")
         # Check if output already exists (for resuming interrupted benchmarks)
-        if config.skip_existing and check_output_exists(method.name, config.output_dir):
+        if stale_version is None and config.skip_existing and check_output_exists(method.name, config.output_dir):
             # Try to load cached benchmark metadata
             cached_result = load_method_result(method.name, config.output_dir)
             
@@ -6121,6 +6165,8 @@ def _run_single_benchmark(
             row.update(summary)
         if result.get("error"):
             row["error"] = result["error"]
+        if method.name.startswith("crispyx_"):
+            row["crispyx_version"] = _crispyx_version()
         
         rows.append(row)
         actually_executed.add(method.name)
