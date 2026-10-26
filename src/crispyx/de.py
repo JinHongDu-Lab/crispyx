@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import h5py
-from scipy.stats import rankdata, t as t_dist
+from scipy.stats import norm, rankdata, t as t_dist
 
 from .data import (
     accepts_in_memory,
@@ -1405,6 +1405,7 @@ def nb_glm_test(
     # ---- Dispersion parameters ----
     dispersion: float | None = None,
     shrink_dispersion: bool = True,
+    targets_per_fit: int = 1,
     # ---- Optimization parameters ----
     max_iter: int = 100,
     tol: float = 1e-8,
@@ -1516,6 +1517,20 @@ def nb_glm_test(
         If True (default), test at the MAP dispersions (genes far above the
         trend keep their gene-wise one, as in DESeq2); if False, at the
         gene-wise ones.
+    targets_per_fit
+        Perturbations fitted together in one model with the controls (1, the
+        default: each perturbation on its own, as DESeq2 run per comparison).
+        With ``k > 1`` the perturbations are taken ``k`` at a time, in the
+        order of ``perturbations`` (else as they appear in the file), and
+        fitted together with every control on the design ``~ covariates +
+        perturbation``, one indicator column per perturbation: the
+        dispersions are estimated once for the ``k`` of them, mostly from the
+        controls, and each perturbation is tested on its own column against
+        the controls. This is how a pseudo-bulk analysis that fits many
+        perturbations as levels of one factor runs (Zhu, Dann *et al.* 2025
+        fitted 50 at a time), and it costs about ``1/k`` of the dispersion
+        estimation. Always fitted on the cells (as with covariates); not with
+        ``lfc_shrinkage_type="apeglm"`` (use :func:`shrink_lfc` afterwards).
     max_iter, tol
         IRLS iterations and convergence tolerance for designs with covariates
         (PyDESeq2: 250 and 1e-8). Without covariates the two-group fit
@@ -1698,6 +1713,14 @@ def nb_glm_test(
     # Validate min_mu parameter
     if min_mu is not None and min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
+    if int(targets_per_fit) != targets_per_fit or targets_per_fit < 1:
+        raise ValueError(f"targets_per_fit must be a positive integer, got {targets_per_fit!r}")
+    targets_per_fit = int(targets_per_fit)
+    if targets_per_fit > 1 and lfc_shrinkage_type == "apeglm":
+        raise ValueError(
+            "lfc_shrinkage_type='apeglm' fits one perturbation at a time; with targets_per_fit > 1 "
+            "shrink afterwards with shrink_lfc."
+        )
 
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -1837,13 +1860,13 @@ def nb_glm_test(
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
     # -------------------------------------------------------------------------
-    # One comparison with covariates (or apeGLM shrinkage), on its cells
+    # Perturbations with covariates (or apeGLM shrinkage), fitted on their cells
     # -------------------------------------------------------------------------
     def _fit_perturbation_worker(
-        group_idx: int,
-        label: str,
+        labels_in_fit: list[str],
+        group_idxs: list[int],
         path: str | Path,
-        group_rows: slice | np.ndarray,
+        rows_in_fit: list,
         control_mask: np.ndarray,
         control_matrix: np.ndarray | sp.csr_matrix,
         control_expr_counts: np.ndarray,
@@ -1869,116 +1892,144 @@ def nb_glm_test(
         shrink_dispersion: bool,
         lfc_shrinkage_type: str,
         threads: int,
-    ) -> dict:
-        """One perturbation against the controls, fitted on their cells with the
-        design ``~ covariates + perturbation`` (glm.fit_glm_deseq2); the same
-        result as the two-group worker, natural-log LFC and SE. ``threads`` is
-        this worker's share of the cores for the numba kernels, which would
-        otherwise each start one thread per core in every worker process."""
+    ) -> list[dict]:
+        """The perturbations ``labels_in_fit`` and the controls, fitted together
+        on their cells with the design ``~ covariates + perturbation``, one
+        indicator column per perturbation (glm.fit_glm_deseq2): the
+        dispersions are estimated once for them all, and each perturbation is
+        tested on its own column against the controls. One perturbation is the
+        per-comparison fit. A result per perturbation, as the two-group
+        worker's (natural-log LFC and SE). ``threads`` is this worker's share
+        of the cores for the numba kernels, which would otherwise each start
+        one thread per core in every worker process."""
         import numba
 
         numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
-        group_mask = np.zeros(control_mask.shape[0], dtype=bool)
-        group_mask[group_rows] = True
-        subset_mask = control_mask | group_mask
+        masks = []
+        for rows in rows_in_fit:
+            mask = np.zeros(control_mask.shape[0], dtype=bool)
+            mask[rows] = True
+            masks.append(mask)
+        subset_mask = control_mask | np.logical_or.reduce(masks)
         design, design_columns = build_design_matrix(
             obs_df.iloc[subset_mask],
             covariate_columns=covariates,
-            perturbation_indicator=group_mask[subset_mask].astype(np.float64),
+            perturbation_indicator=masks[0][subset_mask].astype(np.float64),
             intercept=True,
         )
+        test_columns = [design_columns.index("perturbation")]
+        design_columns[test_columns[0]] = f"perturbation {labels_in_fit[0]!r}"
+        for label, mask in zip(labels_in_fit[1:], masks[1:]):
+            design = np.column_stack([design, mask[subset_mask].astype(np.float64)])
+            test_columns.append(design.shape[1] - 1)
+            design_columns.append(f"perturbation {label!r}")
         if covariates:
-            check_full_rank(design, design_columns, f"nb_glm_test, comparison {label!r} vs control")
-        test_column = design_columns.index("perturbation")
+            what = "comparison" if len(labels_in_fit) == 1 else "perturbations"
+            check_full_rank(design, design_columns,
+                            f"nb_glm_test, {what} {', '.join(map(repr, labels_in_fit))} vs control")
         subset_size_factors = np.asarray(size_factors)[subset_mask]
 
-        # A slice on a file sorted by perturbation (one contiguous read), else
-        # ascending row indices; either way in the subset's row order.
-        backed = read_backed(path)
-        try:
-            group_matrix = backed.X[group_rows, :]
-        finally:
-            backed.file.close()
-        group = np.asarray(group_matrix.toarray() if sp.issparse(group_matrix) else group_matrix, dtype=np.float64)
         counts = np.empty((int(subset_mask.sum()), n_genes), dtype=np.float64)
         counts[control_mask[subset_mask]] = (
             control_matrix.toarray() if sp.issparse(control_matrix) else control_matrix
         )
-        counts[group_mask[subset_mask]] = group
-
-        group_n = group.shape[0]
-        group_expr_counts = np.count_nonzero(group, axis=0)
-        group_total = group.sum(axis=0)
-        valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
-        valid &= ~_low_expr_in_both_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_expr_counts,
-            pert_mean=group_total / max(group_n, 1),
-            control_mean=control_total / max(control_n, 1),
-            n_pert_cells=group_n,
-            n_control_cells=control_n,
-            min_pct_ctrl=min_pct_ctrl,
-            min_pct_pert=min_pct_pert,
-            min_mean_ctrl=min_mean_ctrl,
-            min_mean_pert=min_mean_pert,
-        )
-        # A pair with no counts in one arm has no finite effect to estimate;
-        # see _nonestimable_glm_mask. Excluded here rather than fitted, so it
-        # is reported as untested instead of carrying a bound-determined
-        # effect and an artefactual p-value into the FDR correction.
-        valid &= ~_nonestimable_glm_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_expr_counts,
-            min_cells_ctrl=min_cells_ctrl,
-            min_cells_pert=min_cells_pert,
-        )
-        valid &= (control_total + group_total) >= min_total_count
+        groups, valids = [], []
+        backed = read_backed(path)
+        try:
+            for rows, mask in zip(rows_in_fit, masks):
+                # A slice on a file sorted by perturbation (one contiguous
+                # read), else ascending row indices: the subset's row order.
+                block = backed.X[rows, :]
+                group = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
+                counts[mask[subset_mask]] = group
+                groups.append(group)
+        finally:
+            backed.file.close()
+        for group in groups:
+            group_n = group.shape[0]
+            group_expr_counts = np.count_nonzero(group, axis=0)
+            group_total = group.sum(axis=0)
+            valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
+            valid &= ~_low_expr_in_both_mask(
+                pert_expr_counts=group_expr_counts,
+                control_expr_counts=control_expr_counts,
+                pert_mean=group_total / max(group_n, 1),
+                control_mean=control_total / max(control_n, 1),
+                n_pert_cells=group_n,
+                n_control_cells=control_n,
+                min_pct_ctrl=min_pct_ctrl,
+                min_pct_pert=min_pct_pert,
+                min_mean_ctrl=min_mean_ctrl,
+                min_mean_pert=min_mean_pert,
+            )
+            # A pair with no counts in one arm has no finite effect to
+            # estimate; see _nonestimable_glm_mask. Excluded here rather than
+            # fitted, so it is reported as untested instead of carrying a
+            # bound-determined effect and an artefactual p-value into the FDR
+            # correction.
+            valid &= ~_nonestimable_glm_mask(
+                pert_expr_counts=group_expr_counts,
+                control_expr_counts=control_expr_counts,
+                min_cells_ctrl=min_cells_ctrl,
+                min_cells_pert=min_cells_pert,
+            )
+            valid &= (control_total + group_total) >= min_total_count
+            valids.append(valid)
+        # A gene is fitted when any perturbation tests it; each reports only its own.
         fit = fit_glm_deseq2(
-            design, counts, subset_size_factors, test_column, np.flatnonzero(valid),
+            design, counts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
             dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
             max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter,
         )
-        tested = fit.converged & np.isfinite(fit.statistic)
-        lfc = np.where(tested, fit.lfc, np.nan)
-        se = np.where(tested, fit.se, np.nan)
-        result = {
-            "group_idx": group_idx,
-            "n_tested": int(valid.sum()),
-            "statistic": np.where(tested, fit.statistic, np.nan),
-            "pvalue": np.where(tested, fit.pvalue, np.nan),
-            "logfc": lfc,
-            "logfc_raw": lfc.copy(),
-            "intercept": np.where(tested, fit.intercept, np.nan),
-            "se": se,
-            # Fractions of expressing cells describe the data, not a fit, so
-            # they are reported for every gene, the untested ones included: a
-            # pair expressed in 0% of perturbed and 95% of control cells is a
-            # complete knockdown whose effect is not estimable.
-            "pts": (group_expr_counts / max(group_n, 1)).astype(np.float32),
-            "dispersion": fit.dispersion,
-            "dispersion_raw": fit.genewise_dispersion,
-            "dispersion_trend": fit.trend,
-            "converged": fit.converged,
-        }
-        if lfc_shrinkage_type == "apeglm":
-            # apeGLM refits every coefficient under a Cauchy prior on the
-            # perturbation's, starting from the MLE; an untested gene has no
-            # start and stays NaN. PyDESeq2's lfc_shrink applies no mean floor.
-            shrunk_coef, shrunk_se, _ = shrink_lfc_apeglm(
-                counts=counts,
-                design_matrix=design,
-                size_factors=subset_size_factors,
-                dispersion=fit.dispersion,
-                mle_coef=np.where(tested[None, :], fit.coef.T, np.nan),
-                mle_se=se,
-                shrink_index=test_column,
-                prior_scale=None,  # from this comparison's MLE fold changes
-                n_jobs=1,  # parallel over comparisons instead
-                min_mu=0.0,
-            )
-            result["logfc"] = shrunk_coef[test_column, :]
-            result["se"] = shrunk_se
-        return result
+        results = []
+        for group_idx, column, group, valid in zip(group_idxs, test_columns, groups, valids):
+            b, b_se = fit.coef[:, column], fit.coef_se[:, column]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                statistic = b / b_se
+            tested = valid & fit.coef_converged & np.isfinite(statistic) & (b_se > 0)
+            lfc = np.where(tested, b, np.nan)
+            se = np.where(tested, b_se, np.nan)
+            result = {
+                "group_idx": group_idx,
+                "n_tested": int(valid.sum()),
+                "statistic": np.where(tested, statistic, np.nan),
+                "pvalue": np.where(tested, 2.0 * norm.sf(np.abs(statistic)), np.nan),
+                "logfc": lfc,
+                "logfc_raw": lfc.copy(),
+                "intercept": np.where(tested, fit.intercept, np.nan),
+                "se": se,
+                # Fractions of expressing cells describe the data, not a fit,
+                # so they are reported for every gene, the untested ones
+                # included: a pair expressed in 0% of perturbed and 95% of
+                # control cells is a complete knockdown whose effect is not
+                # estimable.
+                "pts": (np.count_nonzero(group, axis=0) / max(group.shape[0], 1)).astype(np.float32),
+                "dispersion": fit.dispersion,
+                "dispersion_raw": fit.genewise_dispersion,
+                "dispersion_trend": fit.trend,
+                "converged": valid & fit.coef_converged,
+            }
+            if lfc_shrinkage_type == "apeglm":
+                # apeGLM refits every coefficient under a Cauchy prior on the
+                # perturbation's, starting from the MLE; an untested gene has
+                # no start and stays NaN. PyDESeq2's lfc_shrink applies no
+                # mean floor. (One perturbation per fit: see nb_glm_test.)
+                shrunk_coef, shrunk_se, _ = shrink_lfc_apeglm(
+                    counts=counts,
+                    design_matrix=design,
+                    size_factors=subset_size_factors,
+                    dispersion=fit.dispersion,
+                    mle_coef=np.where(tested[None, :], fit.coef.T, np.nan),
+                    mle_se=se,
+                    shrink_index=column,
+                    prior_scale=None,  # from this comparison's MLE fold changes
+                    n_jobs=1,  # parallel over comparisons instead
+                    min_mu=0.0,
+                )
+                result["logfc"] = shrunk_coef[column, :]
+                result["se"] = shrunk_se
+            results.append(result)
+        return results
 
     n_groups = len(candidates)
     
@@ -2003,10 +2054,11 @@ def nb_glm_test(
     # dispersions estimated on that comparison's cells. Without covariates
     # every control term depends on the controls only, so they are summarised
     # in one pass and a comparison costs its own cells
-    # (glm.fit_two_group_deseq2). With covariates, or apeGLM shrinkage (which
-    # refits on the cells), each comparison is fitted on its control and
-    # perturbed cells (glm.fit_glm_deseq2), with the controls held in memory.
-    two_group = not covariates and lfc_shrinkage_type == "none"
+    # (glm.fit_two_group_deseq2). With covariates, apeGLM shrinkage (which
+    # refits on the cells) or several perturbations per fit, each fit runs on
+    # its control and perturbed cells (glm.fit_glm_deseq2), with the controls
+    # held in memory.
+    two_group = not covariates and lfc_shrinkage_type == "none" and targets_per_fit == 1
     # The memory this call may use: memory_limit_gb, capped by what the
     # process's cgroup will still grant (detected when None). Every size
     # chosen below is a share of it.
@@ -2036,8 +2088,8 @@ def nb_glm_test(
         if control_matrix_gb * 4 > max_dense_fraction * budget_gb:
             raise MemoryError(
                 f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
-                "fit the memory budget; with covariates or lfc_shrinkage_type='apeglm' every comparison "
-                "is fitted on all of them. Raise memory_limit_gb, aggregate to pseudo-bulk first "
+                "fit the memory budget; with covariates, lfc_shrinkage_type='apeglm' or targets_per_fit > 1 "
+                "every fit includes all of them. Raise memory_limit_gb, aggregate to pseudo-bulk first "
                 "(cx.pb.aggregate), or test without covariates and shrink afterwards with shrink_lfc."
             )
         backed = read_backed(path)
@@ -2112,6 +2164,7 @@ def nb_glm_test(
             "original_dataset_path": str(path),  # For shrink_lfc to reload data
             "size_factor_method": size_factor_method,
             "min_mu": float(min_mu),
+            "targets_per_fit": targets_per_fit,
             "de_filter": {
                 "min_cells_expressed": int(min_cells_expressed),
                 "min_pct_ctrl": float(min_pct_ctrl),
@@ -2152,6 +2205,12 @@ def nb_glm_test(
     effective_n_jobs = _resolve_n_jobs(n_jobs)
     requested_n_jobs = effective_n_jobs
     n_to_run = len(candidates_to_run)
+    # The fits on the cells: the perturbations targets_per_fit at a time, in a
+    # fixed order, so a resumed run refits the same groups.
+    unfinished = set(candidates_to_run)
+    fits = [candidates[i:i + targets_per_fit] for i in range(0, len(candidates), targets_per_fit)]
+    fits = [labels_in_fit for labels_in_fit in fits if unfinished.intersection(labels_in_fit)]
+    n_fits = len(fits)
     if not two_group:
         unique_labels, label_counts = np.unique(labels, return_counts=True)
         with h5py.File(path, "r") as handle:
@@ -2168,8 +2227,8 @@ def nb_glm_test(
             int(np.percentile(pert_group_sizes, 95)) if len(pert_group_sizes) >= 10 else max_group_size
         )
         control_matrix_mb = control_n * n_genes * 8 / 1e6
-        # Counts, means and the IRLS work arrays of the comparison's cells.
-        work_arrays_mb = (control_n + use_group_size) * n_genes * 8 * 6 / 1e6
+        # Counts, means and the IRLS work arrays of one fit's cells.
+        work_arrays_mb = (control_n + use_group_size * targets_per_fit) * n_genes * 8 * 6 / 1e6
         serialized_args_mb = (control_matrix_mb + n_cells_total * 8 * 3 / 1e6) * 2.5
         per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
 
@@ -2194,9 +2253,9 @@ def nb_glm_test(
         else:
             max_workers_by_size = n_groups
 
-        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
+        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_fits)
         if memory_limited_workers < effective_n_jobs:
-            if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
+            if memory_limited_workers == n_fits and n_fits < max_workers_by_memory and n_fits < max_workers_by_size:
                 limit_reason = "perturbation_count"
             elif memory_limited_workers == max_workers_by_memory:
                 limit_reason = "memory"
@@ -2213,7 +2272,7 @@ def nb_glm_test(
     effective_n_jobs = max(1, effective_n_jobs)
 
     # For small number of perturbations to run, run sequentially to avoid overhead.
-    use_parallel = n_to_run >= 4 and effective_n_jobs > 1 and not two_group
+    use_parallel = n_fits >= 2 and (n_to_run >= 4 or targets_per_fit > 1) and effective_n_jobs > 1 and not two_group
 
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
         """One perturbation against the control summary; same result as the
@@ -2335,9 +2394,26 @@ def nb_glm_test(
             if (len(newly_completed) - len(completed_labels) + len(newly_failed)) % eff_checkpoint_interval == 0:
                 _save_checkpoint()
 
-        def _worker_args(label: str) -> dict:
+        def _record_fit(labels_in_fit: list[str], compute) -> None:
+            # A fit that fails fails each of its perturbations; a resumed run
+            # keeps the rows it already wrote.
+            def fitted(label: str) -> dict:
+                if error is not None:
+                    raise error
+                return by_label[label]
+
+            try:
+                by_label, error = {candidates[r["group_idx"]]: r for r in compute()}, None
+            except Exception as e:
+                by_label, error = {}, e
+            for label in labels_in_fit:
+                if label in unfinished:
+                    _record(label, lambda label=label: fitted(label))
+
+        def _worker_args(labels_in_fit: list[str]) -> dict:
             return dict(
-                group_idx=candidate_to_idx[label], label=label, path=path, group_rows=group_rows[label],
+                labels_in_fit=labels_in_fit, group_idxs=[candidate_to_idx[label] for label in labels_in_fit],
+                path=path, rows_in_fit=[group_rows[label] for label in labels_in_fit],
                 control_mask=control_mask, control_matrix=control_matrix,
                 control_expr_counts=control_expr_counts, control_total=control_total, control_n=control_n,
                 obs_df=obs_df, covariates=covariates, size_factors=size_factors, n_genes=n_genes,
@@ -2363,16 +2439,18 @@ def nb_glm_test(
                 backed.file.close()
                 numba.set_num_threads(threads)
         elif use_parallel:
-            # Each row is written as soon as it is fitted, rather than held
-            # until every earlier one is.
+            # Each fit's rows are written as soon as it is done, rather than
+            # held until every earlier one is.
             results = Parallel(
                 n_jobs=effective_n_jobs, backend="loky", prefer="processes", return_as="generator_unordered",
-            )(delayed(_fit_perturbation_worker)(**_worker_args(label)) for label in candidates_to_run)
-            for res in results:
-                _record(candidates[res["group_idx"]], lambda res=res: res)
+            )(delayed(_fit_perturbation_worker)(**_worker_args(labels_in_fit)) for labels_in_fit in fits)
+            for fit_results in results:
+                labels_in_fit = [candidates[r["group_idx"]] for r in fit_results]
+                _record_fit(labels_in_fit, lambda fit_results=fit_results: fit_results)
         else:
-            for label in candidates_to_run:
-                _record(label, lambda label=label: _fit_perturbation_worker(**_worker_args(label)))
+            for labels_in_fit in fits:
+                _record_fit(labels_in_fit,
+                            lambda labels_in_fit=labels_in_fit: _fit_perturbation_worker(**_worker_args(labels_in_fit)))
 
     # Final checkpoint save
     _save_checkpoint()

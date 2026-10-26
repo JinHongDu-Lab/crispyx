@@ -74,6 +74,18 @@ Version 0.2.3
   outlier replacement stays out: on four Adamson perturbations against
   7,629 controls PyDESeq2's ``refit_cooks`` replaced outliers in 4-15 of
   ~18,800 genes and changed the hits at q < 0.1 by 0-3.
+* **``targets_per_fit`` fits several perturbations in one model.** With
+  ``targets_per_fit=k`` the perturbations are taken ``k`` at a time and
+  fitted together with every control on ``~ covariates + perturbation``, one
+  indicator column per perturbation, as a pseudo-bulk analysis that treats
+  the perturbation as one factor does: dispersions are estimated once per
+  model, mostly from the controls, and each perturbation is tested on its
+  own column. It matches PyDESeq2 fitted the same way (median 1e-3 in z),
+  and reproduces analyses run that way, such as the genome-wide CD4+ T-cell
+  screen of Zhu, Dann *et al.* (PyDESeq2, 50 targets per model): on its
+  guide x donor pseudo-bulk (3,387 control units; log10 cells and donor)
+  ``targets_per_fit=50`` takes 1.2 s per target against about 20 s one at a
+  time. The default, 1, is DESeq2 run per comparison.
 * **The mean floor follows the counts.** ``min_mu`` (fitted means are held
   at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting
   for single cells, when at least half of a sample of the counts are zero,

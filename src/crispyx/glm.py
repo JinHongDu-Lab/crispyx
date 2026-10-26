@@ -2715,8 +2715,11 @@ class DESeq2Result:
 
     ``lfc`` and ``se`` are natural-log; ``intercept`` is the intercept
     coefficient (the controls' log mean without covariates). ``prior_var`` is
-    NaN when no MAP step ran. ``coef`` holds every coefficient
-    ``(genes, design columns)``, from :func:`fit_glm_deseq2` only."""
+    NaN when no MAP step ran. ``coef`` and ``coef_se`` hold every coefficient
+    and its Wald standard error ``(genes, design columns)``, and
+    ``coef_converged`` whether each gene's IRLS converged, from
+    :func:`fit_glm_deseq2` only (several perturbations fitted together are
+    tested from them, one column each)."""
 
     genewise_dispersion: np.ndarray
     trend: np.ndarray
@@ -2731,6 +2734,8 @@ class DESeq2Result:
     converged: np.ndarray
     prior_var: float
     coef: np.ndarray | None = None
+    coef_se: np.ndarray | None = None
+    coef_converged: np.ndarray | None = None
 
 
 def fit_two_group_deseq2(
@@ -2939,7 +2944,8 @@ def fit_glm_deseq2(
     prior_var = float("nan")
     if idx.size == 0:
         return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
-                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan))
+                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
+                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
 
     y_t = np.asfortranarray(y[:, idx])
     offset = np.log(s)
@@ -2988,7 +2994,9 @@ def fit_glm_deseq2(
     stat[idx] = b / b_se
     pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
     converged[idx] = ok
-    coef = np.full((n_genes, p), np.nan)
-    coef[idx] = fit.coef
+    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
+    coef[idx], coef_se[idx] = fit.coef, fit.se
+    coef_converged = np.zeros(n_genes, dtype=bool)
+    coef_converged[idx] = fit.converged
     return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
-                        base_mean, converged, prior_var, coef)
+                        base_mean, converged, prior_var, coef, coef_se, coef_converged)

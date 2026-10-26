@@ -243,3 +243,82 @@ def test_control_summary_does_not_depend_on_the_blocks(screen_and_reference):
     by_gene = np.bincount(np.repeat(np.arange(ctrl.shape[1]), np.diff(one.hist_ptr)),
                           weights=one.hist_val * one.hist_cnt, minlength=ctrl.shape[1])
     np.testing.assert_allclose(by_gene, ctrl.sum(axis=0))
+
+
+def _three_targets(tmp_path, covariates):
+    """Controls and KO1-KO3 (one simulated perturbation split three ways), with batches."""
+    import anndata as ad
+
+    rng = np.random.default_rng(3)
+    counts, labels, _, batch = _screen(seed=3, n_pert=360, batch_sd=0.3 if covariates else 1e-12)
+    labels = labels.copy()
+    labels[labels == "KO1"] = rng.choice(["KO1", "KO2", "KO3"], (labels == "KO1").sum())
+    path = tmp_path / "screen.h5ad"
+    ad.AnnData(counts.astype(np.float32), obs=pd.DataFrame({"perturbation": labels, "batch": batch})).write(path)
+    return path, counts, labels, batch
+
+
+_NO_FILTERS = dict(min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_cells_ctrl=0,
+                   min_cells_pert=0, min_total_count=0)
+
+
+@pytest.mark.parametrize("covariates", [False, True], ids=["condition", "batch"])
+def test_perturbations_fitted_together_match_pydeseq2_with_one_factor(tmp_path, covariates):
+    """targets_per_fit=3: the controls and KO1-KO3 in one model, the
+    perturbation a factor of four levels (as a pseudo-bulk analysis fits many
+    targets at once), against PyDESeq2 fitted the same way with a contrast
+    per perturbation."""
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+
+    from crispyx.de import _global_size_factors, nb_glm_test
+
+    path, counts, labels, batch = _three_targets(tmp_path, covariates)
+    result = nb_glm_test(path, perturbation_column="perturbation", control_label="ctrl",
+                         covariates=["batch"] if covariates else None, targets_per_fit=3, min_mu=0.5,
+                         n_jobs=2, verbose=False, output_path=tmp_path / "de.h5ad", **_NO_FILTERS)
+    sf = _global_size_factors(path, "libsize", 2048, labels, "ctrl")
+    df = pd.DataFrame(counts.astype(int), columns=[f"g{i}" for i in range(counts.shape[1])])
+    meta = pd.DataFrame({"condition": labels, "batch": batch}, index=df.index)
+    dds = DeseqDataSet(counts=df, metadata=meta, design="~batch + condition" if covariates else "~condition",
+                       refit_cooks=False, quiet=True)
+    dds.obs["size_factors"] = sf
+    dds.layers["normed_counts"] = dds.X / sf[:, None]
+    dds.var["_normed_means"] = dds.layers["normed_counts"].mean(0)
+    for step in ("fit_genewise_dispersions", "fit_dispersion_trend", "fit_dispersion_prior",
+                 "fit_MAP_dispersions", "fit_LFC", "calculate_cooks"):
+        getattr(dds, step)()
+    for name in ("KO1", "KO2", "KO3"):
+        stats = DeseqStats(dds, contrast=["condition", name, "ctrl"], cooks_filter=False,
+                           independent_filter=False, quiet=True)
+        stats.summary()
+        dz = np.abs(result[name].statistic - stats.results_df["stat"].to_numpy())
+        assert np.median(dz) < 1e-3 and np.nanmax(dz) < 0.05, (name, np.median(dz), np.nanmax(dz))
+
+
+def test_perturbations_are_fitted_in_groups_of_targets_per_fit(tmp_path):
+    """targets_per_fit=2 on three perturbations, in the order given: KO1 and
+    KO2 together, KO3 on its own -- the same fit as targets_per_fit=1 gives
+    it."""
+    from crispyx.de import nb_glm_test
+
+    path, *_ = _three_targets(tmp_path, covariates=True)
+    kw = dict(perturbation_column="perturbation", control_label="ctrl", covariates=["batch"], n_jobs=1,
+              perturbations=["KO1", "KO2", "KO3"], verbose=False, **_NO_FILTERS)
+    paired = nb_glm_test(path, targets_per_fit=2, output_path=tmp_path / "paired.h5ad", **kw)
+    alone = nb_glm_test(path, output_path=tmp_path / "alone.h5ad", **kw)
+    np.testing.assert_allclose(paired["KO3"].statistic, alone["KO3"].statistic, rtol=1e-10, equal_nan=True)
+    assert not np.allclose(paired["KO1"].statistic, alone["KO1"].statistic, equal_nan=True)
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(targets_per_fit=0), "positive integer"),
+    (dict(targets_per_fit=2, lfc_shrinkage_type="apeglm"), "shrink_lfc"),
+])
+def test_targets_per_fit_is_validated(tmp_path, kwargs, match):
+    from crispyx.de import nb_glm_test
+
+    path, *_ = _three_targets(tmp_path, covariates=False)
+    with pytest.raises(ValueError, match=match):
+        nb_glm_test(path, perturbation_column="perturbation", control_label="ctrl", verbose=False,
+                    output_path=tmp_path / "de.h5ad", **kwargs)

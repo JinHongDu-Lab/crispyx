@@ -194,6 +194,17 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   fixes one value for every gene; ``shrink_dispersion=False`` tests at the
   gene-wise estimates.
 
+* **Several perturbations per model** (``targets_per_fit``): with
+  ``targets_per_fit=k`` the perturbations are fitted ``k`` at a time with all
+  the controls, one indicator column each, so the dispersions are estimated
+  once per ``k`` perturbations (mostly from the controls) and each is tested
+  against the controls on its own column. This reproduces a pseudo-bulk
+  DESeq2 or PyDESeq2 analysis that puts many targets in one model, and with
+  covariates and many control units it is far faster than one
+  perturbation at a time: about 1.2 s against 20 s per target on the
+  genome-wide CD4+ T-cell pseudo-bulk of Zhu, Dann *et al.* (2025), who fitted
+  50 targets per model (see :doc:`notebooks/residual_effects_tutorial`).
+
 * **Cell level or pseudo-bulk?** Cells that share a guide, donor or lane are
   not independent replicates, which is why pseudo-bulk analysis (counts
   summed per guide x batch or donor with ``cx.pb.aggregate(method="sum")``,
