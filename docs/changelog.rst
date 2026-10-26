@@ -1,8 +1,10 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.2.3
+-------------
+
+*Released 2026-10-26.*
 
 * **``nb_glm_test`` refuses input that is not raw counts.** Given
   normalised or log-transformed values it ran and returned results that
