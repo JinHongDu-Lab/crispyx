@@ -82,9 +82,9 @@ Version 0.2.3
   model, mostly from the controls, and each perturbation is tested on its
   own column. It matches PyDESeq2 fitted the same way (median 1e-3 in z),
   and reproduces analyses run that way, such as the genome-wide CD4+ T-cell
-  screen of Zhu, Dann *et al.* (PyDESeq2, 50 targets per model): on its
+  screen of Zhu *et al.* (PyDESeq2, 50 targets per model): on its
   guide x donor pseudo-bulk (3,387 control units; log10 cells and donor)
-  ``targets_per_fit=50`` takes 1.2 s per target against about 20 s one at a
+  ``targets_per_fit=50`` takes 0.3 s per target against about 20 s one at a
   time. The default, 1, is DESeq2 run per comparison.
 * **The mean floor follows the counts.** ``min_mu`` (fitted means are held
   at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting

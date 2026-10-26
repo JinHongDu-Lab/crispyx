@@ -201,8 +201,8 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   against the controls on its own column. This reproduces a pseudo-bulk
   DESeq2 or PyDESeq2 analysis that puts many targets in one model, and with
   covariates and many control units it is far faster than one
-  perturbation at a time: about 1.2 s against 20 s per target on the
-  genome-wide CD4+ T-cell pseudo-bulk of Zhu, Dann *et al.* (2025), who fitted
+  perturbation at a time: about 0.3 s against 20 s per target on the
+  genome-wide CD4+ T-cell pseudo-bulk of Zhu *et al.* (2026, *Cell*), who fitted
   50 targets per model (see :doc:`notebooks/residual_effects_tutorial`).
 
 * **Cell level or pseudo-bulk?** Cells that share a guide, donor or lane are

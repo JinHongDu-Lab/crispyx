@@ -142,8 +142,9 @@ The two nulls turn an effect into a z-score differently:
 - ``null="model"`` divides by the control fit's residual standard deviation,
   Feng *et al.*'s test. Its noise comes from the controls, so even groups of 10
   cells are tested reliably. It treats cells as independent, while cells sharing
-  a guide or a donor are not: on the genome-wide screen of the CD4+ T-cell
-  tutorial it gave about 300 hits to every fake target.
+  a guide or a donor are not: on the genome-wide CD4+ T-cell screen of Zhu
+  *et al.* (the CD4+ T-cell tutorial) it gave about 300 hits to every fake
+  target.
 
 - **Strengths:** about two minutes for every target of a 7-million-cell screen;
   continuous and categorical covariates; small groups, including per-line or
@@ -163,7 +164,10 @@ NB-GLM with covariates
 ``cx.nb_glm_test(..., covariates=[...])`` fits a negative binomial model to the
 counts with the covariates and a perturbation indicator in the design, as DESeq2
 does; ``cx.shrink_lfc`` shrinks the fold changes afterwards. It runs on single
-cells or on pseudo-bulk counts.
+cells or on pseudo-bulk counts. ``targets_per_fit=k`` fits ``k`` targets at a
+time in one model with all the controls, as a pseudo-bulk analysis with the
+target as one factor does: the dispersions are estimated once per model, which
+with many control units is far faster than one target at a time.
 
 On **pseudo-bulk**, counts are summed per guide and donor (or other replicate
 unit) with ``cx.pb.aggregate(..., method="sum")``. Each unit is a replicate, so
@@ -178,14 +182,16 @@ the test accounts for variation between guides and donors.
    result = cx.nb_glm_test("units.h5ad", perturbation_column="target",
                            control_label="non-targeting",
                            covariates=["log10_n_cells", "donor"],
-                           size_factor_method="deseq2")
+                           size_factor_method="deseq2",
+                           targets_per_fit=50)  # as Zhu et al.
 
 - **Strengths:** a count model with log2 fold changes and standard errors. On
-  pseudo-bulk it reproduces the authors' DESeq2 estimates of the CD4+ T-cell
-  screen (median per-target r 0.999) and is the best calibrated of these methods
-  on fake targets.
-- **Weaknesses:** slow: about 1.5 seconds per target on 32 cores on pseudo-bulk,
-  so about five hours for a genome-wide screen. Pseudo-bulk needs replicate units
+  pseudo-bulk it reproduces Zhu *et al.*'s PyDESeq2 estimates of their
+  CD4+ T-cell screen (median per-target r 0.9999) and is the best calibrated of
+  these methods on fake targets.
+- **Weaknesses:** slower: about 0.3 seconds per target on 32 cores on
+  pseudo-bulk with ``targets_per_fit=50`` (about 20 seconds one target at a
+  time), so about an hour for a genome-wide screen. Pseudo-bulk needs replicate units
   (several guides or donors per target); with one donor and one guide there is
   little to estimate the variation from. On single cells, cells are again
   treated as independent, and with covariates the control cells must fit in

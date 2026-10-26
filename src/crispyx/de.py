@@ -1527,7 +1527,7 @@ def nb_glm_test(
         dispersions are estimated once for the ``k`` of them, mostly from the
         controls, and each perturbation is tested on its own column against
         the controls. This is how a pseudo-bulk analysis that fits many
-        perturbations as levels of one factor runs (Zhu, Dann *et al.* 2025
+        perturbations as levels of one factor runs (Zhu *et al.* 2026
         fitted 50 at a time), and it costs about ``1/k`` of the dispersion
         estimation. Always fitted on the cells (as with covariates); not with
         ``lfc_shrinkage_type="apeglm"`` (use :func:`shrink_lfc` afterwards).
