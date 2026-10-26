@@ -1521,6 +1521,7 @@ def run_pydeseq2_base(
     max_control_cells: int | None = None,
     output_name: str = "pertpy_de_pydeseq2",
     size_factor_method: str | None = None,
+    min_mu: float | None = None,
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
@@ -1593,6 +1594,9 @@ def run_pydeseq2_base(
                     design_factors=perturbation_column,
                     refit_cooks=True,
                     n_cpus=n_jobs or 1,
+                    # The mean floor: crispyx 0.2.3 uses 1e-6 on sparse single cells, PyDESeq2 0.5
+                    # by default; a like-for-like comparison needs the same one.
+                    **({"min_mu": min_mu} if min_mu is not None else {}),
                 )
                 if size_factor_method == "libsize":
                     _use_library_size_factors(dds)
@@ -1671,6 +1675,7 @@ def run_pydeseq2_base(
         "subsampled": max_perturbations is not None,
         "control_cells": n_control_cells,
         "size_factor_method": size_factor_method or "pydeseq2 default (median of ratios)",
+        "min_mu": min_mu if min_mu is not None else 0.5,
     }
 
 
@@ -5292,6 +5297,9 @@ def _accuracy_subset_methods(
             if base in ("pertpy_de_pydeseq2", "edger_de_glm"):
                 # NB-GLM references share crispyx's size factors (plan §4).
                 kwargs["size_factor_method"] = spec.get("size_factors", "libsize")
+            if base == "pertpy_de_pydeseq2":
+                # ... and its mean floor (crispyx 0.2.3 on sparse single cells: 1e-6).
+                kwargs["min_mu"] = float(spec.get("min_mu", 1e-6))
             depends_on = ref.depends_on
             if base == "edger_de_glm":
                 # Same perturbation universe as the other references (QC-filtered counts).
