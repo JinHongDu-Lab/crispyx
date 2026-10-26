@@ -194,6 +194,34 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   fixes one value for every gene; ``shrink_dispersion=False`` tests at the
   gene-wise estimates.
 
+* **Cell level or pseudo-bulk?** Cells that share a guide, donor or lane are
+  not independent replicates, which is why pseudo-bulk analysis (counts
+  summed per guide x batch or donor with ``cx.pb.aggregate(method="sum")``,
+  then ``nb_glm_test`` with ``size_factor_method="deseq2"``) is the usual
+  recommendation when replicate units exist. On two Tian iPSC-neuron screens
+  (CRISPRi and CRISPRa) we compared the two levels directly:
+
+  - Cell-level NB-GLM stayed calibrated against fake targets made from
+    control guides (each non-targeting guide tested against the others):
+    0.12-0.25 % of null pairs at \|z\| > 3, against 0.27 % expected.
+  - It found far more hits than pseudo-bulk with 4 units per perturbation
+    (2 guides x 2 batches), e.g. 118 against 19 genes for SPAST. The
+    pseudo-bulk fold changes agreed with the cell-level ones (r 0.97-0.99);
+    pseudo-bulk loses power through wider standard errors when units are
+    few, and by counting the differences between a perturbation's guides as
+    noise. crispyx, PyDESeq2 and R DESeq2 called the same pseudo-bulk hits.
+  - The fake-target check cannot show whether cell level's extra hits rely
+    on a perturbation's guides agreeing (control guides have no knockdown
+    to differ in), and on several Tian targets the two guides' fold changes
+    at the cell-level hits agreed poorly.
+
+  In practice: test at cell level by default; aggregate to pseudo-bulk when
+  each perturbation has several replicate units, or to check that a hit
+  holds across guides and donors; and run a fake-target check (control
+  guides relabelled as targets) on your own screen either way. These are two
+  screens and ten perturbations each; a comparison across screens is
+  planned.
+
 * **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior
   shrinkage to log-fold changes using ``shrink_lfc()`` after running
   ``nb_glm_test()``. This preserves large effects while shrinking
