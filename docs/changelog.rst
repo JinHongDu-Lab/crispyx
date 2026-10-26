@@ -60,8 +60,9 @@ Version 0.2.3
   coefficients refitted at the final dispersions instead of keeping the
   grid's. Given the same size factors and mean floor both agree with
   PyDESeq2: a median 1e-3 in z (at most 0.05) on simulated data, with and
-  without a batch covariate, and 4e-4 to 4e-3 (r >= 0.999) on Adamson, both
-  Tian screens and Frangieh; at the default floors (1e-6 here on single cells, 0.5 in
+  without a batch covariate, and 4e-4 to 4e-3 on six screens (Adamson, Tian
+  CRISPRi and CRISPRa, Frangieh, Huang HCT116 and HEK293T; z correlation
+  0.997-0.9999); at the default floors (1e-6 here on single cells, 0.5 in
   PyDESeq2) the median difference is 0.3-0.4. Where
   PyDESeq2's gene-wise optimiser stops at its lower bound, crispyx finds a
   higher likelihood; those genes are what keep the trends about 5 % apart.

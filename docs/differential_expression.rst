@@ -182,8 +182,8 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   prior around it (genes far above the trend keep their gene-wise value), then
   the Wald test. Given the same size factors and mean floor (``min_mu``) the
   statistics agree with PyDESeq2's: median difference in z 0.0004-0.004 on
-  Adamson, both Tian screens and Frangieh (r >= 0.999), about 0.001 on
-  simulated data; with the floors left at their defaults (crispyx chooses
+  six screens (Adamson, Tian CRISPRi and CRISPRa, Frangieh, Huang HCT116 and
+  HEK293T; z correlation 0.997-0.9999), about 0.001 on simulated data; with the floors left at their defaults (crispyx chooses
   1e-6 for single cells, PyDESeq2 uses 0.5) the median difference is
   0.3-0.4. Cook's distance outlier replacement is not done: on four Adamson perturbations against 7,629 controls, PyDESeq2's
   replaced outliers in 4-15 of ~18,800 genes, moved z by more than 0.5 in
