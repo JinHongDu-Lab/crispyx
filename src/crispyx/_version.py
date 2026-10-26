@@ -2,4 +2,4 @@
 the distribution's metadata reads it at build time, so a source checkout
 reports the code it runs, whatever version is installed."""
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
