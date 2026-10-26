@@ -26,7 +26,8 @@ def crispyx_long(path, perts):
     with h5py.File(path, "r") as f:
         obs = f["obs/perturbation"]
         labels = (obs["categories"][:].astype(str)[obs["codes"][:]] if isinstance(obs, h5py.Group) else obs[:].astype(str))
-        g = f["var/_index"][:].astype(str)
+        key = f["var"].attrs.get("_index", "_index")
+        g = f["var"][key.decode() if isinstance(key, bytes) else key][:].astype(str)
         rows = np.flatnonzero(np.isin(labels, list(perts)))
         get = lambda k: f[k][rows, :] if k in f else np.full((len(rows), len(g)), np.nan)
         cols = {"lfc": get("X"), "z": get("layers/z_score"), "p": get("layers/pvalue"),
