@@ -96,6 +96,16 @@ Version 0.2.3
   guide x donor pseudo-bulk (3,387 control units; log10 cells and donor)
   ``targets_per_fit=50`` takes 0.3 s per target against about 20 s one at a
   time. The default, 1, is DESeq2 run per comparison.
+* **Checks of the control cells.** ``cx.pp.compare_controls`` tests each
+  control guide against a reference pool (e.g. cells without a detected
+  guide) and, as a yardstick, against the other control guides;
+  ``cx.pp.control_guide_correlation`` and ``cx.pl.control_guide_correlation``
+  correlate the control guides' expression deviations and draw them,
+  clustered. On the targeted screen of Feng *et al.*, whose controls are 98 %
+  unassigned cells, each non-targeting guide differed from the unassigned
+  cells in 135-438 genes against 0-16 from the other guides (pseudo-bulk,
+  inlet as a covariate), including the CRISPRi construct and the screen's
+  own targets.
 * **The mean floor follows the counts.** ``min_mu`` (fitted means are held
   at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting
   for single cells, when at least half of a sample of the counts are zero,

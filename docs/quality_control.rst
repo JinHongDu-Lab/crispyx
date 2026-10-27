@@ -17,6 +17,58 @@ automatically and logged for reproducibility. Likewise, omitting
 Individual helpers such as :func:`crispyx.pp.filter_cells` are also
 available for customised pipelines.
 
+.. _check-controls:
+
+Check the control cells
+-----------------------
+
+Every effect is measured against the controls, so it pays to check that they
+behave alike before testing. Two questions come up:
+
+- **Do the control guides agree?** :func:`crispyx.pp.control_guide_correlation`
+  sums each non-targeting guide's counts, takes each guide's deviation from
+  the guides' average (``log1p`` counts per 10,000), and correlates the
+  deviations; :func:`crispyx.pl.control_guide_correlation` draws the matrix,
+  clustered. Guides that differ only by noise correlate near 0. A block of
+  correlated guides shares variation -- a batch, an off-target effect -- that
+  a test reads as signal when those guides are the controls.
+- **May cells without a detected guide join the controls?** Screens with a
+  low assignment rate often pool "unassigned" cells into the controls
+  (Feng *et al.* 2026, *Cell Genomics*, use all of them).
+  :func:`crispyx.pp.compare_controls` tests each non-targeting guide against
+  the unassigned cells and, as a yardstick, against the other non-targeting
+  guides (``nb_glm_test`` with any covariates and settings you pass). If the
+  unassigned cells are like the guides, both comparisons give about as many
+  hits.
+
+.. code-block:: python
+
+   guides = cx.load_obs(path)["guide"].astype(str)
+   controls = sorted(g for g in guides.unique() if g.startswith("NonTarget"))
+
+   corr = cx.pp.control_guide_correlation(path, guide_column="guide",
+                                          controls=controls, reference="unassigned")
+   cx.pl.control_guide_correlation(corr)
+
+   table = cx.pp.compare_controls(path, guide_column="guide", controls=controls,
+                                  reference="unassigned", work_dir="control_check")
+
+Both work on single cells or on pseudo-bulk counts; on pseudo-bulk (units per
+guide and batch from ``cx.pb.aggregate``, ``size_factor_method="deseq2"``, the
+batch as a covariate) the comparison is calibrated and fast.
+
+On the targeted screen of Feng *et al.* (535,000 control cells, 98 % of them
+unassigned), the 20 non-targeting guides correlated at a median r of -0.02
+(at most 0.26). In pseudo-bulk per guide and inlet, with the inlet as a
+covariate, each guide differed from the unassigned cells in 135-438 genes but
+from the other guides in 0-16 (\|z\| > 3 for 1.5-2.3 % of genes against
+0.13-0.39 %); pooled, 849 genes. Among them the CRISPRi construct
+(dCas9-KRAB-MeCP2, lower in unassigned cells), donor-line genes (XIST, MEG3),
+and the screen's own targets, which ran lower in unassigned cells (68 % of
+them, against 55 % of other genes): many unassigned cells carry less of the
+CRISPRi machinery or a guide that was not detected. There, non-targeting
+cells are the safer controls.
+
 Highly variable genes
 ---------------------
 

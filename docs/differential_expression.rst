@@ -214,38 +214,45 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   then ``nb_glm_test`` with ``size_factor_method="deseq2"``) is the usual
   recommendation when replicate units exist. We compared the two levels on
   fake targets made of control guides (no knockdown, but the differences
-  between guides and replicate units real targets have) in six screens
-  (Tian CRISPRi and CRISPRa, Replogle K562 and RPE1 essential, Nadig Jurkat,
-  Frangieh):
+  between guides and replicate units real targets have) in ten screens:
+  Tian CRISPRi and CRISPRa, Replogle K562 genome-wide and K562 and RPE1
+  essential, Nadig Jurkat and HepG2, Nourreddine iPSC, Frangieh, and the
+  targeted screen of Feng *et al.* (\|z\| > 3 is expected in 0.27 % of null
+  pairs, p < 0.05 in 5 %):
 
-  - Cell-level NB-GLM can be miscalibrated. On Frangieh every fake target
-    got hits (median 204), with 10 % of null p-values below 0.05 and 2 % of
-    null pairs at \|z\| > 3 (0.27 % expected); its pseudo-bulk stayed
-    calibrated (3.2 %, 0.16 %). On the Replogle and Nadig screens cell level
-    was close per pair (0.31-0.40 % at \|z\| > 3) but about half of the
-    fake targets got a few hits; on Tian it was calibrated (0.16-0.17 %).
-    Guides that differ from one another for reasons other than the
-    knockdown are counted as signal at cell level; replicate units absorb
-    them.
-  - Pseudo-bulk stayed close to calibrated per pair in every screen
-    (0.07-0.33 % at \|z\| > 3), and was most conservative with the
-    replicate unit as a covariate (fake targets with any hit: 6-20 %).
+  - Cell-level NB-GLM is calibrated on some screens and not others. Tian:
+    0.16-0.17 % at \|z\| > 3. Replogle and Nadig: close per pair
+    (0.31-0.40 %, p < 0.05 in 4.6-5.3 %) but 40-55 % of the fake targets get
+    a few hits. Nourreddine: inflated (0.66 %, 6.5 %; 90 % of fake targets
+    with hits, median 7). Frangieh: every fake target with hits (median 204;
+    2 %, 10 %). Feng's targeted screen: likewise (2.5 %, 11 %), against
+    controls that are 98 % cells without a detected guide (see
+    :ref:`the control-cell check <check-controls>`). Guides that differ from
+    one another for reasons other than the knockdown count as signal at cell
+    level; replicate units absorb them.
+  - Pseudo-bulk stayed close to calibrated where it could form units
+    (0.04-0.36 % at \|z\| > 3, except Nourreddine at 0.52 %), and was most
+    conservative with the replicate unit as a covariate (fake targets with
+    any hit: 6-20 %; Nourreddine 56 % at 0.40 %). It needs enough cells per
+    unit: on Nadig HepG2, whose cells spread thinly over many GEM groups,
+    only 11 of 174 fake targets formed units of 5 cells.
   - Where both are calibrated, cell level is the more powerful. On Tian it
     found far more hits than pseudo-bulk with 4 units per perturbation
     (2 guides x 2 batches), e.g. 118 against 19 genes for SPAST, with the
     same fold changes (r 0.97-0.99): pseudo-bulk loses power through wider
     standard errors when units are few.
   - With covariates, cell-level NB-GLM holds every control cell in memory
-    (dense) in each fit: a few hundred thousand control cells need terabytes,
-    and ``nb_glm_test`` raises ``MemoryError`` instead. Pseudo-bulk with the
-    covariates is the way through there.
+    (dense) in each fit: a hundred thousand control cells or more need
+    hundreds of gigabytes, and ``nb_glm_test`` raises ``MemoryError``
+    instead. Pseudo-bulk with the covariates is the way through there.
 
-  In practice: run a fake-target check on your own screen (control guides
-  relabelled as targets, as in the :doc:`notebooks/residual_effects_tutorial`).
-  Use pseudo-bulk with the replicate unit as a covariate when the screen has
-  replicate units and cell level fails the check, or when its controls are
-  too many for cell level with covariates; use cell level when it passes
-  and power matters, and check that a hit holds across guides.
+  In practice: check the control cells first (:ref:`check-controls`), then
+  run a fake-target check on your own screen (control guides relabelled as
+  targets, as in the :doc:`notebooks/residual_effects_tutorial`). Use
+  pseudo-bulk with the replicate unit as a covariate when the screen has
+  replicate units with enough cells and cell level fails the check, or when
+  its controls are too many for cell level with covariates; use cell level
+  when it passes and power matters, and check that a hit holds across guides.
 
 * **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior
   shrinkage to log-fold changes using ``shrink_lfc()`` after running
