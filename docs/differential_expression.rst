@@ -419,9 +419,10 @@ To compare like with like:
 Gene-wise dispersions can still differ on sparse genes, most often in
 pseudo-bulk: where the likelihood has a second mode at the lower bound
 (1e-8), DESeq2's local search can stop there, while crispyx reports the
-higher-likelihood dispersion. The tests hardly differ: on Tian pseudo-bulk the
-median z difference was 0.001-0.015, the hits differed by a few genes (13
-against 16 for SPAST), and fake targets got the same false hits.
+higher-likelihood dispersion. The tests hardly differ: on Tian CRISPRa
+pseudo-bulk the median z difference was 0.001-0.015, the hits differed by a few
+genes (crispyx found 13 for SPAST, PyDESeq2 16), and fake targets got the same
+false hits.
 
 LFC shrinkage
 -------------
