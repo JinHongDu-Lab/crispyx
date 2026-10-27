@@ -4847,7 +4847,7 @@ def standardize_dataset(
     }
     
     # Read obs/var metadata only (without loading X into memory)
-    adata = ad.read_h5ad(dataset_path, backed='r')
+    adata = read_backed(dataset_path)
     obs_df = adata.obs.copy()
     var_df = adata.var.copy()
     uns_dict = dict(adata.uns)  # shallow copy of uns
