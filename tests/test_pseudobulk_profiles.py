@@ -408,3 +408,16 @@ def test_ambiguous_profile_names_raise(tmp_path):
 def test_method_is_required():
     with pytest.raises(TypeError, match="method"):
         cx.aggregate_pseudobulk("unused.h5ad", groupby="donor")
+
+
+def test_gene_name_column_unlike_var_names_is_written(tmp_path):
+    """Profiles are named by the symbols; the symbol column itself is kept."""
+    path, _, _ = _write_screen(tmp_path)
+    source = ad.read_h5ad(path)
+    source.var = pd.DataFrame({"gene_name": ["A1", "B2", "C3"]}, index=["ENSG01", "ENSG02", "ENSG03"])
+    source.write(path)
+    result = cx.pb.aggregate(path, groupby=["perturbation", "batch"], method="sum", min_cells=1,
+                             gene_name_column="gene_name", output_path=tmp_path / "profiles.h5ad")
+    var = result.backed.var
+    assert list(var.index) == ["A1", "B2", "C3"]
+    assert list(var["gene_name"]) == ["A1", "B2", "C3"]

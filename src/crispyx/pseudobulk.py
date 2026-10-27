@@ -990,7 +990,9 @@ def aggregate_pseudobulk(
             obs["n_cells_aggregated"] = aggregated_counts
             obs["sampled_with_replacement"] = bootstrap_size is not None
             var = backed.var.copy()
-            var.index = pd.Index(gene_symbols, name=backed.var_names.name)
+            # rename, not name=: name=None would keep the symbol column's name, which
+            # anndata refuses to write beside that column
+            var.index = pd.Index(gene_symbols).rename(backed.var_names.name)
             uns = {"crispyx_pseudobulk": metadata, _PROVENANCE_KEY: stamp("pseudobulk", fingerprint)}
             with _replace_on_success(resolved_output) as partial:
                 ad.AnnData(obs=obs, var=var, uns=uns).write(partial)

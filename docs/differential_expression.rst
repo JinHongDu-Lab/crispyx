@@ -5,8 +5,8 @@ Invoke :func:`crispyx.tl.rank_genes_groups` to compare perturbations
 against the control population while matching the familiar
 :func:`scanpy.tl.rank_genes_groups` interface. Choose ``method="wilcoxon"`` (the
 default) for a Mann-Whitney U test, ``method="wald"`` for the streaming Wald
-test, or ``method="nb_glm"`` to fit the negative binomial GLM that supports
-covariates. The helper reuses the automatic control inference so a missing
+test, or ``method="nb_glm"`` to fit DESeq2's negative binomial GLM
+(:doc:`nb_glm`). The helper reuses the automatic control inference so a missing
 ``control_label`` triggers the same adaptive search used earlier, and the
 returned :class:`cx.AnnData` wrapper stores previews of the results in
 ``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
@@ -104,29 +104,11 @@ Series and reused for the same one. Convert a CSR file to CSC once beforehand
 (:func:`crispyx.convert_to_csc`): otherwise every call makes its own temporary
 CSC copy.
 
-
-on-disk results. The plotting functions materialise only the metadata needed
-for plotting, keeping the expression matrix on disk.
-
-PCA visualization
------------------
-
-.. code-block:: python
-
-   # Run PCA first (if not already done)
-   cx.pp.pca(adata_norm, n_comps=50)
-   
-   # Plot variance explained per component
-   cx.pl.pca_variance_ratio(adata_norm, n_pcs=20)
-   
-   # PCA scatter colored by perturbation
-   cx.pl.pca(adata_norm, color='perturbation', components='1,2')
-   
-   # Gene loadings for top components
-   cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
-
 Differential expression visualization
 -------------------------------------
+
+The plotting functions (``cx.pl``) work on on-disk results: they materialise
+only the metadata they need and keep the expression matrix on disk.
 
 .. code-block:: python
 
@@ -148,135 +130,4 @@ Differential expression visualization
        reference="control",
        perturbation_column="perturbation",
        mean_mode="raw",  # or "log1p"
-   )
-
-   # QC plotting (composition + summary distributions)
-   qc = cx.pp.qc_summary(
-       adata_ro,
-       perturbation_column="perturbation",
-       min_genes=100,
-       min_cells_per_perturbation=15,
-       min_cells_per_gene=10,
-   )
-   cx.pl.qc_perturbation_counts(
-       data=adata_ro,
-       perturbation_column="perturbation",
-       cell_mask=qc.cell_mask,
-   )
-   cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
-
-NB-GLM options
---------------
-
-The negative binomial GLM (``method="nb_glm"``) supports several options:
-
-* **Adaptive chunk size** (default): When ``chunk_size=None`` (the default),
-  crispyx automatically calculates an optimal chunk size based on dataset
-  dimensions and ``memory_limit_gb``. Small/medium datasets use the maximum
-  chunk size (256) for speed, while large memory-constrained datasets use
-  smaller chunks to avoid OOM errors. You can still set ``chunk_size``
-  explicitly to override automatic selection.
-
-* **Frozen control mode** (``freeze_control``): For datasets with large control
-  populations (>100K cells), the control matrix can consume 30+ GB of memory.
-  When ``freeze_control=True``, control statistics are pre-computed once and
-  shared across workers via memory-mapped files, reducing per-worker memory
-  from ~32 GB to <1 GB. This enables full parallelization on large datasets.
-  
-  **Auto-detection** (default): When ``freeze_control=None``, crispyx automatically
-  enables frozen control mode when:
-  
-  1. Control matrix exceeds 10 GB (control_n × n_genes × 8 bytes > 10 GB)
-  2. Standard mode would limit parallelization to <4 workers
-  
-  This means large datasets like Feng (110K control cells) automatically use
-  frozen control mode without user intervention, while smaller datasets maintain
-  full flexibility.
-
-* **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior 
-  shrinkage to log-fold changes using ``shrink_lfc()`` after running 
-  ``nb_glm_test()``. This preserves large effects while shrinking 
-  small/uncertain effects toward zero.
-
-* **Dispersion scope** (``dispersion_scope``): ``"global"`` (the default)
-  estimates each gene's dispersion once and uses it in every comparison -- from
-  all cells without covariates, and from the control cells with the covariate
-  design when ``covariates`` are given, as DESeq2 estimates dispersions once per
-  model. ``"per_comparison"`` re-estimates it for each comparison, which is
-  slower.
-
-* **Memory limit** (``memory_limit_gb``): Specify the maximum memory available
-  for the analysis; it is capped by what the job's cgroup will still grant.
-  For ``nb_glm_test()``, this affects chunk size calculation and
-  worker count estimation. For ``wilcoxon_test()``, it sets the gene chunk
-  width (one chunk's cells and every perturbation's results for its genes are
-  held at a time). For ``t_test()``, it controls automatic cell chunk size
-  calculation. For ``shrink_lfc()``, it limits parallel workers in
-  ``method="full"``. The results themselves are never held in memory: each
-  perturbation's (or gene chunk's) values are written into the output file as
-  they are computed. For HPC environments with fixed allocations, set this to
-  your SLURM ``--mem`` value (e.g., ``memory_limit_gb=128``).
-
-* **Results are read from the output file.** The returned
-  ``RankGenesGroupsResult`` reads its matrices from the file: a matrix within
-  1% of the memory budget (any result on a personal machine, short of a
-  genome-wide screen) is read once and kept in memory; a larger one is read on
-  access, so ``result.pvalues[i]`` and ``result["KO1"]`` cost one
-  perturbation's row however large the result is, and
-  ``np.asarray(result.pvalues)`` reads the matrix. ``result.order`` is
-  computed for the rows read. A result holds no open handle on its file, and it
-  follows the file at its path: a later call that rewrites the same
-  ``output_path`` changes what an earlier result object returns; copy the
-  values (``np.asarray``) first if you need both.
-
-* **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
-  ``uns["rank_genes_groups"]`` structure for interoperability with 
-  ``sc.get.rank_genes_groups_df()`` and similar utilities. This option is 
-  available for ``t_test()``, ``wilcoxon_test()``, and ``nb_glm_test()``.
-  Default is ``False`` for performance.
-
-.. code-block:: python
-
-   # NB-GLM, one dispersion per gene shared by every comparison (the default)
-   adata_de = cx.tl.rank_genes_groups(
-       adata_ro,
-       perturbation_column="perturbation",
-       method="nb_glm",
-   )
-
-LFC shrinkage
--------------
-
-For more accurate log-fold change estimates, apply apeGLM shrinkage after
-running the NB-GLM test. This two-step workflow matches DESeq2/PyDESeq2
-best practices:
-
-.. code-block:: python
-
-   # Step 1: Run NB-GLM test
-   result = cx.nb_glm_test(
-       adata_ro,
-       perturbation_column="perturbation",
-   )
-   
-   # Step 2: Apply LFC shrinkage
-   shrunk = cx.shrink_lfc(
-       result.result_path,
-       prior_scale_mode="global",  # or "per_comparison"
-   )
-
-The ``prior_scale_mode`` parameter controls how the shrinkage prior is estimated:
-
-* ``"global"`` (default): Estimate a single prior scale from all comparisons.
-  Recommended for CRISPR screens with many perturbations.
-* ``"per_comparison"``: Estimate prior scale separately for each perturbation.
-  May be more accurate when effect sizes vary substantially across perturbations.
-
-You can also use ``cx.tl.shrink_lfc()`` for API consistency with other tools:
-
-.. code-block:: python
-
-   shrunk = cx.tl.shrink_lfc(
-       result.result_path,
-       prior_scale_mode="global",
    )

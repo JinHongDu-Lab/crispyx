@@ -30,7 +30,6 @@ from __future__ import annotations
 from typing import Literal
 
 import numpy as np
-from scipy.linalg import cho_factor, cho_solve
 
 __all__ = [
     "EPS",
@@ -43,13 +42,11 @@ __all__ = [
     "irls_weights",
     "PIVOT_FLOOR",
     "precondition_columns",
-    "sandwich_variances_2x2",
     "schur_complement",
     "schur_solve",
     "schur_variances",
     "solve_spd_2x2",
     "working_response",
-    "wls_solve",
 ]
 
 #: Division guard.  Not a modelling floor -- see the module docstring.
@@ -184,54 +181,6 @@ def solve_spd_2x2(a, b, c, r0, r1):
     d1 = np.maximum(c - lower * b, PIVOT_FLOOR)
     x1 = (r1 - lower * r0) / d1
     return (r0 - b * x1) / d0, x1
-
-
-def sandwich_variances_2x2(m00, m01, m11, ridge):
-    """Sandwich variances ``e_k' H M H e_k`` of a two-column fit's
-    coefficients, for Fisher information ``M = [[m00, m01], [m01, m11]]``
-    and ``H = (M + ridge I)^-1``, with ``H e_k`` from :func:`solve_spd_2x2`.
-    Returns ``(intercept, second column)``.
-    """
-    a, c = m00 + ridge, m11 + ridge
-
-    def quadratic(v0, v1):
-        return v0 * v0 * m00 + 2 * v0 * v1 * m01 + v1 * v1 * m11
-
-    return (quadratic(*solve_spd_2x2(a, m01, c, 1.0, 0.0)),
-            quadratic(*solve_spd_2x2(a, m01, c, 0.0, 1.0)))
-
-
-def wls_solve(
-    x_weighted: np.ndarray, z_weighted: np.ndarray | None = None, ridge: float = 0.0
-) -> tuple[np.ndarray | None, np.ndarray]:
-    """Coefficients and covariance ``(X'WX + ridge I)^-1`` of a weighted
-    least-squares fit, from its weighted design ``W^1/2 X`` (and response
-    ``W^1/2 z``; without one the coefficients are ``None``).
-
-    A Cholesky factor of the normal matrix when it is positive definite;
-    otherwise an SVD of the weighted design, stacked on ``sqrt(ridge) I``,
-    gives the minimum-norm solution and the pseudo-inverse with singular
-    values below ``matrix_rank``'s tolerance dropped -- without forming a
-    normal matrix whose condition number is the design's squared.
-    """
-    n_features = x_weighted.shape[1]
-    gram = x_weighted.T @ x_weighted
-    gram[np.diag_indices(n_features)] += ridge
-    try:
-        factor = cho_factor(gram, check_finite=False)
-    except np.linalg.LinAlgError:
-        design, response = x_weighted, z_weighted
-        if ridge:
-            design = np.vstack([x_weighted, np.sqrt(ridge) * np.eye(n_features)])
-            if z_weighted is not None:
-                response = np.concatenate([z_weighted, np.zeros(n_features)])
-        u, s, vt = np.linalg.svd(design, full_matrices=False)
-        keep = s > s.max(initial=0.0) * max(design.shape) * np.finfo(np.float64).eps
-        scaled = vt[keep].T / s[keep]                       # V S^-1
-        beta = None if response is None else scaled @ (u[:, keep].T @ response)
-        return beta, scaled @ scaled.T
-    beta = None if z_weighted is None else cho_solve(factor, x_weighted.T @ z_weighted, check_finite=False)
-    return beta, cho_solve(factor, np.eye(n_features), check_finite=False)
 
 
 def irls_weights(mu: np.ndarray, alpha: np.ndarray | float | None) -> np.ndarray:

@@ -35,6 +35,9 @@ from .data import (
     resolve_data_path,
     resolve_output_path,
     write_filtered_subset,
+    load_obs,
+    load_var,
+    write_obs,
 )
 
 logger = logging.getLogger(__name__)
@@ -1875,3 +1878,222 @@ def quality_control_summary(
     _warn_if_heavily_filtered("pp.qc_summary", n_perts_in, n_perts_total, kind="perturbations")
     return result
 
+
+
+def compare_controls(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    guide_column: str,
+    controls: Iterable[str],
+    reference: str | Iterable[str],
+    work_dir: str | Path,
+    min_cells: int = 20,
+    max_reference_cells: int | None = None,
+    seed: int = 0,
+    verbose: int | bool = True,
+    **nb_glm_kwargs,
+) -> pd.DataFrame:
+    """Do the cells used as controls behave alike? Typically: are cells with no
+    detected guide ("unassigned") like cells with a non-targeting guide?
+
+    Screens with a low assignment rate often pool unassigned cells into the
+    controls (Feng *et al.* 2026, *Cell Genomics*, used every unassigned cell).
+    That is sound only if unassigned cells are expressed like non-targeting
+    ones. Each control guide is tested with :func:`crispyx.de.nb_glm_test`
+    twice: against the ``reference`` cells (the unassigned ones), and against
+    the other control guides. The second comparison is the yardstick: two
+    pools of genuine controls also differ, through guide-to-guide
+    differences and the test's own miscalibration. If the reference cells are
+    like the control guides, a guide gets about as many hits against them as
+    against the other guides; many more means they differ. All control-guide
+    cells pooled are also tested against the reference.
+
+    Parameters
+    ----------
+    data
+        Raw counts (h5ad path, or AnnData).
+    guide_column
+        ``obs`` column naming each cell's guide, or the reference label for
+        cells without one.
+    controls
+        The control (non-targeting) guides, values of ``guide_column``.
+    reference
+        The value(s) of ``guide_column`` of the cells to check, e.g.
+        ``"unassigned"``.
+    work_dir
+        Directory for the working files: the control and reference cells
+        (``controls.h5ad``) and the ``nb_glm_test`` results.
+    min_cells
+        Control guides with fewer cells are left out (they still count as
+        "other control guides").
+    max_reference_cells
+        Keep at most this many reference cells, drawn at random (``seed``).
+        With ``covariates`` every fit holds the reference cells in memory, and
+        a large unassigned pool may not fit; a few tens of thousands are plenty.
+    seed
+        Seed for ``max_reference_cells``.
+    verbose
+        Print progress.
+    **nb_glm_kwargs
+        Passed to every :func:`~crispyx.de.nb_glm_test` call (e.g. ``n_jobs``,
+        ``memory_limit_gb``, ``covariates``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per control guide tested, and an ``"all control guides"``
+        row: ``cells``, and for each comparison (``vs reference``,
+        ``vs other controls``) the genes at BH q < 0.1 (``hits``) and the
+        percentage of tested genes with \\|z\\| > 3 (0.27 % for a calibrated
+        null). The table is also written to ``work_dir/compare_controls.csv``.
+    """
+    from .de import nb_glm_test
+
+    owned = {"perturbation_column", "groupby", "control_label", "perturbations", "output_path", "force"}
+    if clash := sorted(owned & nb_glm_kwargs.keys()):
+        raise TypeError(f"compare_controls sets {clash} of nb_glm_test itself")
+    path = resolve_data_path(data)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    guides = load_obs(path)[guide_column].astype(str)
+    reference = {reference} if isinstance(reference, str) else {str(r) for r in reference}
+    controls = sorted({str(c) for c in controls} - reference)
+    sizes = guides.value_counts()
+    tested = [g for g in controls if sizes.get(g, 0) >= min_cells]
+    if len(tested) < 2:
+        raise ValueError(
+            f"compare_controls needs at least two control guides with >= {min_cells} cells; "
+            f"found {len(tested)} of {len(controls)}"
+        )
+    is_reference = guides.isin(reference).to_numpy()
+    if not is_reference.any():
+        raise ValueError(f"no cell has {guide_column!r} in {sorted(reference)}")
+    if max_reference_cells is not None and is_reference.sum() > max_reference_cells:
+        keep = np.random.default_rng(seed).choice(np.flatnonzero(is_reference), max_reference_cells, replace=False)
+        is_reference = np.zeros_like(is_reference)
+        is_reference[keep] = True
+
+    subset = work_dir / "controls.h5ad"
+    write_filtered_subset(
+        path, cell_mask=is_reference | guides.isin(controls).to_numpy(),
+        gene_mask=np.ones(len(load_var(path)), dtype=bool), output_path=subset,
+    )
+    obs = load_obs(subset)
+    guide = obs[guide_column].astype(str).to_numpy()
+    ref = np.isin(guide, list(reference))
+    obs["_cx_vs_reference"] = np.where(ref, "reference", guide)
+    obs["_cx_pooled"] = np.where(ref, "reference", "controls")
+    write_obs(subset, obs)
+    kw = dict(verbose=False, force=True, **nb_glm_kwargs)
+
+    def calls(result, label):
+        z, q = np.asarray(result[label].statistic), np.asarray(result[label].pvalue_adj)
+        finite = np.isfinite(z)
+        return int(np.sum(q[np.isfinite(q)] < 0.1)), 100 * float(np.mean(np.abs(z[finite]) > 3))
+
+    _messages.vprint(verbose, "pp.compare_controls",
+                     f"{len(tested)} control guides against {int(ref.sum()):,} reference cells")
+    vs_reference = nb_glm_test(subset, perturbation_column="_cx_vs_reference", control_label="reference",
+                               perturbations=tested, output_path=work_dir / "vs_reference.h5ad", **kw)
+    pooled = nb_glm_test(subset, perturbation_column="_cx_pooled", control_label="reference",
+                         perturbations=["controls"], output_path=work_dir / "pooled_vs_reference.h5ad", **kw)
+    rows = {}
+    for k, label in enumerate(tested):
+        obs["_cx_vs_controls"] = np.where(guide == label, label, np.where(ref, "_reference", "other"))
+        write_obs(subset, obs)
+        vs_controls = nb_glm_test(subset, perturbation_column="_cx_vs_controls", control_label="other",
+                                  perturbations=[label], output_path=work_dir / "vs_other_controls.h5ad", **kw)
+        hits_r, z3_r = calls(vs_reference, label)
+        hits_c, z3_c = calls(vs_controls, label)
+        rows[label] = {"cells": int((guide == label).sum()), "vs reference: hits": hits_r,
+                       "vs reference: |z|>3 %": z3_r, "vs other controls: hits": hits_c,
+                       "vs other controls: |z|>3 %": z3_c}
+        _messages.vprint(verbose, "pp.compare_controls",
+                         f"{k + 1}/{len(tested)} {label}: {hits_r} hits vs reference, {hits_c} vs other controls")
+    hits_p, z3_p = calls(pooled, "controls")
+    rows["all control guides"] = {"cells": int((~ref).sum()), "vs reference: hits": hits_p,
+                                  "vs reference: |z|>3 %": z3_p, "vs other controls: hits": np.nan,
+                                  "vs other controls: |z|>3 %": np.nan}
+    table = pd.DataFrame.from_dict(rows, orient="index")
+    table.index.name = guide_column
+    table.to_csv(work_dir / "compare_controls.csv")
+    return table
+
+
+def control_guide_correlation(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    guide_column: str,
+    controls: Iterable[str],
+    reference: str | Iterable[str] | None = None,
+    n_genes: int = 2000,
+    min_cells: int = 20,
+    chunk_size: int = 4096,
+) -> pd.DataFrame:
+    """Correlation between the expression profiles of the control guides.
+
+    Each control guide's counts are summed over its cells (one streaming
+    pass over their rows), normalised to ``log1p`` counts per 10,000, and
+    taken as a deviation from the control guides' average. The Pearson
+    correlation of these deviations over the ``n_genes`` most expressed genes
+    is near 0 for guides that differ only by noise; a block of correlated
+    guides is variation they share (a batch, an off-target effect), which a
+    test treats as signal when those guides are the controls. With
+    ``reference`` (e.g. ``"unassigned"``), the reference cells are one more
+    profile, so their distance from the guides shows too.
+
+    Parameters
+    ----------
+    data
+        Raw counts (h5ad path, or AnnData).
+    guide_column
+        ``obs`` column naming each cell's guide.
+    controls
+        The control (non-targeting) guides, values of ``guide_column``.
+    reference
+        Value(s) of ``guide_column`` pooled into one more profile, or None.
+    n_genes
+        The most expressed genes (mean over the control guides) correlated.
+    min_cells
+        Control guides with fewer cells are left out.
+    chunk_size
+        Rows read at a time.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The correlation matrix (guides x guides); ``attrs["n_cells"]`` holds
+        each profile's number of cells. Plot it with
+        :func:`crispyx.plotting.plot_control_guide_correlation`.
+    """
+    path = resolve_data_path(data)
+    guides = load_obs(path)[guide_column].astype(str).to_numpy()
+    reference = set() if reference is None else ({reference} if isinstance(reference, str) else set(map(str, reference)))
+    sizes = pd.Series(guides).value_counts()
+    names = [g for g in sorted({str(c) for c in controls} - reference) if sizes.get(g, 0) >= min_cells]
+    if len(names) < 2:
+        raise ValueError(f"control_guide_correlation needs at least two control guides with >= {min_cells} cells")
+    n_controls = len(names)
+    code = pd.Series(range(n_controls), index=names).reindex(guides).to_numpy(dtype=np.float64, copy=True)
+    if reference:
+        code[np.isin(guides, list(reference))] = n_controls
+        names.append(f"{'/'.join(sorted(reference))} (reference)")
+    code = np.nan_to_num(code, nan=-1).astype(np.int64)
+    rows = np.flatnonzero(code >= 0)
+    sums = np.zeros((len(names), len(load_var(path))))
+    backed = read_backed(path)
+    try:
+        for start in range(0, rows.size, chunk_size):
+            block_rows = rows[start:start + chunk_size]
+            block = sp.csr_matrix(backed.X[block_rows, :], dtype=np.float64)
+            member = sp.csr_matrix((np.ones(block_rows.size), (code[block_rows], np.arange(block_rows.size))),
+                                   shape=(len(names), block_rows.size))
+            sums += np.asarray((member @ block).todense())
+    finally:
+        backed.file.close()
+    profile = np.log1p(sums / np.maximum(sums.sum(axis=1, keepdims=True), 1) * 1e4)
+    genes = np.argsort(profile[:n_controls].mean(axis=0))[::-1][:n_genes]
+    deviation = profile[:, genes] - profile[:n_controls, genes].mean(axis=0)
+    corr = pd.DataFrame(np.corrcoef(deviation), index=names, columns=names)
+    corr.attrs["n_cells"] = {name: int(np.sum(code == k)) for k, name in enumerate(names)}
+    return corr

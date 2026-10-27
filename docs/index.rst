@@ -35,8 +35,10 @@ Key features
   the full matrix
 - **Pseudo-bulk aggregation** — average log expression and pseudo-bulk
   count matrices
-- **Differential expression** — t-test, Wilcoxon, NB-GLM with apeGLM LFC
-  shrinkage
+- **Differential expression** — t-test, Wilcoxon, NB-GLM (DESeq2 per
+  comparison) with apeGLM LFC shrinkage
+- **Control checks** — do the control guides agree, and may cells without a
+  detected guide join them?
 - **Dimension reduction** — memory-efficient PCA and KNN on backed data
 - **Scanpy-compatible API** — familiar namespaces and plotting helpers
 - **HPC-ready** — resume/checkpoint, configurable memory limits, Docker
@@ -60,9 +62,20 @@ Key features
    quality_control
    pseudobulk
    differential_expression
+   nb_glm
    covariate_adjustment
-   notebooks/batch_statistics_tutorial
    large_data
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Tutorials
+
+   notebooks/control_checks
+   notebooks/size_factor_comparison
+   notebooks/residual_effects_genomewide_zhu
+   notebooks/residual_effects_targeted_feng
+   notebooks/stratified_wilcoxon_tutorial
+   notebooks/batch_statistics_tutorial
 
 .. toctree::
    :maxdepth: 2

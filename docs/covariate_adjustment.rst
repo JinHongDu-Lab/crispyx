@@ -46,19 +46,19 @@ At a glance
      - mean residual, ``log1p(CP10k)``
      - spread across targets
      - fastest (one pass)
-     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
+     - :doc:`genome-wide <notebooks/residual_effects_genomewide_zhu>`
    * - ``residual_effects``, ``null="model"``
      - any covariates
      - mean residual, ``log1p(CP10k)``
      - control fit's noise
      - fastest (one pass)
-     - :doc:`targeted <notebooks/residual_effects_feng_tutorial>`
+     - :doc:`targeted <notebooks/residual_effects_targeted_feng>`
    * - NB-GLM on pseudo-bulk
      - any covariates, replicates
      - log2 fold change
      - Wald test, replicate units
      - slow
-     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
+     - :doc:`genome-wide <notebooks/residual_effects_genomewide_zhu>`
    * - NB-GLM on single cells
      - any covariates
      - log2 fold change
@@ -113,7 +113,7 @@ Elteren's test).
 - **Tutorials:** :doc:`notebooks/stratified_wilcoxon_tutorial` (effects,
   standard errors and p-values per batch on the Feng *et al.* targeted
   screen, with a calibration check on fake targets); Part 3 of
-  :doc:`notebooks/residual_effects_feng_tutorial` compares pooled and
+  :doc:`notebooks/residual_effects_targeted_feng` compares pooled and
   stratified controls for the Wilcoxon test alone.
 
 ``residual_effects``: effects from a control-fitted model
@@ -142,8 +142,8 @@ The two nulls turn an effect into a z-score differently:
 - ``null="model"`` divides by the control fit's residual standard deviation,
   Feng *et al.*'s test. Its noise comes from the controls, so even groups of 10
   cells are tested reliably. It treats cells as independent, while cells sharing
-  a guide or a donor are not: on the genome-wide screen of the CD4+ T-cell
-  tutorial it gave about 300 hits to every fake target.
+  a guide or a donor are not: on Zhu *et al.*'s genome-wide CD4+ T-cell screen
+  it gave about 300 hits to every fake target.
 
 - **Strengths:** about two minutes for every target of a 7-million-cell screen;
   continuous and categorical covariates; small groups, including per-line or
@@ -152,9 +152,9 @@ The two nulls turn an effect into a z-score differently:
   change. Every covariate level must occur among the controls (perturbed cells in
   other levels are left out). The robust null needs a genome-wide screen; the
   model null over-calls when cells are not independent.
-- **Tutorials:** :doc:`notebooks/residual_effects_tutorial` (genome-wide,
+- **Tutorials:** :doc:`notebooks/residual_effects_genomewide_zhu` (genome-wide,
   ``null="robust"``, calibration on fake targets) and
-  :doc:`notebooks/residual_effects_feng_tutorial` (targeted, ``null="model"``,
+  :doc:`notebooks/residual_effects_targeted_feng` (targeted, ``null="model"``,
   reproduces the published effects and calls).
 
 NB-GLM with covariates
@@ -163,7 +163,8 @@ NB-GLM with covariates
 ``cx.nb_glm_test(..., covariates=[...])`` fits a negative binomial model to the
 counts with the covariates and a perturbation indicator in the design, as DESeq2
 does; ``cx.shrink_lfc`` shrinks the fold changes afterwards. It runs on single
-cells or on pseudo-bulk counts.
+cells or on pseudo-bulk counts. With many control units, fit many targets per
+model with ``targets_per_fit`` (:ref:`targets-per-fit`).
 
 On **pseudo-bulk**, counts are summed per guide and donor (or other replicate
 unit) with ``cx.pb.aggregate(..., method="sum")``. Each unit is a replicate, so
@@ -178,19 +179,20 @@ the test accounts for variation between guides and donors.
    result = cx.nb_glm_test("units.h5ad", perturbation_column="target",
                            control_label="non-targeting",
                            covariates=["log10_n_cells", "donor"],
-                           size_factor_method="deseq2")
+                           size_factor_method="deseq2",
+                           targets_per_fit=50)  # as Zhu et al.
 
 - **Strengths:** a count model with log2 fold changes and standard errors. On
-  pseudo-bulk it reproduces the authors' DESeq2 estimates of the CD4+ T-cell
-  screen (median per-target r 0.999) and is the best calibrated of these methods
-  on fake targets.
-- **Weaknesses:** slow: about 1.5 seconds per target on 32 cores on pseudo-bulk,
-  so about five hours for a genome-wide screen. Pseudo-bulk needs replicate units
-  (several guides or donors per target); with one donor and one guide there is
-  little to estimate the variation from. On single cells, cells are again
-  treated as independent, and with covariates the control cells must fit in
-  memory.
-- **Tutorial:** Part 2 of :doc:`notebooks/residual_effects_tutorial`.
+  pseudo-bulk it reproduces Zhu *et al.*'s PyDESeq2 estimates of their
+  CD4+ T-cell screen (median per-target r 0.9999) and is the best calibrated of
+  these methods on fake targets.
+- **Weaknesses:** slower: on pseudo-bulk, about 0.3 seconds per target on 32
+  cores with ``targets_per_fit=50``, so about an hour for a genome-wide screen.
+  Pseudo-bulk needs replicate units (several guides or donors per target); with
+  one donor and one guide there is little to estimate the variation from. On
+  single cells, cells are again treated as independent, and with covariates the
+  control cells must fit in memory (see :ref:`cell-or-pseudobulk`).
+- **Tutorial:** Part 2 of :doc:`notebooks/residual_effects_genomewide_zhu`.
 
 Per-batch pseudo-bulk effects
 -----------------------------
@@ -230,9 +232,6 @@ Tutorials
 
 Each approach above on a real screen, with its calibration checked:
 
-.. toctree::
-   :maxdepth: 1
-
-   notebooks/stratified_wilcoxon_tutorial
-   notebooks/residual_effects_feng_tutorial
-   notebooks/residual_effects_tutorial
+- :doc:`notebooks/stratified_wilcoxon_tutorial`
+- :doc:`notebooks/residual_effects_targeted_feng`
+- :doc:`notebooks/residual_effects_genomewide_zhu`

@@ -1,6 +1,92 @@
 Changelog
 =========
 
+Version 0.2.3
+-------------
+
+*Released 2026-10-26.* NB-GLM results change: the default size factors,
+dispersions and mean floor are all new. See :ref:`nb-glm` and
+:ref:`size-factors`.
+
+**Added**
+
+* ``size_factor_method="geomeans"``: causarray's median of ratios against the
+  controls' geometric means (:ref:`size-factors`).
+* ``targets_per_fit=k`` fits ``k`` perturbations in one model with all the
+  controls, as a pseudo-bulk DESeq2 analysis with many targets per model does
+  (:ref:`targets-per-fit`).
+* ``cx.pp.compare_controls``, ``cx.pp.control_guide_correlation`` and
+  ``cx.pl.control_guide_correlation`` check the control cells before testing
+  (:ref:`check-controls`).
+* ``cx.tl.rank_genes_groups(method="nb_glm")`` passes on
+  ``size_factor_method``, ``targets_per_fit``, ``min_mu`` and
+  ``shrink_dispersion``.
+* :doc:`notebooks/size_factor_comparison` compares the size factors and mean
+  floors on screens with known truth.
+
+**Changed**
+
+* ``nb_glm_test`` raises if the input is not raw counts.
+* ``size_factor_method`` defaults to ``"libsize"`` (each cell's total count).
+  ``"deseq2"`` takes the controls as its reference and falls back to
+  ``"geomeans"`` with fewer than five reference genes.
+* Dispersions are estimated per comparison, as DESeq2 does, and scale to
+  genome-wide screens (:ref:`nb-glm`). For agreement with PyDESeq2, see
+  :ref:`pydeseq2-parity`.
+* ``min_mu`` defaults to ``None``: 1e-6 when at least half of the counts are
+  zero, else 0.5. Pass ``min_mu=0.5`` for the previous single-cell behaviour
+  (:ref:`mean-floor`).
+* Results store the dispersions as the layers ``dispersion``,
+  ``dispersion_raw`` and ``dispersion_trend``, replacing ``var["dispersion"]``
+  and the ``iterations`` layer. ``max_iter`` and ``tol`` default to 100 and 1e-8.
+* A perturbation confounded with a covariate fails on its own, with the reason
+  logged, instead of failing the run.
+* When the parametric dispersion trend fails, it falls back to the trimmed mean
+  of the gene-wise dispersions, as in PyDESeq2.
+
+**Removed**
+
+* ``size_factor_method="sparse"``, ``size_factor_scope`` and
+  ``scale_size_factors``.
+* The global dispersion and its parameters: ``dispersion_scope``,
+  ``dispersion_method``, ``use_map_dispersion``, ``freeze_control``,
+  ``use_control_cache``, ``se_method``, ``optimization_method``,
+  ``irls_batch_size`` and ``cook_filter``; also ``glm.NBGLMFitter``.
+* ``calculate_nb_glm_chunk_size``. In ``nb_glm_test``, ``chunk_size`` now sets
+  the cells read per block for the size factors (2,048 by default).
+
+**Fixed**
+
+* ``nb_glm_test`` reorders user-supplied ``size_factors`` when it sorts a
+  large input by perturbation; they were misaligned with the cells.
+* ``cx.pb.aggregate`` with a ``gene_name_column`` that differs from
+  ``var_names`` (e.g. Ensembl IDs with a symbol column) failed to write its
+  result.
+* NB-GLM counts a stored zero in the controls as a cell not expressing the
+  gene, as it already did in the perturbed cells (``pts_rest`` and the
+  expression filters).
+* With covariates, the starting dispersions use the same upper bound as the
+  search (``max(max_disp, n)``, as PyDESeq2), and a fit no longer keeps a
+  second dense copy of each perturbation's cells.
+* An invalid ``size_factor_method`` or ``perturbation_column`` is reported
+  before the input is read or sorted.
+* ``shrink_lfc`` says to re-run ``nb_glm_test`` when given an NB-GLM result
+  from before 0.2.3, which lacks the ``dispersion`` layer.
+
+**Documentation**
+
+* NB-GLM has its own page (:doc:`nb_glm`): dispersions, size factors, the mean
+  floor, cell level or pseudo-bulk, and matching PyDESeq2.
+* The notebooks are listed together under Tutorials; the new
+  :doc:`notebooks/control_checks` runs the control checks on the targeted
+  screen of Feng *et al.*
+* The two ``residual_effects`` notebooks are renamed for their screens:
+  :doc:`notebooks/residual_effects_genomewide_zhu` (genome-wide CD4+ T cells,
+  Zhu *et al.*) and :doc:`notebooks/residual_effects_targeted_feng` (targeted
+  iPSC screen, Feng *et al.*).
+* :doc:`notebooks/residual_effects_targeted_feng` re-run on 0.2.3, with a Part 4
+  that repeats the effects with the non-targeting cells alone as controls.
+
 Version 0.2.2
 -------------
 

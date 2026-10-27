@@ -587,8 +587,6 @@ def test_nb_glm_test_with_many_batches_routes_structured_and_agrees(tmp_path, mo
         return real_auto(design, counts, **kwargs)
 
     monkeypatch.setattr(glm_module, "fit_nb_glm_batch_auto", dense_only)
-    import crispyx.de as de_module
-    monkeypatch.setattr(de_module, "fit_nb_glm_batch_auto", dense_only)
     reference = nb_glm_test(path, data_name="reference", **common)
     monkeypatch.undo()
 

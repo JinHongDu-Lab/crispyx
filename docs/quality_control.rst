@@ -17,6 +17,99 @@ automatically and logged for reproducibility. Likewise, omitting
 Individual helpers such as :func:`crispyx.pp.filter_cells` are also
 available for customised pipelines.
 
+Plot the QC summary:
+
+.. code-block:: python
+
+   qc = cx.pp.qc_summary(
+       adata_ro,
+       perturbation_column="perturbation",
+       min_genes=100,
+       min_cells_per_perturbation=15,
+       min_cells_per_gene=10,
+   )
+   cx.pl.qc_perturbation_counts(
+       data=adata_ro,
+       perturbation_column="perturbation",
+       cell_mask=qc.cell_mask,
+   )
+   cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
+
+.. _check-controls:
+
+Check the control cells
+-----------------------
+
+Every effect is measured against the controls, so it pays to check that they
+behave alike before testing. Two questions come up:
+
+- **Do the control guides agree?** :func:`crispyx.pp.control_guide_correlation`
+  sums each non-targeting guide's counts, takes each guide's deviation from
+  the guides' average (``log1p`` counts per 10,000), and correlates the
+  deviations; :func:`crispyx.pl.control_guide_correlation` draws the matrix,
+  clustered. Guides that differ only by noise correlate near 0. A block of
+  correlated guides shares variation -- a batch, an off-target effect -- that
+  a test reads as signal when those guides are the controls.
+- **May cells without a detected guide join the controls?** Screens with a
+  low assignment rate often pool "unassigned" cells into the controls
+  (Feng *et al.* 2026, *Cell Genomics*, use all of them).
+  :func:`crispyx.pp.compare_controls` tests each non-targeting guide against
+  the unassigned cells and, as a yardstick, against the other non-targeting
+  guides (``nb_glm_test`` with any covariates and settings you pass). If the
+  unassigned cells are like the guides, both comparisons give about as many
+  hits.
+
+.. code-block:: python
+
+   guides = cx.load_obs(path)["guide"].astype(str)
+   controls = sorted(g for g in guides.unique() if g.startswith("NonTarget"))
+
+   corr = cx.pp.control_guide_correlation(path, guide_column="guide",
+                                          controls=controls, reference="unassigned")
+   cx.pl.control_guide_correlation(corr)
+
+   table = cx.pp.compare_controls(path, guide_column="guide", controls=controls,
+                                  reference="unassigned", work_dir="control_check")
+
+Both work on single cells or on pseudo-bulk counts; on pseudo-bulk (units per
+guide and batch from ``cx.pb.aggregate``, ``size_factor_method="deseq2"``, the
+batch as a covariate) the comparison is calibrated and fast.
+
+**Example** (:doc:`notebooks/control_checks`, with the correlation heatmap
+and each guide's hits). The targeted screen of Feng *et al.* has 535,000
+control cells, 98 % of them unassigned. In pseudo-bulk per guide and inlet,
+with the inlet as a covariate:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Each non-targeting guide against
+     - Genes differing
+     - Genes with \|z\| > 3
+   * - the unassigned cells
+     - 132-438
+     - 1.5-2.3 %
+   * - the other non-targeting guides
+     - 0-16
+     - 0.13-0.39 %
+
+- The guides agreed with one another (median r -0.02, at most 0.26).
+- Pooled, 849 genes differed between guides and unassigned cells, including
+  the CRISPRi construct (dCas9-KRAB-MeCP2, lower in unassigned cells),
+  donor-line genes (XIST, MEG3) and the screen's own targets (lower in
+  unassigned cells for 68 % of them, against 55 % of other genes).
+- Many unassigned cells carry less CRISPRi machinery or an undetected guide.
+- The differences are small. Re-estimated with the non-targeting controls
+  alone, the screen's effects hardly change (r 0.97; knockdowns of the
+  targets' own genes identical), except on the construct genes, which shift
+  by up to 0.05; the smaller control set finds a quarter fewer hits
+  (:doc:`notebooks/residual_effects_targeted_feng`, Part 4). Pooling the
+  unassigned cells is acceptable here if effects on the construct genes are
+  discounted.
+
+The check finds differences, not their size. When it finds them, re-estimate
+the effects of interest with each set of controls before choosing.
+
 Highly variable genes
 ---------------------
 
@@ -97,6 +190,19 @@ graph construction that works with on-disk data:
    
    # Build KNN graph from PCA embeddings
    cx.pp.neighbors(adata_norm, n_neighbors=15)
+
+Plot the embedding:
+
+.. code-block:: python
+
+   # Plot variance explained per component
+   cx.pl.pca_variance_ratio(adata_norm, n_pcs=20)
+
+   # PCA scatter colored by perturbation
+   cx.pl.pca(adata_norm, color='perturbation', components='1,2')
+
+   # Gene loadings for top components
+   cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
 
 The PCA implementation uses a hybrid approach:
 

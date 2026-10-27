@@ -4519,109 +4519,6 @@ def calculate_wilcoxon_chunk_size(
     return chunk_size
 
 
-def calculate_nb_glm_chunk_size(
-    n_obs: int,
-    n_vars: int,
-    n_groups: int | None = None,
-    available_memory_gb: float | None = None,
-    memory_limit_gb: float | None = None,
-    safety_factor: float = 8.0,
-    memory_fraction: float = 0.5,
-    min_chunk: int = 32,
-    max_chunk: int = 256,
-) -> int:
-    """Calculate optimal gene chunk size for NB-GLM operations.
-    
-    NB-GLM iterates over genes (columns) and for each chunk:
-    - Loads dense count data: n_obs × chunk_size
-    - Computes dispersion: requires cell-level statistics
-    - Fits GLM: design matrix operations
-    
-    This function is specifically tuned for NB-GLM memory patterns,
-    which differ from Wilcoxon (ranking) and t-test (simple statistics).
-    
-    Parameters
-    ----------
-    n_obs
-        Number of observations (cells) in the dataset.
-    n_vars
-        Number of variables (genes) in the dataset.
-    n_groups
-        Number of perturbation groups. If provided, used to estimate memory
-        for output arrays and design matrix overhead.
-    available_memory_gb
-        Available memory in gigabytes. If None, auto-detects using psutil.
-    memory_limit_gb
-        Optional hard memory limit in GB. If provided, uses the minimum of
-        available memory and this limit.
-    safety_factor
-        Safety multiplier to account for overhead (default 8.0).
-    memory_fraction
-        Fraction of available memory to use (default 0.5).
-    min_chunk
-        Minimum chunk size to return (default 32).
-    max_chunk
-        Maximum chunk size to return (default 256).
-    
-    Returns
-    -------
-    int
-        Recommended gene chunk size, clamped to [min_chunk, max_chunk].
-        For datasets where memory is sufficient, returns max_chunk (256).
-        Only reduces chunk size when memory would be exceeded.
-    
-    Examples
-    --------
-    >>> calculate_nb_glm_chunk_size(100000, 20000, n_groups=100, available_memory_gb=128)
-    256
-    >>> calculate_nb_glm_chunk_size(1200000, 36000, n_groups=500, available_memory_gb=128)
-    143
-    """
-    if available_memory_gb is None:
-        try:
-            available_memory_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for NB-GLM chunk size calculation."
-            )
-            available_memory_gb = 16.0
-    
-    # Apply memory limit if provided
-    if memory_limit_gb is not None:
-        available_memory_gb = min(available_memory_gb, memory_limit_gb)
-    
-    # Usable memory = fraction of available
-    usable_memory_bytes = available_memory_gb * memory_fraction * 1e9
-    
-    # NB-GLM memory per gene (conservative estimate):
-    # - Dense counts: n_obs × 8 bytes (float64)
-    # - Design matrix contribution: n_obs × 2 × 8 bytes
-    # - Working matrices (mu, var, residuals): n_obs × 8 × 3
-    # - Output arrays: n_groups × 8 × 8 (lfc, stat, pvalue, se, etc.)
-    base_memory_per_gene = n_obs * 8 * 6  # ~48 bytes per cell per gene
-    group_memory_per_gene = (n_groups * 8 * 8) if n_groups else 0
-    
-    total_memory_per_gene = (base_memory_per_gene + group_memory_per_gene) * safety_factor
-    
-    # Calculate max chunk from memory
-    if total_memory_per_gene > 0:
-        max_chunk_from_memory = int(usable_memory_bytes / total_memory_per_gene)
-    else:
-        max_chunk_from_memory = max_chunk
-    
-    # Clamp to reasonable range
-    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
-    
-    logger.info(
-        f"Calculated NB-GLM chunk size: {chunk_size} "
-        f"(dataset: {n_obs} cells × {n_vars} genes, "
-        f"groups: {n_groups or 'unknown'}, "
-        f"available memory: {available_memory_gb:.1f}GB)"
-    )
-    
-    return chunk_size
-
-
 def calculate_pca_chunk_size(
     n_obs: int,
     n_vars: int,
@@ -5246,6 +5143,15 @@ def needs_sorting_for_nbglm(
         backed.file.close()
 
 
+def perturbation_sort_order(labels: np.ndarray, control_label: str) -> np.ndarray:
+    """The row order of :func:`sort_by_perturbation`: the controls first, then
+    each label in alphabetical order, cells of a label in their original order."""
+    labels = np.asarray(labels).astype(str)
+    order = [control_label] + sorted(set(labels.tolist()) - {control_label})
+    keys = pd.Categorical(labels, categories=order).codes
+    return np.argsort(keys, kind="stable")
+
+
 def sort_by_perturbation(
     path: str | Path,
     perturbation_column: str = "perturbation",
@@ -5352,16 +5258,8 @@ def sort_by_perturbation(
         if control_label is None:
             control_label = resolve_control_label(labels, None)
         
-        # Create sort order: control first, then alphabetical
-        unique_labels = sorted(set(labels) - {control_label})
-        label_order = [control_label] + unique_labels
-        
-        # Create mapping from label to sort priority
-        label_priority = {label: i for i, label in enumerate(label_order)}
-        
-        # Get sort indices (stable sort to preserve original order within groups)
-        sort_keys = np.array([label_priority[l] for l in labels])
-        sort_indices = np.argsort(sort_keys, kind='stable')
+        sort_indices = perturbation_sort_order(labels, control_label)
+        label_order = [control_label] + sorted(set(labels) - {control_label})
         
         # Compute perturbation boundaries
         sorted_labels = labels[sort_indices]
@@ -5433,7 +5331,7 @@ def sort_by_perturbation(
         )
     
     logger.info(f"Saved sorted dataset: {output_path}")
-    logger.info(f"  Perturbation groups: {len(label_order)} (control + {len(unique_labels)} perturbations)")
+    logger.info(f"  Perturbation groups: {len(label_order)} (control + {len(label_order) - 1} perturbations)")
     
     return output_path
 

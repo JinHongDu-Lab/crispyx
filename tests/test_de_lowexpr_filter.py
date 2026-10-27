@@ -303,11 +303,12 @@ def test_excluded_pairs_keep_their_expression_evidence(tmp_path):
     assert pts_rest[induced] == pytest.approx(0.0)
 
 
-def test_excluded_pairs_keep_their_expression_evidence_without_the_control_cache(tmp_path):
-    """The same, on the path that does not use the cached control statistics.
+def test_excluded_pairs_keep_their_expression_evidence_on_the_cells(tmp_path):
+    """The same, on the path that fits each comparison on its cells (taken for
+    apeGLM shrinkage, as for covariates).
 
-    That path built ``pts`` and ``pts_rest`` behind the validity mask, so the
-    evidence the documentation points at for an excluded pair -- 0% of
+    That path once built ``pts`` and ``pts_rest`` behind the validity mask, so
+    the evidence the documentation points at for an excluded pair -- 0% of
     perturbed cells against 95% of control cells -- was zeroed away on
     precisely the pairs it was there for.
     """
@@ -316,7 +317,7 @@ def test_excluded_pairs_keep_their_expression_evidence_without_the_control_cache
 
     res = nb_glm_test(
         path, perturbation_column="perturbation", control_label="control",
-        output_dir=tmp_path, use_control_cache=False, verbose=False,
+        output_dir=tmp_path, lfc_shrinkage_type="apeglm", verbose=False,
     )
     index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
 
@@ -344,24 +345,21 @@ def test_effect_is_never_reported_as_zero_for_an_excluded_pair(tmp_path):
     assert not (lfc[silenced] == 0.0), "an excluded effect must be NaN, not zero"
 
 
-@pytest.mark.parametrize("use_control_cache", [True, False], ids=["cached", "uncached"])
-def test_shrinkage_does_not_resurrect_an_excluded_pair(tmp_path, use_control_cache):
+def test_shrinkage_does_not_resurrect_an_excluded_pair(tmp_path):
     """apeGLM shrinks the pairs that were fitted; it does not fit the rest.
 
     An excluded pair is dropped before any fit, so it has no MLE to shrink.
-    The cached worker handed the shrinkage its zero-initialised coefficients
-    anyway, which came back as a finite effect beside a NaN p-value -- and on
-    both workers the standard error of an untested gene was replaced by the
-    literal 1.0 the per-gene fallback returns.
+    A former worker handed the shrinkage zero-initialised coefficients
+    anyway, which came back as a finite effect beside a NaN p-value, and the
+    standard error of an untested gene was replaced by the literal 1.0 the
+    per-gene fallback returns.
     """
     path, names = _separation_adata(tmp_path)
     from crispyx.de import nb_glm_test
 
     res = nb_glm_test(
         path, perturbation_column="perturbation", control_label="control",
-        output_dir=tmp_path, data_name=f"apeglm_{use_control_cache}",
-        lfc_shrinkage_type="apeglm", use_control_cache=use_control_cache,
-        verbose=False,
+        output_dir=tmp_path, data_name="apeglm", lfc_shrinkage_type="apeglm", verbose=False,
     )
     index, lfc, stat, pval, pts, pts_rest = _by_gene(res, names)
     se = np.asarray(ad.read_h5ad(res.result_path).layers["standard_error"]).ravel()
@@ -422,7 +420,7 @@ def test_asymmetric_thresholds_reach_nb_glm_test(tmp_path):
 # One meaning for "untested": NaN in every column derived from the comparison
 # ---------------------------------------------------------------------------
 
-def _make_dataset_partly_tested(tmp_path: Path):
+def _make_dataset_partly_tested(tmp_path: Path, *, log_normalise: bool = True):
     """A gene that ``min_cells_expressed`` excludes for KO1 but not for KO2.
 
     Two of the 80 control cells express it, so the control side is not "low"
@@ -446,9 +444,10 @@ def _make_dataset_partly_tested(tmp_path: Path):
     )
     var = pd.DataFrame(index=[f"gene{i}" for i in range(3)])
     adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
-    sc.pp.normalize_total(adata)
-    sc.pp.log1p(adata)
-    adata.X = sp.csr_matrix(adata.X)
+    if log_normalise:
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+        adata.X = sp.csr_matrix(adata.X)
     path = tmp_path / "partly_tested.h5ad"
     adata.write(path)
     return path
@@ -544,7 +543,7 @@ def test_wilcoxon_paths_agree_on_untested_genes(tmp_path):
 def test_n_genes_tested_counts_what_the_filters_kept(tmp_path, fn, memory_limit_gb):
     """obs["n_genes_tested"] is the number of finite p-values in each row,
     on every result path."""
-    path = _make_dataset_partly_tested(tmp_path)
+    path = _make_dataset_partly_tested(tmp_path, log_normalise=fn != "nb_glm_test")
     result = getattr(cx, fn)(
         path, output_dir=tmp_path, data_name=fn, memory_limit_gb=memory_limit_gb, **_UNTESTED_KW
     )

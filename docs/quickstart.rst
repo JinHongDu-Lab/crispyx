@@ -14,7 +14,7 @@ The typical workflow, with the guide page for each step:
 4. **HVG selection** – pick highly variable genes (:doc:`quality_control`)
 5. **Dimension reduction** – PCA and KNN graph construction (:doc:`quality_control`)
 6. **Pseudo-bulk** – aggregate per perturbation (:doc:`pseudobulk`)
-7. **Differential expression** – t-test, Wilcoxon, or NB-GLM (:doc:`differential_expression`)
+7. **Differential expression** – t-test, Wilcoxon (:doc:`differential_expression`), or NB-GLM (:doc:`nb_glm`)
 8. **Plot** – visualise results with Scanpy-style helpers (:doc:`differential_expression`)
 
 Screens run in batches, donors or lines: :doc:`covariate_adjustment` compares

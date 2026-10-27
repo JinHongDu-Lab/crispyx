@@ -22,7 +22,6 @@ _solve_spd_2x2 = nb.njit(cache=True)(solve_spd_2x2)
 # Numba-accelerated gammaln using scipy's cython implementation
 # =============================================================================
 
-_PTR = ctypes.POINTER
 _dble = ctypes.c_double
 _addr = get_cython_function_address("scipy.special.cython_special", "gammaln")
 _functype = ctypes.CFUNCTYPE(_dble, _dble)
@@ -90,58 +89,6 @@ def _nb_loglik_grid_numba(
 # Dispersion estimation kernels
 # =============================================================================
 
-@nb.njit(cache=True)
-def _nb_ll_for_alpha(Y_g, mu_g, alpha):
-    """Compute NB log-likelihood for a single gene at a given alpha.
-    
-    Vectorized across cells using Numba-compatible operations.
-    """
-    r = 1.0 / alpha
-    log_r = np.log(r)
-    gammaln_r = math.lgamma(r)
-    n_cells = Y_g.shape[0]
-    
-    ll = 0.0
-    for i in range(n_cells):
-        y = Y_g[i]
-        mu = mu_g[i]
-        ll += (
-            math.lgamma(y + r)
-            - gammaln_r
-            - math.lgamma(y + 1.0)
-            + r * (log_r - np.log(r + mu + 1e-12))
-            + y * np.log(mu / (r + mu + 1e-12) + 1e-12)
-        )
-    return ll
-
-
-@nb.njit(parallel=True, cache=True)
-def _compute_mle_dispersion_numba(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    dof: float,
-) -> np.ndarray:
-    """Compute MLE dispersion per gene without large intermediate arrays.
-    
-    Memory-optimized: computes per-gene without creating (n_cells, n_genes) intermediates.
-    Uses Numba parallel for speed.
-    """
-    n_cells, n_genes = Y.shape
-    alpha_mle = np.zeros(n_genes, dtype=np.float64)
-    
-    for g in nb.prange(n_genes):
-        acc = 0.0
-        for i in range(n_cells):
-            y_val = Y[i, g]
-            mu_val = mu[i, g]
-            resid = y_val - mu_val
-            variance = resid * resid - y_val
-            denom = max(mu_val * mu_val, 1e-10)
-            acc += variance / denom
-        alpha_mle[g] = acc / dof
-    
-    return alpha_mle
-
 
 @nb.njit(cache=True)
 def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
@@ -166,87 +113,6 @@ def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
                 v -= xtwx[i, k] * xtwx[j, k]
             xtwx[i, j] = v / ljj
     return -log_det  # -0.5 * (2 * sum(log diag(L)))
-
-
-@nb.njit(parallel=True, cache=True)
-def _nb_map_grid_search_numba(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    log_trend: np.ndarray,
-    log_alpha_grid: np.ndarray,
-    prior_var: float,
-    x_indptr: np.ndarray,
-    x_indices: np.ndarray,
-    x_data: np.ndarray,
-    n_features: int,
-) -> tuple:
-    """Vectorized grid search for MAP dispersion across all genes.
-    
-    For each gene, evaluates the posterior (log-likelihood + log-prior) at each
-    grid point and finds the best grid point. Returns the best log-alpha and
-    the indices of adjacent grid points for refinement.
-    
-    Memory optimization: computes gammaln(Y + 1) once per gene instead of
-    n_grid times, saving significant computation time.
-    
-    Parameters
-    ----------
-    Y : (n_cells, n_genes)
-        Count matrix.
-    mu : (n_cells, n_genes)
-        Fitted mean matrix.
-    log_trend : (n_genes,)
-        Log of dispersion trend values.
-    log_alpha_grid : (n_grid,)
-        Grid of log-dispersion values to search.
-    prior_var : float
-        Variance of log-normal prior.
-    x_indptr, x_indices, x_data, n_features
-        The design matrix in CSR form, for the Cox-Reid adjustment
-        (``n_features=0`` for none).
-        
-    Returns
-    -------
-    best_log_alpha : (n_genes,)
-        Best log-alpha value for each gene.
-    best_idx : (n_genes,)
-        Index of best grid point.
-    """
-    n_cells, n_genes = Y.shape
-    n_grid = log_alpha_grid.shape[0]
-    
-    best_log_alpha = np.zeros(n_genes, dtype=np.float64)
-    best_idx = np.zeros(n_genes, dtype=np.int64)
-    
-    # Parallelize over genes
-    for g in nb.prange(n_genes):
-        best_posterior = -np.inf
-        best_k = 0
-        log_trend_g = log_trend[g]
-        Y_g = Y[:, g]
-        mu_g = mu[:, g]
-        xtwx = np.empty((n_features, n_features))
-        
-        # Precompute gammaln(Y_g + 1) for this gene - only done once, not n_grid times!
-        gammaln_y_plus_1 = 0.0
-        for i in range(n_cells):
-            gammaln_y_plus_1 += math.lgamma(Y_g[i] + 1.0)
-        
-        for k in range(n_grid):
-            log_alpha = log_alpha_grid[k]
-            posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1,
-                x_indptr, x_indices, x_data, xtwx,
-            )
-            
-            if posterior > best_posterior:
-                best_posterior = posterior
-                best_k = k
-                best_log_alpha[g] = log_alpha
-        
-        best_idx[g] = best_k
-    
-    return best_log_alpha, best_idx
 
 
 @nb.njit(cache=True)
@@ -391,7 +257,6 @@ def _nb_posterior_with_cache_numba(
     alpha = math.exp(log_alpha)
     r = 1.0 / alpha
     log_r = math.log(r)
-    gammaln_r = math.lgamma(r)
     cox_reid = xtwx.shape[0] > 0
     xtwx[:, :] = 0.0
 
@@ -400,9 +265,9 @@ def _nb_posterior_with_cache_numba(
         y = Y_g[i]
         mu_i = mu_g[i]
         r_plus_mu = r + mu_i + 1e-12
+        # lgamma(y + r) - lgamma(r), without libm's lgamma (see _lgamma_ratio_term)
         ll += (
-            math.lgamma(y + r)
-            - gammaln_r
+            _lgamma_ratio_term(y, r) + y * log_r
             + r * (log_r - math.log(r_plus_mu))
             + y * math.log(mu_i / r_plus_mu + 1e-12)
         )
@@ -424,7 +289,9 @@ def _nb_map_grid_search_with_refinement_numba(
     Y: np.ndarray,
     mu: np.ndarray,
     log_trend: np.ndarray,
-    log_alpha_grid: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    n_grid: int,
     prior_var: float,
     x_indptr: np.ndarray,
     x_indices: np.ndarray,
@@ -433,13 +300,11 @@ def _nb_map_grid_search_with_refinement_numba(
     tol: float = 1e-5,
     max_refine_iter: int = 50,
 ) -> np.ndarray:
-    """Fused grid search + Brent's method refinement for MAP dispersion.
-    
-    This kernel combines grid search and refinement in a single parallelized
-    pass, avoiding joblib overhead for per-gene refinement. Uses Brent's method
-    (quadratic interpolation) for refinement which is more accurate than
-    golden section search.
-    
+    """Each gene's maximum of the Cox-Reid adjusted NB log-likelihood plus the
+    log-normal prior, over log dispersion in ``[lo, hi]``: a grid of
+    ``n_grid`` points, then Brent's method between the best point's
+    neighbours (not at a bound).
+
     Parameters
     ----------
     Y : (n_cells, n_genes)
@@ -447,11 +312,14 @@ def _nb_map_grid_search_with_refinement_numba(
     mu : (n_cells, n_genes)
         Fitted mean matrix.
     log_trend : (n_genes,)
-        Log of dispersion trend values.
-    log_alpha_grid : (n_grid,)
-        Grid of log-dispersion values to search.
+        Log of the prior's mean (the dispersion trend).
+    lo, hi : (n_genes,)
+        Each gene's search range on log dispersion.
+    n_grid : int
+        Grid points over each range.
     prior_var : float
-        Variance of log-normal prior.
+        Variance of the log-normal prior (``inf`` for none: the gene-wise
+        estimate).
     x_indptr, x_indices, x_data, n_features
         The design matrix in CSR form, for the Cox-Reid adjustment
         (``n_features=0`` for none).
@@ -459,73 +327,43 @@ def _nb_map_grid_search_with_refinement_numba(
         Tolerance for Brent convergence.
     max_refine_iter : int
         Maximum refinement iterations.
-        
+
     Returns
     -------
     best_log_alpha : (n_genes,)
         Refined log-alpha value for each gene.
     """
-    n_cells, n_genes = Y.shape
-    n_grid = log_alpha_grid.shape[0]
-    
+    n_genes = Y.shape[1]
     best_log_alpha = np.zeros(n_genes, dtype=np.float64)
-    
-    # Parallelize over genes
     for g in nb.prange(n_genes):
-        best_posterior = -np.inf
-        best_k = 0
         log_trend_g = log_trend[g]
         Y_g = Y[:, g]
         mu_g = mu[:, g]
         xtwx = np.empty((n_features, n_features))
-        
-        # Precompute gammaln(Y_g + 1) for this gene - reused in refinement
-        gammaln_y_plus_1_sum = 0.0
-        for i in range(n_cells):
-            gammaln_y_plus_1_sum += math.lgamma(Y_g[i] + 1.0)
-        
-        # Stage 1: Grid search
+        step = (hi[g] - lo[g]) / (n_grid - 1)
+        # sum(lgamma(y + 1)) is constant in alpha, so it is left out (0.0).
+        best_posterior = -np.inf
+        best_k = 0
         for k in range(n_grid):
-            log_alpha = log_alpha_grid[k]
             posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
+                Y_g, mu_g, lo[g] + k * step, log_trend_g, prior_var, 0.0,
                 x_indptr, x_indices, x_data, xtwx,
             )
-            
             if posterior > best_posterior:
                 best_posterior = posterior
                 best_k = k
-        
-        best_grid_log_alpha = log_alpha_grid[best_k]
-        
-        # Stage 2: Brent's method refinement (if not at boundary)
-        # We want to MAXIMIZE the posterior, so we use Brent to find minimum of -posterior
-        if best_k > 0 and best_k < n_grid - 1:
-            # Bracket: [grid[best_k-1], grid[best_k+1]]
-            a = log_alpha_grid[best_k - 1]
-            b = log_alpha_grid[best_k + 1]
-            
-            if b - a > tol:
-                # Use Brent's method for refinement (more accurate than golden section)
-                refined_log_alpha = _brent_minimize_numba(
-                    Y_g, mu_g, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    x_indptr, x_indices, x_data, xtwx, a, b, tol=tol, max_iter=max_refine_iter
-                )
-                
-                # Final sanity check: ensure refinement is actually better than grid
-                refined_posterior = _nb_posterior_with_cache_numba(
-                    Y_g, mu_g, refined_log_alpha, log_trend_g, prior_var, gammaln_y_plus_1_sum,
-                    x_indptr, x_indices, x_data, xtwx,
-                )
-                if refined_posterior >= best_posterior:
-                    best_log_alpha[g] = refined_log_alpha
-                else:
-                    best_log_alpha[g] = best_grid_log_alpha
-            else:
-                best_log_alpha[g] = best_grid_log_alpha
-        else:
-            best_log_alpha[g] = best_grid_log_alpha
-    
+        best = lo[g] + best_k * step
+        if 0 < best_k < n_grid - 1 and 2 * step > tol:
+            refined = _brent_minimize_numba(
+                Y_g, mu_g, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+                best - step, best + step, tol=tol, max_iter=max_refine_iter,
+            )
+            refined_posterior = _nb_posterior_with_cache_numba(
+                Y_g, mu_g, refined, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+            )
+            if refined_posterior >= best_posterior:
+                best = refined
+        best_log_alpha[g] = best
     return best_log_alpha
 
 
@@ -1515,3 +1353,383 @@ def _residual_effects_rows(
                     xty[gene, total_column] += log_total * y
                 if mito_column >= 0:
                     xty[gene, mito_column] += share * y
+
+
+# =============================================================================
+# Two-group DESeq2 against a control summary
+# =============================================================================
+#
+# A comparison of one perturbation with the controls under the design
+# [intercept, perturbation] fits the two groups' means separately, so every
+# control term of DESeq2's objectives -- the NB log-likelihood, the Cox-Reid
+# term (log det X'WX = log W_control + log W_perturbed) and the intercept's
+# equation -- depends on the controls and the dispersion only. The controls
+# are summarised once (glm.ControlSummary): a per-gene histogram of their
+# non-zero counts, and per size-factor bin the first three moments of the
+# size factors and of the counts weighted by them. Terms smooth in the size
+# factor are evaluated per bin to second order around the bin centre; the
+# perturbed cells, a few hundred, are summed exactly.
+#
+# Per cell, PyDESeq2's NB negative log-likelihood less the terms free of the
+# dispersion alpha is
+#     log1p(alpha*mu)/alpha + y*log1p(alpha*mu) - G(y, 1/alpha),
+#     G(y, r) = lgamma(y + r) - lgamma(r) - y*log(r),
+# written so that no term of order r*log(r) cancels when alpha is tiny.
+
+
+@nb.njit(cache=True)
+def _stirling_ratio_term(y, r):
+    """lgamma(y + r) - lgamma(r) - y log r for r >= 10, from Stirling's series
+    at y + r and r, differenced so that no O(r log r) terms cancel."""
+    x = y + r
+    out = (x - 0.5) * math.log1p(y / r) - y
+    out += 1.0 / (12.0 * x) - 1.0 / (12.0 * r)
+    out -= 1.0 / (360.0 * x * x * x) - 1.0 / (360.0 * r * r * r)
+    out += 1.0 / (1260.0 * x ** 5) - 1.0 / (1260.0 * r ** 5)
+    return out
+
+
+@nb.njit(cache=True)
+def _lgamma_ratio_term(y, r):
+    """G(y, r) = lgamma(y + r) - lgamma(r) - y log r for an integer count y.
+
+    Without libm's lgamma, which writes the global ``signgam`` on every call
+    and so stalls every thread that calls it at once: a count below 32 sums
+    log1p(i/r) for i < y, exactly; a larger one takes the first steps exactly
+    until r + k >= 10 and the rest from Stirling's series.
+    """
+    if y < 32.0:
+        out = 0.0
+        for i in range(int(y)):
+            out += math.log1p(i / r)
+        return out
+    k = 0
+    out = 0.0
+    while r + k < 10.0:
+        out += math.log1p(k / r)
+        k += 1
+    # lgamma(y + r) - lgamma(r + k) - (y - k) log(r + k), plus the change of base
+    return out + _stirling_ratio_term(y - k, r + k) + (y - k) * math.log1p(k / r)
+
+
+@nb.njit(cache=True)
+def _dense_lin_terms(alpha, m, min_mu, centre, s_mom):
+    """Over binned cells with mu = max(s m, min_mu): sum of log1p(alpha mu)/alpha
+    and of the weights mu/(1 + alpha mu), to third order in s about each centre."""
+    nll = 0.0
+    weight = 0.0
+    floor_log = math.log1p(alpha * min_mu)
+    floor_w = min_mu / (1.0 + alpha * min_mu)
+    a = alpha * m
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        c = centre[b]
+        if c * m < min_mu:
+            nll += n_b * floor_log / alpha
+            weight += n_b * floor_w
+            continue
+        v = 1.0 + a * c
+        u = a / v
+        # log1p(a s): derivatives a/v, -a^2/v^2, 2a^3/v^3
+        nll += (n_b * math.log1p(a * c) + s_mom[1, b] * u - 0.5 * s_mom[2, b] * u * u
+                + s_mom[3, b] * u * u * u / 3.0) / alpha
+        # m s/(1 + a s): derivatives m/v^2, -2am/v^3, 6a^2 m/v^4
+        mv = m / v
+        weight += n_b * c * mv + s_mom[1, b] * mv / v - s_mom[2, b] * u * mv / v + s_mom[3, b] * u * u * mv / v
+    return nll, weight
+
+
+@nb.njit(cache=True)
+def _control_count_terms(g, alpha, m, min_mu, centre, y_mom, hist_ptr, hist_val, hist_cnt):
+    """Controls' count-weighted part of the NB negative log-likelihood for
+    gene ``g``: sum of y log1p(alpha mu) - G(y, 1/alpha)."""
+    out = 0.0
+    floor_log = math.log1p(alpha * min_mu)
+    a = alpha * m
+    for b in range(centre.shape[0]):
+        y0 = y_mom[0, g, b]
+        if y0 == 0.0:
+            continue
+        c = centre[b]
+        if c * m < min_mu:
+            out += y0 * floor_log
+            continue
+        u = a / (1.0 + a * c)
+        out += y0 * math.log1p(a * c) + y_mom[1, g, b] * u - 0.5 * y_mom[2, g, b] * u * u \
+            + y_mom[3, g, b] * u * u * u / 3.0
+    r = 1.0 / alpha
+    for k in range(hist_ptr[g], hist_ptr[g + 1]):
+        out -= hist_cnt[k] * _lgamma_ratio_term(hist_val[k], r)
+    return out
+
+
+@nb.njit(cache=True)
+def _cells_count_terms(y, s, m, alpha, min_mu):
+    """The same, summed exactly over a gene's non-zero counts ``y`` in cells
+    with size factors ``s``."""
+    out = 0.0
+    r = 1.0 / alpha
+    for i in range(y.shape[0]):
+        mu = s[i] * m
+        if mu < min_mu:
+            mu = min_mu
+        out += y[i] * math.log1p(alpha * mu) - _lgamma_ratio_term(y[i], r)
+    return out
+
+
+@nb.njit(cache=True)
+def _two_group_objective(log_alpha, g, m_c, m_t, t_y, t_s, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
+                         hist_cnt, t_centre, t_mom, log_prior_mean, prior_var):
+    """DESeq2's dispersion objective (to minimise): NB negative log-likelihood
+    with the Cox-Reid term, plus the log-normal prior when ``prior_var`` > 0.
+    Controls from their summary; the perturbed cells' size factors binned
+    (``t_centre``, ``t_mom``) and their non-zero counts ``t_y`` summed exactly."""
+    alpha = math.exp(log_alpha)
+    dense_c, w_c = _dense_lin_terms(alpha, m_c, min_mu, centre, s_mom)
+    dense_t, w_t = _dense_lin_terms(alpha, m_t, min_mu, t_centre, t_mom)
+    out = dense_c + dense_t
+    out += _control_count_terms(g, alpha, m_c, min_mu, centre, y_mom, hist_ptr, hist_val, hist_cnt)
+    out += _cells_count_terms(t_y, t_s, m_t, alpha, min_mu)
+    out += 0.5 * (math.log(w_c) + math.log(w_t))
+    if prior_var > 0.0:
+        d = log_alpha - log_prior_mean
+        out += d * d / (2.0 * prior_var)
+    return out
+
+
+@nb.njit(parallel=True, cache=True)
+def _two_group_dispersions(genes, m_c, m_t, t_ptr, t_y, t_s, min_mu, centre, s_mom, y_mom, hist_ptr, hist_val,
+                           hist_cnt, t_centre, t_mom, lo_bound, hi_bound, log_prior_mean, prior_var, n_grid, tol):
+    """Minimise the dispersion objective over log alpha in [lo_bound[i],
+    hi_bound[i]] for each gene in ``genes``: a grid of ``n_grid`` points, then
+    golden-section search in the bracket around the grid's best point. The
+    perturbed cells' non-zero counts of gene g are t_y[t_ptr[g]:t_ptr[g+1]]."""
+    out = np.empty(genes.shape[0])
+    invphi = (math.sqrt(5.0) - 1.0) / 2.0
+    for i in nb.prange(genes.shape[0]):
+        g = genes[i]
+        yg = t_y[t_ptr[g]:t_ptr[g + 1]]
+        sg = t_s[t_ptr[g]:t_ptr[g + 1]]
+        prior_mean = log_prior_mean[i] if prior_var > 0.0 else 0.0
+        lo_i = lo_bound[i]
+        step = (hi_bound[i] - lo_i) / (n_grid - 1)
+        best = 0
+        best_val = np.inf
+        for k in range(n_grid):
+            val = _two_group_objective(lo_i + k * step, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom,
+                                       hist_ptr, hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+            if val < best_val:
+                best_val = val
+                best = k
+        lo = lo_i + max(best - 1, 0) * step
+        hi = lo_i + min(best + 1, n_grid - 1) * step
+        x1 = hi - invphi * (hi - lo)
+        x2 = lo + invphi * (hi - lo)
+        f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                  hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+        f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                  hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+        while hi - lo > tol:
+            if f1 < f2:
+                hi = x2
+                x2 = x1
+                f2 = f1
+                x1 = hi - invphi * (hi - lo)
+                f1 = _two_group_objective(x1, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                          hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+            else:
+                lo = x1
+                x1 = x2
+                f1 = f2
+                x2 = lo + invphi * (hi - lo)
+                f2 = _two_group_objective(x2, g, m_c[g], m_t[g], yg, sg, min_mu, centre, s_mom, y_mom, hist_ptr,
+                                          hist_val, hist_cnt, t_centre, t_mom, prior_mean, prior_var)
+        x = 0.5 * (lo + hi)
+        if best_val < min(f1, f2):  # the optimum at a bound of the range
+            x = lo_i + best * step
+        out[i] = math.exp(x)
+    return out
+
+
+@nb.njit(cache=True)
+def _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom):
+    """Controls' part of PyDESeq2's IRLS fixed-point equation for the
+    intercept ``a``, and its derivative. A cell with s*exp(a) >= min_mu adds
+    (y - mu)/(1 + alpha mu); a cell whose mean IRLS holds at min_mu adds
+    W (log(min_mu/s) - a + (y - min_mu)/min_mu), W = min_mu/(1 + alpha min_mu)."""
+    k = math.exp(a)
+    score = 0.0
+    slope = 0.0
+    w_floor = min_mu / (1.0 + alpha * min_mu)
+    ak = alpha * k
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        if n_b == 0.0:
+            continue
+        c = centre[b]
+        y0 = y_mom[0, g, b]
+        if c * k < min_mu:
+            score += w_floor * (n_b * (math.log(min_mu) - a - 1.0) - s_log[b] + y0 / min_mu)
+            slope -= n_b * w_floor
+            continue
+        y1 = y_mom[1, g, b]
+        y2 = y_mom[2, g, b]
+        v = 1.0 + ak * c
+        # sum y/(1 + alpha mu): f(s) = 1/(1 + alpha k s), to third order
+        score += y0 / v - y1 * ak / (v * v) + y2 * ak * ak / (v * v * v) - y_mom[3, g, b] * ak ** 3 / v ** 4
+        # sum mu/(1 + alpha mu): g(s) = k s/(1 + alpha k s), to third order
+        score -= (n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+                  + s_mom[3, b] * alpha * alpha * k ** 3 / v ** 4)
+        # d/da per cell: -mu (1 + alpha y)/(1 + alpha mu)^2; h(s) = k s/(1 + alpha k s)^2
+        h0 = k * c / (v * v)
+        h1 = k * (1.0 - ak * c) / (v * v * v)
+        h2 = -alpha * k * k * (4.0 - 2.0 * ak * c) / (v * v * v * v)
+        slope -= n_b * h0 + s_mom[1, b] * h1 + 0.5 * s_mom[2, b] * h2
+        slope -= alpha * (y0 * h0 + y1 * h1 + 0.5 * y2 * h2)
+    return score, slope
+
+
+@nb.njit(cache=True)
+def _cells_score(y_nz, s_nz, s, b, alpha, min_mu):
+    """The perturbed cells' part of the same equation, summed exactly: every
+    cell (size factors ``s``) as if its count were zero, then the terms in
+    the count for the cells with one (``y_nz`` at size factors ``s_nz``)."""
+    k = math.exp(b)
+    score = 0.0
+    slope = 0.0
+    w_floor = min_mu / (1.0 + alpha * min_mu)
+    for i in range(s.shape[0]):
+        mu = s[i] * k
+        if mu < min_mu:
+            score += w_floor * (math.log(min_mu / s[i]) - b - 1.0)
+            slope -= w_floor
+        else:
+            v = 1.0 + alpha * mu
+            score -= mu / v
+            slope -= mu / (v * v)
+    for j in range(y_nz.shape[0]):
+        mu = s_nz[j] * k
+        if mu < min_mu:
+            score += w_floor * y_nz[j] / min_mu
+        else:
+            v = 1.0 + alpha * mu
+            score += y_nz[j] / v
+            slope -= mu * alpha * y_nz[j] / (v * v)
+    return score, slope
+
+
+@nb.njit(cache=True)
+def _control_weight(a, alpha, centre, s_mom):
+    """Sum over controls of mu/(1 + alpha mu) with the unthresholded mu = s exp(a)."""
+    k = math.exp(a)
+    out = 0.0
+    for b in range(centre.shape[0]):
+        n_b = s_mom[0, b]
+        if n_b == 0.0:
+            continue
+        c = centre[b]
+        v = 1.0 + alpha * k * c
+        out += (n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
+                + s_mom[3, b] * alpha * alpha * k ** 3 / v ** 4)
+    return out
+
+
+@nb.njit(parallel=True, cache=True)
+def _two_group_lfc(genes, dispersion, a0, b0, t_ptr, t_y, t_s, s_t, min_mu, centre, s_mom, s_log, y_mom, ridge,
+                   max_iter, tol):
+    """PyDESeq2's IRLS solution for the control intercept a and the perturbed
+    group's log mean b (LFC = b - a) at the given dispersions -- damped Newton
+    on the fixed-point equations X'(W (z - X beta)) = ridge beta -- and the
+    Wald standard error of b - a from the unthresholded means. The perturbed
+    cells have size factors s_t; gene g's non-zero counts are
+    t_y[t_ptr[g]:t_ptr[g+1]], at size factors t_s (as _two_group_dispersions)."""
+    n = genes.shape[0]
+    a_out = np.full(n, np.nan)
+    b_out = np.full(n, np.nan)
+    se_out = np.full(n, np.nan)
+    converged = np.zeros(n, dtype=np.bool_)
+    for i in nb.prange(n):
+        g = genes[i]
+        alpha = dispersion[i]
+        yg = t_y[t_ptr[g]:t_ptr[g + 1]]
+        sg = t_s[t_ptr[g]:t_ptr[g + 1]]
+        a = a0[i]
+        b = b0[i]
+        for _ in range(max_iter):
+            sc, dc = _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom)
+            st, dt = _cells_score(yg, sg, s_t, b, alpha, min_mu)
+            f1 = sc - ridge * (2.0 * a - b)
+            f2 = st - ridge * (b - a)
+            j11 = dc - 2.0 * ridge
+            j22 = dt - ridge
+            det = j11 * j22 - ridge * ridge
+            if det == 0.0:
+                break
+            da = -(j22 * f1 - ridge * f2) / det
+            db = -(j11 * f2 - ridge * f1) / det
+            norm0 = abs(f1) + abs(f2)
+            step = 1.0
+            na = a
+            nb_ = b
+            for _h in range(30):
+                na = min(max(a + step * da, -30.0), 30.0)
+                nb_ = min(max(b + step * db, -30.0), 30.0)
+                sc2, _dc = _control_score(g, na, alpha, min_mu, centre, s_mom, s_log, y_mom)
+                st2, _dt = _cells_score(yg, sg, s_t, nb_, alpha, min_mu)
+                if abs(sc2 - ridge * (2.0 * na - nb_)) + abs(st2 - ridge * (nb_ - na)) <= norm0:
+                    break
+                step *= 0.5
+            moved = max(abs(na - a), abs(nb_ - b))
+            a = na
+            b = nb_
+            if moved < tol:
+                converged[i] = True
+                break
+        k_t = math.exp(b)
+        w_t = 0.0
+        for j in range(s_t.shape[0]):
+            mu = s_t[j] * k_t
+            w_t += mu / (1.0 + alpha * mu)
+        w_c = _control_weight(a, alpha, centre, s_mom)
+        # M = [[w_c + w_t, w_t], [w_t, w_t]]; H = (M + ridge I)^-1;
+        # se^2 = (H M H)[1, 1], PyDESeq2's wald_test
+        m11 = w_c + w_t + ridge
+        m22 = w_t + ridge
+        dm = m11 * m22 - w_t * w_t
+        c1 = -w_t / dm
+        c2 = m11 / dm
+        var = c1 * c1 * (w_c + w_t) + 2.0 * c1 * c2 * w_t + c2 * c2 * w_t
+        a_out[i] = a
+        b_out[i] = b
+        se_out[i] = math.sqrt(var) if var > 0.0 else np.nan
+    return a_out, b_out, se_out, converged
+
+
+@nb.njit(cache=True)
+def _accumulate_control_summary(data, indices, indptr, bin_of_row, s_rows, centre, y_mom, small_hist,
+                                big_genes, big_values, n_big):
+    """Add a CSR block of control rows to the summary: count-weighted
+    size-factor moments per (gene, bin), counts 1..small_hist.shape[1]-1 into
+    the dense histogram, larger counts into the overflow buffers (returns
+    their new length)."""
+    vmax = small_hist.shape[1] - 1
+    for r in range(indptr.shape[0] - 1):
+        b = bin_of_row[r]
+        d = s_rows[r] - centre[b]
+        for j in range(indptr[r], indptr[r + 1]):
+            y = data[j]
+            if y == 0.0:
+                continue
+            g = indices[j]
+            y_mom[0, g, b] += y
+            y_mom[1, g, b] += y * d
+            y_mom[2, g, b] += y * d * d
+            y_mom[3, g, b] += y * d * d * d
+            v = int(y)
+            if v <= vmax:
+                small_hist[g, v] += 1.0
+            else:
+                big_genes[n_big] = g
+                big_values[n_big] = y
+                n_big += 1
+    return n_big

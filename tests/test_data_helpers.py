@@ -11,7 +11,6 @@ import pytest
 from crispyx.data import (
     AnnData,
     OverlapResult,
-    calculate_nb_glm_chunk_size,
     compute_overlap,
     detect_gene_symbol_column,
     detect_perturbation_column,
@@ -135,31 +134,6 @@ def test_compute_normalized_effects_infers_control(tmp_path, caplog):
     assert list(loaded_var.index) == ["gene0", "gene1", "gene2"]
     assert "Inferred control label" in caplog.text
     result.close()
-
-
-# ============================================================================
-# Tests for calculate_nb_glm_chunk_size
-# ============================================================================
-
-
-@pytest.mark.parametrize(
-    "kwargs, low, high",
-    [
-        (dict(n_obs=10_000, n_vars=5_000, n_groups=50, available_memory_gb=128), 256, 256),
-        (dict(n_obs=1_200_000, n_vars=36_000, n_groups=500, available_memory_gb=128), 32, 255),
-        (dict(n_obs=1_000, n_vars=100, n_groups=10, available_memory_gb=1000, max_chunk=128), 128, 128),
-        (dict(n_obs=10_000_000, n_vars=50_000, n_groups=1000, available_memory_gb=1, min_chunk=64), 64, 64),
-        (dict(n_obs=100_000, n_vars=20_000, n_groups=None, available_memory_gb=64), 32, 256),
-    ],
-    ids=["small-hits-max", "large-reduced", "clamped-to-max", "clamped-to-min", "unknown-groups"],
-)
-def test_calculate_nb_glm_chunk_size(kwargs, low, high):
-    assert low <= calculate_nb_glm_chunk_size(**kwargs) <= high
-
-
-def test_calculate_nb_glm_chunk_size_respects_memory_limit():
-    shape = dict(n_obs=500_000, n_vars=20_000, n_groups=200, available_memory_gb=256)
-    assert calculate_nb_glm_chunk_size(**shape, memory_limit_gb=32) < calculate_nb_glm_chunk_size(**shape)
 
 
 # ============================================================================

@@ -119,27 +119,6 @@ class _EvictEvery:
             self._pending = 0
 
 
-def _estimate_dense_memory_gb(n_cells: int, n_genes: int, n_copies: int = 3) -> float:
-    """Estimate memory required to densify a matrix with work arrays.
-    
-    Parameters
-    ----------
-    n_cells
-        Number of cells (rows).
-    n_genes
-        Number of genes (columns).
-    n_copies
-        Number of dense matrix copies needed (default 3: Y, mu, work arrays).
-        
-    Returns
-    -------
-    float
-        Estimated memory in GB.
-    """
-    bytes_per_element = 8  # float64
-    return n_cells * n_genes * bytes_per_element * n_copies / 1e9
-
-
 def _estimate_gene_batch_size_fitter(
     n_samples: int,
     n_genes: int,
