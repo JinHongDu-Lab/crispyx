@@ -5210,10 +5210,17 @@ ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
 
 
 def _crispyx_version() -> str:
-    """The crispyx version under test, recorded with every crispyx result."""
+    """The crispyx version under test and a fingerprint of its sources
+    (pre-releases share the version number), recorded with every crispyx
+    result, e.g. "0.2.3+f70046bfe14c"."""
+    import hashlib
     import crispyx
 
-    return getattr(crispyx, "__version__", "unknown")
+    root = Path(crispyx.__file__).parent
+    digest = hashlib.md5()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.read_bytes())
+    return f"{getattr(crispyx, '__version__', 'unknown')}+{digest.hexdigest()[:12]}"
 
 
 def run_on_accuracy_subset(
