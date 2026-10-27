@@ -84,6 +84,8 @@ dispersions and mean floor are all new. See :ref:`nb-glm` and
   :doc:`notebooks/residual_effects_genomewide_zhu` (genome-wide CD4+ T cells,
   Zhu *et al.*) and :doc:`notebooks/residual_effects_targeted_feng` (targeted
   iPSC screen, Feng *et al.*).
+* :doc:`notebooks/residual_effects_targeted_feng` re-run on 0.2.3, with a Part 4
+  that repeats the effects with the non-targeting cells alone as controls.
 
 Version 0.2.2
 -------------

@@ -100,6 +100,11 @@ with the inlet as a covariate:
   unassigned cells for 68 % of them, against 55 % of other genes).
 - Many unassigned cells carry less CRISPRi machinery or an undetected guide.
   Here, the non-targeting cells are the safer controls.
+- Re-estimated with the non-targeting controls alone, the screen's effects
+  hardly change (r 0.97; knockdowns of the targets' own genes identical),
+  except on the construct genes, and a quarter of the hits are lost to the
+  smaller control set (:doc:`notebooks/residual_effects_targeted_feng`,
+  Part 4).
 
 Highly variable genes
 ---------------------
