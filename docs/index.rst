@@ -72,8 +72,8 @@ Key features
 
    notebooks/control_checks
    notebooks/size_factor_comparison
-   notebooks/residual_effects_tutorial
-   notebooks/residual_effects_feng_tutorial
+   notebooks/residual_effects_genomewide_zhu
+   notebooks/residual_effects_targeted_feng
    notebooks/stratified_wilcoxon_tutorial
    notebooks/batch_statistics_tutorial
 

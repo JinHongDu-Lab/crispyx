@@ -46,19 +46,19 @@ At a glance
      - mean residual, ``log1p(CP10k)``
      - spread across targets
      - fastest (one pass)
-     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
+     - :doc:`genome-wide <notebooks/residual_effects_genomewide_zhu>`
    * - ``residual_effects``, ``null="model"``
      - any covariates
      - mean residual, ``log1p(CP10k)``
      - control fit's noise
      - fastest (one pass)
-     - :doc:`targeted <notebooks/residual_effects_feng_tutorial>`
+     - :doc:`targeted <notebooks/residual_effects_targeted_feng>`
    * - NB-GLM on pseudo-bulk
      - any covariates, replicates
      - log2 fold change
      - Wald test, replicate units
      - slow
-     - :doc:`genome-wide <notebooks/residual_effects_tutorial>`
+     - :doc:`genome-wide <notebooks/residual_effects_genomewide_zhu>`
    * - NB-GLM on single cells
      - any covariates
      - log2 fold change
@@ -113,7 +113,7 @@ Elteren's test).
 - **Tutorials:** :doc:`notebooks/stratified_wilcoxon_tutorial` (effects,
   standard errors and p-values per batch on the Feng *et al.* targeted
   screen, with a calibration check on fake targets); Part 3 of
-  :doc:`notebooks/residual_effects_feng_tutorial` compares pooled and
+  :doc:`notebooks/residual_effects_targeted_feng` compares pooled and
   stratified controls for the Wilcoxon test alone.
 
 ``residual_effects``: effects from a control-fitted model
@@ -152,9 +152,9 @@ The two nulls turn an effect into a z-score differently:
   change. Every covariate level must occur among the controls (perturbed cells in
   other levels are left out). The robust null needs a genome-wide screen; the
   model null over-calls when cells are not independent.
-- **Tutorials:** :doc:`notebooks/residual_effects_tutorial` (genome-wide,
+- **Tutorials:** :doc:`notebooks/residual_effects_genomewide_zhu` (genome-wide,
   ``null="robust"``, calibration on fake targets) and
-  :doc:`notebooks/residual_effects_feng_tutorial` (targeted, ``null="model"``,
+  :doc:`notebooks/residual_effects_targeted_feng` (targeted, ``null="model"``,
   reproduces the published effects and calls).
 
 NB-GLM with covariates
@@ -192,7 +192,7 @@ the test accounts for variation between guides and donors.
   one donor and one guide there is little to estimate the variation from. On
   single cells, cells are again treated as independent, and with covariates the
   control cells must fit in memory (see :ref:`cell-or-pseudobulk`).
-- **Tutorial:** Part 2 of :doc:`notebooks/residual_effects_tutorial`.
+- **Tutorial:** Part 2 of :doc:`notebooks/residual_effects_genomewide_zhu`.
 
 Per-batch pseudo-bulk effects
 -----------------------------
@@ -233,5 +233,5 @@ Tutorials
 Each approach above on a real screen, with its calibration checked:
 
 - :doc:`notebooks/stratified_wilcoxon_tutorial`
-- :doc:`notebooks/residual_effects_feng_tutorial`
-- :doc:`notebooks/residual_effects_tutorial`
+- :doc:`notebooks/residual_effects_targeted_feng`
+- :doc:`notebooks/residual_effects_genomewide_zhu`

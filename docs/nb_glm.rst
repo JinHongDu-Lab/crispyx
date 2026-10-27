@@ -49,7 +49,7 @@ tested on its own column. The default, 1, is DESeq2 run per comparison.
 With covariates and many control units this is much faster: about 0.3 s per
 target with ``k=50`` against 20 s one at a time, on the genome-wide CD4+
 T-cell pseudo-bulk of Zhu *et al.* (2026, *Cell*), who fitted 50 targets per
-model (see :doc:`notebooks/residual_effects_tutorial`).
+model (see :doc:`notebooks/residual_effects_genomewide_zhu`).
 
 Other options
 -------------
@@ -92,7 +92,7 @@ exist: sum counts per guide x batch or donor with
 
 1. Check the control cells (:ref:`check-controls`).
 2. Run a fake-target check on your screen: relabel control guides as targets,
-   as in :doc:`notebooks/residual_effects_tutorial`.
+   as in :doc:`notebooks/residual_effects_genomewide_zhu`.
 3. Use pseudo-bulk with the replicate unit as a covariate if cell level fails
    the check and the screen has replicate units with enough cells, or if the
    controls are too many for a cell-level fit with covariates.

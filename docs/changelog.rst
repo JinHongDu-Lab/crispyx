@@ -80,6 +80,10 @@ dispersions and mean floor are all new. See :ref:`nb-glm` and
 * The notebooks are listed together under Tutorials; the new
   :doc:`notebooks/control_checks` runs the control checks on the targeted
   screen of Feng *et al.*
+* The two ``residual_effects`` notebooks are renamed for their screens:
+  :doc:`notebooks/residual_effects_genomewide_zhu` (genome-wide CD4+ T cells,
+  Zhu *et al.*) and :doc:`notebooks/residual_effects_targeted_feng` (targeted
+  iPSC screen, Feng *et al.*).
 
 Version 0.2.2
 -------------
