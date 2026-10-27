@@ -1433,3 +1433,50 @@ def plot_overlap_heatmap(
         ax.set_title(title)
 
     return ax
+
+
+def plot_control_guide_correlation(
+    corr: pd.DataFrame,
+    *,
+    cluster: bool = True,
+    ax=None,
+    cmap: str = "RdBu_r",
+    title: str | None = "Control guides: correlation of expression deviations",
+):
+    """Heatmap of :func:`crispyx.qc.control_guide_correlation`.
+
+    Guides are ordered by hierarchical clustering (average linkage on
+    1 - correlation) when ``cluster``, so guides that share variation sit
+    together; labels carry each profile's number of cells. Colours run from
+    -1 to 1.
+
+    Returns
+    -------
+    matplotlib.axes.Axes or None
+    """
+    plt = _require_matplotlib()
+    if plt is None:
+        return None
+    order = list(corr.index)
+    if cluster and len(order) > 2:
+        from scipy.cluster.hierarchy import leaves_list, linkage
+        from scipy.spatial.distance import squareform
+
+        distance = np.clip(1.0 - corr.to_numpy(dtype=float), 0.0, 2.0)
+        np.fill_diagonal(distance, 0.0)
+        order = [order[i] for i in leaves_list(linkage(squareform(distance, checks=False), "average"))]
+    matrix = corr.loc[order, order]
+    n_cells = corr.attrs.get("n_cells", {})
+    labels = [f"{name} ({n_cells[name]:,})" if name in n_cells else name for name in order]
+    n = len(order)
+    if ax is None:
+        _, ax = plt.subplots(figsize=(max(4, 0.32 * n + 3), max(3.5, 0.32 * n + 2)))
+    image = ax.imshow(matrix.to_numpy(dtype=float), cmap=cmap, vmin=-1, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.figure.colorbar(image, ax=ax, shrink=0.6, label="Pearson r")
+    if title:
+        ax.set_title(title, fontsize=10)
+    return ax

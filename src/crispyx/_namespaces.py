@@ -34,6 +34,7 @@ from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
     plot_overlap_heatmap,
+    plot_control_guide_correlation,
     plot_pca,
     plot_pca_loadings,
     plot_pca_variance_ratio,
@@ -54,6 +55,8 @@ from .pseudobulk import (
 )
 from .residual import ResidualNull, residual_effects
 from .qc import (
+    compare_controls,
+    control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
@@ -190,6 +193,21 @@ class _PreprocessingNamespace:
             verbose=verbose,
         )
         return result.filtered
+
+    def compare_controls(self, data, **kwargs):
+        """Whether cells used as controls behave alike, e.g. unassigned cells
+        and cells with a non-targeting guide.
+
+        See :func:`crispyx.qc.compare_controls`.
+        """
+        return compare_controls(data, **kwargs)
+
+    def control_guide_correlation(self, data, **kwargs):
+        """Correlation between the control guides' expression profiles.
+
+        See :func:`crispyx.qc.control_guide_correlation`.
+        """
+        return control_guide_correlation(data, **kwargs)
 
     def convert_to_csc(
         self,
@@ -904,9 +922,12 @@ class _ToolsNamespace:
         if normalised == "nb_glm":
             allowed = {
                 "covariates",
+                "size_factor_method",
                 "dispersion",
-                "fit_method",
+                "shrink_dispersion",
+                "targets_per_fit",
                 "max_iter",
+                "min_mu",
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
@@ -1125,6 +1146,10 @@ class _PlottingNamespace:
     def umap(self, data, **kwargs):
         """Plot UMAP embedding."""
         return plot_umap(data, **kwargs)
+
+    def control_guide_correlation(self, corr, **kwargs):
+        """Heatmap of control guide correlations. See :func:`crispyx.plot_control_guide_correlation`."""
+        return plot_control_guide_correlation(corr, **kwargs)
 
     def overlap_heatmap(self, result, **kwargs):
         """Plot pairwise overlap heatmap. See :func:`crispyx.plot_overlap_heatmap`."""

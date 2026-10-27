@@ -37,7 +37,6 @@ from .data import (
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
     calculate_wilcoxon_chunk_size,
-    calculate_nb_glm_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
     get_perturbation_slice,
@@ -49,6 +48,7 @@ from .data import (
     resolve_output_path,
     scratch_copy_bytes,
     sort_by_perturbation,
+    perturbation_sort_order,
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
@@ -482,8 +482,7 @@ def _uns_value(uns: h5py.Group, key: str, default=None):
     return value.decode() if isinstance(value, bytes) else value
 
 
-# Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
-# cannot estimate its dispersion for the shared, control-fitted value.
+_SIZE_FACTOR_METHODS = ("libsize", "geomeans", "deseq2")
 
 
 def _global_size_factors(
@@ -497,6 +496,52 @@ def _global_size_factors(
     if method == "deseq2":
         return _control_reference_size_factors(path, labels, control_label, chunk_size=chunk_size)
     raise ValueError(f"size_factor_method must be 'libsize', 'geomeans' or 'deseq2', not {method!r}")
+
+
+def _nb_glm_testable_genes(
+    *,
+    pert_expr_counts: np.ndarray,
+    pert_total: np.ndarray,
+    n_pert: int,
+    control_expr_counts: np.ndarray,
+    control_total: np.ndarray,
+    n_control: int,
+    min_cells_expressed: int,
+    min_pct_ctrl: float,
+    min_pct_pert: float,
+    min_mean_ctrl: float,
+    min_mean_pert: float,
+    min_cells_ctrl: int,
+    min_cells_pert: int,
+    min_total_count: float,
+) -> np.ndarray:
+    """The genes ``nb_glm_test`` tests for one perturbation against the
+    controls, after its expression filters. A pair with no counts in one arm
+    has no finite effect to estimate (see _nonestimable_glm_mask): it is
+    excluded rather than fitted, so it is reported as untested instead of
+    carrying a bound-determined effect and an artefactual p-value into the
+    FDR correction."""
+    valid = (control_expr_counts + pert_expr_counts) >= min_cells_expressed
+    valid &= ~_low_expr_in_both_mask(
+        pert_expr_counts=pert_expr_counts,
+        control_expr_counts=control_expr_counts,
+        pert_mean=pert_total / max(n_pert, 1),
+        control_mean=control_total / max(n_control, 1),
+        n_pert_cells=n_pert,
+        n_control_cells=n_control,
+        min_pct_ctrl=min_pct_ctrl,
+        min_pct_pert=min_pct_pert,
+        min_mean_ctrl=min_mean_ctrl,
+        min_mean_pert=min_mean_pert,
+    )
+    valid &= ~_nonestimable_glm_mask(
+        pert_expr_counts=pert_expr_counts,
+        control_expr_counts=control_expr_counts,
+        min_cells_ctrl=min_cells_ctrl,
+        min_cells_pert=min_cells_pert,
+    )
+    valid &= (control_total + pert_total) >= min_total_count
+    return valid
 
 
 def _resolve_candidates(
@@ -1411,7 +1456,7 @@ def nb_glm_test(
     tol: float = 1e-8,
     min_mu: float | None = None,
     poisson_init_iter: int = 5,
-    chunk_size: int | None = None,
+    chunk_size: int = 2048,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
@@ -1479,7 +1524,7 @@ def nb_glm_test(
         Specific perturbations to test. If None, tests all non-control groups.
     size_factors
         Per-cell size factors to use as given (rescaled to geometric mean 1),
-        e.g. scran's or an external run's. If None, ``size_factor_method``
+        e.g. scran's or an external run's, in the input's row order. If None, ``size_factor_method``
         computes them, once for all cells; how the methods differ, and how
         they behaved on single-cell screens, is in the user guide
         (:ref:`size-factors`).
@@ -1527,7 +1572,7 @@ def nb_glm_test(
         dispersions are estimated once for the ``k`` of them, mostly from the
         controls, and each perturbation is tested on its own column against
         the controls. This is how a pseudo-bulk analysis that fits many
-        perturbations as levels of one factor runs (Zhu, Dann *et al.* 2025
+        perturbations as levels of one factor runs (Zhu *et al.* 2026
         fitted 50 at a time), and it costs about ``1/k`` of the dispersion
         estimation. Always fitted on the cells (as with covariates); not with
         ``lfc_shrinkage_type="apeglm"`` (use :func:`shrink_lfc` afterwards).
@@ -1548,8 +1593,9 @@ def nb_glm_test(
     poisson_init_iter
         Initial Poisson iterations before switching to negative binomial.
     chunk_size
-        Number of cells read per block when computing size factors. Smaller
-        values stream more, reducing peak memory at the cost of additional I/O.
+        Number of cells read per block when computing size factors (default
+        2048). Smaller values stream more, reducing peak memory at the cost
+        of additional I/O.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
@@ -1693,9 +1739,9 @@ def nb_glm_test(
     sparse genes, most often in pseudo-bulk: where the likelihood has a
     second mode at the lower bound (1e-8), DESeq2's local search can stay
     there, while crispyx reports the higher-likelihood dispersion. The
-    trends then differ, but the tests hardly do (Tian pseudo-bulk: median
-    z difference 0.001-0.015; hits within a few genes, e.g. 13 against 16
-    for SPAST).
+    trends then differ, but the tests hardly do (Tian CRISPRa pseudo-bulk:
+    median z difference 0.001-0.015; hits within a few genes, e.g. crispyx
+    found 13 for SPAST, PyDESeq2 16).
     """
     # A one-shot iterable would be fingerprinted by its repr and then used up.
     if perturbations is not None:
@@ -1713,6 +1759,9 @@ def nb_glm_test(
     # Validate min_mu parameter
     if min_mu is not None and min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
+    if size_factors is None and size_factor_method not in _SIZE_FACTOR_METHODS:
+        # Checked before the file is read or sorted, which can take long.
+        raise ValueError(f"size_factor_method must be 'libsize', 'geomeans' or 'deseq2', not {size_factor_method!r}")
     if int(targets_per_fit) != targets_per_fit or targets_per_fit < 1:
         raise ValueError(f"targets_per_fit must be a positive integer, got {targets_per_fit!r}")
     targets_per_fit = int(targets_per_fit)
@@ -1773,6 +1822,13 @@ def nb_glm_test(
     backed = read_backed(path)
     try:
         sample = backed.X[:, :256] if _storage_fmt == "csc" else backed.X[:1024]
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        if size_factors is not None:
+            size_factors = _validate_size_factors(size_factors, backed.n_obs)
+            input_labels = backed.obs[perturbation_column].astype(str).to_numpy()
     finally:
         backed.file.close()
     _validate_counts_chunk(sample, context="nb_glm_test")
@@ -1802,6 +1858,9 @@ def nb_glm_test(
             control_label=control_label,
             output_path=path.parent / f"{path.stem}_sorted.h5ad",
         )
+        if size_factors is not None:  # given in the input's row order
+            size_factors = size_factors[perturbation_sort_order(
+                input_labels, control_label or resolve_control_label(input_labels, None))]
 
     backed = read_backed(path)
     try:
@@ -1840,29 +1899,29 @@ def nb_glm_test(
         backed.file.close()
 
     n_cells_total = obs_df.shape[0]
-    
-    # Calculate adaptive chunk_size if not provided
-    # Only reduces chunk_size when memory would be exceeded; successful datasets keep default (256)
-    if chunk_size is None:
-        chunk_size = calculate_nb_glm_chunk_size(
-            n_obs=n_cells_total,
-            n_vars=n_genes,
-            n_groups=len(candidates),
-            memory_limit_gb=memory_limit_gb,
-        )
-        _messages.vprint(verbose, "nb_glm_test", f"chunk_size={chunk_size} (auto)")
-
     if size_factors is None:
         size_factors = _global_size_factors(path, size_factor_method, chunk_size, labels, control_label)
-    else:
-        size_factors = _validate_size_factors(size_factors, n_cells_total)
 
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
     # -------------------------------------------------------------------------
     # Perturbations with covariates (or apeGLM shrinkage), fitted on their cells
     # -------------------------------------------------------------------------
-    def _fit_perturbation_worker(
+    def _fit_perturbation_worker(*, threads: int, **kwargs) -> list[dict]:
+        """:func:`_fit_on_cells` with numba's kernels limited to ``threads``,
+        this worker's share of the cores (each kernel would otherwise start
+        one thread per core in every worker process); the caller's thread
+        count is restored, since a sequential run fits in the caller's process."""
+        import numba
+
+        previous = numba.get_num_threads()
+        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
+        try:
+            return _fit_on_cells(**kwargs)
+        finally:
+            numba.set_num_threads(previous)
+
+    def _fit_on_cells(
         labels_in_fit: list[str],
         group_idxs: list[int],
         path: str | Path,
@@ -1891,7 +1950,6 @@ def nb_glm_test(
         dispersion: float | None,
         shrink_dispersion: bool,
         lfc_shrinkage_type: str,
-        threads: int,
     ) -> list[dict]:
         """The perturbations ``labels_in_fit`` and the controls, fitted together
         on their cells with the design ``~ covariates + perturbation``, one
@@ -1899,12 +1957,7 @@ def nb_glm_test(
         dispersions are estimated once for them all, and each perturbation is
         tested on its own column against the controls. One perturbation is the
         per-comparison fit. A result per perturbation, as the two-group
-        worker's (natural-log LFC and SE). ``threads`` is this worker's share
-        of the cores for the numba kernels, which would otherwise each start
-        one thread per core in every worker process."""
-        import numba
-
-        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
+        worker's (natural-log LFC and SE)."""
         masks = []
         for rows in rows_in_fit:
             mask = np.zeros(control_mask.shape[0], dtype=bool)
@@ -1912,9 +1965,10 @@ def nb_glm_test(
             masks.append(mask)
         # A perturbation confounded with a covariate (e.g. all its cells in a
         # batch with no controls) has no estimable effect: it fails with the
-        # reason, and the others are fitted without it.
+        # reason, and the others are fitted without it. (One perturbation alone
+        # is checked on the joint design below, which is then its own.)
         failed = []
-        if covariates:
+        if covariates and len(labels_in_fit) > 1:
             kept = []
             for k, (label, mask) in enumerate(zip(labels_in_fit, masks)):
                 alone = control_mask | mask
@@ -1947,10 +2001,13 @@ def nb_glm_test(
             design = np.column_stack([design, mask[subset_mask].astype(np.float64)])
             test_columns.append(design.shape[1] - 1)
             design_columns.append(f"perturbation {label!r}")
-        if covariates and len(labels_in_fit) > 1:
+        if covariates:
+            context = (
+                f"nb_glm_test, comparison {labels_in_fit[0]!r} vs control" if len(labels_in_fit) == 1
+                else f"nb_glm_test, perturbations {', '.join(map(repr, labels_in_fit))} vs control"
+            )
             try:
-                check_full_rank(design, design_columns,
-                                f"nb_glm_test, perturbations {', '.join(map(repr, labels_in_fit))} vs control")
+                check_full_rank(design, design_columns, context)
             except ValueError as exc:
                 return failed + [{"group_idx": i, "error": str(exc)} for i in group_idxs]
         subset_size_factors = np.asarray(size_factors)[subset_mask]
@@ -1959,7 +2016,9 @@ def nb_glm_test(
         counts[control_mask[subset_mask]] = (
             control_matrix.toarray() if sp.issparse(control_matrix) else control_matrix
         )
-        groups, valids = [], []
+        # Each perturbation's cells go straight into ``counts``; only their
+        # per-gene summaries are kept, not a second dense copy.
+        pts_list, valids = [], []
         backed = read_backed(path)
         try:
             for rows, mask in zip(rows_in_fit, masks):
@@ -1968,47 +2027,29 @@ def nb_glm_test(
                 block = backed.X[rows, :]
                 group = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
                 counts[mask[subset_mask]] = group
-                groups.append(group)
+                group_n = group.shape[0]
+                group_expr_counts = np.count_nonzero(group, axis=0)
+                group_total = group.sum(axis=0)
+                del block, group
+                pts_list.append((group_expr_counts / max(group_n, 1)).astype(np.float32))
+                valids.append(_nb_glm_testable_genes(
+                    pert_expr_counts=group_expr_counts, pert_total=group_total, n_pert=group_n,
+                    control_expr_counts=control_expr_counts, control_total=control_total, n_control=control_n,
+                    min_cells_expressed=min_cells_expressed, min_pct_ctrl=min_pct_ctrl,
+                    min_pct_pert=min_pct_pert, min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert,
+                    min_cells_ctrl=min_cells_ctrl, min_cells_pert=min_cells_pert,
+                    min_total_count=min_total_count,
+                ))
         finally:
             backed.file.close()
-        for group in groups:
-            group_n = group.shape[0]
-            group_expr_counts = np.count_nonzero(group, axis=0)
-            group_total = group.sum(axis=0)
-            valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
-            valid &= ~_low_expr_in_both_mask(
-                pert_expr_counts=group_expr_counts,
-                control_expr_counts=control_expr_counts,
-                pert_mean=group_total / max(group_n, 1),
-                control_mean=control_total / max(control_n, 1),
-                n_pert_cells=group_n,
-                n_control_cells=control_n,
-                min_pct_ctrl=min_pct_ctrl,
-                min_pct_pert=min_pct_pert,
-                min_mean_ctrl=min_mean_ctrl,
-                min_mean_pert=min_mean_pert,
-            )
-            # A pair with no counts in one arm has no finite effect to
-            # estimate; see _nonestimable_glm_mask. Excluded here rather than
-            # fitted, so it is reported as untested instead of carrying a
-            # bound-determined effect and an artefactual p-value into the FDR
-            # correction.
-            valid &= ~_nonestimable_glm_mask(
-                pert_expr_counts=group_expr_counts,
-                control_expr_counts=control_expr_counts,
-                min_cells_ctrl=min_cells_ctrl,
-                min_cells_pert=min_cells_pert,
-            )
-            valid &= (control_total + group_total) >= min_total_count
-            valids.append(valid)
         # A gene is fitted when any perturbation tests it; each reports only its own.
         fit = fit_glm_deseq2(
             design, counts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
-            dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
+            protected_columns=test_columns[1:], dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
             max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter,
         )
         results = []
-        for group_idx, column, group, valid in zip(group_idxs, test_columns, groups, valids):
+        for group_idx, column, pts, valid in zip(group_idxs, test_columns, pts_list, valids):
             b, b_se = fit.coef[:, column], fit.coef_se[:, column]
             with np.errstate(divide="ignore", invalid="ignore"):
                 statistic = b / b_se
@@ -2029,7 +2070,7 @@ def nb_glm_test(
                 # included: a pair expressed in 0% of perturbed and 95% of
                 # control cells is a complete knockdown whose effect is not
                 # estimable.
-                "pts": (np.count_nonzero(group, axis=0) / max(group.shape[0], 1)).astype(np.float32),
+                "pts": pts,
                 "dispersion": fit.dispersion,
                 "dispersion_raw": fit.genewise_dispersion,
                 "dispersion_trend": fit.trend,
@@ -2303,32 +2344,23 @@ def nb_glm_test(
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
         """One perturbation against the control summary; same result as the
         other workers, natural-log LFC and SE."""
-        block = backed_x[rows, :]
-        y = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
+        # Sparse throughout: a large group (a non-targeting guide fitted as a
+        # perturbation) would not fit in memory densely.
+        y = sp.csr_matrix(backed_x[rows, :], dtype=np.float64)
+        y.sum_duplicates()
+        y.eliminate_zeros()
         s_t = np.asarray(size_factors, dtype=np.float64)[rows]
         group_n = y.shape[0]
-        group_expr_counts = np.count_nonzero(y, axis=0)
-        group_total = y.sum(axis=0)
-        valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
-        valid &= ~_low_expr_in_both_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_expr_counts,
-            pert_mean=group_total / max(group_n, 1),
-            control_mean=control_total / max(control_n, 1),
-            n_pert_cells=group_n,
-            n_control_cells=control_n,
-            min_pct_ctrl=min_pct_ctrl,
-            min_pct_pert=min_pct_pert,
-            min_mean_ctrl=min_mean_ctrl,
-            min_mean_pert=min_mean_pert,
+        group_expr_counts = y.getnnz(axis=0)
+        group_total = np.asarray(y.sum(axis=0)).ravel()
+        valid = _nb_glm_testable_genes(
+            pert_expr_counts=group_expr_counts, pert_total=group_total, n_pert=group_n,
+            control_expr_counts=control_expr_counts, control_total=control_total, n_control=control_n,
+            min_cells_expressed=min_cells_expressed, min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert, min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert,
+            min_cells_ctrl=min_cells_ctrl, min_cells_pert=min_cells_pert,
+            min_total_count=min_total_count,
         )
-        valid &= ~_nonestimable_glm_mask(
-            pert_expr_counts=group_expr_counts,
-            control_expr_counts=control_expr_counts,
-            min_cells_ctrl=min_cells_ctrl,
-            min_cells_pert=min_cells_pert,
-        )
-        valid &= (control_total + group_total) >= min_total_count
         fit = fit_two_group_deseq2(
             control_summary, y, s_t, np.flatnonzero(valid),
             dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
@@ -3792,9 +3824,10 @@ def shrink_lfc(
       expressed genes due to min_mu clamping differences in the likelihood.
     
     .. note::
-        The "stats" method is recommended because CRISPYx NB-GLM fitting uses
-        min_mu=0.5 clamping for numerical stability, which affects the stored
-        MLE coefficients. The "full" method re-evaluates the likelihood without
+        The "stats" method is recommended because the NB-GLM fit floors its
+        means at ``min_mu`` (``uns["min_mu"]``: 0.5 for pseudo-bulk and bulk,
+        1e-6 for single cells by default), which affects the stored MLE
+        coefficients. The "full" method re-evaluates the likelihood without
         this constraint, potentially finding different optima for lowly expressed
         genes. The "stats" method preserves shrinkage direction (always toward
         zero) by working directly with the stored statistics.
@@ -3922,6 +3955,11 @@ def shrink_lfc(
         candidates = [str(g) for g in _h5_index(handle["obs"])]
         gene_symbols = pd.Index([str(g) for g in _h5_index(handle["var"])])
         n_groups, n_genes = handle["X"].shape
+    if "dispersion" not in layer_names:
+        raise ValueError(
+            f"Input file '{path}' lacks the 'dispersion' layer (results from crispyx before 0.2.3); "
+            "re-run nb_glm_test."
+        )
     if "intercept" not in layer_names:
         raise ValueError(
             f"Input file '{path}' lacks 'intercept' layer. "

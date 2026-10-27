@@ -66,6 +66,7 @@ from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
     plot_overlap_heatmap,
+    plot_control_guide_correlation,
     plot_pca,
     plot_pca_loadings,
     plot_pca_variance_ratio,
@@ -83,6 +84,8 @@ from .pseudobulk import (
     compute_pseudobulk_effects,
 )
 from .qc import (
+    compare_controls,
+    control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
@@ -123,6 +126,9 @@ __all__ = [
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",
     "quality_control_summary",
+    "compare_controls",
+    "control_guide_correlation",
+    "plot_control_guide_correlation",
     "highly_variable_genes",
     # Subsampling
     "subsample",
