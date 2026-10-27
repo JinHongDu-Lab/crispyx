@@ -17,6 +17,24 @@ automatically and logged for reproducibility. Likewise, omitting
 Individual helpers such as :func:`crispyx.pp.filter_cells` are also
 available for customised pipelines.
 
+Plot the QC summary:
+
+.. code-block:: python
+
+   qc = cx.pp.qc_summary(
+       adata_ro,
+       perturbation_column="perturbation",
+       min_genes=100,
+       min_cells_per_perturbation=15,
+       min_cells_per_gene=10,
+   )
+   cx.pl.qc_perturbation_counts(
+       data=adata_ro,
+       perturbation_column="perturbation",
+       cell_mask=qc.cell_mask,
+   )
+   cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
+
 .. _check-controls:
 
 Check the control cells
@@ -57,9 +75,10 @@ Both work on single cells or on pseudo-bulk counts; on pseudo-bulk (units per
 guide and batch from ``cx.pb.aggregate``, ``size_factor_method="deseq2"``, the
 batch as a covariate) the comparison is calibrated and fast.
 
-**Example.** The targeted screen of Feng *et al.* has 535,000 control cells,
-98 % of them unassigned. In pseudo-bulk per guide and inlet, with the inlet as
-a covariate:
+**Example** (:doc:`notebooks/control_checks`, with the correlation heatmap
+and each guide's hits). The targeted screen of Feng *et al.* has 535,000
+control cells, 98 % of them unassigned. In pseudo-bulk per guide and inlet,
+with the inlet as a covariate:
 
 .. list-table::
    :header-rows: 1
@@ -68,7 +87,7 @@ a covariate:
      - Genes differing
      - Genes with \|z\| > 3
    * - the unassigned cells
-     - 135-438
+     - 132-438
      - 1.5-2.3 %
    * - the other non-targeting guides
      - 0-16
@@ -162,6 +181,19 @@ graph construction that works with on-disk data:
    
    # Build KNN graph from PCA embeddings
    cx.pp.neighbors(adata_norm, n_neighbors=15)
+
+Plot the embedding:
+
+.. code-block:: python
+
+   # Plot variance explained per component
+   cx.pl.pca_variance_ratio(adata_norm, n_pcs=20)
+
+   # PCA scatter colored by perturbation
+   cx.pl.pca(adata_norm, color='perturbation', components='1,2')
+
+   # Gene loadings for top components
+   cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
 
 The PCA implementation uses a hybrid approach:
 

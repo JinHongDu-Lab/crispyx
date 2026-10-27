@@ -59,6 +59,27 @@ dispersions and mean floor are all new. See :ref:`nb-glm` and
 
 * ``nb_glm_test`` reorders user-supplied ``size_factors`` when it sorts a
   large input by perturbation; they were misaligned with the cells.
+* ``cx.pb.aggregate`` with a ``gene_name_column`` that differs from
+  ``var_names`` (e.g. Ensembl IDs with a symbol column) failed to write its
+  result.
+* NB-GLM counts a stored zero in the controls as a cell not expressing the
+  gene, as it already did in the perturbed cells (``pts_rest`` and the
+  expression filters).
+* With covariates, the starting dispersions use the same upper bound as the
+  search (``max(max_disp, n)``, as PyDESeq2), and a fit no longer keeps a
+  second dense copy of each perturbation's cells.
+* An invalid ``size_factor_method`` or ``perturbation_column`` is reported
+  before the input is read or sorted.
+* ``shrink_lfc`` says to re-run ``nb_glm_test`` when given an NB-GLM result
+  from before 0.2.3, which lacks the ``dispersion`` layer.
+
+**Documentation**
+
+* NB-GLM has its own page (:doc:`nb_glm`): dispersions, size factors, the mean
+  floor, cell level or pseudo-bulk, and matching PyDESeq2.
+* The notebooks are listed together under Tutorials; the new
+  :doc:`notebooks/control_checks` runs the control checks on the targeted
+  screen of Feng *et al.*
 
 Version 0.2.2
 -------------

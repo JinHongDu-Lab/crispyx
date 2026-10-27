@@ -232,9 +232,6 @@ Tutorials
 
 Each approach above on a real screen, with its calibration checked:
 
-.. toctree::
-   :maxdepth: 1
-
-   notebooks/stratified_wilcoxon_tutorial
-   notebooks/residual_effects_feng_tutorial
-   notebooks/residual_effects_tutorial
+- :doc:`notebooks/stratified_wilcoxon_tutorial`
+- :doc:`notebooks/residual_effects_feng_tutorial`
+- :doc:`notebooks/residual_effects_tutorial`
