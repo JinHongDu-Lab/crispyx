@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Version 0.2.4
+-------------
+
+*Unreleased.*
+
+**Fixed**
+
+* NB-GLM without covariates no longer reports a gene as converged when its
+  fit is held at the bound on the log mean; such a gene is reported as not
+  tested. No gene of a Feng *et al.* targeted-screen subset changes.
+* ``batch_process`` resuming or reusing an existing output, ``pca`` /
+  ``neighbors`` / ``umap`` given a path, and standardization no longer read
+  every layer of the file into memory.
+
 Version 0.2.3
 -------------
 
