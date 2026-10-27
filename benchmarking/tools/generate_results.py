@@ -1139,7 +1139,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         # Memory metrics (including step-wise for NB-GLM)
         "peak_memory_mb", "avg_memory_mb",
         "base_peak_memory_mb", "shrinkage_peak_memory_mb",
-        "cells_kept", "genes_kept", "groups"
+        "cells_kept", "genes_kept", "groups", "control_cells"
     ]
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
     # Accuracy reruns of references (*_subset, *_subset_ctrl) are not performance rows.
@@ -1566,13 +1566,15 @@ def _accuracy_subset_markdown(rerun_df: pd.DataFrame, accuracy_perts: Optional[s
                f"(seed {spec.get('seed', 0)}) for every method; the list is in "
                "`.accuracy_perturbations.json`.\n\n")
     if not rerun_df.empty:
-        md += ("Reference reruns on that subset, for references that failed on the full data. "
-               "These are accuracy runs with relaxed limits, not performance rows. "
+        md += ("Reruns on that subset, for accuracy only: they are not performance rows, and their "
+               "time and memory (kept in `benchmark_accuracy_reruns.csv` for the record) are not compared. "
+               "Performance uses the full-data runs, where a failure (timeout, memory limit) is the result. "
                "`_subset` = full control; `_subset_ctrl` = control capped, crispyx rerun on the same cells.\n\n")
-        md += "| method | status | time (s) | peak memory (MB) | groups |\n| --- | --- | --- | --- | --- |\n"
+        md += "| method | status | perturbations | control cells |\n| --- | --- | --- | --- |\n"
         for _, row in rerun_df.sort_values("method").iterrows():
-            md += (f"| {row['method']} | {row.get('status', '')} | {row.get('elapsed_seconds', float('nan')):.0f} | "
-                   f"{row.get('peak_memory_mb', float('nan')):.0f} | {row.get('groups', '')} |\n")
+            cells = row.get("control_cells")
+            cells = "" if cells is None or (isinstance(cells, float) and np.isnan(cells)) else f"{int(cells):,}"
+            md += f"| {row['method']} | {row.get('status', '')} | {row.get('groups', '')} | {cells} |\n"
     return md
 
 
