@@ -2895,6 +2895,7 @@ def fit_glm_deseq2(
     max_iter: int = 100,
     beta_tol: float = 1e-8,
     poisson_init_iter: int = 5,
+    block_genes: int | None = None,
 ) -> DESeq2Result:
     """DESeq2's Wald test of one coefficient of a GLM, as PyDESeq2 runs it on
     ``design`` with the given size factors: :func:`fit_two_group_deseq2` for a
@@ -2929,20 +2930,30 @@ def fit_glm_deseq2(
     max_iter, beta_tol, poisson_init_iter
         IRLS (:func:`fit_nb_glm_batch_auto`'s ``max_iter``, ``tol``,
         ``poisson_init_iter``).
+    block_genes
+        Genes held dense at a time (all when None). Every step but the trend
+        and the prior variance is per gene, so the genes are taken in blocks
+        twice -- gene-wise dispersions, then the trend and prior on them
+        all, then MAP dispersions and coefficients -- and memory is
+        ``O(cells x block_genes)`` beside ``counts``. The results depend on
+        it only within the tolerances of the dispersion search and IRLS.
     """
     from scipy.stats import norm as _norm
 
     design = np.asarray(design, dtype=np.float64)
-    y = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+    counts = counts.tocsc() if sp.issparse(counts) else np.asarray(counts)
     s = np.asarray(size_factors, dtype=np.float64)
-    (n, p), n_genes = design.shape, y.shape[1]
+    (n, p), n_genes = design.shape, counts.shape[1]
     max_disp = max(max_disp, float(n))  # PyDESeq2's bound, for the starting values and the search alike
-    normed = y / s[:, None]
-    base_mean = normed.mean(axis=0)
-    tested = np.zeros(n_genes, dtype=bool)
-    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
-    tested &= y.sum(axis=0) > 0
-    idx = np.flatnonzero(tested)
+    block = n_genes if block_genes is None else max(1, int(block_genes))
+
+    def dense(cols):
+        c = counts[:, cols]
+        return np.asarray(c.toarray() if sp.issparse(c) else c, dtype=np.float64)
+
+    def blocks(cols):
+        for start in range(0, cols.size, block):
+            yield cols[start:start + block]
 
     def nan():
         return np.full(n_genes, np.nan)
@@ -2951,62 +2962,98 @@ def fit_glm_deseq2(
     lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
     converged = np.zeros(n_genes, dtype=bool)
     prior_var = float("nan")
-    if idx.size == 0:
-        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
-                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
-                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
-
-    y_t = np.asfortranarray(y[:, idx])
+    base_mean = nan()
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
     offset = np.log(s)
     irls = dict(offset=offset, protected_columns=(0, test_column, *protected_columns), max_iter=max_iter, tol=beta_tol,
                 poisson_init_iter=poisson_init_iter, min_mu=min_mu)
-    if dispersion is not None:
-        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
-    else:
+    estimate = dispersion is None
+    if estimate:
+        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
+        x_csr = _design_csr(design)
+        linear_mu = np.unique(design, axis=0).shape[0] == p
+        # What the second pass needs to rebuild the means without a refit:
+        # the linear model's coefficients and, else, IRLS's at the starting
+        # dispersions.
+        lin_coef = np.full((p, n_genes), np.nan)
+        start_coef = np.full((n_genes, p), np.nan)
+
+    def means(cols):
+        """The means both dispersion steps are evaluated at: a linear model
+        when it fits every distinct design row exactly, else IRLS."""
+        lin_mu = np.maximum(s[:, None] * (design @ lin_coef[:, cols]), min_mu)
+        if linear_mu:
+            mu = lin_mu
+        else:
+            coef = start_coef[cols]
+            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
+            finite = np.isfinite(coef).all(axis=1)
+            mu[:, ~finite] = lin_mu[:, ~finite]
+        return np.asfortranarray(np.maximum(mu, 1e-10))
+
+    # First pass: base means, and the gene-wise dispersions of tested genes.
+    for cols in blocks(np.arange(n_genes)):
+        y = dense(cols)
+        normed = y / s[:, None]
+        base_mean[cols] = normed.mean(axis=0)
+        tested[cols] &= y.sum(axis=0) > 0
+        if not estimate or not tested[cols].any():
+            continue
+        keep = tested[cols]
+        cols = cols[keep]
         # Starting dispersions: PyDESeq2's _fit_MoM_dispersions.
-        normed_t = normed[:, idx]
-        linear = design @ np.linalg.lstsq(design, normed_t, rcond=None)[0]
-        y_hat = np.maximum(linear, 1.0)
+        normed_t = normed[:, keep]
+        lin_coef[:, cols] = np.linalg.lstsq(design, normed_t, rcond=None)[0]
+        y_hat = np.maximum(design @ lin_coef[:, cols], 1.0)
         rough = np.maximum((((normed_t - y_hat) ** 2 - y_hat) / y_hat**2).sum(axis=0) / max(n - p, 1), 0.0)
         mean_t = normed_t.mean(axis=0)
         moments = np.nan_to_num((normed_t.var(axis=0, ddof=1) - np.mean(1.0 / s) * mean_t) / mean_t**2)
         start = np.clip(np.minimum(rough, moments), min_disp, max_disp)
-        # The means both dispersion steps are evaluated at: a linear model
-        # when it fits every distinct design row exactly, else IRLS.
-        lin_mu = np.maximum(s[:, None] * linear, min_mu)
-        if np.unique(design, axis=0).shape[0] == p:
-            mu = lin_mu
-        else:
-            coef = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=start, **irls).coef
-            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
-            finite = np.isfinite(coef).all(axis=1)
-            mu[:, ~finite] = lin_mu[:, ~finite]
-        mu = np.asfortranarray(np.maximum(mu, 1e-10))
-        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
-        x_csr = _design_csr(design)
-        full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
-        genewise[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-            y_t, mu, np.zeros(idx.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+        y_t = np.asfortranarray(y[:, keep])
+        del y, normed, normed_t, y_hat
+        if not linear_mu:
+            start_coef[cols] = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=start, **irls).coef
+        full = (np.full(cols.size, log_lo), np.full(cols.size, log_hi))
+        genewise[cols] = np.exp(_nb_map_grid_search_with_refinement_numba(
+            y_t, means(cols), np.zeros(cols.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+
+    idx = np.flatnonzero(tested)
+    if idx.size == 0:
+        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
+                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
+    if estimate:
         trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
         final[idx] = genewise[idx]
         if shrink:
             log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
             # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
             prior_var = float(np.fmax(squared_logres - polygamma(1, (n - p) / 2), 0.25))
-            map_disp[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-                y_t, mu, np.log(trend[idx]), *full, n_grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
-            final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])
+            keep_genewise = np.zeros(n_genes, dtype=bool)
+            keep_genewise[idx] = log_resid > 2 * np.sqrt(squared_logres)
+    else:
+        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
 
-    fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[idx], **irls)
-    b, b_se = fit.coef[:, test_column], fit.se[:, test_column]
-    ok = fit.converged & np.isfinite(b) & np.isfinite(b_se) & (b_se > 0)
-    lfc[idx], se[idx], intercept[idx] = b, b_se, fit.coef[:, 0]
+    # Second pass: MAP dispersions, then the coefficients at the final ones.
+    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
+    coef_converged = np.zeros(n_genes, dtype=bool)
+    for cols in blocks(idx):
+        y_t = np.asfortranarray(dense(cols))
+        if estimate and shrink:
+            full = (np.full(cols.size, log_lo), np.full(cols.size, log_hi))
+            map_disp[cols] = np.exp(_nb_map_grid_search_with_refinement_numba(
+                y_t, means(cols), np.log(trend[cols]), *full, n_grid, prior_var, *x_csr, tol=tol,
+                max_refine_iter=100))
+            final[cols] = np.where(keep_genewise[cols], genewise[cols], map_disp[cols])
+        fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[cols], **irls)
+        coef[cols], coef_se[cols], coef_converged[cols] = fit.coef, fit.se, fit.converged
+
+    b, b_se = coef[idx, test_column], coef_se[idx, test_column]
+    ok = coef_converged[idx] & np.isfinite(b) & np.isfinite(b_se) & (b_se > 0)
+    lfc[idx], se[idx], intercept[idx] = b, b_se, coef[idx, 0]
     stat[idx] = b / b_se
     pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
     converged[idx] = ok
-    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
-    coef[idx], coef_se[idx] = fit.coef, fit.se
-    coef_converged = np.zeros(n_genes, dtype=bool)
-    coef_converged[idx] = fit.converged
     return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
                         base_mean, converged, prior_var, coef, coef_se, coef_converged)

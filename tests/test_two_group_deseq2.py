@@ -413,3 +413,23 @@ def test_a_gene_held_at_a_bound_is_not_reported_converged():
     summary = summarize_controls([(np.arange(300), sp.csr_matrix(controls))], sf_c, 2)
     fit = fit_two_group_deseq2(summary, perturbed, sf_t, dispersion=0.05)
     np.testing.assert_array_equal(fit.converged, [True, False])
+
+
+@pytest.mark.parametrize("covariate", [False, True])
+def test_gene_blocks_and_sparse_counts_do_not_change_the_fit(covariate):
+    """Every step but the trend and prior is per gene, so fitting the genes 37
+    at a time from sparse counts gives what one dense block gives -- with the
+    means from a linear model (two groups) and from IRLS (a covariate). Not
+    bit for bit: a block rounds its least squares and IRLS differently, which
+    moves where the dispersion search (tol 1e-6 on log dispersion) stops."""
+    counts, labels, sf, batch = _screen(seed=3, n_genes=120, batch_sd=0.3)
+    design, columns = build_design_matrix(
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"] if covariate else [],
+        perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
+    )
+    genes = np.arange(0, 120, 2)
+    one = fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), genes, min_mu=1e-6)
+    blocked = fit_glm_deseq2(design, sp.csr_matrix(counts), sf, columns.index("perturbation"), genes,
+                             min_mu=1e-6, block_genes=37)
+    for field in one.__dataclass_fields__:
+        np.testing.assert_allclose(getattr(blocked, field), getattr(one, field), rtol=1e-5, err_msg=field)
