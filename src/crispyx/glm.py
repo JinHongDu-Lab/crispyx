@@ -2681,6 +2681,7 @@ def summarize_controls(
     for rows, block in blocks:
         csr = sp.csr_matrix(block, dtype=np.float64)
         csr.sum_duplicates()
+        csr.eliminate_zeros()  # a stored zero is not an expressing cell (nnz, pts_rest)
         rows = np.asarray(rows)
         buf_g = np.empty(csr.nnz, dtype=np.int64)
         buf_v = np.empty(csr.nnz, dtype=np.float64)
@@ -2692,7 +2693,7 @@ def summarize_controls(
         big_values.append(buf_v[:n_big])
         norm_sum += np.asarray((sp.diags(1.0 / s[rows]) @ csr).sum(axis=0)).ravel()
         total += np.asarray(csr.sum(axis=0)).ravel()
-        nnz += np.diff(csr.tocsc().indptr)
+        nnz += np.bincount(csr.indices, minlength=n_genes)
 
     gene_small, value_small = np.nonzero(small_hist[:, 1:])
     gene_all = np.concatenate([gene_small] + big_genes)
@@ -2840,7 +2841,8 @@ def fit_two_group_deseq2(
         final[idx] = genewise[idx]
         if shrink:
             log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
-            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - 2) / 2), 0.25))  # NaN without genes
+            # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - 2) / 2), 0.25))
             # The MAP lies between the gene-wise estimate and the trend (the
             # prior's mean) where the likelihood has one mode; a short grid
             # over that bracket keeps a second mode from being missed.
@@ -2934,6 +2936,7 @@ def fit_glm_deseq2(
     y = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
     s = np.asarray(size_factors, dtype=np.float64)
     (n, p), n_genes = design.shape, y.shape[1]
+    max_disp = max(max_disp, float(n))  # PyDESeq2's bound, for the starting values and the search alike
     normed = y / s[:, None]
     base_mean = normed.mean(axis=0)
     tested = np.zeros(n_genes, dtype=bool)
@@ -2979,7 +2982,7 @@ def fit_glm_deseq2(
             finite = np.isfinite(coef).all(axis=1)
             mu[:, ~finite] = lin_mu[:, ~finite]
         mu = np.asfortranarray(np.maximum(mu, 1e-10))
-        log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
+        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
         x_csr = _design_csr(design)
         full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
         genewise[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
@@ -2988,7 +2991,8 @@ def fit_glm_deseq2(
         final[idx] = genewise[idx]
         if shrink:
             log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
-            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - p) / 2), 0.25))  # NaN without genes
+            # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - p) / 2), 0.25))
             map_disp[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
                 y_t, mu, np.log(trend[idx]), *full, n_grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
             final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])

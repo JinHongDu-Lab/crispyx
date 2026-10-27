@@ -1,6 +1,6 @@
 """Size factors for count models: library size, causarray's geometric means
 and DESeq2's median of ratios, each against the screen's controls where a
-reference is needed (see docs/differential_expression.rst, "Size factors")."""
+reference is needed (see docs/nb_glm.rst, "Size factors")."""
 
 from __future__ import annotations
 
@@ -228,7 +228,7 @@ def _control_reference_size_factors(
     # controls' factors, and the fallback), and how many cells of each label
     # count each reference gene.
     size_factors = np.full(labels.size, np.nan, dtype=np.float64)
-    counted = np.zeros((len(uniques), reference.size), dtype=np.int64)
+    counted = np.zeros((len(uniques), reference.size), dtype=np.int32)  # labels x reference genes
     backed = read_backed(path)
     try:
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
@@ -245,7 +245,7 @@ def _control_reference_size_factors(
                 (np.ones(n_rows), (codes[slc], np.arange(n_rows))), shape=(len(uniques), n_rows)
             )
             add = (onehot @ present).tocoo()
-            counted[add.row, add.col] += add.data.astype(np.int64)
+            counted[add.row, add.col] += add.data.astype(np.int32)
     finally:
         backed.file.close()
 
