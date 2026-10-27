@@ -400,3 +400,16 @@ def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
     with pytest.raises(TypeError, match="fit_method"):
         cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
                                 control_label="ctrl", output_dir=tmp_path, fit_method="joint")
+
+
+def test_a_gene_held_at_a_bound_is_not_reported_converged():
+    """Convergence is judged on the full Newton step, so a gene whose log mean
+    the fit clips at 30 (and so stops moving) is not reported converged, while
+    an ordinary gene beside it is."""
+    rng = np.random.default_rng(0)
+    sf_c, sf_t = rng.lognormal(0, 0.3, 300), rng.lognormal(0, 0.3, 3)
+    controls = rng.negative_binomial(20, 20 / (20 + 1e3 * sf_c[:, None]), size=(300, 2)).astype(float)
+    perturbed = np.column_stack([3e3 * sf_t, 1e14 * sf_t])  # e^30 is ~1.1e13
+    summary = summarize_controls([(np.arange(300), sp.csr_matrix(controls))], sf_c, 2)
+    fit = fit_two_group_deseq2(summary, perturbed, sf_t, dispersion=0.05)
+    np.testing.assert_array_equal(fit.converged, [True, False])

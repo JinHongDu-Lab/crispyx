@@ -1682,8 +1682,12 @@ def _two_group_lfc(genes, dispersion, a0, b0, t_ptr, t_y, t_s, s_t, min_mu, cent
             moved = max(abs(na - a), abs(nb_ - b))
             a = na
             b = nb_
-            if moved < tol:
+            # Converged on the full Newton step: the step actually taken also
+            # shrinks when the line search gives up or a bound clips it.
+            if max(abs(da), abs(db)) < tol:
                 converged[i] = True
+                break
+            if moved < tol:
                 break
         k_t = math.exp(b)
         w_t = 0.0
