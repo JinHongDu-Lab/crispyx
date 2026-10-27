@@ -1928,8 +1928,8 @@ def compare_controls(
         "other control guides").
     max_reference_cells
         Keep at most this many reference cells, drawn at random (``seed``).
-        With ``covariates`` every fit holds the reference cells in memory, and
-        a large unassigned pool may not fit; a few tens of thousands are plenty.
+        With ``covariates`` every fit runs over all the reference cells, so a
+        large unassigned pool is slow; a few tens of thousands are plenty.
     seed
         Seed for ``max_reference_cells``.
     verbose

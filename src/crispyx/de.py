@@ -610,7 +610,7 @@ def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, n
 _OPERATIONAL_ARGS = frozenset({
     "data", "verbose", "resume", "checkpoint_interval", "n_jobs",
     "profiling", "force", "output_path", "output_dir", "data_name",
-    "format_mismatch_policy", "memory_limit_gb", "max_dense_fraction",
+    "format_mismatch_policy", "memory_limit_gb",
     "cell_chunk_size", "chunk_size",
 })
 
@@ -1480,7 +1480,6 @@ def nb_glm_test(
     resume: bool = False,
     checkpoint_interval: int | None = None,
     memory_limit_gb: float | None = None,
-    max_dense_fraction: float = 0.3,
     n_jobs: int | None = None,
     force: bool = False,
 ) -> RankGenesGroupsResult:
@@ -1684,12 +1683,9 @@ def nb_glm_test(
     memory_limit_gb
         Memory limit in GB; the effective limit is
         min(available memory, memory_limit_gb). Default None (system memory).
-        It sizes the parallel workers of a design with covariates, which hold
-        the control cells in memory.
-    max_dense_fraction
-        Largest share of the memory limit the dense control cells may take,
-        times four, in a design with covariates (or with apeGLM shrinkage);
-        beyond it ``MemoryError`` is raised. Default 0.3.
+        With covariates, apeGLM shrinkage or ``targets_per_fit > 1`` it sizes
+        the parallel workers and the gene blocks each fit holds dense; the
+        control cells are held sparse.
     n_jobs
         Number of cores. Without covariates the comparisons run in turn, each
         parallel over genes; with covariates, in parallel worker processes.
@@ -1927,7 +1923,7 @@ def nb_glm_test(
         path: str | Path,
         rows_in_fit: list,
         control_mask: np.ndarray,
-        control_matrix: np.ndarray | sp.csr_matrix,
+        control_matrix: sp.csr_matrix,
         control_expr_counts: np.ndarray,
         control_total: np.ndarray,
         control_n: int,
@@ -1950,6 +1946,7 @@ def nb_glm_test(
         dispersion: float | None,
         shrink_dispersion: bool,
         lfc_shrinkage_type: str,
+        block_genes: int,
     ) -> list[dict]:
         """The perturbations ``labels_in_fit`` and the controls, fitted together
         on their cells with the design ``~ covariates + perturbation``, one
@@ -2012,25 +2009,22 @@ def nb_glm_test(
                 return failed + [{"group_idx": i, "error": str(exc)} for i in group_idxs]
         subset_size_factors = np.asarray(size_factors)[subset_mask]
 
-        counts = np.empty((int(subset_mask.sum()), n_genes), dtype=np.float64)
-        counts[control_mask[subset_mask]] = (
-            control_matrix.toarray() if sp.issparse(control_matrix) else control_matrix
-        )
-        # Each perturbation's cells go straight into ``counts``; only their
-        # per-gene summaries are kept, not a second dense copy.
+        # The fit's counts stay sparse: fit_glm_deseq2 (and apeGLM below)
+        # densify block_genes genes at a time.
+        parts, positions = [control_matrix], [np.flatnonzero(control_mask[subset_mask])]
         pts_list, valids = [], []
         backed = read_backed(path)
         try:
             for rows, mask in zip(rows_in_fit, masks):
                 # A slice on a file sorted by perturbation (one contiguous
                 # read), else ascending row indices: the subset's row order.
-                block = backed.X[rows, :]
-                group = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
-                counts[mask[subset_mask]] = group
+                group = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
+                group.eliminate_zeros()
+                parts.append(group)
+                positions.append(np.flatnonzero(mask[subset_mask]))
                 group_n = group.shape[0]
-                group_expr_counts = np.count_nonzero(group, axis=0)
-                group_total = group.sum(axis=0)
-                del block, group
+                group_expr_counts = group.getnnz(axis=0)
+                group_total = np.asarray(group.sum(axis=0)).ravel()
                 pts_list.append((group_expr_counts / max(group_n, 1)).astype(np.float32))
                 valids.append(_nb_glm_testable_genes(
                     pert_expr_counts=group_expr_counts, pert_total=group_total, n_pert=group_n,
@@ -2042,11 +2036,17 @@ def nb_glm_test(
                 ))
         finally:
             backed.file.close()
+        # Row j of the stacked parts is the subset's row positions[j].
+        positions = np.concatenate(positions)
+        order = np.empty(positions.size, dtype=np.int64)
+        order[positions] = np.arange(positions.size)
+        counts = sp.vstack(parts, format="csr")[order].tocsc()
+        del parts
         # A gene is fitted when any perturbation tests it; each reports only its own.
         fit = fit_glm_deseq2(
             design, counts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
             protected_columns=test_columns[1:], dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
-            max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter,
+            max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter, block_genes=block_genes,
         )
         results = []
         for group_idx, column, pts, valid in zip(group_idxs, test_columns, pts_list, valids):
@@ -2081,19 +2081,27 @@ def nb_glm_test(
                 # perturbation's, starting from the MLE; an untested gene has
                 # no start and stays NaN. PyDESeq2's lfc_shrink applies no
                 # mean floor. (One perturbation per fit: see nb_glm_test.)
-                shrunk_coef, shrunk_se, _ = shrink_lfc_apeglm(
-                    counts=counts,
-                    design_matrix=design,
-                    size_factors=subset_size_factors,
-                    dispersion=fit.dispersion,
-                    mle_coef=np.where(tested[None, :], fit.coef.T, np.nan),
-                    mle_se=se,
-                    shrink_index=column,
-                    prior_scale=None,  # from this comparison's MLE fold changes
-                    n_jobs=1,  # parallel over comparisons instead
-                    min_mu=0.0,
-                )
-                result["logfc"] = shrunk_coef[column, :]
+                # The prior's scale comes from every gene's MLE fold change;
+                # each gene's refit is its own, so they run a block at a time.
+                mle_coef = np.where(tested[None, :], fit.coef.T, np.nan)
+                prior_scale = _estimate_apeglm_prior_scale(mle_coef[column], se)
+                shrunk_lfc, shrunk_se = np.full(n_genes, np.nan), np.full(n_genes, np.nan)
+                for start in range(0, n_genes, block_genes):
+                    cols = slice(start, start + block_genes)
+                    shrunk_coef, shrunk_se[cols], _ = shrink_lfc_apeglm(
+                        counts=counts[:, cols].toarray(),
+                        design_matrix=design,
+                        size_factors=subset_size_factors,
+                        dispersion=fit.dispersion[cols],
+                        mle_coef=mle_coef[:, cols],
+                        mle_se=se[cols],
+                        shrink_index=column,
+                        prior_scale=prior_scale,
+                        n_jobs=1,  # parallel over comparisons instead
+                        min_mu=0.0,
+                    )
+                    shrunk_lfc[cols] = shrunk_coef[column, :]
+                result["logfc"] = shrunk_lfc
                 result["se"] = shrunk_se
             results.append(result)
         return failed + results
@@ -2124,13 +2132,12 @@ def nb_glm_test(
     # (glm.fit_two_group_deseq2). With covariates, apeGLM shrinkage (which
     # refits on the cells) or several perturbations per fit, each fit runs on
     # its control and perturbed cells (glm.fit_glm_deseq2), with the controls
-    # held in memory.
+    # held in memory as a sparse matrix and the genes fitted in blocks.
     two_group = not covariates and lfc_shrinkage_type == "none" and targets_per_fit == 1
     # The memory this call may use: memory_limit_gb, capped by what the
     # process's cgroup will still grant (detected when None). Every size
     # chosen below is a share of it.
     budget_gb = _resolve_memory_limit_bytes(memory_limit_gb) / 1e9
-    control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
     control_summary = None
     control_matrix = None
     if two_group:
@@ -2150,29 +2157,14 @@ def nb_glm_test(
         control_expr_counts = control_summary.nnz
         control_total = control_summary.total
     else:
-        # A comparison densifies the controls with its own cells, and its
-        # dispersion steps hold a few matrices of that size.
-        if control_matrix_gb * 4 > max_dense_fraction * budget_gb:
-            raise MemoryError(
-                f"nb_glm_test: the {control_n:,} control cells ({control_matrix_gb:.1f} GB dense) do not "
-                "fit the memory budget; with covariates, lfc_shrinkage_type='apeglm' or targets_per_fit > 1 "
-                "every fit includes all of them. Raise memory_limit_gb, aggregate to pseudo-bulk first "
-                "(cx.pb.aggregate), or test without covariates and shrink afterwards with shrink_lfc."
-            )
         backed = read_backed(path)
         try:
-            control_matrix = backed.X[control_mask, :]
-            if sp.issparse(control_matrix):
-                control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
-            else:
-                control_matrix = np.asarray(control_matrix, dtype=np.float64)
+            control_matrix = sp.csr_matrix(backed.X[control_mask, :], dtype=np.float64)
         finally:
             backed.file.close()
         drop_file_cache(path)  # Free page cache from control matrix read
-        if sp.issparse(control_matrix):
-            control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
-        else:
-            control_expr_counts = np.sum(control_matrix > 0, axis=0)
+        control_matrix.eliminate_zeros()
+        control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
         control_total = np.asarray(control_matrix.sum(axis=0), dtype=np.float64).ravel()
 
     # pts_rest describes the control arm: the same vector for every row.
@@ -2293,19 +2285,26 @@ def nb_glm_test(
         use_group_size = (
             int(np.percentile(pert_group_sizes, 95)) if len(pert_group_sizes) >= 10 else max_group_size
         )
-        control_matrix_mb = control_n * n_genes * 8 / 1e6
-        # Counts, means and the IRLS work arrays of one fit's cells.
-        work_arrays_mb = (control_n + use_group_size * targets_per_fit) * n_genes * 8 * 6 / 1e6
-        serialized_args_mb = (control_matrix_mb + n_cells_total * 8 * 3 / 1e6) * 2.5
-        per_worker_mb = serialized_args_mb + work_arrays_mb + 2000
+        # A fit's genes are dense a block at a time: its counts, means and the
+        # dispersion and IRLS work arrays, about 16 arrays of cells x genes.
+        # A block takes a tenth of the budget, so that several workers fit,
+        # and is sized for the largest fit.
+        largest_fit_cells = control_n + max_group_size * targets_per_fit
+        block_genes = int(min(n_genes, max(1, budget_gb * 1e9 * 0.1 / (largest_fit_cells * 8 * 16))))
+        # Sparse sizes are nnz x 12 bytes (float64 data, int32 indices). A
+        # worker stacks, reorders and converts its fit's cells (three copies
+        # at most) beside one block.
+        fit_sparse_mb = (control_n + use_group_size * targets_per_fit) * nnz_per_cell * 12 * 3 / 1e6
+        block_mb = (control_n + use_group_size * targets_per_fit) * block_genes * 8 * 16 / 1e6
+        per_worker_mb = fit_sparse_mb + block_mb + 2000
 
-        # The parent holds one copy of the control matrix plus its own arrays.
-        # The largest perturbation is sized on its own rather than by the p95
+        # The parent holds the sparse controls plus its own arrays. The
+        # largest perturbation is sized on its own rather than by the p95
         # group above: its worker holds its counts however many cells it has
         # -- a 165k-cell non-targeting group fitted as a perturbation is
         # ~20 GB of them.
         largest_group_mb = max_group_size * nnz_per_cell * 12 * 2 / 1e6
-        base_memory_mb = control_matrix_mb + largest_group_mb + 1000
+        base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + 1000
         available_mb = budget_gb * 1000
         # Reserve 20% headroom for safety
         usable_mb = available_mb * 0.8
@@ -2488,7 +2487,7 @@ def nb_glm_test(
                 min_cells_pert=min_cells_pert, min_total_count=min_total_count, max_iter=max_iter, tol=tol,
                 min_mu=min_mu, poisson_init_iter=poisson_init_iter, dispersion=dispersion,
                 shrink_dispersion=shrink_dispersion, lfc_shrinkage_type=lfc_shrinkage_type,
-                threads=max(1, requested_n_jobs // (effective_n_jobs if use_parallel else 1)),
+                block_genes=block_genes, threads=max(1, requested_n_jobs // (effective_n_jobs if use_parallel else 1)),
             )
 
         if two_group:

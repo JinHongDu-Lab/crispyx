@@ -6,6 +6,20 @@ Version 0.2.4
 
 *Unreleased.*
 
+**Changed**
+
+* NB-GLM with covariates, ``lfc_shrinkage_type="apeglm"`` or
+  ``targets_per_fit > 1`` no longer needs the control cells dense in memory:
+  they are held sparse and each fit takes the genes a block at a time, the
+  block sized from ``memory_limit_gb``. Such a run no longer raises
+  ``MemoryError`` for many controls. Results agree with the single-block fit
+  within the tolerances of the dispersion search and IRLS.
+* ``glm.fit_glm_deseq2`` takes sparse counts and ``block_genes``.
+
+**Removed**
+
+* ``max_dense_fraction`` (``nb_glm_test``): nothing is held dense in full.
+
 **Fixed**
 
 * NB-GLM without covariates no longer reports a gene as converged when its

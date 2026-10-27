@@ -28,10 +28,12 @@ distance outlier replacement is not done (see :ref:`pydeseq2-parity`).
   pass, so a comparison costs only its own cells and any number of controls
   fits. All 18,293 perturbations of Huang-HCT116 (3.4 million cells, 166,000
   controls) take 6.3 h and 2.8 GB on 32 cores.
-* **With covariates** (or ``lfc_shrinkage_type="apeglm"``), each comparison is
-  fitted on all its cells, with the controls held in memory. If they do not
-  fit, ``nb_glm_test`` raises ``MemoryError``; aggregate to pseudo-bulk first
-  (``cx.pb.aggregate``).
+* **With covariates** (or ``lfc_shrinkage_type="apeglm"``, or
+  ``targets_per_fit > 1``), each comparison is fitted on all its cells. The
+  controls are held sparse and the genes are fitted a block at a time, the
+  block sized from ``memory_limit_gb``, so memory grows with the cells times
+  the block rather than times every gene. The time still grows with the
+  number of controls.
 * ``dispersion=<value>`` fixes one dispersion for every gene;
   ``shrink_dispersion=False`` tests at the gene-wise estimates.
 
@@ -94,8 +96,8 @@ exist: sum counts per guide x batch or donor with
 2. Run a fake-target check on your screen: relabel control guides as targets,
    as in :doc:`notebooks/residual_effects_genomewide_zhu`.
 3. Use pseudo-bulk with the replicate unit as a covariate if cell level fails
-   the check and the screen has replicate units with enough cells, or if the
-   controls are too many for a cell-level fit with covariates.
+   the check and the screen has replicate units with enough cells, or if a
+   cell-level fit with covariates takes too long over many controls.
 4. Otherwise use cell level, which is more powerful, and check that each hit
    holds across guides.
 

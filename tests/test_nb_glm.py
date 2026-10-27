@@ -147,14 +147,27 @@ def test_nb_glm_null_is_calibrated_on_a_replicated_design_with_many_batches(tmp_
     assert 0.9 < 1.4826 * np.median(np.abs(z - np.median(z))) < 1.1
 
 
-def test_controls_too_large_for_memory_raise_with_covariates(tmp_path):
-    """With covariates the controls are fitted in memory; when they do not
-    fit, the call raises (it used to return all-NaN with the errors only
-    logged)."""
+@pytest.mark.parametrize(
+    "options",
+    [dict(covariates=["depth", "donor"]), dict(lfc_shrinkage_type="apeglm"),
+     dict(covariates=["depth"], targets_per_fit=2)],
+    ids=["covariates", "apeglm", "targets_per_fit"],
+)
+def test_fits_with_every_control_run_in_gene_blocks_under_a_small_budget(tmp_path, options):
+    """Covariates, apeGLM and several perturbations per fit put every control
+    cell into each fit. The cells are held sparse and the genes fitted a block
+    at a time, so a budget too small for one dense fit (here one gene per
+    block) gives the result of a single block, within the solvers'
+    tolerances."""
     path = _covariate_screen(tmp_path)
-    with pytest.raises(MemoryError, match="pseudo-bulk"):
-        nb_glm_test(path, perturbation_column="perturbation", control_label="control", covariates=["depth"],
-                    memory_limit_gb=1e-6, n_jobs=1, verbose=False, output_path=tmp_path / "out.h5ad")
+    kwargs = dict(perturbation_column="perturbation", control_label="control", n_jobs=1, verbose=False, **options)
+    whole = nb_glm_test(path, output_path=tmp_path / "whole.h5ad", **kwargs)
+    blocked = nb_glm_test(path, output_path=tmp_path / "blocked.h5ad", memory_limit_gb=1e-6, **kwargs)
+    a, b = ad.read_h5ad(whole.result_path), ad.read_h5ad(blocked.result_path)
+    assert np.isfinite(a.X).any()
+    np.testing.assert_allclose(b.X, a.X, rtol=1e-4, atol=1e-8)
+    for layer in ("z_score", "dispersion"):
+        np.testing.assert_allclose(b.layers[layer], a.layers[layer], rtol=1e-4, atol=1e-8, err_msg=layer)
 
 
 def test_without_covariates_the_controls_are_streamed(tmp_path):

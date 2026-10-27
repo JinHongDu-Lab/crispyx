@@ -190,8 +190,9 @@ the test accounts for variation between guides and donors.
   cores with ``targets_per_fit=50``, so about an hour for a genome-wide screen.
   Pseudo-bulk needs replicate units (several guides or donors per target); with
   one donor and one guide there is little to estimate the variation from. On
-  single cells, cells are again treated as independent, and with covariates the
-  control cells must fit in memory (see :ref:`cell-or-pseudobulk`).
+  single cells, cells are again treated as independent, and every fit runs
+  over all the control cells, so its time grows with them (see
+  :ref:`cell-or-pseudobulk`).
 - **Tutorial:** Part 2 of :doc:`notebooks/residual_effects_genomewide_zhu`.
 
 Per-batch pseudo-bulk effects
