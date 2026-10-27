@@ -99,12 +99,16 @@ with the inlet as a covariate:
   donor-line genes (XIST, MEG3) and the screen's own targets (lower in
   unassigned cells for 68 % of them, against 55 % of other genes).
 - Many unassigned cells carry less CRISPRi machinery or an undetected guide.
-  Here, the non-targeting cells are the safer controls.
-- Re-estimated with the non-targeting controls alone, the screen's effects
-  hardly change (r 0.97; knockdowns of the targets' own genes identical),
-  except on the construct genes, and a quarter of the hits are lost to the
-  smaller control set (:doc:`notebooks/residual_effects_targeted_feng`,
-  Part 4).
+- The differences are small. Re-estimated with the non-targeting controls
+  alone, the screen's effects hardly change (r 0.97; knockdowns of the
+  targets' own genes identical), except on the construct genes, which shift
+  by up to 0.05; the smaller control set finds a quarter fewer hits
+  (:doc:`notebooks/residual_effects_targeted_feng`, Part 4). Pooling the
+  unassigned cells is acceptable here if effects on the construct genes are
+  discounted.
+
+The check finds differences, not their size. When it finds them, re-estimate
+the effects of interest with each set of controls before choosing.
 
 Highly variable genes
 ---------------------
