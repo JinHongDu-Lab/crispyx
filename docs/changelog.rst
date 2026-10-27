@@ -4,122 +4,61 @@ Changelog
 Version 0.2.3
 -------------
 
-*Released 2026-10-26.*
+*Released 2026-10-26.* NB-GLM results change: the default size factors,
+dispersions and mean floor are all new. See :ref:`nb-glm` and
+:ref:`size-factors`.
 
-* **``nb_glm_test`` refuses input that is not raw counts.** Given
-  normalised or log-transformed values it ran and returned results that
-  looked plausible but were not: on a log1p copy of 1,716 Adamson cells the
-  log fold changes correlated 0.93 with those from the counts, and the
-  z-scores had half their spread. It now raises before any work, after
-  reading one slice of the matrix.
-* **Size factors default to library size; ``"geomeans"`` is added;
-  ``"deseq2"`` takes the controls as the reference; ``"sparse"``,
-  ``size_factor_scope`` and ``scale_size_factors`` are removed.**
-  ``size_factor_method`` is ``"libsize"`` (each cell's total count, the
-  default), ``"geomeans"`` (causarray's median of ratios on genes with a
-  control mean of at least 2, against the controls' geometric means) or
-  ``"deseq2"`` (DESeq2's median of ratios on the genes counted in every
-  control, for pseudo-bulk and bulk; it falls back to ``"geomeans"`` with
-  fewer than five such genes). Every reference is the controls, so a
-  control's factor does not depend on the perturbations compared.
-  ``"sparse"`` -- a median of ratios over every expressed gene, the default
-  until now and what ``"deseq2"`` fell back to on single-cell data -- followed
-  only part of a depth difference: on fake perturbations drawn from the
-  deepest control cells it called nearly every well-counted gene up (mean z
-  +5.6 and 6,578 false hits per fake on Huang-HCT116, against +0.11 and 22
-  with library size), and real perturbations that differ in depth got
-  inflated hit counts (176 against 9). Per-comparison size factors
-  (``size_factor_scope``) recomputed every control's factor in each
-  comparison, rested on the handful of genes counted in every cell compared,
-  and could not run at scale; ``scale_size_factors`` changed no test. The user
-  guide compares the methods on semi-synthetic screens with known truth,
-  single-cell and pseudo-bulk: library size follows depth best in single
-  cells but fails under composition shifts (up to 46 % of null pairs at
-  p < 0.05); on pseudo-bulk ``"geomeans"`` and ``"deseq2"`` stay calibrated
-  in every scenario. It also shows that the mean floor ``min_mu=0.5``
-  (DESeq2's bulk default) makes single-cell tests conservative and biases
-  low-count genes under depth differences, which ``min_mu=1e-6`` removes.
-  NB-GLM results computed with default size factors change.
-* **NB-GLM estimates dispersions per comparison, as DESeq2 does, and at
-  the scale of a genome-wide screen; the global dispersion is removed.**
-  Each perturbation is tested against the controls with PyDESeq2's steps
-  on that comparison's cells: gene-wise Cox-Reid dispersions, the
-  parametric trend, the prior variance, MAP dispersions, the outlier rule
-  (genes far above the trend keep their gene-wise value), IRLS with the
-  mean floor and ridge, and the Wald test. Without covariates the controls
-  are summarised once -- a count histogram per gene and size-factor-binned
-  moments -- and each perturbation is fitted from that summary and its own
-  cells; controls of any size are streamed. On 20,000 Huang-HCT116 controls
-  and 20 perturbations this takes 16 s and 3.4 GB on a 32-core Mac, against
-  300 s and 58 GB for the former global dispersion; all 18,293 perturbations
-  of Huang-HCT116 (3.4 million cells, 166,000 controls) take 6.3 h and
-  2.8 GB on a 32-core node of a Slurm-based HPC cluster. With covariates each
-  comparison is fitted on its cells with the full design: means by IRLS at
-  PyDESeq2's starting dispersions, then the same dispersion steps, with the
-  gene-wise search refined (Brent) instead of a 10-point grid, and the
-  coefficients refitted at the final dispersions instead of keeping the
-  grid's. Given the same size factors and mean floor both agree with
-  PyDESeq2: a median 1e-3 in z (at most 0.05) on simulated data, with and
-  without a batch covariate, and 4e-4 to 4e-3 on six screens (Adamson, Tian
-  CRISPRi and CRISPRa, Frangieh, Huang HCT116 and HEK293T; z correlation
-  0.997-0.9999); at the default floors (1e-6 here on single cells, 0.5 in
-  PyDESeq2) the median difference is 0.3-0.4. Where
-  PyDESeq2's gene-wise optimiser stops at its lower bound, crispyx finds a
-  higher likelihood; those genes are what keep the trends about 5 % apart.
-  ``dispersion_scope``, ``dispersion_method``, ``use_map_dispersion``,
-  ``freeze_control``, ``use_control_cache``, ``se_method``,
-  ``optimization_method``, ``irls_batch_size`` and ``cook_filter`` (which
-  did nothing) are removed, as are the
-  control cache, frozen-control and streaming global-dispersion code and
-  ``glm.NBGLMFitter``; ``dispersion`` (a fixed value) and
-  ``shrink_dispersion=False`` (test at the gene-wise dispersions) remain.
-  ``max_iter`` and ``tol`` (IRLS with covariates) default to 100 and 1e-8.
-  Results always store the dispersions as layers (``dispersion``,
-  ``dispersion_raw``, ``dispersion_trend``); ``var["dispersion"]`` and the
-  ``iterations`` layer are gone. A perturbation confounded with a covariate
-  (e.g. all its cells in a batch without controls) fails on its own, with
-  the reason logged, in worker processes and in fits of several
-  perturbations too. NB-GLM results change. Cook's distance
-  outlier replacement stays out: on four Adamson perturbations against
-  7,629 controls PyDESeq2's ``refit_cooks`` replaced outliers in 4-15 of
-  ~18,800 genes and changed the hits at q < 0.1 by 0-3.
-* **``targets_per_fit`` fits several perturbations in one model.** With
-  ``targets_per_fit=k`` the perturbations are taken ``k`` at a time and
-  fitted together with every control on ``~ covariates + perturbation``, one
-  indicator column per perturbation, as a pseudo-bulk analysis that treats
-  the perturbation as one factor does: dispersions are estimated once per
-  model, mostly from the controls, and each perturbation is tested on its
-  own column. It matches PyDESeq2 fitted the same way (median 1e-3 in z,
-  same size factors and floor),
-  and reproduces analyses run that way, such as the genome-wide CD4+ T-cell
-  screen of Zhu *et al.* (PyDESeq2, 50 targets per model): on its
-  guide x donor pseudo-bulk (3,387 control units; log10 cells and donor)
-  ``targets_per_fit=50`` takes 0.3 s per target against about 20 s one at a
-  time. The default, 1, is DESeq2 run per comparison.
-* **Checks of the control cells.** ``cx.pp.compare_controls`` tests each
-  control guide against a reference pool (e.g. cells without a detected
-  guide) and, as a yardstick, against the other control guides;
-  ``cx.pp.control_guide_correlation`` and ``cx.pl.control_guide_correlation``
-  correlate the control guides' expression deviations and draw them,
-  clustered. On the targeted screen of Feng *et al.*, whose controls are 98 %
-  unassigned cells, each non-targeting guide differed from the unassigned
-  cells in 135-438 genes against 0-16 from the other guides (pseudo-bulk,
-  inlet as a covariate), including the CRISPRi construct and the screen's
-  own targets.
-* **The mean floor follows the counts.** ``min_mu`` (fitted means are held
-  at least this while fitting) defaults to ``None``: 1e-6, DESeq2's setting
-  for single cells, when at least half of a sample of the counts are zero,
-  else 0.5, DESeq2's bulk default; the value used is in ``uns["min_mu"]``.
-  On sparse counts 0.5 made tests conservative (1.2-1.7 % of null pairs at
-  p < 0.05 for weak perturbations on semi-synthetic Adamson and Huang
-  screens, power 0.42-0.44) and biased genes below about one count when
-  groups differ in depth; with 1e-6, 4.5-5.1 % and power 0.51-0.53. Single-
-  cell results change; pass ``min_mu=0.5`` for the previous behaviour or to
-  match a default PyDESeq2 run. The comparisons are in the new notebook
-  ``docs/notebooks/size_factor_comparison.ipynb``.
-* The dispersion trend falls back, as PyDESeq2's does, to the trimmed mean
-  of the gene-wise dispersions when the parametric fit fails, instead of
-  keeping a near-zero coefficient or fitting a polynomial.
+**Added**
+
+* ``size_factor_method="geomeans"``: causarray's median of ratios against the
+  controls' geometric means (:ref:`size-factors`).
+* ``targets_per_fit=k`` fits ``k`` perturbations in one model with all the
+  controls, as a pseudo-bulk DESeq2 analysis with many targets per model does
+  (:ref:`targets-per-fit`).
+* ``cx.pp.compare_controls``, ``cx.pp.control_guide_correlation`` and
+  ``cx.pl.control_guide_correlation`` check the control cells before testing
+  (:ref:`check-controls`).
+* ``cx.tl.rank_genes_groups(method="nb_glm")`` passes on
+  ``size_factor_method``, ``targets_per_fit``, ``min_mu`` and
+  ``shrink_dispersion``.
+* :doc:`notebooks/size_factor_comparison` compares the size factors and mean
+  floors on screens with known truth.
+
+**Changed**
+
+* ``nb_glm_test`` raises if the input is not raw counts.
+* ``size_factor_method`` defaults to ``"libsize"`` (each cell's total count).
+  ``"deseq2"`` takes the controls as its reference and falls back to
+  ``"geomeans"`` with fewer than five reference genes.
+* Dispersions are estimated per comparison, as DESeq2 does, and scale to
+  genome-wide screens (:ref:`nb-glm`). For agreement with PyDESeq2, see
+  :ref:`pydeseq2-parity`.
+* ``min_mu`` defaults to ``None``: 1e-6 when at least half of the counts are
+  zero, else 0.5. Pass ``min_mu=0.5`` for the previous single-cell behaviour
+  (:ref:`mean-floor`).
+* Results store the dispersions as the layers ``dispersion``,
+  ``dispersion_raw`` and ``dispersion_trend``, replacing ``var["dispersion"]``
+  and the ``iterations`` layer. ``max_iter`` and ``tol`` default to 100 and 1e-8.
+* A perturbation confounded with a covariate fails on its own, with the reason
+  logged, instead of failing the run.
+* When the parametric dispersion trend fails, it falls back to the trimmed mean
+  of the gene-wise dispersions, as in PyDESeq2.
+
+**Removed**
+
+* ``size_factor_method="sparse"``, ``size_factor_scope`` and
+  ``scale_size_factors``.
+* The global dispersion and its parameters: ``dispersion_scope``,
+  ``dispersion_method``, ``use_map_dispersion``, ``freeze_control``,
+  ``use_control_cache``, ``se_method``, ``optimization_method``,
+  ``irls_batch_size`` and ``cook_filter``; also ``glm.NBGLMFitter``.
+* ``calculate_nb_glm_chunk_size``. In ``nb_glm_test``, ``chunk_size`` now sets
+  the cells read per block for the size factors (2,048 by default).
+
+**Fixed**
+
+* ``nb_glm_test`` reorders user-supplied ``size_factors`` when it sorts a
+  large input by perturbation; they were misaligned with the cells.
 
 Version 0.2.2
 -------------

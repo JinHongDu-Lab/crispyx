@@ -1590,21 +1590,31 @@ def _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom):
 
 
 @nb.njit(cache=True)
-def _cells_score(y, s, b, alpha, min_mu):
-    """The perturbed cells' part of the same equation, summed exactly."""
+def _cells_score(y_nz, s_nz, s, b, alpha, min_mu):
+    """The perturbed cells' part of the same equation, summed exactly: every
+    cell (size factors ``s``) as if its count were zero, then the terms in
+    the count for the cells with one (``y_nz`` at size factors ``s_nz``)."""
     k = math.exp(b)
     score = 0.0
     slope = 0.0
     w_floor = min_mu / (1.0 + alpha * min_mu)
-    for i in range(y.shape[0]):
+    for i in range(s.shape[0]):
         mu = s[i] * k
         if mu < min_mu:
-            score += w_floor * (math.log(min_mu / s[i]) - b + (y[i] - min_mu) / min_mu)
+            score += w_floor * (math.log(min_mu / s[i]) - b - 1.0)
             slope -= w_floor
         else:
             v = 1.0 + alpha * mu
-            score += (y[i] - mu) / v
-            slope -= mu * (1.0 + alpha * y[i]) / (v * v)
+            score -= mu / v
+            slope -= mu / (v * v)
+    for j in range(y_nz.shape[0]):
+        mu = s_nz[j] * k
+        if mu < min_mu:
+            score += w_floor * y_nz[j] / min_mu
+        else:
+            v = 1.0 + alpha * mu
+            score += y_nz[j] / v
+            slope -= mu * alpha * y_nz[j] / (v * v)
     return score, slope
 
 
@@ -1625,12 +1635,14 @@ def _control_weight(a, alpha, centre, s_mom):
 
 
 @nb.njit(parallel=True, cache=True)
-def _two_group_lfc(genes, dispersion, a0, b0, y_t, s_t, min_mu, centre, s_mom, s_log, y_mom, ridge,
+def _two_group_lfc(genes, dispersion, a0, b0, t_ptr, t_y, t_s, s_t, min_mu, centre, s_mom, s_log, y_mom, ridge,
                    max_iter, tol):
     """PyDESeq2's IRLS solution for the control intercept a and the perturbed
     group's log mean b (LFC = b - a) at the given dispersions -- damped Newton
     on the fixed-point equations X'(W (z - X beta)) = ridge beta -- and the
-    Wald standard error of b - a from the unthresholded means."""
+    Wald standard error of b - a from the unthresholded means. The perturbed
+    cells have size factors s_t; gene g's non-zero counts are
+    t_y[t_ptr[g]:t_ptr[g+1]], at size factors t_s (as _two_group_dispersions)."""
     n = genes.shape[0]
     a_out = np.full(n, np.nan)
     b_out = np.full(n, np.nan)
@@ -1639,12 +1651,13 @@ def _two_group_lfc(genes, dispersion, a0, b0, y_t, s_t, min_mu, centre, s_mom, s
     for i in nb.prange(n):
         g = genes[i]
         alpha = dispersion[i]
-        yg = np.ascontiguousarray(y_t[:, g])
+        yg = t_y[t_ptr[g]:t_ptr[g + 1]]
+        sg = t_s[t_ptr[g]:t_ptr[g + 1]]
         a = a0[i]
         b = b0[i]
         for _ in range(max_iter):
             sc, dc = _control_score(g, a, alpha, min_mu, centre, s_mom, s_log, y_mom)
-            st, dt = _cells_score(yg, s_t, b, alpha, min_mu)
+            st, dt = _cells_score(yg, sg, s_t, b, alpha, min_mu)
             f1 = sc - ridge * (2.0 * a - b)
             f2 = st - ridge * (b - a)
             j11 = dc - 2.0 * ridge
@@ -1662,7 +1675,7 @@ def _two_group_lfc(genes, dispersion, a0, b0, y_t, s_t, min_mu, centre, s_mom, s
                 na = min(max(a + step * da, -30.0), 30.0)
                 nb_ = min(max(b + step * db, -30.0), 30.0)
                 sc2, _dc = _control_score(g, na, alpha, min_mu, centre, s_mom, s_log, y_mom)
-                st2, _dt = _cells_score(yg, s_t, nb_, alpha, min_mu)
+                st2, _dt = _cells_score(yg, sg, s_t, nb_, alpha, min_mu)
                 if abs(sc2 - ridge * (2.0 * na - nb_)) + abs(st2 - ridge * (nb_ - na)) <= norm0:
                     break
                 step *= 0.5
@@ -1674,7 +1687,7 @@ def _two_group_lfc(genes, dispersion, a0, b0, y_t, s_t, min_mu, centre, s_mom, s
                 break
         k_t = math.exp(b)
         w_t = 0.0
-        for j in range(yg.shape[0]):
+        for j in range(s_t.shape[0]):
             mu = s_t[j] * k_t
             w_t += mu / (1.0 + alpha * mu)
         w_c = _control_weight(a, alpha, centre, s_mom)

@@ -1949,6 +1949,9 @@ def compare_controls(
     """
     from .de import nb_glm_test
 
+    owned = {"perturbation_column", "groupby", "control_label", "perturbations", "output_path", "force"}
+    if clash := sorted(owned & nb_glm_kwargs.keys()):
+        raise TypeError(f"compare_controls sets {clash} of nb_glm_test itself")
     path = resolve_data_path(data)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -2071,7 +2074,7 @@ def control_guide_correlation(
     if len(names) < 2:
         raise ValueError(f"control_guide_correlation needs at least two control guides with >= {min_cells} cells")
     n_controls = len(names)
-    code = pd.Series(range(n_controls), index=names).reindex(guides).to_numpy()
+    code = pd.Series(range(n_controls), index=names).reindex(guides).to_numpy(dtype=np.float64, copy=True)
     if reference:
         code[np.isin(guides, list(reference))] = n_controls
         names.append(f"{'/'.join(sorted(reference))} (reference)")

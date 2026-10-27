@@ -37,7 +37,6 @@ from .data import (
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
     calculate_wilcoxon_chunk_size,
-    calculate_nb_glm_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
     get_perturbation_slice,
@@ -49,6 +48,7 @@ from .data import (
     resolve_output_path,
     scratch_copy_bytes,
     sort_by_perturbation,
+    perturbation_sort_order,
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
@@ -480,10 +480,6 @@ def _uns_value(uns: h5py.Group, key: str, default=None):
     if hasattr(value, "item"):
         value = value.item()
     return value.decode() if isinstance(value, bytes) else value
-
-
-# Controls with fewer counts of a gene than this (DESeq2's usual pre-filter)
-# cannot estimate its dispersion for the shared, control-fitted value.
 
 
 def _global_size_factors(
@@ -1411,7 +1407,7 @@ def nb_glm_test(
     tol: float = 1e-8,
     min_mu: float | None = None,
     poisson_init_iter: int = 5,
-    chunk_size: int | None = None,
+    chunk_size: int = 2048,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
     min_pct_ctrl: float = 0.01,
@@ -1479,7 +1475,7 @@ def nb_glm_test(
         Specific perturbations to test. If None, tests all non-control groups.
     size_factors
         Per-cell size factors to use as given (rescaled to geometric mean 1),
-        e.g. scran's or an external run's. If None, ``size_factor_method``
+        e.g. scran's or an external run's, in the input's row order. If None, ``size_factor_method``
         computes them, once for all cells; how the methods differ, and how
         they behaved on single-cell screens, is in the user guide
         (:ref:`size-factors`).
@@ -1548,8 +1544,9 @@ def nb_glm_test(
     poisson_init_iter
         Initial Poisson iterations before switching to negative binomial.
     chunk_size
-        Number of cells read per block when computing size factors. Smaller
-        values stream more, reducing peak memory at the cost of additional I/O.
+        Number of cells read per block when computing size factors (default
+        2048). Smaller values stream more, reducing peak memory at the cost
+        of additional I/O.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
@@ -1773,6 +1770,9 @@ def nb_glm_test(
     backed = read_backed(path)
     try:
         sample = backed.X[:, :256] if _storage_fmt == "csc" else backed.X[:1024]
+        if size_factors is not None:
+            size_factors = _validate_size_factors(size_factors, backed.n_obs)
+            input_labels = backed.obs[perturbation_column].astype(str).to_numpy()
     finally:
         backed.file.close()
     _validate_counts_chunk(sample, context="nb_glm_test")
@@ -1802,6 +1802,9 @@ def nb_glm_test(
             control_label=control_label,
             output_path=path.parent / f"{path.stem}_sorted.h5ad",
         )
+        if size_factors is not None:  # given in the input's row order
+            size_factors = size_factors[perturbation_sort_order(
+                input_labels, control_label or resolve_control_label(input_labels, None))]
 
     backed = read_backed(path)
     try:
@@ -1840,29 +1843,29 @@ def nb_glm_test(
         backed.file.close()
 
     n_cells_total = obs_df.shape[0]
-    
-    # Calculate adaptive chunk_size if not provided
-    # Only reduces chunk_size when memory would be exceeded; successful datasets keep default (256)
-    if chunk_size is None:
-        chunk_size = calculate_nb_glm_chunk_size(
-            n_obs=n_cells_total,
-            n_vars=n_genes,
-            n_groups=len(candidates),
-            memory_limit_gb=memory_limit_gb,
-        )
-        _messages.vprint(verbose, "nb_glm_test", f"chunk_size={chunk_size} (auto)")
-
     if size_factors is None:
         size_factors = _global_size_factors(path, size_factor_method, chunk_size, labels, control_label)
-    else:
-        size_factors = _validate_size_factors(size_factors, n_cells_total)
 
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
     # -------------------------------------------------------------------------
     # Perturbations with covariates (or apeGLM shrinkage), fitted on their cells
     # -------------------------------------------------------------------------
-    def _fit_perturbation_worker(
+    def _fit_perturbation_worker(*, threads: int, **kwargs) -> list[dict]:
+        """:func:`_fit_on_cells` with numba's kernels limited to ``threads``,
+        this worker's share of the cores (each kernel would otherwise start
+        one thread per core in every worker process); the caller's thread
+        count is restored, since a sequential run fits in the caller's process."""
+        import numba
+
+        previous = numba.get_num_threads()
+        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
+        try:
+            return _fit_on_cells(**kwargs)
+        finally:
+            numba.set_num_threads(previous)
+
+    def _fit_on_cells(
         labels_in_fit: list[str],
         group_idxs: list[int],
         path: str | Path,
@@ -1891,7 +1894,6 @@ def nb_glm_test(
         dispersion: float | None,
         shrink_dispersion: bool,
         lfc_shrinkage_type: str,
-        threads: int,
     ) -> list[dict]:
         """The perturbations ``labels_in_fit`` and the controls, fitted together
         on their cells with the design ``~ covariates + perturbation``, one
@@ -1899,12 +1901,7 @@ def nb_glm_test(
         dispersions are estimated once for them all, and each perturbation is
         tested on its own column against the controls. One perturbation is the
         per-comparison fit. A result per perturbation, as the two-group
-        worker's (natural-log LFC and SE). ``threads`` is this worker's share
-        of the cores for the numba kernels, which would otherwise each start
-        one thread per core in every worker process."""
-        import numba
-
-        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
+        worker's (natural-log LFC and SE)."""
         masks = []
         for rows in rows_in_fit:
             mask = np.zeros(control_mask.shape[0], dtype=bool)
@@ -2004,7 +2001,7 @@ def nb_glm_test(
         # A gene is fitted when any perturbation tests it; each reports only its own.
         fit = fit_glm_deseq2(
             design, counts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
-            dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
+            protected_columns=test_columns[1:], dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
             max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter,
         )
         results = []
@@ -2303,12 +2300,15 @@ def nb_glm_test(
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
         """One perturbation against the control summary; same result as the
         other workers, natural-log LFC and SE."""
-        block = backed_x[rows, :]
-        y = np.asarray(block.toarray() if sp.issparse(block) else block, dtype=np.float64)
+        # Sparse throughout: a large group (a non-targeting guide fitted as a
+        # perturbation) would not fit in memory densely.
+        y = sp.csr_matrix(backed_x[rows, :], dtype=np.float64)
+        y.sum_duplicates()
+        y.eliminate_zeros()
         s_t = np.asarray(size_factors, dtype=np.float64)[rows]
         group_n = y.shape[0]
-        group_expr_counts = np.count_nonzero(y, axis=0)
-        group_total = y.sum(axis=0)
+        group_expr_counts = y.getnnz(axis=0)
+        group_total = np.asarray(y.sum(axis=0)).ravel()
         valid = (control_expr_counts + group_expr_counts) >= min_cells_expressed
         valid &= ~_low_expr_in_both_mask(
             pert_expr_counts=group_expr_counts,
@@ -3792,9 +3792,10 @@ def shrink_lfc(
       expressed genes due to min_mu clamping differences in the likelihood.
     
     .. note::
-        The "stats" method is recommended because CRISPYx NB-GLM fitting uses
-        min_mu=0.5 clamping for numerical stability, which affects the stored
-        MLE coefficients. The "full" method re-evaluates the likelihood without
+        The "stats" method is recommended because the NB-GLM fit floors its
+        means at ``min_mu`` (``uns["min_mu"]``: 0.5 for pseudo-bulk and bulk,
+        1e-6 for single cells by default), which affects the stored MLE
+        coefficients. The "full" method re-evaluates the likelihood without
         this constraint, potentially finding different optima for lowly expressed
         genes. The "stats" method preserves shrinkage direction (always toward
         zero) by working directly with the stored statistics.

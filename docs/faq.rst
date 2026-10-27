@@ -22,9 +22,9 @@ For very large datasets, consider:
 
 * Converting to CSC before Wilcoxon or ``batch_process`` (see :doc:`large_data`).
 * Converting to CSR before NB-GLM.
-* With covariates and >100K control cells, aggregating to pseudo-bulk
-  (``cx.pb.aggregate``) before NB-GLM; without covariates the controls are
-  streamed once and their number does not matter.
+* For NB-GLM with covariates and >100K control cells, aggregating to
+  pseudo-bulk first (``cx.pb.aggregate``; see :ref:`cell-or-pseudobulk`).
+  Without covariates, the number of controls does not matter.
 
 When should I use CSC vs CSR format, and how do I control the streaming order?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

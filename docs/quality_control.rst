@@ -57,17 +57,30 @@ Both work on single cells or on pseudo-bulk counts; on pseudo-bulk (units per
 guide and batch from ``cx.pb.aggregate``, ``size_factor_method="deseq2"``, the
 batch as a covariate) the comparison is calibrated and fast.
 
-On the targeted screen of Feng *et al.* (535,000 control cells, 98 % of them
-unassigned), the 20 non-targeting guides correlated at a median r of -0.02
-(at most 0.26). In pseudo-bulk per guide and inlet, with the inlet as a
-covariate, each guide differed from the unassigned cells in 135-438 genes but
-from the other guides in 0-16 (\|z\| > 3 for 1.5-2.3 % of genes against
-0.13-0.39 %); pooled, 849 genes. Among them the CRISPRi construct
-(dCas9-KRAB-MeCP2, lower in unassigned cells), donor-line genes (XIST, MEG3),
-and the screen's own targets, which ran lower in unassigned cells (68 % of
-them, against 55 % of other genes): many unassigned cells carry less of the
-CRISPRi machinery or a guide that was not detected. There, non-targeting
-cells are the safer controls.
+**Example.** The targeted screen of Feng *et al.* has 535,000 control cells,
+98 % of them unassigned. In pseudo-bulk per guide and inlet, with the inlet as
+a covariate:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Each non-targeting guide against
+     - Genes differing
+     - Genes with \|z\| > 3
+   * - the unassigned cells
+     - 135-438
+     - 1.5-2.3 %
+   * - the other non-targeting guides
+     - 0-16
+     - 0.13-0.39 %
+
+- The guides agreed with one another (median r -0.02, at most 0.26).
+- Pooled, 849 genes differed between guides and unassigned cells, including
+  the CRISPRi construct (dCas9-KRAB-MeCP2, lower in unassigned cells),
+  donor-line genes (XIST, MEG3) and the screen's own targets (lower in
+  unassigned cells for 68 % of them, against 55 % of other genes).
+- Many unassigned cells carry less CRISPRi machinery or an undetected guide.
+  Here, the non-targeting cells are the safer controls.
 
 Highly variable genes
 ---------------------

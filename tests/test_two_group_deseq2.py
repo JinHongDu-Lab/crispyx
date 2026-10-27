@@ -322,3 +322,81 @@ def test_targets_per_fit_is_validated(tmp_path, kwargs, match):
     with pytest.raises(ValueError, match=match):
         nb_glm_test(path, perturbation_column="perturbation", control_label="ctrl", verbose=False,
                     output_path=tmp_path / "de.h5ad", **kwargs)
+
+
+def test_every_perturbation_fitted_together_is_estimated_as_an_effect():
+    """With more perturbations than other columns, the ones after the first are
+    still effects under test, not nuisance group levels the structured
+    solver bounds at clip_group (10): a fold change of e^11.5 is reported."""
+    rng = np.random.default_rng(0)
+    groups = np.repeat(np.arange(5), [200, 50, 50, 50, 50])  # controls, then four perturbations
+    design = np.column_stack([np.ones(groups.size)] + [(groups == k).astype(float) for k in range(1, 5)])
+    lfc = np.zeros((5, 20))
+    lfc[3, 0] = 11.5
+    counts = rng.poisson(5.0 * np.exp(lfc[groups])).astype(np.float64)
+    res = fit_glm_deseq2(design, counts, np.ones(groups.size), 1, protected_columns=(2, 3, 4), min_mu=1e-6)
+    observed = np.log(counts[groups == 3, 0].mean() / counts[groups == 0, 0].mean())
+    assert res.coef[0, 3] == pytest.approx(observed, abs=1e-6)
+
+
+def test_sparse_and_dense_perturbed_counts_give_the_same_fit(screen_and_reference):
+    counts, labels, sf, _ = screen_and_reference
+    summary, dense = _fit(counts, labels, sf)
+    sparse = fit_two_group_deseq2(summary, sp.csr_matrix(counts[labels != "ctrl"]), sf[labels != "ctrl"])
+    for key in ("lfc", "se", "dispersion", "genewise_dispersion"):
+        np.testing.assert_allclose(getattr(sparse, key), getattr(dense, key), rtol=1e-10, equal_nan=True)
+
+
+def test_prior_variance_has_its_floor_when_no_gene_is_above_the_dispersion_floor():
+    """Constant counts put every gene-wise dispersion at its lower bound, so no
+    gene enters the residual MAD; the prior variance is still 0.25, not NaN."""
+    counts = np.full((60, 5), 3.0)
+    labels = np.array(["ctrl"] * 40 + ["KO1"] * 20)
+    for fit in (_fit(counts, labels, np.ones(60))[1],
+                fit_glm_deseq2(np.column_stack([np.ones(60), labels == "KO1"]), counts, np.ones(60), 1)):
+        assert fit.prior_var == 0.25
+        assert np.isfinite(fit.dispersion).all()
+
+
+def test_a_sequential_fit_with_covariates_restores_the_numba_thread_count(tmp_path):
+    import numba
+
+    from crispyx.de import nb_glm_test
+
+    path, *_ = _three_targets(tmp_path, covariates=True)
+    before = numba.get_num_threads()
+    nb_glm_test(path, perturbation_column="perturbation", control_label="ctrl", covariates=["batch"], n_jobs=1,
+                perturbations=["KO1"], verbose=False, output_path=tmp_path / "de.h5ad")
+    assert numba.get_num_threads() == before
+
+
+def test_given_size_factors_follow_their_cells_into_the_sorted_copy(tmp_path, monkeypatch):
+    """Size factors are given in the input's row order; when nb_glm_test sorts
+    the input by perturbation first, each cell keeps its own."""
+    import crispyx.de as de
+
+    path, counts, labels, _ = _three_targets(tmp_path, covariates=False)
+    sf = np.random.default_rng(1).lognormal(0, 0.4, labels.size)
+    kw = dict(perturbation_column="perturbation", control_label="ctrl", size_factors=sf, verbose=False)
+    unsorted = de.nb_glm_test(path, output_path=tmp_path / "unsorted.h5ad", **kw)
+    monkeypatch.setattr(de, "needs_sorting_for_nbglm", lambda *a, **k: True)
+    sorted_ = de.nb_glm_test(path, output_path=tmp_path / "sorted.h5ad", **kw)
+    assert (tmp_path / "screen_sorted.h5ad").exists()
+    for name in ("KO1", "KO2", "KO3"):
+        np.testing.assert_allclose(sorted_[name].statistic, unsorted[name].statistic, rtol=1e-8, equal_nan=True)
+
+
+def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
+    import crispyx as cx
+
+    path, *_ = _three_targets(tmp_path, covariates=False)
+    result = cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
+                                     control_label="ctrl", output_dir=tmp_path, verbose=False,
+                                     targets_per_fit=3, size_factor_method="geomeans", min_mu=0.5,
+                                     shrink_dispersion=False)
+    assert result.uns["targets_per_fit"].load() == 3
+    assert result.uns["size_factor_method"].load() == "geomeans"
+    assert result.uns["min_mu"].load() == 0.5
+    with pytest.raises(TypeError, match="fit_method"):
+        cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
+                                control_label="ctrl", output_dir=tmp_path, fit_method="joint")

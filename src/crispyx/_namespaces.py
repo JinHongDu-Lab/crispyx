@@ -194,30 +194,13 @@ class _PreprocessingNamespace:
         )
         return result.filtered
 
-    def compare_controls(
-        self,
-        data: str | Path | ad.AnnData,
-        *,
-        guide_column: str,
-        controls,
-        reference,
-        work_dir: str | Path,
-        min_cells: int = 20,
-        max_reference_cells: int | None = None,
-        seed: int = 0,
-        verbose: int | bool = True,
-        **nb_glm_kwargs,
-    ):
+    def compare_controls(self, data, **kwargs):
         """Whether cells used as controls behave alike, e.g. unassigned cells
         and cells with a non-targeting guide.
 
         See :func:`crispyx.qc.compare_controls`.
         """
-        return compare_controls(
-            data, guide_column=guide_column, controls=controls, reference=reference, work_dir=work_dir,
-            min_cells=min_cells, max_reference_cells=max_reference_cells, seed=seed, verbose=verbose,
-            **nb_glm_kwargs,
-        )
+        return compare_controls(data, **kwargs)
 
     def control_guide_correlation(self, data, **kwargs):
         """Correlation between the control guides' expression profiles.
@@ -939,9 +922,12 @@ class _ToolsNamespace:
         if normalised == "nb_glm":
             allowed = {
                 "covariates",
+                "size_factor_method",
                 "dispersion",
-                "fit_method",
+                "shrink_dispersion",
+                "targets_per_fit",
                 "max_iter",
+                "min_mu",
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",

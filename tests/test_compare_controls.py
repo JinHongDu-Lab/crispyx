@@ -74,3 +74,10 @@ def test_compare_controls_needs_two_control_guides(tmp_path):
     with pytest.raises(ValueError, match="at least two control guides"):
         cx.pp.compare_controls(path, guide_column="guide", controls=["NT0"], reference="unassigned",
                                work_dir=tmp_path / "work", verbose=False)
+
+
+def test_compare_controls_refuses_nb_glm_arguments_it_sets_itself(tmp_path):
+    path = _screen(tmp_path, 1.0)
+    with pytest.raises(TypeError, match="force"):
+        cx.pp.compare_controls(path, guide_column="guide", controls=["NT0", "NT1"], reference="unassigned",
+                               work_dir=tmp_path / "work", force=False)

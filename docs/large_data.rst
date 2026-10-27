@@ -83,15 +83,20 @@ before running NB-GLM:
 
 The function uses format-aware streaming: CSC sources are read in
 column-chunks (axis=1) and scattered into CSR buffers; dense sources are
-read in row-chunks (axis=0). Without covariates, NB-GLM summarises the
-control cells in one streaming pass, in chunks of 4,096 cells (each gene's
-count histogram and size-factor-binned moments), and fits every comparison
-against that summary, so the control matrix is never densified and peak
-memory stays at O(chunk_size × n_genes) rather than O(n_control × n_genes).
-With covariates the controls are held in memory. Size factors are computed in one pass
-over the rows (``"libsize"``) or two (``"geomeans"``, ``"deseq2"``: the
-controls' geometric means, then each cell's median ratio), never holding
-the matrix. After each streaming phase,
+read in row-chunks (axis=0).
+
+NB-GLM then streams the CSR file:
+
+* Size factors are computed in blocks of ``chunk_size`` rows (2,048 by
+  default), never holding the matrix. ``"deseq2"`` holds only a
+  perturbations × reference-genes count table.
+* Without covariates, the control cells are summarised in one pass, 4,096 at
+  a time (each gene's count histogram and size-factor-binned moments), and
+  every comparison is fitted against that summary. Peak memory is
+  O(chunk_size × n_genes), not O(n_control × n_genes).
+* With covariates, the control cells are held in memory.
+
+After each streaming phase,
 ``drop_file_cache()`` evicts file data from the kernel page cache so that
 cgroup-limited environments (e.g. SLURM) do not count cached pages toward the
 memory limit. Streaming reads, and files being written -- a DE result as it is
