@@ -801,12 +801,19 @@ def run_edger_de(
     max_control_cells: int | None = None,
     output_name: str = "edger_de_glm",
     size_factor_method: str | None = None,
+    per_comparison: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> Dict[str, Any]:
     """Run edgeR DE on filtered dataset.
 
     With ``max_perturbations``, only control and a seeded perturbation subset
     are read (optionally with a seeded control sample), and the joint model is
     fitted on those cells.
+
+    ``per_comparison=True`` fits each perturbation against the controls alone
+    (its own DGEList, dispersions and QL fit, design ~ group), as PyDESeq2 and
+    crispyx do, in parallel worker processes (R ``parallel::mclapply``) sized
+    to ``memory_limit_gb``.
     """
     import gc
     import os
@@ -875,48 +882,90 @@ def run_edger_de(
         ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
         ro.globalenv['use_libsize'] = ro.BoolVector([size_factor_method == "libsize"])
         
-        ro.r('''
-        rownames(counts) <- gene_names
-        y <- DGEList(counts=counts, group=groups)
-        # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
-        # i.e. crispyx's library-size factors; otherwise TMM.
-        if (!use_libsize) y <- calcNormFactors(y)
-        design <- model.matrix(~0 + groups)
-        colnames(design) <- gsub("groups", "", colnames(design))
-        y <- estimateDisp(y, design)
-        fit <- glmQLFit(y, design)
-        ''')
-        
-        all_results = []
-        for group in unique_groups:
-            ro.globalenv['target_group'] = safe_name[group]
+        if per_comparison:
+            # Workers fork from this process; each holds its comparison's
+            # counts (control + one perturbation) about four times over.
+            n_ctrl = int((groups == control_label).sum())
+            largest = max(int((groups == g).sum()) for g in unique_groups)
+            per_fit_gb = adata.n_vars * (n_ctrl + largest) * 8 * 4 / 1e9
+            budget_gb = 0.6 * (memory_limit_gb or 64.0)
+            n_workers = max(1, min(n_threads, len(unique_groups), int(budget_gb // max(per_fit_gb, 1e-3))))
+            ro.globalenv['targets'] = ro.StrVector([safe_name[g] for g in unique_groups])
             ro.globalenv['control'] = safe_name[control_label]
-            
-            ro.r('''
-            contrast_vec <- makeContrasts(
-                contrasts = paste0(target_group, "-", control),
-                levels = design
-            )
-            lrt <- glmQLFTest(fit, contrast=contrast_vec)
+            ro.r(f'''
+            rownames(counts) <- gene_names
+            tryCatch({{ RhpcBLASctl::blas_set_num_threads(1) }}, error=function(e) {{ }})
+            fit_one <- function(g) tryCatch({{
+                idx <- groups == control | groups == g
+                grp <- factor(groups[idx], levels=c(control, g))
+                y <- DGEList(counts=counts[, idx, drop=FALSE], group=grp)
+                if (!use_libsize) y <- calcNormFactors(y)
+                design <- model.matrix(~grp)
+                y <- estimateDisp(y, design)
+                tt <- glmQLFTest(glmQLFit(y, design), coef=2)$table
+                data.frame(gene=rownames(tt), logFC=tt$logFC, logCPM=tt$logCPM, F=tt$F,
+                           PValue=tt$PValue, FDR=p.adjust(tt$PValue, method="BH"),
+                           group=g, stringsAsFactors=FALSE)
+            }}, error=function(e) conditionMessage(e))
+            per_target <- parallel::mclapply(targets, fit_one, mc.cores={n_workers})
+            failed <- sapply(per_target, function(r) !is.data.frame(r))
+            first_error <- if (any(failed)) as.character(per_target[[which(failed)[1]]]) else ""
+            res <- do.call(rbind, per_target[!failed])
             ''')
+            n_failed = int(np.sum(np.array(ro.r('failed'))))
+            back = {v: k for k, v in safe_name.items()}
+            if n_failed == len(unique_groups):
+                raise RuntimeError(f"edgeR failed for all {n_failed} perturbations; first error: {ro.r('first_error')[0]}")
+            cols = {c: np.array(ro.r(f'res${c}')) for c in ("gene", "logFC", "logCPM", "F", "PValue", "FDR", "group")}
+            all_results = [pd.DataFrame({
+                'gene': cols["gene"], 'logFC': cols["logFC"], 'logCPM': cols["logCPM"], 'F': cols["F"],
+                'PValue': cols["PValue"], 'FDR': cols["FDR"],
+                'perturbation': [back[g] for g in cols["group"]],
+            })]
+        else:
+            ro.r('''
+            rownames(counts) <- gene_names
+            y <- DGEList(counts=counts, group=groups)
+            # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
+            # i.e. crispyx's library-size factors; otherwise TMM.
+            if (!use_libsize) y <- calcNormFactors(y)
+            design <- model.matrix(~0 + groups)
+            colnames(design) <- gsub("groups", "", colnames(design))
+            y <- estimateDisp(y, design)
+            fit <- glmQLFit(y, design)
+            ''')
+        
+            all_results = []
+            for group in unique_groups:
+                ro.globalenv['target_group'] = safe_name[group]
+                ro.globalenv['control'] = safe_name[control_label]
             
-            genes = np.array(ro.r('rownames(lrt$table)'))
-            logFC = np.array(ro.r('lrt$table$logFC'))
-            logCPM = np.array(ro.r('lrt$table$logCPM'))
-            F_stat = np.array(ro.r('lrt$table$F'))
-            PValue = np.array(ro.r('lrt$table$PValue'))
-            FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
+                ro.r('''
+                contrast_vec <- makeContrasts(
+                    contrasts = paste0(target_group, "-", control),
+                    levels = design
+                )
+                lrt <- glmQLFTest(fit, contrast=contrast_vec)
+                ''')
             
-            all_results.append(pd.DataFrame({
-                'gene': genes,
-                'logFC': logFC,
-                'logCPM': logCPM,
-                'F': F_stat,
-                'PValue': PValue,
-                'FDR': FDR,
-                'perturbation': group
-            }))
+                genes = np.array(ro.r('rownames(lrt$table)'))
+                logFC = np.array(ro.r('lrt$table$logFC'))
+                logCPM = np.array(ro.r('lrt$table$logCPM'))
+                F_stat = np.array(ro.r('lrt$table$F'))
+                PValue = np.array(ro.r('lrt$table$PValue'))
+                FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
             
+                all_results.append(pd.DataFrame({
+                    'gene': genes,
+                    'logFC': logFC,
+                    'logCPM': logCPM,
+                    'F': F_stat,
+                    'PValue': PValue,
+                    'FDR': FDR,
+                    'perturbation': group
+                }))
+            
+
     final_results = pd.concat(all_results, ignore_index=True)
     t_process_end = time.perf_counter()
     gc.collect()
@@ -937,6 +986,9 @@ def run_edger_de(
         "subsampled": max_perturbations is not None,
         "control_cells": int((groups == control_label).sum()),
         "size_factor_method": size_factor_method or "edgeR default (TMM)",
+        "design": "per comparison" if per_comparison else "joint",
+        "failed_groups": n_failed if per_comparison else 0,
+        "workers": n_workers if per_comparison else 1,
     }
 
 def run_pertpy_de(
@@ -5304,6 +5356,11 @@ def _accuracy_subset_methods(
             if base in ("pertpy_de_pydeseq2", "edger_de_glm"):
                 # NB-GLM references share crispyx's size factors (plan §4).
                 kwargs["size_factor_method"] = spec.get("size_factors", "libsize")
+            if base == "edger_de_glm":
+                # Each perturbation against the controls alone, as PyDESeq2 and
+                # crispyx fit it (decided 2026-10-27).
+                kwargs["per_comparison"] = True
+                kwargs["memory_limit_gb"] = float(spec.get("memory_limit", 240))
             if base == "pertpy_de_pydeseq2":
                 # ... and its mean floor (crispyx 0.2.3 on sparse single cells: 1e-6).
                 kwargs["min_mu"] = float(spec.get("min_mu", 1e-6))
