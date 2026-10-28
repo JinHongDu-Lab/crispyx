@@ -423,6 +423,43 @@ def read_backed(path: str | Path, mode: Literal["r", "r+"] = "r") -> ad.AnnData:
     return adata
 
 
+def read_rows_csc(path: str | Path, rows: np.ndarray, chunk_rows: int = 4096) -> sp.csc_matrix:
+    """The rows ``rows`` (ascending) of ``path``'s ``X`` as an in-memory CSC
+    matrix, in the file's dtype, without stored zeros.
+
+    Built in two passes over the rows, ``chunk_rows`` at a time -- the
+    column counts, then the non-zeros scattered into place (as
+    :func:`convert_to_csc` transposes) -- so memory peaks at the result plus
+    one chunk, where reading CSR and converting holds both and more.
+    """
+    rows = np.asarray(rows)
+    starts = range(0, rows.size, chunk_rows)
+    backed = read_backed(path)
+    try:
+        n_cols = backed.n_vars
+
+        def chunks():
+            for start in starts:
+                chunk = sp.csr_matrix(backed.X[rows[start:start + chunk_rows], :])
+                chunk.eliminate_zeros()
+                yield start, chunk
+
+        counts = np.zeros(n_cols, dtype=np.int64)
+        dtype = None
+        for _, chunk in chunks():
+            counts += np.bincount(chunk.indices, minlength=n_cols)
+            dtype = chunk.dtype
+        indptr = np.concatenate([[0], np.cumsum(counts)])
+        data = np.empty(int(indptr[-1]), dtype=dtype or np.float64)
+        indices = np.empty(int(indptr[-1]), dtype=np.int32 if rows.size <= np.iinfo(np.int32).max else np.int64)
+        offset = indptr[:-1].copy()
+        for start, chunk in chunks():
+            _scatter_band(chunk.indptr, chunk.indices, chunk.data, start, 0, n_cols, offset, data, indices)
+    finally:
+        backed.file.close()
+    return sp.csc_matrix((data, indices, indptr), shape=(rows.size, n_cols))
+
+
 # Read into memory by read_backed, as anndata's backed mode does.
 _IN_MEMORY_SLOTS = ("obs", "var", "uns", "obsm", "varm", "obsp", "varp")
 
