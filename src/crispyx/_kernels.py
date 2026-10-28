@@ -115,6 +115,11 @@ def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
     return -log_det  # -0.5 * (2 * sum(log diag(L)))
 
 
+#: Counts below this are tallied per gene for the NB likelihood's lgamma
+#: terms (_nb_posterior_with_cache_numba); _lgamma_ratio_term sums them exactly.
+_SMALL_COUNTS = 32
+
+
 @nb.njit(cache=True)
 def _brent_minimize_numba(
     Y_g: np.ndarray,
@@ -122,6 +127,7 @@ def _brent_minimize_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    small_counts: np.ndarray,
     x_indptr: np.ndarray,
     x_indices: np.ndarray,
     x_data: np.ndarray,
@@ -142,7 +148,8 @@ def _brent_minimize_numba(
     # Initial setup
     x = w = v = a + golden * (b - a)
     fx = fw = fv = -_nb_posterior_with_cache_numba(
-        Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, xtwx
+        Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum, small_counts, x_indptr, x_indices, x_data,
+        xtwx,
     )
     
     d = 0.0  # Distance to next point
@@ -198,7 +205,8 @@ def _brent_minimize_numba(
             u = x + (tol1 if d > 0 else -tol1)
         
         fu = -_nb_posterior_with_cache_numba(
-            Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum, x_indptr, x_indices, x_data, xtwx
+            Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum, small_counts, x_indptr, x_indices, x_data,
+            xtwx,
         )
         
         # Update a, b, v, w, x
@@ -240,6 +248,7 @@ def _nb_posterior_with_cache_numba(
     log_trend_g: float,
     prior_var: float,
     gammaln_y_plus_1_sum: float,
+    small_counts: np.ndarray,
     x_indptr: np.ndarray,
     x_indices: np.ndarray,
     x_data: np.ndarray,
@@ -251,7 +260,10 @@ def _nb_posterior_with_cache_numba(
     alpha mu)``, is accumulated into the work buffer ``xtwx`` (``(0, 0)``
     for no adjustment) in the same pass over the cells as the likelihood;
     the design ``X`` is given in CSR form, so a one-hot batch design costs a
-    few products per cell rather than ``n_features**2``.
+    few products per cell rather than ``n_features**2``. ``small_counts[k]``
+    is the number of cells with count ``k`` (below its length): their
+    ``lgamma(y + r) - lgamma(r)`` terms depend on the count only, so each
+    value's is formed once, by recurrence, rather than once per cell.
     """
     n_cells = Y_g.shape[0]
     alpha = math.exp(log_alpha)
@@ -260,14 +272,20 @@ def _nb_posterior_with_cache_numba(
     cox_reid = xtwx.shape[0] > 0
     xtwx[:, :] = 0.0
 
+    # lgamma(y + r) - lgamma(r) - y log r, without libm's lgamma (see
+    # _lgamma_ratio_term): sum(log1p(i / r), i < y) for the small counts.
     ll = 0.0
+    term = 0.0
+    for k in range(1, small_counts.shape[0]):
+        term += math.log1p((k - 1) / r)
+        ll += small_counts[k] * term
+    n_small = small_counts.shape[0]
     for i in range(n_cells):
         y = Y_g[i]
         mu_i = mu_g[i]
         r_plus_mu = r + mu_i + 1e-12
-        # lgamma(y + r) - lgamma(r), without libm's lgamma (see _lgamma_ratio_term)
         ll += (
-            _lgamma_ratio_term(y, r) + y * log_r
+            (_lgamma_ratio_term(y, r) if y >= n_small else 0.0) + y * log_r
             + r * (log_r - math.log(r_plus_mu))
             + y * math.log(mu_i / r_plus_mu + 1e-12)
         )
@@ -340,13 +358,17 @@ def _nb_map_grid_search_with_refinement_numba(
         Y_g = Y[:, g]
         mu_g = mu[:, g]
         xtwx = np.empty((n_features, n_features))
+        small_counts = np.zeros(_SMALL_COUNTS)
+        for i in range(Y_g.shape[0]):
+            if Y_g[i] < _SMALL_COUNTS:
+                small_counts[int(Y_g[i])] += 1.0
         step = (hi[g] - lo[g]) / (n_grid - 1)
         # sum(lgamma(y + 1)) is constant in alpha, so it is left out (0.0).
         best_posterior = -np.inf
         best_k = 0
         for k in range(n_grid):
             posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, lo[g] + k * step, log_trend_g, prior_var, 0.0,
+                Y_g, mu_g, lo[g] + k * step, log_trend_g, prior_var, 0.0, small_counts,
                 x_indptr, x_indices, x_data, xtwx,
             )
             if posterior > best_posterior:
@@ -355,11 +377,12 @@ def _nb_map_grid_search_with_refinement_numba(
         best = lo[g] + best_k * step
         if 0 < best_k < n_grid - 1 and 2 * step > tol:
             refined = _brent_minimize_numba(
-                Y_g, mu_g, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+                Y_g, mu_g, log_trend_g, prior_var, 0.0, small_counts, x_indptr, x_indices, x_data, xtwx,
                 best - step, best + step, tol=tol, max_iter=max_refine_iter,
             )
             refined_posterior = _nb_posterior_with_cache_numba(
-                Y_g, mu_g, refined, log_trend_g, prior_var, 0.0, x_indptr, x_indices, x_data, xtwx,
+                Y_g, mu_g, refined, log_trend_g, prior_var, 0.0, small_counts, x_indptr, x_indices, x_data,
+                xtwx,
             )
             if refined_posterior >= best_posterior:
                 best = refined
