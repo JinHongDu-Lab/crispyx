@@ -104,11 +104,13 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
 
 def _bound_losses_are_lower(res, dds, counts, design, sf):
     """Where PyDESeq2's gene-wise optimiser stops at min_disp, our estimate has
-    the lower Cox-Reid loss at PyDESeq2's own means."""
+    the lower Cox-Reid loss at PyDESeq2's own means. "At" is within 1%: its
+    L-BFGS-B can stop just short of the bound (1.0014e-8 with numpy 1.26 and
+    SciPy 1.16)."""
     from pydeseq2.utils import nb_nll
 
     theirs = dds.var["genewise_dispersions"].to_numpy()
-    at_bound = theirs <= 1e-8 * 1.0001
+    at_bound = theirs <= 1e-8 * 1.01
     assert at_bound.sum() < 0.1 * at_bound.size
     for g in np.flatnonzero(at_bound):
         y, mu = counts[:, g], dds.layers["_mu_hat"][:, g]
