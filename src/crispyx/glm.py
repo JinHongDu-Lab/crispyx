@@ -70,14 +70,21 @@ def _run_gene_batches(fit, starts, threaded: bool) -> None:
     from concurrent.futures import ThreadPoolExecutor
     from threadpoolctl import threadpool_limits
 
-    n_threads = min(numba.get_num_threads(), len(starts)) if threaded else 1
-    if n_threads <= 1:
+    if not threaded:
         for start in starts:
             fit(start)
         return
-    with threadpool_limits(1, user_api="blas"), ThreadPoolExecutor(n_threads) as pool:
-        for _ in pool.map(fit, starts):
-            pass
+    # BLAS at one thread on one thread too: a multi-threaded BLAS (OpenBLAS)
+    # reduces in another order, and the result would depend on the count.
+    n_threads = min(numba.get_num_threads(), len(starts))
+    with threadpool_limits(1, user_api="blas"):
+        if n_threads <= 1:
+            for start in starts:
+                fit(start)
+            return
+        with ThreadPoolExecutor(n_threads) as pool:
+            for _ in pool.map(fit, starts):
+                pass
 
 
 @dataclass

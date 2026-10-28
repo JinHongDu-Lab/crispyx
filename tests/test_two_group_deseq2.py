@@ -457,3 +457,33 @@ def test_apeglm_refits_on_threads_are_the_sequential_ones():
     for a, b in zip(one, threads):
         np.testing.assert_array_equal(a, b)
     assert np.isfinite(one[0][1]).sum() > 30
+
+
+def test_threaded_irls_holds_blas_to_one_thread_on_one_thread_too(monkeypatch):
+    """The threaded IRLS holds BLAS to one thread; on a single numba thread it
+    must too, or a multi-threaded BLAS (OpenBLAS) reduces in another order and
+    one thread's result differs from N threads' (seen on Linux: z by 1e-6)."""
+    import contextlib
+    import numba
+    import threadpoolctl
+
+    limits = []
+
+    @contextlib.contextmanager
+    def record(limit, user_api=None):
+        limits.append((limit, user_api))
+        yield
+
+    monkeypatch.setattr(threadpoolctl, "threadpool_limits", record)
+    counts, labels, sf, batch = _screen(seed=5, n_genes=30, batch_sd=0.3)
+    design, columns = build_design_matrix(
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"],
+        perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
+    )
+    previous = numba.get_num_threads()
+    numba.set_num_threads(1)
+    try:
+        fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), min_mu=1e-6)
+    finally:
+        numba.set_num_threads(previous)
+    assert limits and all(entry == (1, "blas") for entry in limits)
