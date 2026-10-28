@@ -821,6 +821,14 @@ def run_edger_de(
     
     # Capture function start time (before imports)
     t_func_start = time.perf_counter()
+
+    if per_comparison:
+        return _run_edger_per_comparison(
+            dataset_path, perturbation_column=perturbation_column, control_label=control_label,
+            output_dir=output_dir, n_jobs=n_jobs, max_perturbations=max_perturbations,
+            subset_seed=subset_seed, max_control_cells=max_control_cells, output_name=output_name,
+            size_factor_method=size_factor_method, memory_limit_gb=memory_limit_gb, t_func_start=t_func_start,
+        )
     
     from .env_config import get_global_env_config
     
@@ -882,89 +890,47 @@ def run_edger_de(
         ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
         ro.globalenv['use_libsize'] = ro.BoolVector([size_factor_method == "libsize"])
         
-        if per_comparison:
-            # Workers fork from this process; each holds its comparison's
-            # counts (control + one perturbation) about four times over.
-            n_ctrl = int((groups == control_label).sum())
-            largest = max(int((groups == g).sum()) for g in unique_groups)
-            per_fit_gb = adata.n_vars * (n_ctrl + largest) * 8 * 4 / 1e9
-            budget_gb = 0.6 * (memory_limit_gb or 64.0)
-            n_workers = max(1, min(n_threads, len(unique_groups), int(budget_gb // max(per_fit_gb, 1e-3))))
-            ro.globalenv['targets'] = ro.StrVector([safe_name[g] for g in unique_groups])
+        ro.r('''
+        rownames(counts) <- gene_names
+        y <- DGEList(counts=counts, group=groups)
+        # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
+        # i.e. crispyx's library-size factors; otherwise TMM.
+        if (!use_libsize) y <- calcNormFactors(y)
+        design <- model.matrix(~0 + groups)
+        colnames(design) <- gsub("groups", "", colnames(design))
+        y <- estimateDisp(y, design)
+        fit <- glmQLFit(y, design)
+        ''')
+    
+        all_results = []
+        for group in unique_groups:
+            ro.globalenv['target_group'] = safe_name[group]
             ro.globalenv['control'] = safe_name[control_label]
-            ro.r(f'''
-            rownames(counts) <- gene_names
-            tryCatch({{ RhpcBLASctl::blas_set_num_threads(1) }}, error=function(e) {{ }})
-            fit_one <- function(g) tryCatch({{
-                idx <- groups == control | groups == g
-                grp <- factor(groups[idx], levels=c(control, g))
-                y <- DGEList(counts=counts[, idx, drop=FALSE], group=grp)
-                if (!use_libsize) y <- calcNormFactors(y)
-                design <- model.matrix(~grp)
-                y <- estimateDisp(y, design)
-                tt <- glmQLFTest(glmQLFit(y, design), coef=2)$table
-                data.frame(gene=rownames(tt), logFC=tt$logFC, logCPM=tt$logCPM, F=tt$F,
-                           PValue=tt$PValue, FDR=p.adjust(tt$PValue, method="BH"),
-                           group=g, stringsAsFactors=FALSE)
-            }}, error=function(e) conditionMessage(e))
-            per_target <- parallel::mclapply(targets, fit_one, mc.cores={n_workers})
-            failed <- sapply(per_target, function(r) !is.data.frame(r))
-            first_error <- if (any(failed)) as.character(per_target[[which(failed)[1]]]) else ""
-            res <- do.call(rbind, per_target[!failed])
-            ''')
-            n_failed = int(np.sum(np.array(ro.r('failed'))))
-            back = {v: k for k, v in safe_name.items()}
-            if n_failed == len(unique_groups):
-                raise RuntimeError(f"edgeR failed for all {n_failed} perturbations; first error: {ro.r('first_error')[0]}")
-            cols = {c: np.array(ro.r(f'res${c}')) for c in ("gene", "logFC", "logCPM", "F", "PValue", "FDR", "group")}
-            all_results = [pd.DataFrame({
-                'gene': cols["gene"], 'logFC': cols["logFC"], 'logCPM': cols["logCPM"], 'F': cols["F"],
-                'PValue': cols["PValue"], 'FDR': cols["FDR"],
-                'perturbation': [back[g] for g in cols["group"]],
-            })]
-        else:
+        
             ro.r('''
-            rownames(counts) <- gene_names
-            y <- DGEList(counts=counts, group=groups)
-            # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
-            # i.e. crispyx's library-size factors; otherwise TMM.
-            if (!use_libsize) y <- calcNormFactors(y)
-            design <- model.matrix(~0 + groups)
-            colnames(design) <- gsub("groups", "", colnames(design))
-            y <- estimateDisp(y, design)
-            fit <- glmQLFit(y, design)
+            contrast_vec <- makeContrasts(
+                contrasts = paste0(target_group, "-", control),
+                levels = design
+            )
+            lrt <- glmQLFTest(fit, contrast=contrast_vec)
             ''')
         
-            all_results = []
-            for group in unique_groups:
-                ro.globalenv['target_group'] = safe_name[group]
-                ro.globalenv['control'] = safe_name[control_label]
-            
-                ro.r('''
-                contrast_vec <- makeContrasts(
-                    contrasts = paste0(target_group, "-", control),
-                    levels = design
-                )
-                lrt <- glmQLFTest(fit, contrast=contrast_vec)
-                ''')
-            
-                genes = np.array(ro.r('rownames(lrt$table)'))
-                logFC = np.array(ro.r('lrt$table$logFC'))
-                logCPM = np.array(ro.r('lrt$table$logCPM'))
-                F_stat = np.array(ro.r('lrt$table$F'))
-                PValue = np.array(ro.r('lrt$table$PValue'))
-                FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
-            
-                all_results.append(pd.DataFrame({
-                    'gene': genes,
-                    'logFC': logFC,
-                    'logCPM': logCPM,
-                    'F': F_stat,
-                    'PValue': PValue,
-                    'FDR': FDR,
-                    'perturbation': group
-                }))
-            
+            genes = np.array(ro.r('rownames(lrt$table)'))
+            logFC = np.array(ro.r('lrt$table$logFC'))
+            logCPM = np.array(ro.r('lrt$table$logCPM'))
+            F_stat = np.array(ro.r('lrt$table$F'))
+            PValue = np.array(ro.r('lrt$table$PValue'))
+            FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
+        
+            all_results.append(pd.DataFrame({
+                'gene': genes,
+                'logFC': logFC,
+                'logCPM': logCPM,
+                'F': F_stat,
+                'PValue': PValue,
+                'FDR': FDR,
+                'perturbation': group
+            }))
 
     final_results = pd.concat(all_results, ignore_index=True)
     t_process_end = time.perf_counter()
@@ -986,10 +952,133 @@ def run_edger_de(
         "subsampled": max_perturbations is not None,
         "control_cells": int((groups == control_label).sum()),
         "size_factor_method": size_factor_method or "edgeR default (TMM)",
-        "design": "per comparison" if per_comparison else "joint",
-        "failed_groups": n_failed if per_comparison else 0,
-        "workers": n_workers if per_comparison else 1,
+        "design": "joint",
     }
+
+
+def _edger_comparisons_worker(dataset_path, perturbation_column, control_label, max_perturbations,
+                              subset_seed, max_control_cells, targets, use_libsize, r_home):
+    """One worker process: control + its share of the perturbations, one edgeR fit each
+    (own DGEList, dispersions and QL fit; design ~ group). A process of its own, with its
+    own R, so workers share nothing (forked R workers deadlocked under rpy2)."""
+    import numpy as np
+    import pandas as pd
+    configure_r_environment(r_home)
+    from rpy2 import robjects as ro
+    from rpy2.robjects import numpy2ri
+    from rpy2.robjects.conversion import localconverter
+
+    if max_perturbations is None:
+        import scanpy as sc
+        adata = sc.read_h5ad(str(dataset_path))
+    else:
+        adata, _ = _load_perturbation_subset(dataset_path, perturbation_column, control_label,
+                                             max_perturbations, subset_seed, max_control_cells=max_control_cells)
+    labels = adata.obs[perturbation_column].astype(str).to_numpy()
+    ro.r('suppressPackageStartupMessages(library(edgeR)); '
+         'tryCatch(RhpcBLASctl::blas_set_num_threads(1), error=function(e) NULL)')
+    ctrl = np.flatnonzero(labels == control_label)
+    genes = adata.var_names.astype(str).to_numpy()
+    frames, failed, first_error = [], 0, ""
+    for target in targets:
+        rows = np.concatenate([ctrl, np.flatnonzero(labels == target)])
+        counts = adata.X[rows].T
+        counts = counts.toarray() if hasattr(counts, "toarray") else np.asarray(counts)
+        with localconverter(ro.default_converter + numpy2ri.converter):
+            ro.globalenv["counts"] = counts.astype(np.float64)
+            ro.globalenv["is_target"] = ro.BoolVector((labels[rows] == target).tolist())
+            ro.globalenv["use_libsize"] = ro.BoolVector([use_libsize])
+            ro.r('''res <- tryCatch({
+                grp <- factor(ifelse(is_target, "target", "control"), levels=c("control", "target"))
+                y <- DGEList(counts=counts, group=grp)
+                if (!use_libsize) y <- calcNormFactors(y)
+                design <- model.matrix(~grp)
+                y <- estimateDisp(y, design)
+                tt <- glmQLFTest(glmQLFit(y, design), coef=2)$table
+                list(ok=TRUE, logFC=tt$logFC, logCPM=tt$logCPM, F=tt$F, PValue=tt$PValue)
+            }, error=function(e) list(ok=FALSE, msg=conditionMessage(e)))''')
+            res = {k: ro.r(f"res${k}") for k in ("ok", "msg", "logFC", "logCPM", "F", "PValue")}
+        if not bool(np.asarray(res["ok"])[0]):
+            failed += 1
+            first_error = first_error or f"{target}: {np.asarray(res['msg'])[0]}"
+            continue
+        pv = np.asarray(res["PValue"], dtype=float)
+        order = np.argsort(pv)
+        fdr = np.empty_like(pv)
+        fdr[order] = np.minimum.accumulate((pv[order] * len(pv) / np.arange(1, len(pv) + 1))[::-1])[::-1].clip(max=1)
+        frames.append(pd.DataFrame({"gene": genes, "logFC": np.asarray(res["logFC"], dtype=float),
+                                    "logCPM": np.asarray(res["logCPM"], dtype=float), "F": np.asarray(res["F"], dtype=float),
+                                    "PValue": pv, "FDR": fdr, "perturbation": target}))
+    return frames, failed, first_error
+
+
+def _run_edger_per_comparison(
+    dataset_path, *, perturbation_column, control_label, output_dir, n_jobs, max_perturbations,
+    subset_seed, max_control_cells, output_name, size_factor_method, memory_limit_gb, t_func_start,
+) -> Dict[str, Any]:
+    """edgeR per comparison (each perturbation against the controls), in spawned
+    worker processes sized to the memory limit; see run_edger_de."""
+    import multiprocessing as mp
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+    import anndata as ad
+    from .env_config import get_global_env_config
+
+    env_config = get_global_env_config()
+    r_home = env_config.r_home if env_config else None
+    t_load_start = time.perf_counter()
+    backed = ad.read_h5ad(str(dataset_path), backed="r")
+    try:
+        labels = backed.obs[perturbation_column].astype(str)
+        n_genes = backed.n_vars
+    finally:
+        backed.file.close()
+    if max_perturbations is not None:
+        targets = _seeded_perturbation_subset(labels.unique(), control_label, max_perturbations, subset_seed)
+    else:
+        targets = sorted(set(labels) - {control_label})
+    counts_per_label = labels.value_counts()
+    n_ctrl = int(min(counts_per_label.get(control_label, 0), max_control_cells or np.inf))
+    largest = int(max(counts_per_label.get(t, 0) for t in targets))
+    t_load_end = time.perf_counter()
+    # A worker holds its input (all controls + the subset's perturbations, float32 sparse)
+    # and one comparison dense in float64 about four times (R copies).
+    per_worker_gb = n_genes * (n_ctrl + largest) * 8 * 4 / 1e9 + 2.0
+    budget_gb = 0.7 * (memory_limit_gb or 64.0)
+    n_workers = max(1, min(n_jobs or 1, len(targets), int(budget_gb // per_worker_gb)))
+    shares = [targets[i::n_workers] for i in range(n_workers)]
+    t_process_start = time.perf_counter()
+    with ProcessPoolExecutor(n_workers, mp_context=mp.get_context("spawn")) as pool:
+        parts = list(pool.map(
+            _edger_comparisons_worker,
+            *zip(*[(str(dataset_path), perturbation_column, control_label, max_perturbations, subset_seed,
+                    max_control_cells, share, size_factor_method == "libsize", r_home) for share in shares])))
+    t_process_end = time.perf_counter()
+    frames = [f for fr, _, _ in parts for f in fr]
+    n_failed = sum(n for _, n, _ in parts)
+    first_error = next((e for _, _, e in parts if e), "")
+    if not frames:
+        raise RuntimeError(f"edgeR failed for all {len(targets)} perturbations; first error: {first_error}")
+    t_save_start = time.perf_counter()
+    output_path = Path(output_dir) / f"{output_name}.csv"
+    pd.concat(frames, ignore_index=True).to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
+    return {
+        "result_path": str(output_path),
+        "groups": len(targets) - n_failed,
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
+        "control_cells": n_ctrl,
+        "size_factor_method": size_factor_method or "edgeR default (TMM)",
+        "design": "per comparison",
+        "failed_groups": n_failed,
+        "first_error": first_error,
+        "workers": n_workers,
+    }
+
 
 def run_pertpy_de(
     dataset_path: Path,
