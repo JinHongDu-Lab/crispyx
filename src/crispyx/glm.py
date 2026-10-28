@@ -50,6 +50,27 @@ logger = logging.getLogger(__name__)
 _MAX_STEP_HALVINGS = 8
 
 
+def _run_gene_batches(fit, starts, threaded: bool) -> None:
+    """``fit(start)`` for each gene batch, on numba's thread count when
+    ``threaded``. A batch is NumPy work on its own genes (NumPy releases the
+    GIL for it) written to its own rows, so the result is that of the loop;
+    BLAS is held to one thread meanwhile. Only a batch that calls no parallel
+    numba kernel may be threaded: numba's default threading layer is not
+    safe to enter from several threads."""
+    import numba
+    from concurrent.futures import ThreadPoolExecutor
+    from threadpoolctl import threadpool_limits
+
+    n_threads = min(numba.get_num_threads(), len(starts)) if threaded else 1
+    if n_threads <= 1:
+        for start in starts:
+            fit(start)
+        return
+    with threadpool_limits(1, user_api="blas"), ThreadPoolExecutor(n_threads) as pool:
+        for _ in pool.map(fit, starts):
+            pass
+
+
 @dataclass
 class NBGLMBatchResult:
     """Result of fitting NB GLM for multiple genes in a batch."""
@@ -1500,7 +1521,7 @@ class NBGLMBatchFitter:
         offset_col = self.offset[:, None]
 
         # Process genes in batches
-        for batch_start in range(0, n_valid, gene_batch_size):
+        def fit(batch_start):
             batch_end = min(batch_start + gene_batch_size, n_valid)
             batch = slice(batch_start, batch_end)
             Y_batch = Y_valid[:, batch]
@@ -1549,6 +1570,10 @@ class NBGLMBatchFitter:
             gene_converged[batch] = conv
             gene_n_iter[batch] = first_iters + second_iters
             gene_deviance[batch] = dev_batch
+
+        # Estimating the dispersion (Cox-Reid) calls a parallel numba kernel.
+        _run_gene_batches(fit, range(0, n_valid, gene_batch_size),
+                          threaded=self.family == "poisson" or fixed_alpha is not None)
 
         # Standard errors from the unfloored fitted mean; see _wald_weights.
         se_valid = self._compute_se_batch(self._wald_weights(beta_all, alpha_all))
@@ -2356,7 +2381,7 @@ class StructuredGLMBatchFitter:
             dev_resid=np.empty((self.n_samples, n_genes)) if return_dev_resid else None,
         )
 
-        for start in range(0, n_genes, gene_batch_size):
+        def fit(start):
             batch = slice(start, min(start + gene_batch_size, n_genes))
             self._fit_genes(
                 counts[:, batch],
@@ -2366,6 +2391,10 @@ class StructuredGLMBatchFitter:
                 return_mu=return_mu,
                 return_dev_resid=return_dev_resid,
             )
+
+        # Estimating the dispersion calls a parallel numba kernel.
+        _run_gene_batches(fit, range(0, n_genes, gene_batch_size),
+                          threaded=self.family == "poisson" or alpha is not None)
         return out
 
     def _fit_genes(

@@ -2304,7 +2304,10 @@ def nb_glm_test(
         # -- a 165k-cell non-targeting group fitted as a perturbation is
         # ~20 GB of them.
         largest_group_mb = max_group_size * nnz_per_cell * 12 * 2 / 1e6
-        base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + 1000
+        # IRLS runs its gene batches (~100 MB of work arrays each) on the
+        # workers' threads, which number the cores asked for in all.
+        irls_threads_mb = requested_n_jobs * 200
+        base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + irls_threads_mb + 1000
         available_mb = budget_gb * 1000
         # Reserve 20% headroom for safety
         usable_mb = available_mb * 0.8
