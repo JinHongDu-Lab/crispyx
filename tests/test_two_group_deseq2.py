@@ -439,3 +439,21 @@ def test_gene_blocks_and_sparse_counts_do_not_change_the_fit(covariate):
                              columns.index("perturbation"), genes, min_mu=1e-6, block_genes=37)
     for field in one.__dataclass_fields__:
         np.testing.assert_array_equal(getattr(stacked, field), getattr(blocked, field), err_msg=field)
+
+
+def test_apeglm_refits_on_threads_are_the_sequential_ones():
+    """nb_glm_test refits a large fit's genes on threads (backend="threading"):
+    each gene's refit is its own, so the result is that of one at a time."""
+    from crispyx.glm import shrink_lfc_apeglm
+
+    counts, labels, sf = _screen(seed=4, n_genes=40)
+    design = np.column_stack([np.ones(labels.size), (labels == "KO1").astype(float)])
+    fit = fit_glm_deseq2(design, counts, sf, 1, min_mu=1e-6)
+    mle = np.where(fit.converged[None, :], fit.coef.T, np.nan)
+    kw = dict(shrink_index=1, prior_scale=1.0, min_mu=0.0)
+    one = shrink_lfc_apeglm(counts, design, sf, fit.dispersion, mle, fit.coef_se[:, 1], n_jobs=1, **kw)
+    threads = shrink_lfc_apeglm(counts, design, sf, fit.dispersion, mle, fit.coef_se[:, 1], n_jobs=4,
+                                batch_size=1, backend="threading", **kw)
+    for a, b in zip(one, threads):
+        np.testing.assert_array_equal(a, b)
+    assert np.isfinite(one[0][1]).sum() > 30

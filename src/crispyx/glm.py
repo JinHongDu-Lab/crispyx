@@ -669,6 +669,7 @@ def shrink_lfc_apeglm(
     tol: float = 1e-6,
     n_jobs: int = -1,
     batch_size: int = 128,
+    backend: Literal["loky", "threading"] = "loky",
     min_mu: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply apeGLM LFC shrinkage using Cauchy prior (PyDESeq2-compatible).
@@ -713,6 +714,11 @@ def shrink_lfc_apeglm(
         Number of parallel jobs. Default -1 uses all available cores.
     batch_size
         Number of genes per joblib batch (default: 128, matching PyDESeq2).
+    backend
+        joblib backend: worker processes (``"loky"``), or threads
+        (``"threading"``), which share ``counts`` rather than receive it;
+        a gene's refit is NumPy work over its cells, run without the GIL
+        when there are many.
     min_mu
         Minimum mean value for mu clamping in NB log-likelihood. If > 0,
         mu is clamped to be at least min_mu. This should match the min_mu
@@ -749,9 +755,7 @@ def shrink_lfc_apeglm(
     
     logger.debug(f"apeGLM shrinkage: prior_scale={prior_scale:.4f}, n_genes={n_genes}, min_mu={min_mu}")
     
-    # Parallel optimization over genes using joblib with loky backend
-    # (loky uses process-based parallelism, avoiding GIL for CPU-bound optimization)
-    results = Parallel(n_jobs=n_jobs, batch_size=batch_size, backend="loky")(
+    results = Parallel(n_jobs=n_jobs, batch_size=batch_size, backend=backend)(
         delayed(_fit_gene_apeglm_lbfgsb)(
             counts[:, j],
             design_matrix,

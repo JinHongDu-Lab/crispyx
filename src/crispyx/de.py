@@ -2082,6 +2082,13 @@ def nb_glm_test(
                 # mean floor. (One perturbation per fit: see nb_glm_test.)
                 # The prior's scale comes from every gene's MLE fold change;
                 # each gene's refit is its own, so they run a block at a time.
+                # With many cells, a gene per task on the fit's threads (which
+                # share the block): 4.75x at 536k cells. With few, a refit's
+                # NumPy calls are too short to leave the GIL free, and threads
+                # cost 25% at 8.6k.
+                import numba
+
+                ape_threads = numba.get_num_threads() if design.shape[0] >= 100_000 else 1
                 mle_coef = np.where(tested[None, :], fit.coef.T, np.nan)
                 prior_scale = _estimate_apeglm_prior_scale(mle_coef[column], se)
                 shrunk_lfc, shrunk_se = np.full(n_genes, np.nan), np.full(n_genes, np.nan)
@@ -2096,7 +2103,9 @@ def nb_glm_test(
                         mle_se=se[cols],
                         shrink_index=column,
                         prior_scale=prior_scale,
-                        n_jobs=1,  # parallel over comparisons instead
+                        n_jobs=ape_threads,
+                        batch_size=1,
+                        backend="threading",
                         min_mu=0.0,
                     )
                     shrunk_lfc[cols] = shrunk_coef[column, :]
