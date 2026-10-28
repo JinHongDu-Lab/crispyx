@@ -2906,6 +2906,20 @@ def _log_residuals(genewise: np.ndarray, trend: np.ndarray, min_disp: float) -> 
     return log_resid, float((np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2)
 
 
+def column_parts(counts) -> list:
+    """``counts`` -- a matrix, or a list of row blocks -- as a list of blocks
+    whose columns slice cheaply: CSC when sparse (a CSC block is not copied)."""
+    blocks = counts if isinstance(counts, (list, tuple)) else [counts]
+    return [b.tocsc() if sp.issparse(b) else np.asarray(b) for b in blocks]
+
+
+def dense_columns(parts: list, cols) -> np.ndarray:
+    """The columns ``cols`` of the row blocks ``parts``, stacked, as dense float64."""
+    return np.vstack([
+        np.asarray(b[:, cols].toarray() if sp.issparse(b) else b[:, cols], dtype=np.float64) for b in parts
+    ])
+
+
 def fit_glm_deseq2(
     design: ArrayLike,
     counts: ArrayLike,
@@ -2945,7 +2959,9 @@ def fit_glm_deseq2(
     design
         Design matrix ``(cells, coefficients)``, intercept first.
     counts
-        Counts ``(cells, genes)``, dense or sparse.
+        Counts ``(cells, genes)``, dense or sparse, or a list of such row
+        blocks in the order of ``design``'s rows (e.g. the controls, then a
+        perturbation's cells), so that no fit copies the controls.
     size_factors
         The cells' size factors.
     test_column
@@ -2970,15 +2986,14 @@ def fit_glm_deseq2(
     from scipy.stats import norm as _norm
 
     design = np.asarray(design, dtype=np.float64)
-    counts = counts.tocsc() if sp.issparse(counts) else np.asarray(counts)
+    parts = column_parts(counts)
     s = np.asarray(size_factors, dtype=np.float64)
-    (n, p), n_genes = design.shape, counts.shape[1]
+    (n, p), n_genes = design.shape, parts[0].shape[1]
     max_disp = max(max_disp, float(n))  # PyDESeq2's bound, for the starting values and the search alike
     block = n_genes if block_genes is None else max(1, int(block_genes))
 
     def dense(cols):
-        c = counts[:, cols]
-        return np.asarray(c.toarray() if sp.issparse(c) else c, dtype=np.float64)
+        return dense_columns(parts, cols)
 
     def blocks(cols):
         for start in range(0, cols.size, block):

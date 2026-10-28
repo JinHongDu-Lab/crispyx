@@ -433,3 +433,9 @@ def test_gene_blocks_and_sparse_counts_do_not_change_the_fit(covariate):
                              min_mu=1e-6, block_genes=37)
     for field in one.__dataclass_fields__:
         np.testing.assert_allclose(getattr(blocked, field), getattr(one, field), rtol=1e-5, err_msg=field)
+    # The same rows given as row blocks (as nb_glm_test passes the controls
+    # and a perturbation's cells) are the same matrix.
+    stacked = fit_glm_deseq2(design, [sp.csc_matrix(counts[:200]), counts[200:]], sf,
+                             columns.index("perturbation"), genes, min_mu=1e-6, block_genes=37)
+    for field in one.__dataclass_fields__:
+        np.testing.assert_array_equal(getattr(stacked, field), getattr(blocked, field), err_msg=field)

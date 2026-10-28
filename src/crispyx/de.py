@@ -59,6 +59,7 @@ from .data import (
 from .glm import (
     build_design_matrix,
     check_full_rank,
+    dense_columns,
     fit_glm_deseq2,
     fit_two_group_deseq2,
     summarize_controls,
@@ -1923,7 +1924,7 @@ def nb_glm_test(
         path: str | Path,
         rows_in_fit: list,
         control_mask: np.ndarray,
-        control_matrix: sp.csr_matrix,
+        control_matrix: sp.csc_matrix,
         control_expr_counts: np.ndarray,
         control_total: np.ndarray,
         control_n: int,
@@ -1985,17 +1986,19 @@ def nb_glm_test(
             group_idxs = [group_idxs[k] for k in kept]
             rows_in_fit = [rows_in_fit[k] for k in kept]
             masks = [masks[k] for k in kept]
-        subset_mask = control_mask | np.logical_or.reduce(masks)
+        # The fit's rows: the controls, then each perturbation's cells (each
+        # group in file order, as it is read below).
+        fit_rows = np.concatenate([np.flatnonzero(control_mask), *map(np.flatnonzero, masks)])
         design, design_columns = build_design_matrix(
-            obs_df.iloc[subset_mask],
+            obs_df.iloc[fit_rows],
             covariate_columns=covariates,
-            perturbation_indicator=masks[0][subset_mask].astype(np.float64),
+            perturbation_indicator=masks[0][fit_rows].astype(np.float64),
             intercept=True,
         )
         test_columns = [design_columns.index("perturbation")]
         design_columns[test_columns[0]] = f"perturbation {labels_in_fit[0]!r}"
         for label, mask in zip(labels_in_fit[1:], masks[1:]):
-            design = np.column_stack([design, mask[subset_mask].astype(np.float64)])
+            design = np.column_stack([design, mask[fit_rows].astype(np.float64)])
             test_columns.append(design.shape[1] - 1)
             design_columns.append(f"perturbation {label!r}")
         if covariates:
@@ -2007,24 +2010,25 @@ def nb_glm_test(
                 check_full_rank(design, design_columns, context)
             except ValueError as exc:
                 return failed + [{"group_idx": i, "error": str(exc)} for i in group_idxs]
-        subset_size_factors = np.asarray(size_factors)[subset_mask]
+        subset_size_factors = np.asarray(size_factors)[fit_rows]
 
-        # The fit's counts stay sparse: fit_glm_deseq2 (and apeGLM below)
-        # densify block_genes genes at a time.
-        parts, positions = [control_matrix], [np.flatnonzero(control_mask[subset_mask])]
+        # The fit's counts are its row blocks, left sparse (the controls are
+        # not copied): fit_glm_deseq2 and apeGLM below densify block_genes
+        # genes at a time.
+        parts = [control_matrix]
         pts_list, valids = [], []
         backed = read_backed(path)
         try:
             for rows, mask in zip(rows_in_fit, masks):
                 # A slice on a file sorted by perturbation (one contiguous
-                # read), else ascending row indices: the subset's row order.
+                # read), else ascending row indices: file order either way.
                 group = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
                 group.eliminate_zeros()
-                parts.append(group)
-                positions.append(np.flatnonzero(mask[subset_mask]))
                 group_n = group.shape[0]
                 group_expr_counts = group.getnnz(axis=0)
                 group_total = np.asarray(group.sum(axis=0)).ravel()
+                parts.append(group.tocsc())
+                del group
                 pts_list.append((group_expr_counts / max(group_n, 1)).astype(np.float32))
                 valids.append(_nb_glm_testable_genes(
                     pert_expr_counts=group_expr_counts, pert_total=group_total, n_pert=group_n,
@@ -2036,15 +2040,9 @@ def nb_glm_test(
                 ))
         finally:
             backed.file.close()
-        # Row j of the stacked parts is the subset's row positions[j].
-        positions = np.concatenate(positions)
-        order = np.empty(positions.size, dtype=np.int64)
-        order[positions] = np.arange(positions.size)
-        counts = sp.vstack(parts, format="csr")[order].tocsc()
-        del parts
         # A gene is fitted when any perturbation tests it; each reports only its own.
         fit = fit_glm_deseq2(
-            design, counts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
+            design, parts, subset_size_factors, test_columns[0], np.flatnonzero(np.logical_or.reduce(valids)),
             protected_columns=test_columns[1:], dispersion=dispersion, shrink=shrink_dispersion, min_mu=min_mu,
             max_iter=max_iter, beta_tol=tol, poisson_init_iter=poisson_init_iter, block_genes=block_genes,
         )
@@ -2089,7 +2087,7 @@ def nb_glm_test(
                 for start in range(0, n_genes, block_genes):
                     cols = slice(start, start + block_genes)
                     shrunk_coef, shrunk_se[cols], _ = shrink_lfc_apeglm(
-                        counts=counts[:, cols].toarray(),
+                        counts=dense_columns(parts, cols),
                         design_matrix=design,
                         size_factors=subset_size_factors,
                         dispersion=fit.dispersion[cols],
@@ -2163,6 +2161,8 @@ def nb_glm_test(
         finally:
             backed.file.close()
         drop_file_cache(path)  # Free page cache from control matrix read
+        # CSC, so that a fit takes a block of genes without copying the rest.
+        control_matrix = control_matrix.tocsc()
         control_matrix.eliminate_zeros()
         control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
         control_total = np.asarray(control_matrix.sum(axis=0), dtype=np.float64).ravel()
@@ -2292,9 +2292,9 @@ def nb_glm_test(
         largest_fit_cells = control_n + max_group_size * targets_per_fit
         block_genes = int(min(n_genes, max(1, budget_gb * 1e9 * 0.1 / (largest_fit_cells * 8 * 16))))
         # Sparse sizes are nnz x 12 bytes (float64 data, int32 indices). A
-        # worker stacks, reorders and converts its fit's cells (three copies
-        # at most) beside one block.
-        fit_sparse_mb = (control_n + use_group_size * targets_per_fit) * nnz_per_cell * 12 * 3 / 1e6
+        # worker reads its perturbations' cells (CSR, then CSC) beside one
+        # block; the controls it shares with the parent.
+        fit_sparse_mb = use_group_size * targets_per_fit * nnz_per_cell * 12 * 2 / 1e6
         block_mb = (control_n + use_group_size * targets_per_fit) * block_genes * 8 * 16 / 1e6
         per_worker_mb = fit_sparse_mb + block_mb + 2000
 
