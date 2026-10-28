@@ -42,7 +42,10 @@ stored in**:
 * **CSR** (Compressed Sparse Row) -- fast for cell-(row-)major functions:
   :func:`crispyx.t_test`, :func:`crispyx.nb_glm_test`, size factors, quality
   control, and :func:`crispyx.normalize_total_log1p`. Convert with
-  :func:`crispyx.convert_to_csr`.
+  :func:`crispyx.convert_to_csr`. :func:`crispyx.nb_glm_test` with
+  covariates (or apeGLM, or ``targets_per_fit > 1``) also needs the control
+  cells by gene: it builds a CSC copy of them in memory, from the CSR file,
+  so keep the file CSR.
 
 Which axis a function needs follows directly from what it has to hold in
 memory at once. ``batch_process`` keeps one accumulator per
