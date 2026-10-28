@@ -998,6 +998,7 @@ def _edger_comparisons_worker(dataset_path, perturbation_column, control_label, 
                 list(ok=TRUE, logFC=tt$logFC, logCPM=tt$logCPM, F=tt$F, PValue=tt$PValue)
             }, error=function(e) list(ok=FALSE, msg=conditionMessage(e)))''')
             res = {k: ro.r(f"res${k}") for k in ("ok", "msg", "logFC", "logCPM", "F", "PValue")}
+            ro.r("rm(res, counts); invisible(gc())")
         if not bool(np.asarray(res["ok"])[0]):
             failed += 1
             first_error = first_error or f"{target}: {np.asarray(res['msg'])[0]}"
@@ -1042,8 +1043,9 @@ def _run_edger_per_comparison(
     largest = int(max(counts_per_label.get(t, 0) for t in targets))
     t_load_end = time.perf_counter()
     # A worker holds its input (all controls + the subset's perturbations, float32 sparse)
-    # and one comparison dense in float64 about four times (R copies).
-    per_worker_gb = n_genes * (n_ctrl + largest) * 8 * 4 / 1e9 + 2.0
+    # and one comparison dense in float64 many times over: edgeR's dispersion and QL fits
+    # peaked at ~12-15 copies (Nourreddine, 36k genes x 20k controls: 48-89 GB a worker).
+    per_worker_gb = n_genes * (n_ctrl + largest) * 8 * 12 / 1e9 + 2.0
     budget_gb = 0.7 * (memory_limit_gb or 64.0)
     n_workers = max(1, min(n_jobs or 1, len(targets), int(budget_gb // per_worker_gb)))
     shares = [targets[i::n_workers] for i in range(n_workers)]
