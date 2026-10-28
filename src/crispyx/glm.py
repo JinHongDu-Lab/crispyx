@@ -50,6 +50,16 @@ logger = logging.getLogger(__name__)
 _MAX_STEP_HALVINGS = 8
 
 
+def _min_gene_batch(n_genes: int) -> int:
+    """The fewest genes an "auto" IRLS batch holds: 1/64 of them, at most 16.
+    With hundreds of thousands of cells the memory target alone gives
+    batches of one or two genes, and threads running such batches mostly
+    wait on the interpreter (5x slower at 536k cells); 16 genes there are
+    ~0.8 GB of work arrays. Not tied to the thread count, so that results do
+    not depend on it."""
+    return min(-(-n_genes // 64), 16)
+
+
 def _run_gene_batches(fit, starts, threaded: bool) -> None:
     """``fit(start)`` for each gene batch, on numba's thread count when
     ``threaded``. A batch is NumPy work on its own genes (NumPy releases the
@@ -1157,6 +1167,7 @@ class NBGLMBatchFitter:
             gene_batch_size = _estimate_gene_batch_size_fitter(
                 self.n_samples, n_valid, n_work_arrays=8, target_mb=100.0
             )
+            gene_batch_size = max(gene_batch_size, _min_gene_batch(n_valid))
         elif gene_batch_size is None:
             gene_batch_size = n_valid  # Process all at once
         
@@ -2365,6 +2376,7 @@ class StructuredGLMBatchFitter:
             gene_batch_size = _estimate_gene_batch_size_fitter(
                 self.n_samples, n_genes, n_work_arrays=12, target_mb=100.0
             )
+            gene_batch_size = max(gene_batch_size, _min_gene_batch(n_genes))
         elif gene_batch_size is None:
             gene_batch_size = n_genes
         gene_batch_size = max(1, int(gene_batch_size))

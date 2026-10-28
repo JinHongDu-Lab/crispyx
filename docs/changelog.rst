@@ -14,7 +14,10 @@ Version 0.2.4
   block sized from ``memory_limit_gb``. Such a run no longer raises
   ``MemoryError`` for many controls. Results agree with the single-block fit
   within the tolerances of the dispersion search and IRLS.
-* ``glm.fit_glm_deseq2`` takes sparse counts and ``block_genes``.
+* ``glm.fit_glm_deseq2`` takes sparse counts, a list of row blocks (the
+  controls are passed to every fit without a copy) and ``block_genes``.
+* The IRLS of those fits runs its gene batches on all the cores given to a
+  fit, with the same results: about 3x faster per fit.
 
 **Removed**
 

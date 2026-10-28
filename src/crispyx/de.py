@@ -2155,13 +2155,20 @@ def nb_glm_test(
         control_expr_counts = control_summary.nnz
         control_total = control_summary.total
     else:
+        # Read a block of rows at a time and kept in the file's dtype (a fit
+        # densifies its gene blocks to float64), so that the read peaks at
+        # twice the sparse controls: CSR, then CSC, so that a fit takes a
+        # block of genes without copying the rest.
+        control_rows = np.flatnonzero(control_mask)
         backed = read_backed(path)
         try:
-            control_matrix = sp.csr_matrix(backed.X[control_mask, :], dtype=np.float64)
+            control_matrix = sp.vstack([
+                sp.csr_matrix(backed.X[control_rows[start:start + 4096], :])
+                for start in range(0, control_rows.size, 4096)
+            ], format="csr")
         finally:
             backed.file.close()
         drop_file_cache(path)  # Free page cache from control matrix read
-        # CSC, so that a fit takes a block of genes without copying the rest.
         control_matrix = control_matrix.tocsc()
         control_matrix.eliminate_zeros()
         control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
