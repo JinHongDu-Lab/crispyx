@@ -21,7 +21,8 @@ Version 0.2.4
   cores. With a categorical covariate of many levels (batch, lane, inlet)
   results are unchanged to rounding; with other designs the kernel starts
   each gene from its mean rather than from a Poisson fit, which moves results
-  within the fit's tolerance (z by about 1e-8).
+  within the fit's tolerances (z by up to about 1e-5 on 535,000 cells, with
+  no change in which genes are called).
 * The controls are read into memory as CSC in two passes over their rows,
   peaking at the result plus a chunk (50 GB rather than 96 GB for 535,000
   cells). Keep the input CSR (:doc:`faq`).
