@@ -23,6 +23,7 @@ from ._kernels import (
     _accumulate_control_summary,
     _two_group_dispersions,
     _two_group_lfc,
+    _structured_nb_irls,
 )
 
 from ._irls import (
@@ -2394,6 +2395,9 @@ class StructuredGLMBatchFitter:
                     f"dispersion must have shape ({n_genes},), got {alpha.shape}"
                 )
 
+        if threaded and alpha is not None and not (return_mu or return_dev_resid):
+            return self._fit_numba(counts, alpha)
+
         if gene_batch_size == "auto":
             gene_batch_size = _estimate_gene_batch_size_fitter(
                 self.n_samples, n_genes, n_work_arrays=12, target_mb=100.0
@@ -2431,6 +2435,22 @@ class StructuredGLMBatchFitter:
         _run_gene_batches(fit, range(0, n_genes, gene_batch_size),
                           threaded=threaded and (self.family == "poisson" or alpha is not None))
         return out
+
+    def _fit_numba(self, counts: np.ndarray, alpha: np.ndarray) -> StructuredGLMResult:
+        """:meth:`_irls` and its standard errors at the fixed dispersions
+        ``alpha``, one gene per numba thread (``_kernels._structured_nb_irls``):
+        the same steps without the batches' ``(cells x genes)`` work arrays,
+        which on many threads wait on the allocator and the GIL."""
+        constant = np.flatnonzero(np.all(self.design == self.design[0], axis=0) & (self.design[0] != 0.0))
+        column = int(constant[0]) if constant.size else -1
+        coef, se, deviance, converged, n_iter = _structured_nb_irls(
+            np.ascontiguousarray(self.design), self.groups.labels, self.offset, np.asfortranarray(counts), alpha,
+            self.n_groups, column, float(self.design[0, column]) if column >= 0 else 1.0,
+            float(np.exp(self.offset).mean()), self._eta_min, ETA_MAX, ETA_MIN, self.min_mu > 0.0,
+            self.max_iter, self.tol, self.ridge, self.ridge_group, self.clip_group, _MAX_STEP_HALVINGS, EPS,
+        )
+        return StructuredGLMResult(coef=coef, se=se, dispersion=alpha.copy(), deviance=deviance,
+                                   converged=converged, n_iter=n_iter, mu=None, dev_resid=None)
 
     def _fit_genes(
         self, counts, alpha, out, batch, *, return_mu, return_dev_resid

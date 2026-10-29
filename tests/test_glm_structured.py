@@ -675,3 +675,24 @@ def test_fit_without_a_constant_column_starts_consistently():
     )
     assert np.all(np.isfinite(result.coef))
     assert result.converged.mean() > 0.5
+
+
+@pytest.mark.parametrize("min_mu", [1e-6, 0.0])
+def test_numba_kernel_is_the_numpy_fit(min_mu):
+    """threaded=True at a fixed dispersion fits each gene in one numba kernel
+    (one gene per thread, no batch arrays); it takes the same steps as the
+    NumPy batches, so the fits agree to rounding, with the same convergence
+    and iteration counts -- sparse genes on the mean floor included."""
+    counts, design, groups, _, offset, alpha = make_screen(
+        seed=11, n=600, p=40, n_groups=8, n_covariates=3, baseline=(0.02, 50.0)
+    )
+    fitter = StructuredGLMBatchFitter(design, groups, offset=offset, max_iter=100, tol=1e-8, min_mu=min_mu)
+    kw = dict(dispersion=alpha, return_mu=False, return_dev_resid=False)
+    numpy_fit = fitter.fit_batch(counts, threaded=False, **kw)
+    kernel_fit = fitter.fit_batch(counts, threaded=True, **kw)
+    np.testing.assert_allclose(kernel_fit.coef, numpy_fit.coef, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(kernel_fit.se, numpy_fit.se, rtol=1e-8)
+    np.testing.assert_allclose(kernel_fit.deviance, numpy_fit.deviance, rtol=1e-10)
+    np.testing.assert_array_equal(kernel_fit.converged, numpy_fit.converged)
+    np.testing.assert_array_equal(kernel_fit.n_iter, numpy_fit.n_iter)
+    assert numpy_fit.converged.all()

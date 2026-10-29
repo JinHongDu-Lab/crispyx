@@ -1760,3 +1760,292 @@ def _accumulate_control_summary(data, indices, indptr, bin_of_row, s_rows, centr
                 big_values[n_big] = y
                 n_big += 1
     return n_big
+
+
+# =============================================================================
+# Structured NB IRLS at a fixed dispersion, one gene per thread
+# =============================================================================
+#
+# StructuredGLMBatchFitter._irls, gene by gene: the same start, Newton step
+# (arrowhead Hessian solved through the Schur complement of the group block),
+# step halving, convergence rules and standard errors, in one pass over a
+# gene's cells per quantity and no temporary (cells x genes) arrays. The NumPy
+# fitter's batches allocate such arrays at every step, and on many threads
+# they wait on the allocator and the GIL; this runs on all of them.
+
+
+@nb.njit(cache=True)
+def _structured_predictor(X, labels, offset, bf, bg, eta_lo, eta_hi, eta, mu):
+    """eta = clip(offset + X bf + bg[label], eta_lo, eta_hi) and mu = exp(eta)."""
+    n, dx = X.shape
+    for i in range(n):
+        v = offset[i]
+        for j in range(dx):
+            v += X[i, j] * bf[j]
+        if labels[i] >= 0:
+            v += bg[labels[i]]
+        v = min(max(v, eta_lo), eta_hi)
+        eta[i] = v
+        mu[i] = math.exp(v)
+
+
+@nb.njit(cache=True)
+def _structured_deviance(y, eta, mu, size, ylogy):
+    """2 (sum y log y - sum y eta + sum (y + r) log1p((mu - y) / (y + r))), as Deviance.total."""
+    cross = 0.0
+    tail = 0.0
+    for i in range(y.shape[0]):
+        cross += y[i] * eta[i]
+        yr = y[i] + size
+        tail += yr * math.log1p((mu[i] - y[i]) / yr)
+    return 2.0 * (ylogy - cross + tail)
+
+
+@nb.njit(cache=True)
+def _structured_blocks(X, labels, w, wz, with_rhs, gram, cross, diag, rx, rg, ridge, ridge_group):
+    """X'WX (+ ridge), X'WG and diag(G'WG) (+ ridge_group) for the weights w,
+    and with_rhs, X'Wz and G'Wz for wz = w z."""
+    n, dx = X.shape
+    gram[:, :] = 0.0
+    cross[:, :] = 0.0
+    diag[:] = 0.0
+    rx[:] = 0.0
+    rg[:] = 0.0
+    for i in range(n):
+        wi = w[i]
+        k = labels[i]
+        for j in range(dx):
+            xw = X[i, j] * wi
+            for l in range(j + 1):
+                gram[j, l] += xw * X[i, l]
+            if k >= 0:
+                cross[j, k] += xw
+            if with_rhs:
+                rx[j] += X[i, j] * wz[i]
+        if k >= 0:
+            diag[k] += wi
+            if with_rhs:
+                rg[k] += wz[i]
+    for j in range(dx):
+        for l in range(j):
+            gram[l, j] = gram[j, l]
+        gram[j, j] += ridge
+    for k in range(diag.shape[0]):
+        diag[k] += ridge_group
+
+
+@nb.njit(cache=True)
+def _solve_small(A, B):
+    """A^-1 B for a small square A, by Gaussian elimination with partial
+    pivoting (as LAPACK's gesv); NaN when A is singular."""
+    m = A.shape[0]
+    a = A.copy()
+    x = B.copy()
+    for c in range(m):
+        p = c
+        for r in range(c + 1, m):
+            if abs(a[r, c]) > abs(a[p, c]):
+                p = r
+        if a[p, c] == 0.0:
+            x[:, :] = np.nan
+            return x
+        if p != c:
+            for j in range(m):
+                t = a[c, j]
+                a[c, j] = a[p, j]
+                a[p, j] = t
+            for j in range(x.shape[1]):
+                t = x[c, j]
+                x[c, j] = x[p, j]
+                x[p, j] = t
+        for r in range(c + 1, m):
+            f = a[r, c] / a[c, c]
+            if f != 0.0:
+                for j in range(c, m):
+                    a[r, j] -= f * a[c, j]
+                for j in range(x.shape[1]):
+                    x[r, j] -= f * x[c, j]
+    for c in range(m - 1, -1, -1):
+        for j in range(x.shape[1]):
+            v = x[c, j]
+            for k in range(c + 1, m):
+                v -= a[c, k] * x[k, j]
+            x[c, j] = v / a[c, c]
+    return x
+
+
+@nb.njit(cache=True)
+def _schur(gram, cross, diag):
+    """S = C - B D^-1 B'."""
+    dx, a = cross.shape
+    S = gram.copy()
+    for j in range(dx):
+        for l in range(dx):
+            v = 0.0
+            for k in range(a):
+                v += cross[j, k] * cross[l, k] / diag[k]
+            S[j, l] -= v
+    return S
+
+
+@nb.njit(parallel=True, cache=True)
+def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_val, mean_exp_offset,
+                        eta_lo, eta_hi, wald_lo, floored, max_iter, tol, ridge, ridge_group, clip_group,
+                        max_halvings, eps):
+    """StructuredGLMBatchFitter._irls and its standard errors at the fixed NB
+    dispersions alpha, for each column of Y (Fortran order), one gene per
+    thread. Returns coef (genes, dx + a: covariates, then groups), se,
+    deviance, converged and n_iter."""
+    n, dx = X.shape
+    n_genes = Y.shape[1]
+    a = n_groups
+    coef = np.zeros((n_genes, dx + a))
+    se = np.full((n_genes, dx + a), np.inf)
+    dev_out = np.full(n_genes, np.nan)
+    converged = np.zeros(n_genes, dtype=np.bool_)
+    n_iter = np.zeros(n_genes, dtype=np.int32)
+    for g in nb.prange(n_genes):
+        y = Y[:, g]
+        ag = alpha[g]
+        size = 1.0 / min(max(ag, eps), 1e10)
+        ylogy = 0.0
+        total = 0.0
+        for i in range(n):
+            total += y[i]
+            if y[i] > 0.0:
+                ylogy += y[i] * math.log(y[i])
+        bf = np.zeros(dx)
+        bg = np.zeros(a)
+        if const_col >= 0:
+            bf[const_col] = math.log(max(total / n, 1e-3) / mean_exp_offset) / const_val
+        eta = np.empty(n)
+        mu = np.empty(n)
+        _structured_predictor(X, labels, offset, bf, bg, eta_lo, eta_hi, eta, mu)
+        dev = _structured_deviance(y, eta, mu, size, ylogy)
+        w = np.empty(n)
+        wz = np.empty(n)
+        new_eta = np.empty(n)
+        new_mu = np.empty(n)
+        half_eta = np.empty(n)
+        half_mu = np.empty(n)
+        gram = np.empty((dx, dx))
+        cross = np.empty((dx, a))
+        diag = np.empty(a)
+        rx = np.empty(dx)
+        rg = np.empty(a)
+        conv = False
+        it = 0
+        for iteration in range(1, max_iter + 1):
+            # The Newton step at (eta, mu): weights, working response, normal equations.
+            for i in range(n):
+                wi = mu[i] / (1.0 + ag * mu[i])
+                w[i] = wi
+                wz[i] = wi * (eta[i] - offset[i] + (y[i] - mu[i]) / max(mu[i], eps))
+            _structured_blocks(X, labels, w, wz, True, gram, cross, diag, rx, rg, ridge, ridge_group)
+            S = _schur(gram, cross, diag)
+            rhs = np.empty((dx, 1))
+            for j in range(dx):
+                v = rx[j]
+                for k in range(a):
+                    v -= cross[j, k] / diag[k] * rg[k]
+                rhs[j, 0] = v
+            full_f = _solve_small(S, rhs)[:, 0].copy()
+            full_g = np.empty(a)
+            for k in range(a):
+                v = rg[k]
+                for j in range(dx):
+                    v -= cross[j, k] * full_f[j]
+                full_g[k] = min(max(v / diag[k], -clip_group), clip_group)
+            _structured_predictor(X, labels, offset, full_f, full_g, eta_lo, eta_hi, new_eta, new_mu)
+            new_dev = _structured_deviance(y, new_eta, new_mu, size, ylogy)
+            new_f = full_f.copy()
+            new_g = full_g.copy()
+
+            # A gene resting on the mean floor takes the full step and is
+            # judged by the deviance ratio (as the NumPy fitter).
+            on_floor = False
+            if floored:
+                for i in range(n):
+                    if eta[i] <= eta_lo:
+                        on_floor = True
+                        break
+            ceiling = dev + 1e-9 * abs(dev)
+            rose = new_dev > ceiling
+            worse = rose and not on_floor
+            scale = max(abs(dev), 1e-8)
+            excess = (new_dev - dev) / scale
+            step = 1.0
+            for _h in range(max_halvings):
+                if not worse:
+                    break
+                step *= 0.5
+                half_f = bf + step * (full_f - bf)
+                half_g = bg + step * (full_g - bg)
+                _structured_predictor(X, labels, offset, half_f, half_g, eta_lo, eta_hi, half_eta, half_mu)
+                half_dev = _structured_deviance(y, half_eta, half_mu, size, ylogy)
+                excess = min(excess, (half_dev - dev) / scale)
+                if half_dev <= ceiling:
+                    new_f = half_f
+                    new_g = half_g
+                    new_eta[:] = half_eta
+                    new_mu[:] = half_mu
+                    new_dev = half_dev
+                    worse = False
+            fixed_point = rose and on_floor
+            if worse:
+                new_f = bf.copy()
+                new_g = bg.copy()
+                new_eta[:] = eta
+                new_mu[:] = mu
+                new_dev = dev
+            relative_change = abs(new_dev - dev) / scale
+            deviance_ratio = abs(new_dev - dev) / (abs(new_dev) + 0.1)
+            coef_change = 0.0
+            for j in range(dx):
+                coef_change = max(coef_change, abs(new_f[j] - bf[j]))
+            for k in range(a):
+                coef_change = max(coef_change, abs(new_g[k] - bg[k]))
+            bf = new_f
+            bg = new_g
+            eta[:] = new_eta
+            mu[:] = new_mu
+            dev = new_dev
+            it = iteration
+            if fixed_point:
+                conv = deviance_ratio < tol and coef_change < tol
+            elif worse:
+                conv = excess < tol
+            else:
+                conv = relative_change < tol and coef_change < tol
+            if conv or worse:
+                break
+
+        # Standard errors from the blocks at the fit, with the unfloored mean.
+        if floored:
+            _structured_predictor(X, labels, offset, bf, bg, wald_lo, eta_hi, half_eta, half_mu)
+            for i in range(n):
+                w[i] = half_mu[i] / (1.0 + ag * half_mu[i])
+        else:
+            for i in range(n):
+                w[i] = mu[i] / (1.0 + ag * mu[i])
+        _structured_blocks(X, labels, w, wz, False, gram, cross, diag, rx, rg, ridge, ridge_group)
+        S = _schur(gram, cross, diag)
+        rhs = np.zeros((dx, dx + a))
+        for j in range(dx):
+            rhs[j, j] = 1.0
+            for k in range(a):
+                rhs[j, dx + k] = cross[j, k]
+        solved = _solve_small(S, rhs)
+        for j in range(dx):
+            coef[g, j] = bf[j]
+            se[g, j] = math.sqrt(max(solved[j, j], 0.0))
+        for k in range(a):
+            quad = 0.0
+            for j in range(dx):
+                quad += cross[j, k] * solved[j, dx + k]
+            coef[g, dx + k] = bg[k]
+            se[g, dx + k] = math.sqrt(max(1.0 / diag[k] + quad / (diag[k] * diag[k]), 0.0))
+        dev_out[g] = dev
+        converged[g] = conv
+        n_iter[g] = it
+    return coef, se, dev_out, converged, n_iter
