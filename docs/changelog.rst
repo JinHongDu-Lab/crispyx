@@ -16,8 +16,10 @@ Version 0.2.4
   within the tolerances of the dispersion search and IRLS.
 * ``glm.fit_glm_deseq2`` takes sparse counts, a list of row blocks (the
   controls are passed to every fit without a copy) and ``block_genes``.
-* The IRLS of those fits runs its gene batches on all the cores given to a
-  fit, with the same results: about 3x faster per fit.
+* The IRLS of those fits runs on all the cores given to a fit, with the same
+  results: with a categorical covariate of many levels (batch, lane, inlet)
+  each gene is fitted in one compiled kernel, about 5x faster at 536,000
+  cells; otherwise the gene batches run on threads, about 3x faster per fit.
 * The controls are read into memory as CSC in two passes over their rows,
   peaking at the result plus a chunk (50 GB rather than 96 GB for 535,000
   cells). Keep the input CSR (:doc:`faq`).
@@ -25,7 +27,7 @@ Version 0.2.4
   value rather than per cell (20% faster); apeGLM refits a fit's genes on
   its threads when the fit has 100,000 cells or more (about 5x).
 * With covariates, apeGLM or ``targets_per_fit > 1``, one perturbation
-  against 535,000 control cells and 147 coefficients takes 52 minutes on 32
+  against 535,000 control cells and 147 coefficients takes 33 minutes on 32
   cores (89 before this release, which also needed the controls dense).
 
 **Removed**
