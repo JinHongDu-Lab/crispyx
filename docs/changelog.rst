@@ -1,6 +1,60 @@
 Changelog
 =========
 
+Version 0.2.4
+-------------
+
+*Released 2026-10-30.* NB-GLM with covariates, apeGLM or several perturbations
+per fit no longer needs the control cells dense in memory, and is faster;
+results move only within the fits' tolerances.
+
+**Changed**
+
+* NB-GLM with covariates, ``lfc_shrinkage_type="apeglm"`` or
+  ``targets_per_fit > 1`` no longer needs the control cells dense in memory:
+  they are held sparse and each fit takes the genes a block at a time, the
+  block sized from ``memory_limit_gb``. Such a run no longer raises
+  ``MemoryError`` for many controls. Results agree with the single-block fit
+  within the tolerances of the dispersion search and IRLS.
+* ``glm.fit_glm_deseq2`` takes sparse counts, a list of row blocks (the
+  controls are passed to every fit without a copy) and ``block_genes``.
+* The IRLS of those fits runs in one compiled kernel, a gene per core, about
+  5-11x faster at 536,000 cells, and gives the same result on any number of
+  cores. With a categorical covariate of many levels (batch, lane, inlet)
+  results are unchanged to rounding; with other designs the kernel starts
+  each gene from its mean rather than from a Poisson fit, which moves results
+  within the fit's tolerances (z by up to about 1e-5 on 535,000 cells, with
+  no change in which genes are called).
+* The controls are read into memory as CSC in two passes over their rows,
+  peaking at the result plus a chunk (50 GB rather than 96 GB for 535,000
+  cells). Keep the input CSR (:doc:`faq`).
+* The dispersion search forms the likelihood's lgamma terms once per count
+  value rather than per cell (20% faster); apeGLM refits a fit's genes on
+  its threads when the fit has 100,000 cells or more (about 5x).
+* With covariates, apeGLM or ``targets_per_fit > 1``, one perturbation
+  against 535,000 control cells and 147 coefficients takes 33 minutes on 32
+  cores (89 before this release, which also needed the controls dense).
+
+**Removed**
+
+* ``max_dense_fraction`` (``nb_glm_test``): nothing is held dense in full.
+
+**Fixed**
+
+* NB-GLM without covariates no longer reports a gene as converged when its
+  fit is held at the bound on the log mean; such a gene is reported as not
+  tested. No gene of a Feng *et al.* targeted-screen subset changes.
+* ``batch_process`` resuming or reusing an existing output, ``pca`` /
+  ``neighbors`` / ``umap`` given a path, and standardization no longer read
+  every layer of the file into memory.
+
+**Documentation**
+
+* The notes that controls must fit in memory for a fit with covariates are
+  gone (:doc:`nb_glm`, :doc:`covariate_adjustment`, ``compare_controls``); the
+  :doc:`faq` says to keep the file CSR for ``nb_glm_test``.
+* The tutorials are re-executed on 0.2.4.
+
 Version 0.2.3
 -------------
 

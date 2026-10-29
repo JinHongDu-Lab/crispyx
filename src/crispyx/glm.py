@@ -23,6 +23,7 @@ from ._kernels import (
     _accumulate_control_summary,
     _two_group_dispersions,
     _two_group_lfc,
+    _structured_nb_irls,
 )
 
 from ._irls import (
@@ -48,6 +49,27 @@ logger = logging.getLogger(__name__)
 
 #: Maximum Newton step halvings before a gene's step is accepted as-is.
 _MAX_STEP_HALVINGS = 8
+
+
+def _nb_irls_kernel(design, labels, n_groups, offset, counts, alpha, *, ridge, ridge_group, clip_group,
+                    max_iter, tol, min_mu):
+    """NB IRLS at the fixed dispersions ``alpha`` and its standard errors, one
+    gene per numba thread (``_kernels._structured_nb_irls``): ``design``'s
+    columns plus ``n_groups`` one-hot groups given by ``labels`` (``-1`` for
+    none; ``n_groups`` may be 0), ``ridge`` per design column. Starts from
+    each gene's offset-adjusted mean, carried by the constant column.
+    Returns coef, se, deviance, converged, n_iter."""
+    design = np.ascontiguousarray(design, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    constant = np.flatnonzero(np.all(design == design[0], axis=0) & (design[0] != 0.0))
+    column = int(constant[0]) if constant.size else -1
+    return _structured_nb_irls(
+        design, np.asarray(labels, dtype=np.int64), offset, np.asfortranarray(counts, dtype=np.float64),
+        np.asarray(alpha, dtype=np.float64), int(n_groups), column,
+        float(design[0, column]) if column >= 0 else 1.0, float(np.exp(offset).mean()),
+        eta_floor(min_mu), ETA_MAX, ETA_MIN, min_mu > 0.0, int(max_iter), float(tol),
+        np.asarray(ridge, dtype=np.float64), float(ridge_group), float(clip_group), _MAX_STEP_HALVINGS, EPS,
+    )
 
 
 @dataclass
@@ -639,6 +661,7 @@ def shrink_lfc_apeglm(
     tol: float = 1e-6,
     n_jobs: int = -1,
     batch_size: int = 128,
+    backend: Literal["loky", "threading"] = "loky",
     min_mu: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply apeGLM LFC shrinkage using Cauchy prior (PyDESeq2-compatible).
@@ -683,6 +706,11 @@ def shrink_lfc_apeglm(
         Number of parallel jobs. Default -1 uses all available cores.
     batch_size
         Number of genes per joblib batch (default: 128, matching PyDESeq2).
+    backend
+        joblib backend: worker processes (``"loky"``), or threads
+        (``"threading"``), which share ``counts`` rather than receive it;
+        a gene's refit is NumPy work over its cells, run without the GIL
+        when there are many.
     min_mu
         Minimum mean value for mu clamping in NB log-likelihood. If > 0,
         mu is clamped to be at least min_mu. This should match the min_mu
@@ -719,9 +747,7 @@ def shrink_lfc_apeglm(
     
     logger.debug(f"apeGLM shrinkage: prior_scale={prior_scale:.4f}, n_genes={n_genes}, min_mu={min_mu}")
     
-    # Parallel optimization over genes using joblib with loky backend
-    # (loky uses process-based parallelism, avoiding GIL for CPU-bound optimization)
-    results = Parallel(n_jobs=n_jobs, batch_size=batch_size, backend="loky")(
+    results = Parallel(n_jobs=n_jobs, batch_size=batch_size, backend=backend)(
         delayed(_fit_gene_apeglm_lbfgsb)(
             counts[:, j],
             design_matrix,
@@ -2070,8 +2096,9 @@ class StructuredGLMBatchFitter:
     def _hessian_blocks(self, weights):
         """The three blocks of the arrowhead Hessian for the given weights."""
         gram = gram_batched(self.design, weights, ridge=self.ridge)
-        cross = self.groups.cross(self._design_sorted, self.groups.sort(weights))
-        diagonal = self.groups.sums(weights) + self.ridge_group
+        weights_sorted = self.groups.sort(weights)
+        cross = self.groups.cross(self._design_sorted, weights_sorted)
+        diagonal = self.groups.sums_sorted(weights_sorted) + self.ridge_group
         return gram, cross, diagonal
 
     def _newton_step(self, counts, eta, mu, alpha):
@@ -2299,6 +2326,7 @@ class StructuredGLMBatchFitter:
         return_mu: bool = True,
         return_dev_resid: bool = True,
         gene_batch_size: int | Literal["auto"] | None = "auto",
+        threaded: bool = False,
     ) -> StructuredGLMResult:
         """Fit one GLM per gene.
 
@@ -2320,6 +2348,10 @@ class StructuredGLMBatchFitter:
             memory; ``"auto"`` sizes it for ~100 MB of them, as
             :class:`NBGLMBatchFitter` does.  ``None`` fits every gene in one
             batch.  (``counts`` itself is held whole either way.)
+        threaded
+            With ``dispersion`` given and neither ``return_mu`` nor
+            ``return_dev_resid``, fit in one numba kernel, a gene per numba
+            thread (:meth:`_fit_numba`), rather than in NumPy batches.
         """
         counts = np.asarray(
             counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
@@ -2335,6 +2367,9 @@ class StructuredGLMBatchFitter:
                 raise ValueError(
                     f"dispersion must have shape ({n_genes},), got {alpha.shape}"
                 )
+
+        if threaded and alpha is not None and not (return_mu or return_dev_resid):
+            return self._fit_numba(counts, alpha)
 
         if gene_batch_size == "auto":
             gene_batch_size = _estimate_gene_batch_size_fitter(
@@ -2367,6 +2402,19 @@ class StructuredGLMBatchFitter:
                 return_dev_resid=return_dev_resid,
             )
         return out
+
+    def _fit_numba(self, counts: np.ndarray, alpha: np.ndarray) -> StructuredGLMResult:
+        """:meth:`_irls` and its standard errors at the fixed dispersions
+        ``alpha``, one gene per numba thread (``_kernels._structured_nb_irls``):
+        the same steps without the batches' ``(cells x genes)`` work arrays,
+        which on many threads wait on the allocator and the GIL."""
+        coef, se, deviance, converged, n_iter = _nb_irls_kernel(
+            self.design, self.groups.labels, self.n_groups, self.offset, counts, alpha,
+            ridge=np.full(self.n_features, self.ridge), ridge_group=self.ridge_group, clip_group=self.clip_group,
+            max_iter=self.max_iter, tol=self.tol, min_mu=self.min_mu,
+        )
+        return StructuredGLMResult(coef=coef, se=se, dispersion=alpha.copy(), deviance=deviance,
+                                   converged=converged, n_iter=n_iter, mu=None, dev_resid=None)
 
     def _fit_genes(
         self, counts, alpha, out, batch, *, return_mu, return_dev_resid
@@ -2493,6 +2541,7 @@ def fit_nb_glm_batch_auto(
     min_total_count: float = 1.0,
     ridge_penalty: float = 1e-6,
     fixed_dispersion: ArrayLike | None = None,
+    threaded: bool = False,
 ) -> NBGLMBatchResult:
     """Fit a batch NB GLM, using the structured solver when it pays.
 
@@ -2525,6 +2574,10 @@ def fit_nb_glm_batch_auto(
     fixed_dispersion
         Per-gene dispersion of shape ``(n_genes,)`` to hold fixed instead of
         estimating it; ``dispersion_method`` is then unused.
+    threaded
+        With ``fixed_dispersion``, fit in the numba kernel, a gene per numba
+        thread, with either solver's design (see
+        :meth:`StructuredGLMBatchFitter.fit_batch`).
     """
     design = np.asarray(design, dtype=np.float64)
     n_features = design.shape[1]
@@ -2537,6 +2590,33 @@ def fit_nb_glm_batch_auto(
             group_columns = candidates[found]
 
     covariate_columns = np.setdiff1d(np.arange(n_features), group_columns)
+    if group_columns.size <= covariate_columns.size and threaded and fixed_dispersion is not None:
+        # The kernel with no group block, in NBGLMBatchFitter's unit
+        # root-mean-square columns (its ridge maps to ridge / scale**2 there),
+        # on the genes it would fit. It starts from each gene's mean where the
+        # NumPy fitter starts from a Poisson fit: both converge to the same
+        # coefficients within tol.
+        counts = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+        n_genes = counts.shape[1]
+        scaled, scale = precondition_columns(design)
+        offset = np.zeros(design.shape[0]) if offset is None else np.asarray(offset, dtype=np.float64)
+        valid = np.flatnonzero(counts.sum(axis=0) >= min_total_count)
+        coef = np.zeros((n_genes, n_features))
+        se = np.full((n_genes, n_features), np.inf)
+        dispersion = np.full(n_genes, np.nan)
+        converged = np.zeros(n_genes, dtype=bool)
+        n_iter = np.zeros(n_genes, dtype=np.int32)
+        deviance = np.full(n_genes, np.nan)
+        if valid.size:
+            alpha = np.asarray(fixed_dispersion, dtype=np.float64)[valid]
+            c, s, deviance[valid], converged[valid], n_iter[valid] = _nb_irls_kernel(
+                scaled, np.full(design.shape[0], -1), 0, offset, counts[:, valid], alpha,
+                ridge=ridge_penalty / scale**2, ridge_group=0.0, clip_group=0.0,
+                max_iter=max_iter, tol=tol, min_mu=min_mu,
+            )
+            coef[valid], se[valid], dispersion[valid] = c / scale, s / scale, alpha
+        return NBGLMBatchResult(coef=coef, se=se, dispersion=dispersion,
+                                converged=converged, n_iter=n_iter, deviance=deviance)
     if group_columns.size <= covariate_columns.size:
         return NBGLMBatchFitter(
             design, offset=offset, max_iter=max_iter, tol=tol,
@@ -2570,6 +2650,7 @@ def fit_nb_glm_batch_auto(
     ).fit_batch(
         counts[:, valid], return_mu=False, return_dev_resid=False,
         dispersion=None if fixed_dispersion is None else np.asarray(fixed_dispersion, dtype=np.float64)[valid],
+        threaded=threaded,
     )
 
     n_covariates = covariate_columns.size
@@ -2877,6 +2958,20 @@ def _log_residuals(genewise: np.ndarray, trend: np.ndarray, min_disp: float) -> 
     return log_resid, float((np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2)
 
 
+def column_parts(counts) -> list:
+    """``counts`` -- a matrix, or a list of row blocks -- as a list of blocks
+    whose columns slice cheaply: CSC when sparse (a CSC block is not copied)."""
+    blocks = counts if isinstance(counts, (list, tuple)) else [counts]
+    return [b.tocsc() if sp.issparse(b) else np.asarray(b) for b in blocks]
+
+
+def dense_columns(parts: list, cols) -> np.ndarray:
+    """The columns ``cols`` of the row blocks ``parts``, stacked, as dense float64."""
+    return np.vstack([
+        np.asarray(b[:, cols].toarray() if sp.issparse(b) else b[:, cols], dtype=np.float64) for b in parts
+    ])
+
+
 def fit_glm_deseq2(
     design: ArrayLike,
     counts: ArrayLike,
@@ -2895,6 +2990,7 @@ def fit_glm_deseq2(
     max_iter: int = 100,
     beta_tol: float = 1e-8,
     poisson_init_iter: int = 5,
+    block_genes: int | None = None,
 ) -> DESeq2Result:
     """DESeq2's Wald test of one coefficient of a GLM, as PyDESeq2 runs it on
     ``design`` with the given size factors: :func:`fit_two_group_deseq2` for a
@@ -2915,7 +3011,9 @@ def fit_glm_deseq2(
     design
         Design matrix ``(cells, coefficients)``, intercept first.
     counts
-        Counts ``(cells, genes)``, dense or sparse.
+        Counts ``(cells, genes)``, dense or sparse, or a list of such row
+        blocks in the order of ``design``'s rows (e.g. the controls, then a
+        perturbation's cells), so that no fit copies the controls.
     size_factors
         The cells' size factors.
     test_column
@@ -2929,20 +3027,29 @@ def fit_glm_deseq2(
     max_iter, beta_tol, poisson_init_iter
         IRLS (:func:`fit_nb_glm_batch_auto`'s ``max_iter``, ``tol``,
         ``poisson_init_iter``).
+    block_genes
+        Genes held dense at a time (all when None). Every step but the trend
+        and the prior variance is per gene, so the genes are taken in blocks
+        twice -- gene-wise dispersions, then the trend and prior on them
+        all, then MAP dispersions and coefficients -- and memory is
+        ``O(cells x block_genes)`` beside ``counts``. The results depend on
+        it only within the tolerances of the dispersion search and IRLS.
     """
     from scipy.stats import norm as _norm
 
     design = np.asarray(design, dtype=np.float64)
-    y = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+    parts = column_parts(counts)
     s = np.asarray(size_factors, dtype=np.float64)
-    (n, p), n_genes = design.shape, y.shape[1]
+    (n, p), n_genes = design.shape, parts[0].shape[1]
     max_disp = max(max_disp, float(n))  # PyDESeq2's bound, for the starting values and the search alike
-    normed = y / s[:, None]
-    base_mean = normed.mean(axis=0)
-    tested = np.zeros(n_genes, dtype=bool)
-    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
-    tested &= y.sum(axis=0) > 0
-    idx = np.flatnonzero(tested)
+    block = n_genes if block_genes is None else max(1, int(block_genes))
+
+    def dense(cols):
+        return dense_columns(parts, cols)
+
+    def blocks(cols):
+        for start in range(0, cols.size, block):
+            yield cols[start:start + block]
 
     def nan():
         return np.full(n_genes, np.nan)
@@ -2951,62 +3058,104 @@ def fit_glm_deseq2(
     lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
     converged = np.zeros(n_genes, dtype=bool)
     prior_var = float("nan")
-    if idx.size == 0:
-        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
-                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
-                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
-
-    y_t = np.asfortranarray(y[:, idx])
+    base_mean = nan()
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
     offset = np.log(s)
+    # Threaded: a call is one block of genes, so its batches' work arrays
+    # are bounded by the block.
     irls = dict(offset=offset, protected_columns=(0, test_column, *protected_columns), max_iter=max_iter, tol=beta_tol,
-                poisson_init_iter=poisson_init_iter, min_mu=min_mu)
-    if dispersion is not None:
-        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
-    else:
+                poisson_init_iter=poisson_init_iter, min_mu=min_mu, threaded=True)
+    estimate = dispersion is None
+    if estimate:
+        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
+        x_csr = _design_csr(design)
+        # A projection of the rows has no more distinct values than there
+        # are distinct rows, so more than p of them settle it without
+        # sorting the rows (17 s for 536k cells and 147 columns).
+        projected = design @ np.sqrt(np.arange(2.0, p + 2.0))
+        linear_mu = np.unique(projected).size <= p and np.unique(design, axis=0).shape[0] == p
+        # What the second pass needs to rebuild the means without a refit:
+        # the linear model's coefficients and, else, IRLS's at the starting
+        # dispersions.
+        lin_coef = np.full((p, n_genes), np.nan)
+        start_coef = np.full((n_genes, p), np.nan)
+
+    def means(cols):
+        """The means both dispersion steps are evaluated at: a linear model
+        when it fits every distinct design row exactly, else IRLS."""
+        lin_mu = np.maximum(s[:, None] * (design @ lin_coef[:, cols]), min_mu)
+        if linear_mu:
+            mu = lin_mu
+        else:
+            coef = start_coef[cols]
+            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
+            finite = np.isfinite(coef).all(axis=1)
+            mu[:, ~finite] = lin_mu[:, ~finite]
+        return np.asfortranarray(np.maximum(mu, 1e-10))
+
+    # First pass: base means, and the gene-wise dispersions of tested genes.
+    for cols in blocks(np.arange(n_genes)):
+        y = dense(cols)
+        normed = y / s[:, None]
+        base_mean[cols] = normed.mean(axis=0)
+        tested[cols] &= y.sum(axis=0) > 0
+        if not estimate or not tested[cols].any():
+            continue
+        keep = tested[cols]
+        cols = cols[keep]
         # Starting dispersions: PyDESeq2's _fit_MoM_dispersions.
-        normed_t = normed[:, idx]
-        linear = design @ np.linalg.lstsq(design, normed_t, rcond=None)[0]
-        y_hat = np.maximum(linear, 1.0)
+        normed_t = normed[:, keep]
+        lin_coef[:, cols] = np.linalg.lstsq(design, normed_t, rcond=None)[0]
+        y_hat = np.maximum(design @ lin_coef[:, cols], 1.0)
         rough = np.maximum((((normed_t - y_hat) ** 2 - y_hat) / y_hat**2).sum(axis=0) / max(n - p, 1), 0.0)
         mean_t = normed_t.mean(axis=0)
         moments = np.nan_to_num((normed_t.var(axis=0, ddof=1) - np.mean(1.0 / s) * mean_t) / mean_t**2)
         start = np.clip(np.minimum(rough, moments), min_disp, max_disp)
-        # The means both dispersion steps are evaluated at: a linear model
-        # when it fits every distinct design row exactly, else IRLS.
-        lin_mu = np.maximum(s[:, None] * linear, min_mu)
-        if np.unique(design, axis=0).shape[0] == p:
-            mu = lin_mu
-        else:
-            coef = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=start, **irls).coef
-            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
-            finite = np.isfinite(coef).all(axis=1)
-            mu[:, ~finite] = lin_mu[:, ~finite]
-        mu = np.asfortranarray(np.maximum(mu, 1e-10))
-        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
-        x_csr = _design_csr(design)
-        full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
-        genewise[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-            y_t, mu, np.zeros(idx.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+        y_t = np.asfortranarray(y[:, keep])
+        del y, normed, normed_t, y_hat
+        if not linear_mu:
+            start_coef[cols] = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=start, **irls).coef
+        full = (np.full(cols.size, log_lo), np.full(cols.size, log_hi))
+        genewise[cols] = np.exp(_nb_map_grid_search_with_refinement_numba(
+            y_t, means(cols), np.zeros(cols.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+
+    idx = np.flatnonzero(tested)
+    if idx.size == 0:
+        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
+                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
+    if estimate:
         trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
         final[idx] = genewise[idx]
         if shrink:
             log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
             # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
             prior_var = float(np.fmax(squared_logres - polygamma(1, (n - p) / 2), 0.25))
-            map_disp[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
-                y_t, mu, np.log(trend[idx]), *full, n_grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
-            final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])
+            keep_genewise = np.zeros(n_genes, dtype=bool)
+            keep_genewise[idx] = log_resid > 2 * np.sqrt(squared_logres)
+    else:
+        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
 
-    fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[idx], **irls)
-    b, b_se = fit.coef[:, test_column], fit.se[:, test_column]
-    ok = fit.converged & np.isfinite(b) & np.isfinite(b_se) & (b_se > 0)
-    lfc[idx], se[idx], intercept[idx] = b, b_se, fit.coef[:, 0]
+    # Second pass: MAP dispersions, then the coefficients at the final ones.
+    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
+    coef_converged = np.zeros(n_genes, dtype=bool)
+    for cols in blocks(idx):
+        y_t = np.asfortranarray(dense(cols))
+        if estimate and shrink:
+            full = (np.full(cols.size, log_lo), np.full(cols.size, log_hi))
+            map_disp[cols] = np.exp(_nb_map_grid_search_with_refinement_numba(
+                y_t, means(cols), np.log(trend[cols]), *full, n_grid, prior_var, *x_csr, tol=tol,
+                max_refine_iter=100))
+            final[cols] = np.where(keep_genewise[cols], genewise[cols], map_disp[cols])
+        fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[cols], **irls)
+        coef[cols], coef_se[cols], coef_converged[cols] = fit.coef, fit.se, fit.converged
+
+    b, b_se = coef[idx, test_column], coef_se[idx, test_column]
+    ok = coef_converged[idx] & np.isfinite(b) & np.isfinite(b_se) & (b_se > 0)
+    lfc[idx], se[idx], intercept[idx] = b, b_se, coef[idx, 0]
     stat[idx] = b / b_se
     pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
     converged[idx] = ok
-    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
-    coef[idx], coef_se[idx] = fit.coef, fit.se
-    coef_converged = np.zeros(n_genes, dtype=bool)
-    coef_converged[idx] = fit.converged
     return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
                         base_mean, converged, prior_var, coef, coef_se, coef_converged)

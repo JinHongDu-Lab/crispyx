@@ -682,7 +682,7 @@ def batch_process(
             # width that output was written with. Skipped under force=True,
             # which reads nothing from the existing output -- including when
             # it is too damaged to open, the case force exists for.
-            existing = ad.read_h5ad(resolved_output, backed="r")
+            existing = read_backed(resolved_output)
             try:
                 stored_chunk_size = existing.uns.get("chunk_size")
             finally:
@@ -735,7 +735,7 @@ def batch_process(
         # tell a finished result from one whose run was killed. Only the
         # completion marker, written after the last chunk, can.
         if resolved_output.exists() and not force:
-            existing = ad.read_h5ad(resolved_output, backed="r")
+            existing = read_backed(resolved_output)
             try:
                 complete = _run_is_complete(existing)
             finally:
@@ -792,7 +792,7 @@ def batch_process(
                         f"gene chunk {last_completed_chunk} by scanning {resolved_output.name}",
                     )
         if resume and last_completed_chunk >= 0 and resolved_output.exists():
-            existing = ad.read_h5ad(resolved_output, backed="r")
+            existing = read_backed(resolved_output)
             try:
                 # A finished output rejected above fails this too, so it is
                 # recomputed rather than "resumed" with nothing left to do.

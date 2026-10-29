@@ -453,6 +453,32 @@ def test_resume_after_interruption_matches_uninterrupted_run(tmp_path):
     assert not checkpoint_path.exists()  # cleaned up on successful completion
 
 
+def test_resume_and_reuse_checks_leave_output_layers_on_disk(tmp_path, monkeypatch):
+    """The checks on an existing output read its uns and shape only: anndata's
+    backed mode would load every layer, each as large as the result."""
+    path, *_ = _write_data(tmp_path)
+    output_path = tmp_path / "resumable.h5ad"
+    kwargs = dict(groupby="perturbation", batch_column="batch", statistic_name="std",
+                  cell_chunk_size=100)
+    with pytest.raises(RuntimeError, match="Reducer failed"):
+        cx.batch_process(
+            path, _crashing_reducer(crash_after_updates=9 * 2 + 3),
+            output_path=output_path, chunk_size=2, force=True, **kwargs,
+        )
+
+    read_h5ad = ad.read_h5ad
+
+    def no_backed_read(filename, backed=None, **kw):
+        assert not backed, f"anndata backed read of {filename}"
+        return read_h5ad(filename, backed=backed, **kw)
+
+    monkeypatch.setattr(ad, "read_h5ad", no_backed_read)
+    # The stored chunk width, the completion marker and the resume match.
+    cx.batch_process(path, _moment_reducer(), output_path=output_path, resume=True, **kwargs).close()
+    # A finished output, reused.
+    cx.batch_process(path, _moment_reducer(), output_path=output_path, **kwargs).close()
+
+
 def test_resume_falls_back_to_scanning_output_when_checkpoint_corrupted(tmp_path):
     path, *_ = _write_data(tmp_path)
     kwargs = dict(

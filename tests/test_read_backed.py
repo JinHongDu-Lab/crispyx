@@ -73,3 +73,24 @@ def test_the_anndata_wrapper_and_functions_on_a_layer_use_it(path, tmp_path):
 
 def _dense(matrix):
     return matrix.toarray() if sp.issparse(matrix) else np.asarray(matrix)
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_read_rows_csc_is_the_rows_as_csc(tmp_path, dense):
+    """read_rows_csc builds the selected rows' CSC in two passes over chunks of
+    rows; it is the CSR rows converted, with stored zeros dropped."""
+    from crispyx.data import read_rows_csc
+
+    rng = np.random.default_rng(0)
+    counts = sp.random(97, 23, density=0.2, random_state=1, format="csr", dtype=np.float32)
+    counts.data = np.round(counts.data * 10)  # some become stored zeros
+    path = tmp_path / "x.h5ad"
+    ad.AnnData(counts.toarray() if dense else counts).write_h5ad(path)
+    rows = np.sort(rng.choice(97, 60, replace=False))
+    got = read_rows_csc(path, rows, chunk_rows=7)
+    want = counts[rows].tocsc()
+    want.eliminate_zeros()
+    assert sp.isspmatrix_csc(got) and got.dtype == np.float32
+    np.testing.assert_array_equal(got.indptr, want.indptr)
+    np.testing.assert_array_equal(got.indices, want.indices)
+    np.testing.assert_array_equal(got.data, want.data)

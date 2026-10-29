@@ -172,8 +172,15 @@ class TestEstimateDiskUsage:
         )
         assert {"tempdir", "output"} <= result.keys()
 
-    def test_reachable_via_tl_namespace_and_matches_top_level(self, tmp_path):
+    def test_reachable_via_tl_namespace_and_matches_top_level(self, tmp_path, monkeypatch):
         """cx.tl.estimate_disk_usage is the same function as cx.estimate_disk_usage."""
+        import psutil
+        from types import SimpleNamespace
+
+        # Chunk sizes follow the available memory, which drifts between the
+        # two calls; pin it so both estimate the same run.
+        pinned = SimpleNamespace(available=8 * 1024**3, total=16 * 1024**3)
+        monkeypatch.setattr(psutil, "virtual_memory", lambda: pinned)
         path = _make_normalised_h5ad(tmp_path)
         via_top_level = cx.estimate_disk_usage(
             "t_test", path, perturbation_column="perturbation", control_label="control",

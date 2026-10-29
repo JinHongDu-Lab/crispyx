@@ -20,6 +20,7 @@ from .data import (
     concat_h5ad,
     downsample_counts,
     normalize_total_log1p,
+    read_backed,
     resolve_data_path,
 )
 from .de import (
@@ -504,7 +505,7 @@ class _PreprocessingNamespace:
         from .dimred import pca as _pca
 
         if isinstance(data, (str, Path)):
-            adata = ad.read_h5ad(data, backed='r')
+            adata = read_backed(data)
         else:
             adata = data
 
@@ -562,7 +563,7 @@ class _PreprocessingNamespace:
         from .dimred import neighbors as _neighbors
 
         if isinstance(data, (str, Path)):
-            adata = ad.read_h5ad(data, backed='r')
+            adata = read_backed(data)
         else:
             adata = data
 
@@ -762,7 +763,7 @@ class _ToolsNamespace:
         from .dimred import umap as _umap
 
         if isinstance(data, (str, Path)):
-            adata = ad.read_h5ad(data, backed='r')
+            adata = read_backed(data)
         else:
             adata = data
 

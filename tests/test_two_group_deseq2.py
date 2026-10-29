@@ -104,11 +104,13 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
 
 def _bound_losses_are_lower(res, dds, counts, design, sf):
     """Where PyDESeq2's gene-wise optimiser stops at min_disp, our estimate has
-    the lower Cox-Reid loss at PyDESeq2's own means."""
+    the lower Cox-Reid loss at PyDESeq2's own means. "At" is within 1%: its
+    L-BFGS-B can stop just short of the bound (1.0014e-8 with numpy 1.26 and
+    SciPy 1.16)."""
     from pydeseq2.utils import nb_nll
 
     theirs = dds.var["genewise_dispersions"].to_numpy()
-    at_bound = theirs <= 1e-8 * 1.0001
+    at_bound = theirs <= 1e-8 * 1.01
     assert at_bound.sum() < 0.1 * at_bound.size
     for g in np.flatnonzero(at_bound):
         y, mu = counts[:, g], dds.layers["_mu_hat"][:, g]
@@ -400,3 +402,84 @@ def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
     with pytest.raises(TypeError, match="fit_method"):
         cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
                                 control_label="ctrl", output_dir=tmp_path, fit_method="joint")
+
+
+def test_a_gene_held_at_a_bound_is_not_reported_converged():
+    """Convergence is judged on the full Newton step, so a gene whose log mean
+    the fit clips at 30 (and so stops moving) is not reported converged, while
+    an ordinary gene beside it is."""
+    rng = np.random.default_rng(0)
+    sf_c, sf_t = rng.lognormal(0, 0.3, 300), rng.lognormal(0, 0.3, 3)
+    controls = rng.negative_binomial(20, 20 / (20 + 1e3 * sf_c[:, None]), size=(300, 2)).astype(float)
+    perturbed = np.column_stack([3e3 * sf_t, 1e14 * sf_t])  # e^30 is ~1.1e13
+    summary = summarize_controls([(np.arange(300), sp.csr_matrix(controls))], sf_c, 2)
+    fit = fit_two_group_deseq2(summary, perturbed, sf_t, dispersion=0.05)
+    np.testing.assert_array_equal(fit.converged, [True, False])
+
+
+@pytest.mark.parametrize("covariate", [False, True])
+def test_gene_blocks_and_sparse_counts_do_not_change_the_fit(covariate):
+    """Every step but the trend and prior is per gene, so fitting the genes 37
+    at a time from sparse counts gives what one dense block gives -- with the
+    means from a linear model (two groups) and from IRLS (a covariate). Not
+    bit for bit: a block rounds its least squares and IRLS differently, which
+    moves where the dispersion search (tol 1e-6 on log dispersion) stops."""
+    counts, labels, sf, batch = _screen(seed=3, n_genes=120, batch_sd=0.3)
+    design, columns = build_design_matrix(
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"] if covariate else [],
+        perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
+    )
+    genes = np.arange(0, 120, 2)
+    one = fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), genes, min_mu=1e-6)
+    blocked = fit_glm_deseq2(design, sp.csr_matrix(counts), sf, columns.index("perturbation"), genes,
+                             min_mu=1e-6, block_genes=37)
+    for field in one.__dataclass_fields__:
+        np.testing.assert_allclose(getattr(blocked, field), getattr(one, field), rtol=1e-5, err_msg=field)
+    # The same rows given as row blocks (as nb_glm_test passes the controls
+    # and a perturbation's cells) are the same matrix.
+    stacked = fit_glm_deseq2(design, [sp.csc_matrix(counts[:200]), counts[200:]], sf,
+                             columns.index("perturbation"), genes, min_mu=1e-6, block_genes=37)
+    for field in one.__dataclass_fields__:
+        np.testing.assert_array_equal(getattr(stacked, field), getattr(blocked, field), err_msg=field)
+
+
+def test_apeglm_refits_on_threads_are_the_sequential_ones():
+    """nb_glm_test refits a large fit's genes on threads (backend="threading"):
+    each gene's refit is its own, so the result is that of one at a time."""
+    from crispyx.glm import shrink_lfc_apeglm
+
+    counts, labels, sf = _screen(seed=4, n_genes=40)
+    design = np.column_stack([np.ones(labels.size), (labels == "KO1").astype(float)])
+    fit = fit_glm_deseq2(design, counts, sf, 1, min_mu=1e-6)
+    mle = np.where(fit.converged[None, :], fit.coef.T, np.nan)
+    kw = dict(shrink_index=1, prior_scale=1.0, min_mu=0.0)
+    one = shrink_lfc_apeglm(counts, design, sf, fit.dispersion, mle, fit.coef_se[:, 1], n_jobs=1, **kw)
+    threads = shrink_lfc_apeglm(counts, design, sf, fit.dispersion, mle, fit.coef_se[:, 1], n_jobs=4,
+                                batch_size=1, backend="threading", **kw)
+    for a, b in zip(one, threads):
+        np.testing.assert_array_equal(a, b)
+    assert np.isfinite(one[0][1]).sum() > 30
+
+
+@pytest.mark.parametrize("covariate", [False, True])
+def test_fits_are_the_same_on_one_thread_and_several(covariate):
+    """fit_glm_deseq2's IRLS fits each gene on one thread, in the numba
+    kernel, with no BLAS: the result does not depend on the thread count (the
+    NumPy batches it replaced did, by 1e-6 in z under OpenBLAS)."""
+    import numba
+
+    counts, labels, sf, batch = _screen(seed=5, n_genes=30, batch_sd=0.3)
+    design, columns = build_design_matrix(
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"] if covariate else [],
+        perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
+    )
+    previous = numba.get_num_threads()
+    fits = []
+    try:
+        for threads in (1, min(4, numba.config.NUMBA_NUM_THREADS)):
+            numba.set_num_threads(threads)
+            fits.append(fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), min_mu=1e-6))
+    finally:
+        numba.set_num_threads(previous)
+    for field in fits[0].__dataclass_fields__:
+        np.testing.assert_array_equal(getattr(fits[1], field), getattr(fits[0], field), err_msg=field)

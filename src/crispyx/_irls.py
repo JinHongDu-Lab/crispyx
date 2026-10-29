@@ -404,7 +404,18 @@ class OneHotGroups:
         Returns shape ``(n_groups, n_genes)``.  This is the diagonal of
         ``G' W G`` when ``values`` are the IRLS weights.
         """
-        return np.asarray(self.matrix.T @ values)
+        return self.sums_sorted(self.sort(values))
+
+    def sums_sorted(self, values_sorted: np.ndarray) -> np.ndarray:
+        """:meth:`sums` of values already in :meth:`sort` order: a NumPy sum
+        per group's contiguous slice, which releases the GIL (a sparse
+        product does not, and serialised the IRLS's threads)."""
+        out = np.zeros((self.n_groups, values_sorted.shape[1]), dtype=np.float64)
+        for k in range(self.n_groups):
+            start, stop = self._starts[k], self._ends[k]
+            if stop > start:
+                values_sorted[start:stop].sum(axis=0, out=out[k])
+        return out
 
     def cross(self, design_sorted: np.ndarray, weights_sorted: np.ndarray) -> np.ndarray:
         """``X' W G`` per gene, shape ``(n_groups, n_features, n_genes)``.
@@ -427,11 +438,13 @@ class OneHotGroups:
         return out
 
     def expand(self, per_group: np.ndarray) -> np.ndarray:
-        """Scatter ``(n_genes, n_groups)`` values back to ``(n_samples, n_genes)``."""
-        out = np.zeros((self.n_samples, per_group.shape[0]), dtype=np.float64)
-        assigned = self.labels >= 0
-        out[assigned] = per_group.T[self.labels[assigned]]
-        return out
+        """Scatter ``(n_genes, n_groups)`` values back to ``(n_samples, n_genes)``.
+
+        One ``take`` from the values with a zero row appended, which a cell
+        in no group (label ``-1``) picks."""
+        padded = np.zeros((self.n_groups + 1, per_group.shape[0]), dtype=np.float64)
+        padded[:-1] = per_group.T
+        return padded.take(self.labels, axis=0)
 
 
 def _arrowhead_blocks(
