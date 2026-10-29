@@ -2124,8 +2124,9 @@ class StructuredGLMBatchFitter:
     def _hessian_blocks(self, weights):
         """The three blocks of the arrowhead Hessian for the given weights."""
         gram = gram_batched(self.design, weights, ridge=self.ridge)
-        cross = self.groups.cross(self._design_sorted, self.groups.sort(weights))
-        diagonal = self.groups.sums(weights) + self.ridge_group
+        weights_sorted = self.groups.sort(weights)
+        cross = self.groups.cross(self._design_sorted, weights_sorted)
+        diagonal = self.groups.sums_sorted(weights_sorted) + self.ridge_group
         return gram, cross, diagonal
 
     def _newton_step(self, counts, eta, mu, alpha):
@@ -3056,7 +3057,11 @@ def fit_glm_deseq2(
     if estimate:
         log_lo, log_hi = np.log(min_disp), np.log(max_disp)
         x_csr = _design_csr(design)
-        linear_mu = np.unique(design, axis=0).shape[0] == p
+        # A projection of the rows has no more distinct values than there
+        # are distinct rows, so more than p of them settle it without
+        # sorting the rows (17 s for 536k cells and 147 columns).
+        projected = design @ np.sqrt(np.arange(2.0, p + 2.0))
+        linear_mu = np.unique(projected).size <= p and np.unique(design, axis=0).shape[0] == p
         # What the second pass needs to rebuild the means without a refit:
         # the linear model's coefficients and, else, IRLS's at the starting
         # dispersions.
