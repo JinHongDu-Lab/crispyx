@@ -21,6 +21,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--methods", nargs="+", required=True)
     ap.add_argument("--inputs", default="benchmarking/accuracy_inputs")
+    ap.add_argument("--memory-limit", type=float, default=None,
+                    help="GB: overrides each method's memory limit and its own memory budget (edgeR workers)")
     args = ap.parse_args()
     raw = yaml.safe_load(open(args.config))
     cfg = rb.BenchmarkConfig.from_dict(raw)
@@ -49,7 +51,9 @@ def main() -> None:
         def point(kw):
             kw = dict(kw)
             for k, v in kw.items():
-                if isinstance(v, (str, Path)) and str(v) in swap:
+                if k == "memory_limit_gb" and args.memory_limit and v:
+                    kw[k] = min(float(v), args.memory_limit)
+                elif isinstance(v, (str, Path)) and str(v) in swap:
                     kw[k] = swap[str(v)]
                 elif k == "function_kwargs":
                     kw[k] = point(v)
@@ -58,6 +62,8 @@ def main() -> None:
                                kwargs=point(m.kwargs), summary=m.summary, depends_on=m.depends_on)
         limits = {k: spec[k] for k in ("memory_limit", "time_limit") if k in spec} if name.endswith(rb.ACCURACY_SUBSET_SUFFIXES) \
             else {"memory_limit": cfg.resource_limits.memory_limit, "time_limit": cfg.resource_limits.time_limit}
+        if args.memory_limit:
+            limits["memory_limit"] = min(limits.get("memory_limit") or args.memory_limit, args.memory_limit)
         mem = int(limits["memory_limit"] * 1024**3) if limits.get("memory_limit") else None
         context = {"output_dir": out, "dataset_path": str(std)}
         print(f"{d}: running {name} ({control} input, limits {limits})", flush=True)
