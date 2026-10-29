@@ -51,41 +51,25 @@ logger = logging.getLogger(__name__)
 _MAX_STEP_HALVINGS = 8
 
 
-def _max_gene_batch(n_genes: int) -> int:
-    """The most genes an "auto" IRLS batch holds: 1/64 of them, so that a
-    fit's batches outnumber the threads. The memory target alone floors a
-    batch at 256 genes, which at 536k cells left a 580-gene block three
-    batches, three threads busy, and the fit 3x slower. Not tied to the
-    thread count, so that results do not depend on it."""
-    return max(1, -(-n_genes // 64))
-
-
-def _run_gene_batches(fit, starts, threaded: bool) -> None:
-    """``fit(start)`` for each gene batch, on numba's thread count when
-    ``threaded``. A batch is NumPy work on its own genes (NumPy releases the
-    GIL for it) written to its own rows, so the result is that of the loop;
-    BLAS is held to one thread meanwhile. Only a batch that calls no parallel
-    numba kernel may be threaded: numba's default threading layer is not
-    safe to enter from several threads."""
-    import numba
-    from concurrent.futures import ThreadPoolExecutor
-    from threadpoolctl import threadpool_limits
-
-    if not threaded:
-        for start in starts:
-            fit(start)
-        return
-    # BLAS at one thread on one thread too: a multi-threaded BLAS (OpenBLAS)
-    # reduces in another order, and the result would depend on the count.
-    n_threads = min(numba.get_num_threads(), len(starts))
-    with threadpool_limits(1, user_api="blas"):
-        if n_threads <= 1:
-            for start in starts:
-                fit(start)
-            return
-        with ThreadPoolExecutor(n_threads) as pool:
-            for _ in pool.map(fit, starts):
-                pass
+def _nb_irls_kernel(design, labels, n_groups, offset, counts, alpha, *, ridge, ridge_group, clip_group,
+                    max_iter, tol, min_mu):
+    """NB IRLS at the fixed dispersions ``alpha`` and its standard errors, one
+    gene per numba thread (``_kernels._structured_nb_irls``): ``design``'s
+    columns plus ``n_groups`` one-hot groups given by ``labels`` (``-1`` for
+    none; ``n_groups`` may be 0), ``ridge`` per design column. Starts from
+    each gene's offset-adjusted mean, carried by the constant column.
+    Returns coef, se, deviance, converged, n_iter."""
+    design = np.ascontiguousarray(design, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    constant = np.flatnonzero(np.all(design == design[0], axis=0) & (design[0] != 0.0))
+    column = int(constant[0]) if constant.size else -1
+    return _structured_nb_irls(
+        design, np.asarray(labels, dtype=np.int64), offset, np.asfortranarray(counts, dtype=np.float64),
+        np.asarray(alpha, dtype=np.float64), int(n_groups), column,
+        float(design[0, column]) if column >= 0 else 1.0, float(np.exp(offset).mean()),
+        eta_floor(min_mu), ETA_MAX, ETA_MIN, min_mu > 0.0, int(max_iter), float(tol),
+        np.asarray(ridge, dtype=np.float64), float(ridge_group), float(clip_group), _MAX_STEP_HALVINGS, EPS,
+    )
 
 
 @dataclass
@@ -1102,7 +1086,6 @@ class NBGLMBatchFitter:
         gene_batch_size: int | Literal["auto"] | None = "auto",
         use_numba: bool = True,
         fixed_dispersion: ArrayLike | None = None,
-        threaded: bool = False,
     ) -> NBGLMBatchResult:
         """Fit NB GLM for all genes in the count matrix.
         
@@ -1123,11 +1106,6 @@ class NBGLMBatchFitter:
         fixed_dispersion
             Per-gene NB dispersion of shape ``(n_genes,)`` to hold fixed
             instead of estimating it.  Ignored when ``family="poisson"``.
-        threaded
-            Fit the gene batches on numba's thread count (with the dispersion
-            held fixed; see :func:`_run_gene_batches`), an "auto" batch then
-            holding at most 1/64 of the genes. Each thread holds a batch's
-            work arrays, so the caller bounds the genes per call.
             
         Returns
         -------
@@ -1184,8 +1162,6 @@ class NBGLMBatchFitter:
             gene_batch_size = _estimate_gene_batch_size_fitter(
                 self.n_samples, n_valid, n_work_arrays=8, target_mb=100.0
             )
-            if threaded:
-                gene_batch_size = min(gene_batch_size, _max_gene_batch(n_valid))
         elif gene_batch_size is None:
             gene_batch_size = n_valid  # Process all at once
         
@@ -1199,7 +1175,7 @@ class NBGLMBatchFitter:
         # Fallback to batched NumPy implementation
         return self._fit_batch_numpy_batched(
             Y, Y_valid, valid_genes, valid_indices, n_genes, gene_batch_size,
-            fixed_alpha=fixed_alpha, threaded=threaded,
+            fixed_alpha=fixed_alpha,
         )
     
     def _fit_batch_numba(
@@ -1512,7 +1488,6 @@ class NBGLMBatchFitter:
         n_genes: int,
         gene_batch_size: int,
         fixed_alpha: np.ndarray | None = None,
-        threaded: bool = False,
     ) -> NBGLMBatchResult:
         """NumPy-based IRLS with gene batching to reduce memory.
 
@@ -1551,7 +1526,7 @@ class NBGLMBatchFitter:
         offset_col = self.offset[:, None]
 
         # Process genes in batches
-        def fit(batch_start):
+        for batch_start in range(0, n_valid, gene_batch_size):
             batch_end = min(batch_start + gene_batch_size, n_valid)
             batch = slice(batch_start, batch_end)
             Y_batch = Y_valid[:, batch]
@@ -1600,10 +1575,6 @@ class NBGLMBatchFitter:
             gene_converged[batch] = conv
             gene_n_iter[batch] = first_iters + second_iters
             gene_deviance[batch] = dev_batch
-
-        # Estimating the dispersion (Cox-Reid) calls a parallel numba kernel.
-        _run_gene_batches(fit, range(0, n_valid, gene_batch_size),
-                          threaded=threaded and (self.family == "poisson" or fixed_alpha is not None))
 
         # Standard errors from the unfloored fitted mean; see _wald_weights.
         se_valid = self._compute_se_batch(self._wald_weights(beta_all, alpha_all))
@@ -2378,7 +2349,9 @@ class StructuredGLMBatchFitter:
             :class:`NBGLMBatchFitter` does.  ``None`` fits every gene in one
             batch.  (``counts`` itself is held whole either way.)
         threaded
-            As for :meth:`NBGLMBatchFitter.fit_batch`.
+            With ``dispersion`` given and neither ``return_mu`` nor
+            ``return_dev_resid``, fit in one numba kernel, a gene per numba
+            thread (:meth:`_fit_numba`), rather than in NumPy batches.
         """
         counts = np.asarray(
             counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
@@ -2402,8 +2375,6 @@ class StructuredGLMBatchFitter:
             gene_batch_size = _estimate_gene_batch_size_fitter(
                 self.n_samples, n_genes, n_work_arrays=12, target_mb=100.0
             )
-            if threaded:
-                gene_batch_size = min(gene_batch_size, _max_gene_batch(n_genes))
         elif gene_batch_size is None:
             gene_batch_size = n_genes
         gene_batch_size = max(1, int(gene_batch_size))
@@ -2420,7 +2391,7 @@ class StructuredGLMBatchFitter:
             dev_resid=np.empty((self.n_samples, n_genes)) if return_dev_resid else None,
         )
 
-        def fit(start):
+        for start in range(0, n_genes, gene_batch_size):
             batch = slice(start, min(start + gene_batch_size, n_genes))
             self._fit_genes(
                 counts[:, batch],
@@ -2430,10 +2401,6 @@ class StructuredGLMBatchFitter:
                 return_mu=return_mu,
                 return_dev_resid=return_dev_resid,
             )
-
-        # Estimating the dispersion calls a parallel numba kernel.
-        _run_gene_batches(fit, range(0, n_genes, gene_batch_size),
-                          threaded=threaded and (self.family == "poisson" or alpha is not None))
         return out
 
     def _fit_numba(self, counts: np.ndarray, alpha: np.ndarray) -> StructuredGLMResult:
@@ -2441,13 +2408,10 @@ class StructuredGLMBatchFitter:
         ``alpha``, one gene per numba thread (``_kernels._structured_nb_irls``):
         the same steps without the batches' ``(cells x genes)`` work arrays,
         which on many threads wait on the allocator and the GIL."""
-        constant = np.flatnonzero(np.all(self.design == self.design[0], axis=0) & (self.design[0] != 0.0))
-        column = int(constant[0]) if constant.size else -1
-        coef, se, deviance, converged, n_iter = _structured_nb_irls(
-            np.ascontiguousarray(self.design), self.groups.labels, self.offset, np.asfortranarray(counts), alpha,
-            self.n_groups, column, float(self.design[0, column]) if column >= 0 else 1.0,
-            float(np.exp(self.offset).mean()), self._eta_min, ETA_MAX, ETA_MIN, self.min_mu > 0.0,
-            self.max_iter, self.tol, self.ridge, self.ridge_group, self.clip_group, _MAX_STEP_HALVINGS, EPS,
+        coef, se, deviance, converged, n_iter = _nb_irls_kernel(
+            self.design, self.groups.labels, self.n_groups, self.offset, counts, alpha,
+            ridge=np.full(self.n_features, self.ridge), ridge_group=self.ridge_group, clip_group=self.clip_group,
+            max_iter=self.max_iter, tol=self.tol, min_mu=self.min_mu,
         )
         return StructuredGLMResult(coef=coef, se=se, dispersion=alpha.copy(), deviance=deviance,
                                    converged=converged, n_iter=n_iter, mu=None, dev_resid=None)
@@ -2611,7 +2575,9 @@ def fit_nb_glm_batch_auto(
         Per-gene dispersion of shape ``(n_genes,)`` to hold fixed instead of
         estimating it; ``dispersion_method`` is then unused.
     threaded
-        As for :meth:`NBGLMBatchFitter.fit_batch`.
+        With ``fixed_dispersion``, fit in the numba kernel, a gene per numba
+        thread, with either solver's design (see
+        :meth:`StructuredGLMBatchFitter.fit_batch`).
     """
     design = np.asarray(design, dtype=np.float64)
     n_features = design.shape[1]
@@ -2624,12 +2590,39 @@ def fit_nb_glm_batch_auto(
             group_columns = candidates[found]
 
     covariate_columns = np.setdiff1d(np.arange(n_features), group_columns)
+    if group_columns.size <= covariate_columns.size and threaded and fixed_dispersion is not None:
+        # The kernel with no group block, in NBGLMBatchFitter's unit
+        # root-mean-square columns (its ridge maps to ridge / scale**2 there),
+        # on the genes it would fit. It starts from each gene's mean where the
+        # NumPy fitter starts from a Poisson fit: both converge to the same
+        # coefficients within tol.
+        counts = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+        n_genes = counts.shape[1]
+        scaled, scale = precondition_columns(design)
+        offset = np.zeros(design.shape[0]) if offset is None else np.asarray(offset, dtype=np.float64)
+        valid = np.flatnonzero(counts.sum(axis=0) >= min_total_count)
+        coef = np.zeros((n_genes, n_features))
+        se = np.full((n_genes, n_features), np.inf)
+        dispersion = np.full(n_genes, np.nan)
+        converged = np.zeros(n_genes, dtype=bool)
+        n_iter = np.zeros(n_genes, dtype=np.int32)
+        deviance = np.full(n_genes, np.nan)
+        if valid.size:
+            alpha = np.asarray(fixed_dispersion, dtype=np.float64)[valid]
+            c, s, deviance[valid], converged[valid], n_iter[valid] = _nb_irls_kernel(
+                scaled, np.full(design.shape[0], -1), 0, offset, counts[:, valid], alpha,
+                ridge=ridge_penalty / scale**2, ridge_group=0.0, clip_group=0.0,
+                max_iter=max_iter, tol=tol, min_mu=min_mu,
+            )
+            coef[valid], se[valid], dispersion[valid] = c / scale, s / scale, alpha
+        return NBGLMBatchResult(coef=coef, se=se, dispersion=dispersion,
+                                converged=converged, n_iter=n_iter, deviance=deviance)
     if group_columns.size <= covariate_columns.size:
         return NBGLMBatchFitter(
             design, offset=offset, max_iter=max_iter, tol=tol,
             poisson_init_iter=poisson_init_iter, dispersion_method=dispersion_method,
             min_mu=min_mu, min_total_count=min_total_count, ridge_penalty=ridge_penalty,
-        ).fit_batch(counts, fixed_dispersion=fixed_dispersion, threaded=threaded)
+        ).fit_batch(counts, fixed_dispersion=fixed_dispersion)
 
     counts = np.asarray(
         counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64

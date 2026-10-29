@@ -461,31 +461,25 @@ def test_apeglm_refits_on_threads_are_the_sequential_ones():
     assert np.isfinite(one[0][1]).sum() > 30
 
 
-def test_threaded_irls_holds_blas_to_one_thread_on_one_thread_too(monkeypatch):
-    """The threaded IRLS holds BLAS to one thread; on a single numba thread it
-    must too, or a multi-threaded BLAS (OpenBLAS) reduces in another order and
-    one thread's result differs from N threads' (seen on Linux: z by 1e-6)."""
-    import contextlib
+@pytest.mark.parametrize("covariate", [False, True])
+def test_fits_are_the_same_on_one_thread_and_several(covariate):
+    """fit_glm_deseq2's IRLS fits each gene on one thread, in the numba
+    kernel, with no BLAS: the result does not depend on the thread count (the
+    NumPy batches it replaced did, by 1e-6 in z under OpenBLAS)."""
     import numba
-    import threadpoolctl
 
-    limits = []
-
-    @contextlib.contextmanager
-    def record(limit, user_api=None):
-        limits.append((limit, user_api))
-        yield
-
-    monkeypatch.setattr(threadpoolctl, "threadpool_limits", record)
     counts, labels, sf, batch = _screen(seed=5, n_genes=30, batch_sd=0.3)
     design, columns = build_design_matrix(
-        pd.DataFrame({"batch": batch}), covariate_columns=["batch"],
+        pd.DataFrame({"batch": batch}), covariate_columns=["batch"] if covariate else [],
         perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
     )
     previous = numba.get_num_threads()
-    numba.set_num_threads(1)
+    fits = []
     try:
-        fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), min_mu=1e-6)
+        for threads in (1, min(4, numba.config.NUMBA_NUM_THREADS)):
+            numba.set_num_threads(threads)
+            fits.append(fit_glm_deseq2(design, counts, sf, columns.index("perturbation"), min_mu=1e-6))
     finally:
         numba.set_num_threads(previous)
-    assert limits and all(entry == (1, "blas") for entry in limits)
+    for field in fits[0].__dataclass_fields__:
+        np.testing.assert_array_equal(getattr(fits[1], field), getattr(fits[0], field), err_msg=field)

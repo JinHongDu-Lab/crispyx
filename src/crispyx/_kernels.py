@@ -1803,8 +1803,9 @@ def _structured_deviance(y, eta, mu, size, ylogy):
 
 @nb.njit(cache=True)
 def _structured_blocks(X, labels, w, wz, with_rhs, gram, cross, diag, rx, rg, ridge, ridge_group):
-    """X'WX (+ ridge), X'WG and diag(G'WG) (+ ridge_group) for the weights w,
-    and with_rhs, X'Wz and G'Wz for wz = w z."""
+    """X'WX (+ ridge, one value per column), X'WG and diag(G'WG)
+    (+ ridge_group) for the weights w, and with_rhs, X'Wz and G'Wz for
+    wz = w z."""
     n, dx = X.shape
     gram[:, :] = 0.0
     cross[:, :] = 0.0
@@ -1829,7 +1830,7 @@ def _structured_blocks(X, labels, w, wz, with_rhs, gram, cross, diag, rx, rg, ri
     for j in range(dx):
         for l in range(j):
             gram[l, j] = gram[j, l]
-        gram[j, j] += ridge
+        gram[j, j] += ridge[j]
     for k in range(diag.shape[0]):
         diag[k] += ridge_group
 
@@ -1894,7 +1895,8 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
                         max_halvings, eps):
     """StructuredGLMBatchFitter._irls and its standard errors at the fixed NB
     dispersions alpha, for each column of Y (Fortran order), one gene per
-    thread. Returns coef (genes, dx + a: covariates, then groups), se,
+    thread; ridge is per covariate column, and n_groups may be 0 (a dense
+    design). Returns coef (genes, dx + a: covariates, then groups), se,
     deviance, converged and n_iter."""
     n, dx = X.shape
     n_genes = Y.shape[1]

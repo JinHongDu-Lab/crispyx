@@ -24,6 +24,7 @@ from crispyx.glm import (
     StructuredGLMBatchFitter,
     detect_onehot_block,
     fit_glm_onehot,
+    fit_nb_glm_batch_auto,
 )
 
 #: Counts per group below which an NB GLM coefficient is not meaningfully
@@ -696,3 +697,31 @@ def test_numba_kernel_is_the_numpy_fit(min_mu):
     np.testing.assert_array_equal(kernel_fit.converged, numpy_fit.converged)
     np.testing.assert_array_equal(kernel_fit.n_iter, numpy_fit.n_iter)
     assert numpy_fit.converged.all()
+
+
+@pytest.mark.parametrize("min_mu", [1e-6, 0.0])
+def test_dense_designs_take_the_kernel_within_tolerance(min_mu):
+    """A design with no large one-hot block goes to NBGLMBatchFitter; threaded
+    at a fixed dispersion it takes the kernel instead, in the fitter's
+    rescaled columns (a covariate of order 1e4 included). The kernel starts
+    from each gene's mean and the NumPy fitter from a Poisson fit, so they
+    agree within IRLS's tolerance rather than to rounding."""
+    rng = np.random.default_rng(1)
+    n, n_genes = 1500, 60
+    design = np.column_stack([np.ones(n), (rng.random(n) < 0.1).astype(float), rng.lognormal(9, 0.4, n),
+                              rng.uniform(0, 15, n)])
+    beta = np.column_stack([rng.uniform(-2, 2, n_genes), rng.normal(0, 0.7, n_genes),
+                            rng.normal(0, 2e-5, n_genes), rng.normal(0, 0.02, n_genes)])
+    offset = rng.normal(0, 0.3, n)
+    alpha = rng.uniform(0.05, 1.5, n_genes)
+    mu = np.exp(offset[:, None] + design @ beta.T)
+    counts = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)).astype(float)
+    kw = dict(offset=offset, protected_columns=(0, 1), max_iter=100, tol=1e-8, min_mu=min_mu,
+              fixed_dispersion=alpha)
+    numpy_fit = fit_nb_glm_batch_auto(design, counts, threaded=False, **kw)
+    kernel_fit = fit_nb_glm_batch_auto(design, counts, threaded=True, **kw)
+    np.testing.assert_array_equal(kernel_fit.converged, numpy_fit.converged)
+    assert numpy_fit.converged.all()
+    np.testing.assert_allclose(kernel_fit.coef[:, 1], numpy_fit.coef[:, 1], atol=1e-7)
+    np.testing.assert_allclose(kernel_fit.se[:, 1], numpy_fit.se[:, 1], rtol=1e-6)
+    np.testing.assert_allclose(kernel_fit.deviance, numpy_fit.deviance, rtol=1e-10)
