@@ -4,7 +4,9 @@ Changelog
 Version 0.2.4
 -------------
 
-*Unreleased.*
+*Released 2026-10-30.* NB-GLM with covariates, apeGLM or several perturbations
+per fit no longer needs the control cells dense in memory, and is faster;
+results move only within the fits' tolerances.
 
 **Changed**
 
@@ -45,6 +47,13 @@ Version 0.2.4
 * ``batch_process`` resuming or reusing an existing output, ``pca`` /
   ``neighbors`` / ``umap`` given a path, and standardization no longer read
   every layer of the file into memory.
+
+**Documentation**
+
+* The notes that controls must fit in memory for a fit with covariates are
+  gone (:doc:`nb_glm`, :doc:`covariate_adjustment`, ``compare_controls``); the
+  :doc:`faq` says to keep the file CSR for ``nb_glm_test``.
+* The tutorials are re-executed on 0.2.4.
 
 Version 0.2.3
 -------------
