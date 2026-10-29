@@ -16,10 +16,12 @@ Version 0.2.4
   within the tolerances of the dispersion search and IRLS.
 * ``glm.fit_glm_deseq2`` takes sparse counts, a list of row blocks (the
   controls are passed to every fit without a copy) and ``block_genes``.
-* The IRLS of those fits runs on all the cores given to a fit, with the same
-  results: with a categorical covariate of many levels (batch, lane, inlet)
-  each gene is fitted in one compiled kernel, about 5x faster at 536,000
-  cells; otherwise the gene batches run on threads, about 3x faster per fit.
+* The IRLS of those fits runs in one compiled kernel, a gene per core, about
+  5-11x faster at 536,000 cells, and gives the same result on any number of
+  cores. With a categorical covariate of many levels (batch, lane, inlet)
+  results are unchanged to rounding; with other designs the kernel starts
+  each gene from its mean rather than from a Poisson fit, which moves results
+  within the fit's tolerance (z by about 1e-8).
 * The controls are read into memory as CSC in two passes over their rows,
   peaking at the result plus a chunk (50 GB rather than 96 GB for 535,000
   cells). Keep the input CSR (:doc:`faq`).
