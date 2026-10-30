@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1081,16 +1081,43 @@ def _accuracy_perturbations(output_dir: Path) -> Optional[set]:
     spec = json.loads(spec_path.read_text())
     backed = ad.read_h5ad(str(qc_path), backed="r")
     try:
-        labels = backed.obs["perturbation"].astype(str).unique()
+        all_labels = backed.obs["perturbation"].astype(str)
+        labels = all_labels.unique()
+        n_control = int((all_labels == "control").sum())
     finally:
         backed.file.close()
     chosen = _seeded_perturbation_subset(
         labels, "control", int(spec.get("n_perturbations", 50)), int(spec.get("seed", 0))
     )
+    cap = spec.get("max_control_cells")
     (output_dir / ".accuracy_perturbations.json").write_text(
-        json.dumps({**spec, "perturbations": chosen}, indent=1)
+        json.dumps({**spec, "control_cells": n_control,
+                    "control_capped": bool(cap and n_control > int(cap)),
+                    "perturbations": chosen}, indent=1)
     )
     return set(chosen)
+
+
+def _accuracy_control_capped(output_dir: Path) -> Optional[bool]:
+    """Whether the dataset's accuracy comparisons use the capped control.
+
+    Decided by the data alone (plan 2026-10-25 §3.2, revised 2026-10-30): the
+    control is capped when it holds more than ``max_control_cells`` cells, for
+    every method, whatever ran or failed on which machine.
+    """
+    path = output_dir / ".accuracy_perturbations.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("control_capped")
+
+
+def _accuracy_role(comparison: str, capped: Optional[bool]) -> Tuple[str, str]:
+    """(control, role) of a DE accuracy comparison: the control its cells hold,
+    and whether that is the dataset's primary comparison or a supplementary one."""
+    control = "capped" if "_subset_ctrl" in comparison else "full"
+    if capped is None:
+        return control, ""
+    return control, "primary" if (control == "capped") == capped else "supplementary"
 
 
 def evaluate_benchmarks(output_dir: Path) -> None:
@@ -1193,12 +1220,14 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         ("crispyx_de_lfcshrink", "pertpy_de_lfcshrink", "de_lfcshrink"),
         # DE GLM - external tool comparison, same size factors
         ("edger_de_glm_subset", "pertpy_de_pydeseq2_subset", "de"),
+        ("edger_de_glm_subset_ctrl", "pertpy_de_pydeseq2_subset_ctrl", "de"),
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
-        # Accuracy reruns of references that failed on the full data
-        # (plan 2026-10-25 §3.2). "_subset": the accuracy subset against the
-        # full control, so crispyx's full-data result is compared directly.
+        # Accuracy reruns (plan 2026-10-25 §3.2). "_subset": the accuracy subset
+        # against the full control, so crispyx's full-data result is compared
+        # directly. Which pairs are primary depends on the control's size alone
+        # (see _accuracy_role): a control over the cap uses the "_subset_ctrl" pairs.
         ("crispyx_de_t_test", "scanpy_de_t_test_subset", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon_subset", "de"),
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2_subset", "de"),
@@ -1224,6 +1253,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             ])
     
     accuracy_perts = _accuracy_perturbations(output_dir)
+    control_capped = _accuracy_control_capped(output_dir)
 
     def _load_de_result(method_name: str, result_path_val: Optional[str], use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
         """Load and standardize a DE result from file.
@@ -1445,6 +1475,10 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         except Exception as e:
             print(f"Error comparing {method_a_name} vs {method_b_name}: {e}")
     
+    for acc in accuracy_results:
+        if acc.get("comp_type") in ("de", "de_raw", "de_lfcshrink"):
+            acc["control"], acc["role"] = _accuracy_role(acc["comparison"], control_capped)
+
     # Generate overlap heatmaps
     overlap_heatmaps: Dict[str, Path] = {}
     if de_results_for_heatmaps:
@@ -1570,6 +1604,17 @@ def _accuracy_subset_markdown(rerun_df: pd.DataFrame, accuracy_perts: Optional[s
                "time and memory (kept in `benchmark_accuracy_reruns.csv` for the record) are not compared. "
                "Performance uses the full-data runs, where a failure (timeout, memory limit) is the result. "
                "`_subset` = full control; `_subset_ctrl` = control capped, crispyx rerun on the same cells.\n\n")
+    spec_path = output_dir / ".accuracy_perturbations.json"
+    if spec_path.exists():
+        spec = json.loads(spec_path.read_text())
+        n_ctrl, cap = spec.get("control_cells"), spec.get("max_control_cells")
+        if n_ctrl is not None and cap:
+            md += (f"Control: {n_ctrl:,} cells, cap {int(cap):,}. By the rule (decided by the control's size, "
+                   "not by which runs fit on a machine), this dataset's primary accuracy comparisons use the "
+                   + ("**capped** control (`_subset_ctrl` pairs, every method on the same cells); comparisons "
+                      "on the full control are supplementary.\n\n" if spec.get("control_capped") else
+                      "**full** control (the cap does not bind).\n\n"))
+    if not rerun_df.empty:
         md += "| method | status | perturbations | control cells |\n| --- | --- | --- | --- |\n"
         for _, row in rerun_df.sort_values("method").iterrows():
             cells = row.get("control_cells")
