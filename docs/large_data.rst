@@ -128,7 +128,10 @@ success) rather than in ``$TMPDIR``, so an interrupted run can continue with
 ``resume=True``; their ``"output"`` estimate covers that file.
 ``cx.tl.batch_process`` writes results directly into its output file as each
 gene chunk finishes, so its ``"output"`` estimate likewise accounts for the
-full footprint (see ``resume`` below for what that also enables). crispyx warns
+full footprint (see ``resume`` below for what that also enables). Every other
+output is written as a hidden partial file beside its final name and renamed
+into place when complete, so an interrupted run leaves any previous output
+untouched (:doc:`faq`). crispyx warns
 automatically -- without
 blocking the call -- if free space on the relevant filesystem looks tight or
 the write is unusually large. There is no configurable disk budget analogous

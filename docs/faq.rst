@@ -305,6 +305,20 @@ your control:
 The saved file is also what lets crispyx tell later whether a result it
 finds is still current (see the next question).
 
+What is left behind if a run is killed?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Nothing that passes for a result. Every output is written beside its final
+name as a hidden partial file, ``.<name>.<pid>-<host>.partial``, and renamed
+into place only once the write is complete and the sparse ``X`` pointers are
+consistent (:func:`crispyx.data.check_sparse_layout`). A run that fails or is
+interrupted removes its partial file; a run killed outright (``SIGKILL``, an
+out-of-memory kill, a scheduler timeout) cannot, and leaves it for you to
+delete. Either way, whatever was at the output path before is still there. The
+resumable functions (``t_test``, ``wilcoxon_test``, ``nb_glm_test``,
+``batch_process``) keep their work file instead, so ``resume=True`` can
+continue it.
+
 My DE result is loaded instantly on the second call — is that expected?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

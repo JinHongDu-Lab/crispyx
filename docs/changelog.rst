@@ -1,6 +1,24 @@
 Changelog
 =========
 
+Version 0.2.5
+-------------
+
+*Unreleased.*
+
+**Fixed**
+
+* Every function that writes an ``.h5ad`` output now writes it beside the
+  final name as a hidden partial file (``.<name>.<pid>-<host>.partial``) and
+  renames it into place only once the write is complete and its sparse
+  ``X`` pointers are consistent. A run that fails or is killed midway
+  (``normalize_total_log1p``, ``downsample_counts``, ``qc_summary``,
+  ``pb.normalized_effects`` used to fill their output in place) leaves the
+  previous output untouched instead of a truncated file a later call could
+  reuse, and two jobs writing the same output no longer rename each other's
+  half-written file into place. ``cx.data.check_sparse_layout`` performs the
+  pointer check on any file.
+
 Version 0.2.4
 -------------
 

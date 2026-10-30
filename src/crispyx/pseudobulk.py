@@ -586,7 +586,8 @@ def compute_normalized_effects(
     _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
     _messages.vprint(verbose, log_name, f"{len(candidates)} perturbations × {n_genes} genes")
     _messages.print_saving(verbose, log_name, resolved_output)
-    adata.write(resolved_output)
+    with _replace_on_success(resolved_output) as partial:
+        adata.write(partial)
     return AnnData(resolved_output)
 
 

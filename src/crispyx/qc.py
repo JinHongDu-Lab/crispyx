@@ -25,6 +25,7 @@ from .data import (
     h5ad_data_bytes,
     AnnData,
     _ensure_csr,
+    _replace_on_success,
     calculate_optimal_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
@@ -1011,7 +1012,8 @@ def _qc_in_memory(
 
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    adata_filtered.write(output_path)
+    with _replace_on_success(output_path) as partial:
+        adata_filtered.write(partial)
     
     # Expand gene_cell_counts to original size
     gene_cell_counts_full = np.zeros(original_n_vars, dtype=np.int64)
