@@ -35,6 +35,49 @@ Plot the QC summary:
    )
    cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
 
+Assign guides to cells
+----------------------
+
+A screen that ships its guide-capture counts rather than per-cell calls needs
+one rule to turn them into labels. :func:`crispyx.pp.assign_guides` gives each
+cell its most abundant guide when that guide has at least ``min_umi`` UMIs
+(default 3) and at least ``min_ratio`` times the runner-up's (default 2); any
+other cell, with no guide, two guides at similar counts, or a multiplet, is
+left ``NA``. Such a cell is not a control: whether the unassigned cells may
+join the controls is the question :func:`crispyx.pp.compare_controls`
+answers below.
+
+.. code-block:: python
+
+   # cells x guides UMI matrix: an array, an AnnData, or an h5ad streamed in blocks
+   guide = cx.pp.assign_guides("data/guide_counts.h5ad", min_umi=3, min_ratio=2.0)
+   obs = cx.load_obs("data/counts.h5ad")
+   obs["guide"] = guide.reindex(obs.index)
+   cx.write_obs("data/counts.h5ad", obs)
+   # then map guide names to targets: normalise_perturbation_labels(target_pattern=...)
+
+Check the file before analysis
+------------------------------
+
+:func:`crispyx.pp.check_data` reads ``obs``, ``var`` and a few sampled blocks
+of ``X`` and reports the mistakes that mislead an analysis without making it
+fail: a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP``
+...) left as a perturbation beside the control label, labels that are still
+guide names, labels that differ only by case, symbols truncated at a hyphen,
+targets that name no gene in ``var``, duplicate gene names, ``X`` that does
+not hold counts, cells whose row sum exceeds their recorded total, and
+inconsistent sparse pointers. Each finding is an ``Issue`` with a level;
+``raise_on_errors`` stops a pipeline on the errors.
+
+.. code-block:: python
+
+   issues = cx.pp.check_data(
+       "data/counts.h5ad",
+       perturbation_column="perturbation",
+       control_label="control",
+   )
+   cx.raise_on_errors(issues)   # ValueError listing the errors, if any
+
 .. _check-controls:
 
 Check the control cells

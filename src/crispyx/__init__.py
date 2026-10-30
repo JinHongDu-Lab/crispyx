@@ -41,6 +41,7 @@ from .data import (
     normalise_perturbation_labels,
     read_h5ad_ondisk,
     read_backed,
+    recover_counts,
     resolve_data_path,
     standardise_gene_names,
     write_filtered_subset,
@@ -84,12 +85,16 @@ from .pseudobulk import (
     compute_pseudobulk_effects,
 )
 from .qc import (
+    Issue,
+    assign_guides,
+    check_perturbation_data,
     compare_controls,
     control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
     quality_control_summary,
+    raise_on_errors,
 )
 from .residual import residual_effects
 from .sample import subsample
@@ -128,6 +133,10 @@ __all__ = [
     "quality_control_summary",
     "compare_controls",
     "control_guide_correlation",
+    "assign_guides",
+    "check_perturbation_data",
+    "Issue",
+    "raise_on_errors",
     "plot_control_guide_correlation",
     "highly_variable_genes",
     # Subsampling
@@ -156,6 +165,7 @@ __all__ = [
     "resolve_data_path",
     "normalize_total_log1p",
     "downsample_counts",
+    "recover_counts",
     "convert_to_csc",
     "convert_to_csr",
     "compress_h5ad",

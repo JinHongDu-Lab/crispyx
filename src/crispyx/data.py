@@ -3313,6 +3313,244 @@ def downsample_counts(
     return AnnData(output_path)
 
 
+def _recover_counts_block(csr: sp.csr_matrix, n_counts: np.ndarray | None, *, context: str) -> np.ndarray:
+    """The integer counts behind one CSR block of ``log1p(normalize_total(counts))``
+    values, as float32 in the block's own order; see :func:`recover_counts`."""
+    values = np.expm1(csr.data.astype(np.float64))
+    if values.size == 0:
+        return values.astype(np.float32)
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError(f"{context}: X holds negative or non-finite values; not log1p data")
+    counts = np.diff(csr.indptr)
+    nonempty = counts > 0
+    if n_counts is not None:
+        sums = np.add.reduceat(values, csr.indptr[:-1][nonempty])
+        scale = np.ones(csr.shape[0])
+        scale[nonempty] = n_counts[nonempty] / sums
+    else:
+        scale = np.ones(csr.shape[0])
+        scale[nonempty] = 1.0 / np.minimum.reduceat(values, csr.indptr[:-1][nonempty])
+    recovered = values * np.repeat(scale, counts)
+    rounded = np.rint(recovered)
+    off = np.abs(recovered - rounded) > _RECOVER_COUNTS_TOLERANCE
+    if off.any() or (rounded < 1).any():
+        bad_rows = np.unique(np.repeat(np.arange(csr.shape[0]), counts)[off | (rounded < 1)])
+        how = "the cell's total" if n_counts is not None else "the cell's smallest value as one count"
+        raise ValueError(
+            f"{context}: the recovered values of {len(bad_rows)} cells in a block of {csr.shape[0]} "
+            f"are not integers (scaling by {how}; max deviation "
+            f"{np.abs(recovered - rounded).max():.3f}). Either X is not log1p of a total-count "
+            "normalisation, or these cells' smallest count is above 1: pass n_counts_column "
+            "with each cell's original total."
+        )
+    return rounded.astype(np.float32)
+
+
+#: How far a recovered value may lie from an integer before the recovery is
+#: refused. float32 log1p and expm1 of counts up to ~1e5 round-trip within 0.01.
+_RECOVER_COUNTS_TOLERANCE = 0.02
+
+
+@accepts_in_memory
+def recover_counts(
+    data: str | Path | "AnnData" | ad.AnnData,
+    output_path: str | Path | None = None,
+    *,
+    n_counts_column: str | None = None,
+    chunk_size: int = 4096,
+    data_name: str | None = None,
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+    verbose: int | bool = True,
+) -> "AnnData":
+    """Recover the integer counts behind a ``log1p(normalize_total(counts))``
+    matrix, streamed.
+
+    Screens are often published only after total-count normalisation and
+    ``log1p``, while :func:`crispyx.tl.nb_glm_test`, pseudo-bulk count sums and
+    :func:`downsample_counts` need the counts. ``expm1`` undoes the log and
+    leaves each cell's counts multiplied by one factor, the normalisation
+    target over the cell's total. That factor is recovered per cell:
+
+    * with ``n_counts_column``, an ``obs`` column holding each cell's original
+      total, as the total over the cell's ``expm1`` sum, which is exact;
+    * otherwise as one over the cell's smallest non-zero ``expm1`` value,
+      exact whenever the cell's smallest count is 1, which holds for
+      practically every real cell.
+
+    Every recovered value must lie within 0.02 of an integer and be at least
+    1, or the call raises: a cell whose smallest count is 2 or more, a wrong
+    total, or a matrix that is not ``log1p`` of a total-count normalisation
+    all fail rather than yield rounded nonsense. A matrix that already holds
+    integer counts is refused too.
+
+    ``X`` is written as float32 CSR with the source's sparsity pattern.
+    ``layers``/``obsm``/``varm``/``obsp``/``varp``/``uns`` are carried
+    through unchanged; a source ``.raw`` is dropped with a warning.
+    ``uns["crispyx_recover_counts"]`` records how the factor was found.
+
+    Parameters
+    ----------
+    data
+        Path to the source h5ad file, or a backed AnnData. An in-memory
+        AnnData is streamed from a temporary copy; ``output_path`` is then
+        required.
+    output_path
+        Path for the output h5ad file. If None, derived from ``data_name``.
+    n_counts_column
+        ``obs`` column with each cell's original total count, if known.
+    chunk_size
+        Number of cells per streamed block.
+    data_name
+        Custom name for the output file.
+    format_mismatch_policy
+        What to do with a CSC source, which streaming by rows re-reads in
+        full for every chunk; see :func:`stream_on_fast_axis`.
+    verbose
+        Print progress information.
+
+    Returns
+    -------
+    AnnData
+        Read-only AnnData wrapper pointing to the output file.
+    """
+    name = "pp.recover_counts"
+    validate_format_mismatch_policy(format_mismatch_policy)
+    source_path = resolve_data_path(data)
+    output_path = resolve_output_path(
+        source_path, suffix="recover_counts", data_name=data_name, output_path=output_path,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _messages.print_saving(verbose, name, output_path)
+
+    backed = read_backed(source_path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        obs = backed.obs.copy()
+        var = backed.var.copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
+        uns = dict(backed.uns)
+        layer_keys = [key for key in backed.layers.keys() if key is not None]
+        obsm_keys = list(backed.obsm.keys())
+        varm_keys = list(backed.varm.keys())
+        obsp_keys = list(backed.obsp.keys())
+        varp_keys = list(backed.varp.keys())
+        has_raw = backed.raw is not None
+    finally:
+        backed.file.close()
+
+    n_counts = None
+    if n_counts_column is not None:
+        if n_counts_column not in obs.columns:
+            raise KeyError(
+                f"n_counts_column '{n_counts_column}' not found in obs. Available: {list(obs.columns)}"
+            )
+        n_counts = pd.to_numeric(obs[n_counts_column]).to_numpy(dtype=np.float64)
+        if not np.isfinite(n_counts).all() or (n_counts < 0).any():
+            raise ValueError(f"{name}: '{n_counts_column}' must hold non-negative, finite totals for every cell")
+    uns["crispyx_recover_counts"] = {
+        "scale": f"n_counts_column:{n_counts_column}" if n_counts is not None else "row_minimum",
+    }
+
+    if has_raw:
+        _messages.warn(
+            name,
+            "source AnnData has a `.raw` layer; it is not copied to the "
+            "output. Regenerate it from the source file separately if you need it.",
+        )
+
+    with stream_on_fast_axis(
+        source_path, axis=0, policy=format_mismatch_policy, fn_name=name,
+        scratch_dir=output_path.parent, chunk_size=chunk_size, verbose=verbose,
+    ) as stream_path:
+        # First pass: the output has the source's sparsity pattern, so its
+        # row pointers are known before any value is recovered.
+        row_nnz = np.zeros(n_obs, dtype=np.int64)
+        backed = read_backed(stream_path)
+        try:
+            row = 0
+            first = True
+            for _, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, warn_slow_axis=False,
+            ):
+                csr = _ensure_csr(block)
+                if first and csr.nnz and _looks_like_counts(csr.data):
+                    raise ValueError(
+                        f"{name}: X already holds integer counts; there is nothing to recover."
+                    )
+                first = False
+                row_nnz[row:row + csr.shape[0]] = np.diff(csr.indptr)
+                row += csr.shape[0]
+        finally:
+            backed.file.close()
+        total_nnz = int(row_nnz.sum())
+        idx_dtype = np.int32 if total_nnz <= np.iinfo(np.int32).max else np.int64
+        indptr = np.zeros(n_obs + 1, dtype=idx_dtype)
+        np.cumsum(row_nnz, out=indptr[1:])
+        hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+        warn_if_disk_space_low(estimate_sparse_output_bytes(total_nnz), output_path, context=name)
+
+        with _replace_on_success(output_path) as partial:
+            placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+            ad.AnnData(placeholder, obs=obs, var=var, uns=uns).write(partial)
+            with h5py.File(partial, "r+", libver="latest") as dest:
+                if "X" in dest:
+                    del dest["X"]
+                grp = dest.create_group("X")
+                grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+                grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+                grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+                chunks = (hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+                data_ds = grp.create_dataset("data", shape=(total_nnz,), dtype=np.float32, chunks=chunks)
+                indices_ds = grp.create_dataset("indices", shape=(total_nnz,), dtype=idx_dtype, chunks=chunks)
+                grp.create_dataset("indptr", data=indptr)
+
+                backed = read_backed(stream_path)
+                try:
+                    offset = 0
+                    row = 0
+                    evict = _EvictEvery(partial, stream_path)
+                    n_chunks = (n_obs + chunk_size - 1) // chunk_size
+                    with _create_progress_context(n_chunks, name, verbose, unit="chunk") as pbar:
+                        for _, block in iter_matrix_chunks(
+                            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
+                            warn_slow_axis=False,
+                        ):
+                            csr = _ensure_csr(block)
+                            totals = None if n_counts is None else n_counts[row:row + csr.shape[0]]
+                            values = _recover_counts_block(csr, totals, context=name)
+                            nnz = values.shape[0]
+                            if nnz:
+                                data_ds[offset:offset + nnz] = values
+                                indices_ds[offset:offset + nnz] = csr.indices.astype(idx_dtype, copy=False)
+                                offset += nnz
+                                evict(nnz * 8)
+                            row += csr.shape[0]
+                            pbar.update(1)
+                finally:
+                    backed.file.close()
+
+            if layer_keys:
+                with h5py.File(source_path, "r") as src, h5py.File(partial, "r+") as dst:
+                    dst_layers = dst.require_group("layers")
+                    for key in layer_keys:
+                        if key in dst_layers:
+                            del dst_layers[key]
+                        src.copy(src[f"layers/{key}"], dst_layers, name=key)
+            if obsm_keys or varm_keys or obsp_keys or varp_keys:
+                backed = read_backed(source_path)
+                try:
+                    _copy_extra_slots(
+                        partial, source=backed, obsm_keys=obsm_keys, varm_keys=varm_keys,
+                        obsp_keys=obsp_keys, varp_keys=varp_keys, cell_mask=None, gene_mask=None,
+                    )
+                finally:
+                    backed.file.close()
+
+    _messages.print_done(verbose, name, f"{n_obs} cells × {n_vars} genes, {total_nnz} counts recovered")
+    return AnnData(output_path)
+
+
 def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     """Bytes the CSR<->CSC converters may hold in their output buffers.
 
@@ -6049,6 +6287,7 @@ def normalise_perturbation_labels(
     strip_prefixes: list[str] | None = None,
     strip_suffixes: list[str] | None = None,
     strip_suffix_regex: str | None = None,
+    target_pattern: str | None = None,
     control_aliases: list[str] | None = None,
     canonical_control: str = "NTC",
     inplace: bool = True,
@@ -6060,7 +6299,18 @@ def normalise_perturbation_labels(
     1. Strip specified prefixes via vectorised ``pd.Series.str.replace``.
     2. Strip specified suffixes via vectorised ``pd.Series.str.replace``.
     3. Apply a custom regex substitution (``strip_suffix_regex``).
-    4. Map known control aliases to ``canonical_control``.
+    4. Replace each label that matches ``target_pattern`` by its one capture
+       group, the target gene; labels that do not match are left as they are.
+    5. Map known control aliases to ``canonical_control``.
+
+    Guide names put the target gene first and the rest after a separator
+    (``NKX2-5_-_172659581.23-P1P2``, ``sgHLA-B-2``, ``HLA_B_GTGGGAGCCTGG...``),
+    so a pattern anchored on the *rest* keeps the gene whole; splitting at the
+    first separator truncates ``NKX2-5`` to ``NKX2`` and merges ``HLA-A`` and
+    ``HLA-B`` into one ``HLA``. Write the pattern for the library's grammar,
+    e.g. ``r"^(.+?)_[+-]_\\d+"`` for hCRISPRi-v2 names or
+    ``r"^(.+)_[ACGT]{18,25}$"`` for ``GENE_spacer`` names, and check the
+    result with :func:`crispyx.qc.check_perturbation_data`.
 
     Parameters
     ----------
@@ -6075,6 +6325,10 @@ def normalise_perturbation_labels(
     strip_suffix_regex
         A Python regex applied via ``pd.Series.str.replace`` after
         prefix/suffix stripping.
+    target_pattern
+        A Python regex with exactly one capture group. A label that matches
+        (``re.search``) becomes the group's text; one that does not is left
+        unchanged, so control names pass through to step 5.
     control_aliases
         Additional strings (case-insensitive) treated as control labels.
         The built-in aliases (``ntc``, ``ctrl``, ``scramble``, …) are always
@@ -6118,7 +6372,14 @@ def normalise_perturbation_labels(
     if strip_suffix_regex:
         labels = labels.str.replace(strip_suffix_regex, "", regex=True)
 
-    # Step 4: unify control labels
+    # Step 4: the target gene out of a guide name
+    if target_pattern is not None:
+        if _re.compile(target_pattern).groups != 1:
+            raise ValueError("target_pattern must have exactly one capture group, the target gene")
+        target = labels.str.extract(target_pattern, expand=False)
+        labels = labels.where(target.isna(), target)
+
+    # Step 5: unify control labels
     all_aliases = set(_DEFAULT_CONTROL_ALIASES)
     if control_aliases:
         all_aliases.update(a.lower() for a in control_aliases)
