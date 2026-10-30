@@ -41,6 +41,18 @@ recovering counts, assigning guides, checking the file.
   half-written file into place. ``cx.data.check_sparse_layout`` performs the
   pointer check on any file.
 
+**Documentation**
+
+* The README, :doc:`index`, :doc:`comparison`, :doc:`faq`, :doc:`installation`
+  and ``llms.txt`` state what crispyx does in the same terms, and stale
+  claims are gone: the NB-GLM is no longer described as a simplified model
+  without covariates, its agreement with PyDESeq2 is quoted from
+  :doc:`nb_glm` (z correlation 0.997-0.9999) rather than as an LFC
+  correlation of 0.97, the "2x faster" figure is replaced by a measured
+  time, memory is described as set by ``memory_limit_gb`` rather than by
+  dataset size, and a version that never existed is no longer cited in
+  :doc:`data_preparation`.
+
 Version 0.2.4
 -------------
 
