@@ -11,7 +11,7 @@
 
 Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, requiring large RAM allocations and often making routine workflows impractical on laptops or shared compute nodes.
 
-**crispyx** solves this by streaming data directly from on-disk AnnData (`.h5ad`) files. Quality control, normalisation, pseudo-bulk aggregation, and differential expression all operate without materialising the full matrix.
+**crispyx** runs quality control, normalisation, pseudo-bulk aggregation, differential expression (t-test, Wilcoxon, NB-GLM with covariates, covariate-adjusted residual effects), control checks and PCA/KNN on screens stored as `.h5ad` files, streaming from disk under a memory budget, so that million-cell screens run on a laptop or a cluster node. The API mirrors Scanpy. It starts from an `.h5ad` file; it does not read raw sequencing outputs, and it is not a general single-cell toolkit.
 
 **Documentation:** [crispyx.readthedocs.io](https://crispyx.readthedocs.io/en/latest/) — [installation](https://crispyx.readthedocs.io/en/latest/installation.html), [quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), [tutorials](https://crispyx.readthedocs.io/en/latest/notebooks/crispyx_tutorial.html) and [API reference](https://crispyx.readthedocs.io/en/latest/api.html).
 
@@ -73,13 +73,13 @@ For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, p
 - **Storage-format aware** – Gene-streaming functions (`wilcoxon_test`, `batch_process`) can convert a CSR source once to a temporary, memory-bounded CSC copy beside the output instead of re-reading the whole matrix once per gene chunk; `format_mismatch_policy="auto"` (the default) measures the source's read throughput and does so only when the re-reads would really cost more than the conversion, so a small local file is streamed as-is and a large one on a network filesystem is converted; `convert_to_csc`/`convert_to_csr` honour `memory_limit_gb` and preserve the value dtype
 - **Dimension reduction** – Memory-efficient PCA and KNN graph construction on backed data
 - **Scanpy-compatible API & plotting** – Familiar `cx.pp`, `cx.pb`, `cx.tl`, and `cx.pl` namespaces; Scanpy-style rank genes plots, volcano, MA, PCA, UMAP, QC summaries, and overlap heatmaps
-- **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
+- **Data preparation utilities** – Edit backed metadata without loading X; normalise perturbation labels and take target genes out of guide names (`target_pattern`); assign guides from guide-capture counts (`cx.pp.assign_guides`); recover integer counts from data published as log1p-normalised values (`cx.pp.recover_counts`); concatenate multi-file screens; check a file for the mistakes that mislead an analysis (`cx.pp.check_data`); auto-detect metadata columns
 - **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`
 - **Disk-aware** – Estimates and warns about scratch-disk usage before large writes or CSC/CSR conversions, and `cx.estimate_disk_usage(...)` answers "how much disk will this need?" up front; the memory savings above assume the machine has enough free disk for streaming intermediates and output files
 
 ## Performance
 
-crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both speed and memory across a range of CRISPR screen dataset sizes, with results matching Scanpy to Pearson *r* > 0.999:
+Across 12 public CRISPR screens, crispyx completes every dataset where Scanpy, Pertpy/PyDESeq2 and edgeR run out of memory or time, with t-test and Wilcoxon results matching Scanpy to Pearson *r* > 0.999 and NB-GLM statistics agreeing with PyDESeq2 given the same size factors (z correlation 0.997–0.9999):
 
 <p align="center">
   <img src="docs/_static/fig2.png" width="800" alt="Benchmark results across 12 CRISPR screens: (a) dataset sizes, (b) completion status by method, (c) concordance with Scanpy, (d) runtime scaling, (e) peak memory scaling">

@@ -1,7 +1,10 @@
 # crispyx
 
-> crispyx is a Python package for memory-efficient, streaming analysis of
-> large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files.
+> crispyx runs quality control, normalisation, pseudo-bulk aggregation,
+> differential expression, control checks and PCA/KNN on CRISPR and
+> Perturb-seq screens stored as .h5ad files, streaming from disk under a
+> memory budget so that million-cell screens run on a laptop or a cluster
+> node. The API mirrors Scanpy.
 
 ## Purpose
 
@@ -15,10 +18,19 @@ without materializing the full matrix.
 ## Key capabilities
 
 - Streaming QC and preprocessing (filter cells, perturbations, genes;
-  normalize and log-transform) without loading the full matrix
+  normalize and log-transform; subsample; thin counts) without loading the
+  full matrix
+- Data preparation: edit obs/var without reading X; normalise perturbation
+  labels and take target genes out of guide names; assign guides from
+  guide-capture counts; recover integer counts from log1p-normalised data;
+  concatenate multi-file screens; check a file for the mistakes that mislead
+  an analysis (cx.pp.check_data)
 - Pseudobulk aggregation: average log expression and pseudobulk count matrices
-- Differential expression: t-test, Wilcoxon rank-sum, negative binomial GLM
-  with apeGLM log-fold-change shrinkage
+- Differential expression: t-test, Wilcoxon rank-sum (also batch-stratified),
+  negative binomial GLM at cell level or on pseudo-bulk with covariates and
+  apeGLM log-fold-change shrinkage; covariate-adjusted residual effects
+- Control checks: do the control guides agree, and may unassigned cells join
+  the controls?
 - Memory-efficient PCA and KNN graph construction on backed AnnData
 - Scanpy-compatible API: cx.pp, cx.pb, cx.tl, cx.pl namespaces
 - HPC support: resume/checkpoint, configurable memory_limit_gb, Docker and
@@ -37,9 +49,11 @@ at scale (t-test, Wilcoxon, NB-GLM) on the same dataset.
   identical results (Pearson r > 0.9999 for t-test and Wilcoxon), but uses
   2–43x less time and 2–6x less memory by streaming from disk rather than
   loading into RAM.
-- **vs Pertpy/PyDESeq2**: crispyx's NB-GLM is 2x faster and runs within 64 GB
-  where Pertpy/PyDESeq2 exceeds 120 GB or fails on genome-wide datasets.
-  Pearson r > 0.97 vs PyDESeq2 for LFC estimates.
+- **vs Pertpy/PyDESeq2**: crispyx's NB-GLM fits DESeq2's model per
+  perturbation against the controls, streamed under a memory budget; given
+  the same size factors and mean floor, z correlation 0.997-0.9999 with
+  PyDESeq2. It completes genome-wide screens where Pertpy/PyDESeq2 exceeds
+  the available memory.
 - **vs edgeR**: edgeR times out or errors on most genome-wide datasets tested.
   crispyx completes all 12 benchmark datasets.
 
@@ -50,7 +64,9 @@ Benchmarked across 12 public CRISPR screen datasets (21K–1.97M cells):
   Pertpy and edgeR fail on most genome-wide datasets.
 - t-test: 2–11x faster than Scanpy with identical results
 - Wilcoxon: 2–43x faster than Scanpy with identical results
-- NB-GLM: 2x faster than Pertpy, completes where Pertpy runs out of memory
+- NB-GLM: completes where Pertpy/PyDESeq2 runs out of memory; one
+  perturbation against 535,000 control cells with 147 coefficients takes
+  33 minutes on 32 cores
 
 ## Links
 

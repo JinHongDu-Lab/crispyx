@@ -56,10 +56,13 @@ the data; see :doc:`faq` before ranking on ``logfoldchanges``.
 crispyx vs Pertpy / PyDESeq2
 -----------------------------
 
-**Summary:** crispyx's NB-GLM is substantially faster than Pertpy/PyDESeq2
-and uses substantially less memory, completing genome-wide datasets where
-Pertpy/PyDESeq2 typically exceeds available memory or fails outright.
-Log-fold-change estimates match PyDESeq2 closely (Pearson *r* > 0.97).
+**Summary:** crispyx's NB-GLM is DESeq2's model fitted one perturbation at a
+time against the controls, at cell level or on pseudo-bulk, with covariates
+and apeGLM shrinkage, streamed under a memory budget. Given the same size
+factors and mean floor its statistics agree with PyDESeq2's (z correlation
+0.997-0.9999, median difference in z 0.0004-0.004 on six screens; see
+:doc:`nb_glm`). It completes genome-wide screens where Pertpy/PyDESeq2 exceeds
+the available memory.
 
 When to use crispyx NB-GLM instead of Pertpy/PyDESeq2
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -73,8 +76,8 @@ When to use crispyx NB-GLM instead of Pertpy/PyDESeq2
 When to use Pertpy/PyDESeq2 instead of crispyx
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- You need the full PyDESeq2 feature set (custom design matrices, contrasts,
-  Cook's distance filtering, etc.).
+- You need arbitrary contrasts or Cook's-distance outlier filtering; crispyx
+  fits one reference group against the controls per fit.
 - Your dataset is small enough that memory is not a constraint.
 - You need Pertpy's other perturbation analysis methods (augur, mixscape, etc.).
 
@@ -117,12 +120,16 @@ Limitations of crispyx
   QC, normalization, pseudobulk, and differential expression for large CRISPR
   screens. Trajectory inference, RNA velocity, and spatial transcriptomics are
   outside its scope.
-- The NB-GLM uses a simplified model (per-gene intercept and perturbation
-  effect) without support for complex design matrices or batch covariates
-  beyond what is in the current API.
-- On small datasets that fit in RAM, crispyx offers no meaningful advantage
-  over Scanpy or Pertpy. Use Scanpy or Pertpy for datasets under ~50,000 cells
-  if memory is not a concern.
+- The NB-GLM tests one perturbation (or a few, ``targets_per_fit``) against
+  the controls per fit, with categorical and continuous covariates; it does
+  not fit arbitrary contrasts or filter outliers by Cook's distance.
+- crispyx does not read raw sequencing outputs (Cell Ranger matrices,
+  MatrixMarket, CSV): it starts from an ``.h5ad`` file, which Scanpy or
+  anndata write from those.
+- On a dataset that fits in RAM, the memory savings do not matter. The
+  reasons to use crispyx there are the methods: cell-level NB-GLM with
+  covariates, covariate-adjusted residual effects, the control checks and
+  the data-preparation utilities.
 
 See also
 --------

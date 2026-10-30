@@ -400,12 +400,14 @@ Scanpy's broader ecosystem, use Scanpy.
 Can I use crispyx instead of Pertpy or PyDESeq2 for NB-GLM?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Yes. crispyx implements a negative binomial GLM that is approximately 2× faster
-than Pertpy/PyDESeq2 and uses far less memory on genome-wide datasets. Results
-agree with PyDESeq2 (Pearson *r* > 0.97 for LFC estimates). crispyx does not
-implement the full PyDESeq2 feature set (custom design matrices, Cook's
-outlier filtering, etc.). For large genome-wide screens where PyDESeq2 runs
-out of memory, crispyx is currently the only practical Python option.
+Yes. ``nb_glm_test`` fits DESeq2's model one perturbation at a time against
+the controls, at cell level or on pseudo-bulk, with covariates and apeGLM
+shrinkage, streamed under a memory budget. Given the same size factors and
+mean floor its statistics agree with PyDESeq2's (z correlation 0.997-0.9999,
+median difference in z 0.0004-0.004 on six screens; :doc:`nb_glm`). It does
+not fit arbitrary contrasts or filter outliers by Cook's distance. On a
+genome-wide screen whose controls do not fit in memory as a dense matrix it
+is the practical Python option.
 
 Does crispyx replace the full Pertpy workflow?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

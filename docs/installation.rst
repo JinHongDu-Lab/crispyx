@@ -6,8 +6,10 @@ Requirements
 
 * **Python ≥ 3.10**
 * A working C compiler for Numba JIT (usually ships with your OS)
-* Approximately 4 GB of RAM for typical datasets; larger genome-wide screens
-  benefit from 16–64 GB
+* Memory is set by ``memory_limit_gb``, not by the dataset: the streaming
+  steps run within a few GB on any screen. The exception is a cell-level
+  NB-GLM with covariates, whose fit holds the control cells sparse in
+  memory (about 50 GB for 535,000 controls).
 
 Install from PyPI
 -----------------
