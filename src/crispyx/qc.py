@@ -2398,6 +2398,23 @@ def check_perturbation_data(
         symbol_column = detect_gene_symbol_column(path, verbose=False)
         hint = f"; pass gene_name_column='{symbol_column}'" if symbol_column else ""
         warnings_.append("var_names are Ensembl IDs, so results are reported by ID" + hint)
+    par_y = var_names[var_names.str.endswith("_PAR_Y") & var_names.str.replace(r"_PAR_Y$", "", regex=True).isin(var_names)]
+    if len(par_y):
+        warnings_.append(f"{len(par_y)} genes have a _PAR_Y row beside their X row, so their counts are split: "
+                         "pp.collapse_genes(by=var_names without the suffix) sums them; " + _examples(par_y))
+    suffixed = var_names[var_names.str.match(r"^.+-\d+$")]
+    made_unique = suffixed[suffixed.str.replace(r"-\d+$", "", regex=True).isin(var_names)]
+    if len(made_unique):
+        warnings_.append(f"{len(made_unique)} var_names look like var_names_make_unique suffixes of other var_names, "
+                         "so one symbol sits on several rows: pp.collapse_genes(by=...) sums them; "
+                         + _examples(made_unique))
+    if gene_name_column is not None and gene_name_column in var.columns:
+        symbols_all = pd.Index(var[gene_name_column].astype(str))
+        repeated = symbols_all[symbols_all.duplicated()].unique()
+        if len(repeated):
+            warnings_.append(f"{len(repeated)} symbols in '{gene_name_column}' sit on more than one row, so results "
+                             f"by symbol split their counts: pp.collapse_genes(by='{gene_name_column}') sums them; "
+                             + _examples(repeated))
 
     # --- X ----------------------------------------------------------------------
     try:

@@ -121,3 +121,20 @@ def test_target_pattern_keeps_hyphenated_symbols_whole(tmp_path):
     assert got.tolist() == ["NKX2-5", "HLA-B", "control", "GATA4"]
     with pytest.raises(ValueError, match="exactly one capture group"):
         normalise_perturbation_labels(path, "perturbation", target_pattern=r"^.+?_[+-]_\d+", inplace=False)
+
+
+def test_split_genes_are_reported(tmp_path):
+    genes = ["ENSG00000183072", "ENSG00000183072_PAR_Y", "ENSG00000136574", "ENSG00000089225", "ENSG00000234745", "ENSG00000141510"]
+    path = _write(tmp_path / "x.h5ad", ["control", "GATA4"] * 6, genes=genes)
+    var = cx.load_var(path)
+    var["symbol"] = ["A", "A", "B", "C", "C", "E"]
+    cx.write_var(path, var)
+    warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", gene_name_column="symbol",
+                                          verbose=False), "warning")
+    assert any("1 genes have a _PAR_Y row" in m for m in warnings)
+    assert any("2 symbols in 'symbol' sit on more than one row" in m and "'A', 'C'" in m for m in warnings)
+    var.index = ["NKX2-5", "NKX2-5-1", "GATA4", "GATA4-1", "GATA4-2", "MYH6"]
+    cx.write_var(path, var)
+    warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", verbose=False), "warning")
+    assert any("3 var_names look like var_names_make_unique suffixes" in m and "'NKX2-5-1'" in m for m in warnings)
+    assert not any("_PAR_Y" in m for m in warnings)

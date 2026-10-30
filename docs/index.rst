@@ -34,8 +34,9 @@ Key features
 - **Streaming QC & preprocessing** — filter and normalise without loading
   the full matrix
 - **Data preparation** — normalise labels and take targets out of guide
-  names, assign guides, recover counts from log1p data, concatenate
-  multi-file screens, and check a file before analysis
+  names, assign guides, recover counts from log1p data, collapse genes split
+  over several rows, concatenate multi-file screens, and check a file before
+  analysis
 - **Pseudo-bulk aggregation** — average log expression and pseudo-bulk
   count matrices
 - **Differential expression** — t-test, Wilcoxon, NB-GLM (DESeq2 per

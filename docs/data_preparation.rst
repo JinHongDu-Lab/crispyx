@@ -146,6 +146,39 @@ makes the call raise rather than round.
        n_counts_column="n_counts",   # omit if the file carries no totals
    )
 
+Collapsing the rows of one gene
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A published matrix often carries one gene on several rows: Ensembl IDs that
+share a symbol, the ``_PAR_Y`` copy of a pseudo-autosomal gene beside its X
+copy, ``GENE-1``/``GENE-2`` left by ``var_names_make_unique``, or the rows
+of two annotation releases after a concatenation. A test then splits the
+gene's counts between rows, and a join across screens pairs the wrong rows.
+:func:`crispyx.pp.collapse_genes` sums the rows that share a key, streamed,
+and drops the rows whose key is missing. The key is a ``var`` column or one
+value per gene that you build, from the file itself or from your own
+reference table; ``var`` columns that agree within every group are kept, and
+``n_source_genes`` records how many rows each gene came from.
+:func:`crispyx.pp.check_data` points out the rows that call for it.
+
+.. code-block:: python
+
+   # Ensembl IDs that share a symbol
+   collapsed = cx.pp.collapse_genes(
+       "data/counts.h5ad", output_path="data/by_symbol.h5ad", by="gene_symbol",
+   )
+
+   # _PAR_Y rows onto their X copies, keeping the IDs as var_names
+   var = cx.load_var("data/counts.h5ad")
+   collapsed = cx.pp.collapse_genes(
+       "data/counts.h5ad",
+       output_path="data/par_merged.h5ad",
+       by=var.index.str.replace(r"_PAR_Y$", "", regex=True),
+   )
+
+A mapping that follows each ID through Ensembl's history to one gene of a
+pinned release is planned for a later version.
+
 Auto-detecting metadata columns
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -64,9 +64,10 @@ of ``X`` and reports the mistakes that mislead an analysis without making it
 fail: a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP``
 ...) left as a perturbation beside the control label, labels that are still
 guide names, labels that differ only by case, symbols truncated at a hyphen,
-targets that name no gene in ``var``, duplicate gene names, ``X`` that does
-not hold counts, cells whose row sum exceeds their recorded total, and
-inconsistent sparse pointers. Each finding is an ``Issue`` with a level;
+targets that name no gene in ``var``, duplicate gene names, genes split over
+several rows (``_PAR_Y`` copies, ``var_names_make_unique`` suffixes, symbols
+on more than one row), ``X`` that does not hold counts, cells whose row sum
+exceeds their recorded total, and inconsistent sparse pointers. Each finding is an ``Issue`` with a level;
 ``raise_on_errors`` stops a pipeline on the errors.
 
 .. code-block:: python

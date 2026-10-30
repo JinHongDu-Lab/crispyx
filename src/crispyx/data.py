@@ -3551,6 +3551,210 @@ def recover_counts(
     return AnnData(output_path)
 
 
+def _gene_groups(var: pd.DataFrame, by: "str | pd.Series | Sequence", *, context: str) -> tuple[np.ndarray, pd.DataFrame]:
+    """The group of every source gene (``-1`` for a dropped one) and the
+    ``var`` table of the collapsed genes, one row per group in the order the
+    groups first appear."""
+    by_column = by if isinstance(by, str) else None
+    if by_column is not None:
+        if by_column not in var.columns:
+            raise KeyError(f"{context}: var has no column '{by_column}'. Available: {list(var.columns)}")
+        keys = var[by_column]
+    else:
+        values = np.asarray(by, dtype=object)
+        if len(values) != len(var):
+            raise ValueError(f"{context}: `by` has {len(values)} keys for {len(var)} genes")
+        keys = pd.Series(values, index=var.index)
+    keys = keys.astype(object).where(keys.notna(), None)
+    keys = keys.map(lambda k: None if k is None or str(k) == "" else str(k))
+    kept = keys.notna().to_numpy()
+    if not kept.any():
+        raise ValueError(f"{context}: every gene has a missing key; nothing would be left")
+    codes, groups = pd.factorize(keys[kept], sort=False)
+    group_of_gene = np.full(len(var), -1, dtype=np.int64)
+    group_of_gene[kept] = codes
+    new_var = pd.DataFrame(index=pd.Index(groups, name=var.index.name, dtype=object))
+    new_var["n_source_genes"] = np.bincount(codes, minlength=len(groups))
+    source = var.loc[kept]
+    for column in source.columns:
+        if column == by_column or column == "n_source_genes":
+            continue
+        values = source[column].astype(object).where(source[column].notna(), None).to_numpy()
+        per_group = pd.Series(values).groupby(codes).nunique(dropna=False)
+        if (per_group == 1).all():
+            first = np.zeros(len(groups), dtype=np.int64)
+            first[codes[::-1]] = np.arange(len(codes))[::-1]
+            new_var[column] = source[column].to_numpy()[first]
+    return group_of_gene, new_var
+
+
+@accepts_in_memory
+def collapse_genes(
+    data: str | Path | "AnnData" | ad.AnnData,
+    output_path: str | Path | None = None,
+    *,
+    by: "str | pd.Series | Sequence",
+    chunk_size: int = 4096,
+    data_name: str | None = None,
+    format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+    verbose: int | bool = True,
+) -> "AnnData":
+    """Sum the rows of ``var`` that are one gene, streamed.
+
+    A published matrix often carries one gene on several rows: Ensembl IDs
+    that share a symbol, the ``_PAR_Y`` copy of a pseudo-autosomal gene beside
+    its X copy, ``GENE-1``/``GENE-2`` left by ``var_names_make_unique``, or
+    the rows of two annotation releases after a concatenation. Summing them
+    makes the gene one feature, so a test does not split its counts, a
+    symbol does not name two rows and a join across screens pairs the right
+    genes. The grouping key is supplied by the caller: a ``var`` column, or a
+    Series/array with one key per source gene. A gene whose key is missing
+    (``NA`` or ``""``) is dropped. The release-pinned mapping that derives
+    such a key from Ensembl history is planned for a later version; until
+    then build it with your own reference table.
+
+    The output ``var`` has one row per key, in the order the keys first
+    appear, a ``n_source_genes`` column, and every source ``var`` column that
+    takes a single value within each group (a column that differs between the
+    rows of a gene is dropped). ``X`` is written as float32 CSR; ``obs``,
+    ``obsm``, ``obsp`` and ``uns`` are carried through, while ``layers``,
+    ``varm``, ``varp`` and ``.raw``, which are per source gene, are dropped
+    with a warning. ``uns["crispyx_collapse_genes"]`` records the counts.
+
+    Parameters
+    ----------
+    data
+        Path to the source h5ad file, or a backed AnnData. An in-memory
+        AnnData is streamed from a temporary copy; ``output_path`` is then
+        required.
+    output_path
+        Path for the output h5ad file. If None, derived from ``data_name``.
+    by
+        A ``var`` column name, or one key per source gene (aligned to ``var``).
+    chunk_size
+        Number of cells per streamed block.
+    data_name
+        Custom name for the output file.
+    format_mismatch_policy
+        What to do with a CSC source, which streaming by rows re-reads in
+        full for every chunk; see :func:`stream_on_fast_axis`.
+    verbose
+        Print progress information.
+
+    Returns
+    -------
+    AnnData
+        Read-only AnnData wrapper pointing to the output file.
+    """
+    name = "pp.collapse_genes"
+    validate_format_mismatch_policy(format_mismatch_policy)
+    source_path = resolve_data_path(data)
+    output_path = resolve_output_path(
+        source_path, suffix="collapse_genes", data_name=data_name, output_path=output_path,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _messages.print_saving(verbose, name, output_path)
+
+    meta = _read_h5ad_metadata(source_path)
+    obs, var, uns = meta["obs"], meta["var"], dict(meta["uns"])
+    obs.index = obs.index.astype(str)
+    var.index = var.index.astype(str)
+    n_obs, n_vars = len(obs), len(var)
+    group_of_gene, new_var = _gene_groups(var, by, context=name)
+    n_genes = len(new_var)
+    n_dropped = int((group_of_gene < 0).sum())
+    kept = group_of_gene >= 0
+    summing = sp.csc_matrix(
+        (np.ones(int(kept.sum()), dtype=np.float32), (np.flatnonzero(kept), group_of_gene[kept])),
+        shape=(n_vars, n_genes),
+    )
+    uns["crispyx_collapse_genes"] = {
+        "by": by if isinstance(by, str) else "keys",
+        "n_source_genes": n_vars,
+        "n_genes": n_genes,
+        "n_dropped": n_dropped,
+    }
+    dropped_slots = [slot for slot in ("layers", "varm", "varp") if meta[slot]] + (["raw"] if meta["has_raw"] else [])
+    if dropped_slots:
+        _messages.warn(
+            name,
+            f"{', '.join(dropped_slots)} are per source gene and are not copied to the output; "
+            "collapse each layer you need separately.",
+        )
+    _messages.vprint(
+        verbose, name,
+        f"{n_vars} genes → {n_genes} ({int((new_var['n_source_genes'] > 1).sum())} summed from several rows, "
+        f"{n_dropped} dropped for a missing key)",
+    )
+
+    with stream_on_fast_axis(
+        source_path, axis=0, policy=format_mismatch_policy, fn_name=name,
+        scratch_dir=output_path.parent, chunk_size=chunk_size, verbose=verbose,
+    ) as stream_path:
+        with h5py.File(stream_path, "r") as handle:
+            source_nnz = handle["X/data"].shape[0] if isinstance(handle["X"], h5py.Group) else n_obs * n_vars
+        warn_if_disk_space_low(estimate_sparse_output_bytes(source_nnz), output_path, context=name)
+        hdf5_chunk_size = min(262144, max(8192, source_nnz // 16))
+
+        with _replace_on_success(output_path) as partial:
+            placeholder = sp.csr_matrix((n_obs, n_genes), dtype=np.float32)
+            ad.AnnData(placeholder, obs=obs, var=new_var, uns=uns).write(partial)
+            with h5py.File(partial, "r+", libver="latest") as dest:
+                if "X" in dest:
+                    del dest["X"]
+                grp = dest.create_group("X")
+                grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+                grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+                grp.attrs["shape"] = np.array([n_obs, n_genes], dtype=np.int64)
+                data_ds = grp.create_dataset(
+                    "data", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=(hdf5_chunk_size,),
+                )
+                indices_ds = grp.create_dataset(
+                    "indices", shape=(0,), maxshape=(None,), dtype=np.int32, chunks=(hdf5_chunk_size,),
+                )
+                indptr_ds = grp.create_dataset("indptr", shape=(n_obs + 1,), dtype=np.int64)
+                indptr_ds[0] = 0
+
+                backed = read_backed(stream_path)
+                try:
+                    offset = 0
+                    row = 0
+                    evict = _EvictEvery(partial, stream_path)
+                    n_chunks = (n_obs + chunk_size - 1) // chunk_size
+                    with _create_progress_context(n_chunks, name, verbose, unit="chunk") as pbar:
+                        for _, block in iter_matrix_chunks(
+                            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False,
+                            warn_slow_axis=False,
+                        ):
+                            csr = sp.csr_matrix(_ensure_csr(block, dtype=np.float32) @ summing)
+                            csr.sum_duplicates()
+                            csr.sort_indices()
+                            nnz = csr.nnz
+                            if nnz:
+                                data_ds.resize((offset + nnz,))
+                                indices_ds.resize((offset + nnz,))
+                                data_ds[offset:offset + nnz] = csr.data
+                                indices_ds[offset:offset + nnz] = csr.indices.astype(np.int32, copy=False)
+                                evict(nnz * 8)
+                            indptr_ds[row + 1:row + 1 + csr.shape[0]] = csr.indptr[1:].astype(np.int64) + offset
+                            offset += nnz
+                            row += csr.shape[0]
+                            pbar.update(1)
+                finally:
+                    backed.file.close()
+                total_nnz = offset
+
+            if meta["obsm"] or meta["obsp"]:
+                with h5py.File(source_path, "r") as handle:
+                    _copy_extra_slots(
+                        partial, source=_H5Slots(handle), obsm_keys=meta["obsm"], varm_keys=[],
+                        obsp_keys=meta["obsp"], varp_keys=[], cell_mask=None, gene_mask=None,
+                    )
+
+    _messages.print_done(verbose, name, f"{n_obs} cells × {n_genes} genes, {total_nnz} non-zeros")
+    return AnnData(output_path)
+
+
 def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     """Bytes the CSR<->CSC converters may hold in their output buffers.
 

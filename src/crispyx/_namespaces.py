@@ -20,6 +20,7 @@ from .data import (
     concat_h5ad,
     downsample_counts,
     recover_counts,
+    collapse_genes,
     normalize_total_log1p,
     read_backed,
     resolve_data_path,
@@ -431,6 +432,33 @@ class _PreprocessingNamespace:
             data,
             output_path,
             n_counts_column=n_counts_column,
+            chunk_size=chunk_size,
+            data_name=data_name,
+            format_mismatch_policy=format_mismatch_policy,
+            verbose=verbose,
+        )
+
+    def collapse_genes(
+        self,
+        data: str | Path | ad.AnnData,
+        output_path: str | Path | None = None,
+        *,
+        by: "str | pd.Series | Sequence",
+        chunk_size: int = 4096,
+        data_name: str | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        verbose: int | bool = True,
+    ) -> AnnData:
+        """Sum the rows of ``var`` that are one gene, under a caller-supplied
+        key, streamed.
+
+        See :func:`crispyx.data.collapse_genes` for the full parameter
+        documentation.
+        """
+        return collapse_genes(
+            data,
+            output_path,
+            by=by,
             chunk_size=chunk_size,
             data_name=data_name,
             format_mismatch_policy=format_mismatch_policy,

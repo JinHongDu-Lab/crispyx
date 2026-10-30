@@ -5,7 +5,7 @@ Version 0.2.5
 -------------
 
 *Unreleased.* Utilities for preparing a published screen for analysis:
-recovering counts, assigning guides, checking the file.
+recovering counts, assigning guides, collapsing split genes, checking the file.
 
 **Added**
 
@@ -17,13 +17,21 @@ recovering counts, assigning guides, checking the file.
 * ``cx.pp.assign_guides``: the guide that dominates each cell's guide-capture
   counts (at least ``min_umi`` UMIs and ``min_ratio`` times the runner-up),
   ``NA`` otherwise, from an array, an AnnData or an h5ad streamed in blocks.
+* ``cx.pp.collapse_genes``: sums the rows of ``var`` that are one gene under
+  a caller-supplied key (a ``var`` column, or one key per gene), streamed,
+  dropping rows whose key is missing: Ensembl IDs that share a symbol,
+  ``_PAR_Y`` copies beside their X copies, ``var_names_make_unique`` suffixes,
+  rows of two annotation releases after a concatenation. ``var`` columns that
+  agree within every group are kept; ``n_source_genes`` records the rows per
+  gene.
 * ``cx.pp.check_data`` (``crispyx.qc.check_perturbation_data``): checks a
   screen's file for the mistakes that mislead an analysis without failing it
   (control synonyms left as perturbations, labels that are still guide names,
   labels differing only by case, truncated hyphenated symbols, targets absent
-  from ``var``, duplicate gene names, non-integer counts, row sums above the
-  recorded totals, inconsistent sparse pointers) and returns a list of
-  ``Issue`` with a level; ``raise_on_errors`` stops a pipeline on an error.
+  from ``var``, duplicate gene names, genes split over several rows,
+  non-integer counts, row sums above the recorded totals, inconsistent
+  sparse pointers) and returns a list of ``Issue`` with a level;
+  ``raise_on_errors`` stops a pipeline on an error.
 * ``normalise_perturbation_labels(target_pattern=...)``: a regex with one
   capture group that takes the target gene out of a guide name without
   truncating hyphenated symbols such as ``NKX2-5`` or ``HLA-B``.

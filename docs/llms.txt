@@ -23,6 +23,7 @@ without materializing the full matrix.
 - Data preparation: edit obs/var without reading X; normalise perturbation
   labels and take target genes out of guide names; assign guides from
   guide-capture counts; recover integer counts from log1p-normalised data;
+  sum the rows of a gene split over several (cx.pp.collapse_genes);
   concatenate multi-file screens; check a file for the mistakes that mislead
   an analysis (cx.pp.check_data)
 - Pseudobulk aggregation: average log expression and pseudobulk count matrices
