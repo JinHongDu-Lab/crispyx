@@ -4,8 +4,10 @@ Changelog
 Version 0.2.5
 -------------
 
-*Unreleased.* Utilities for preparing a published screen for analysis:
-recovering counts, assigning guides, collapsing split genes, checking the file.
+*Unreleased.* Utilities for preparing a published screen for analysis
+(recovering counts, assigning guides, collapsing split genes, checking the
+file), a fixed-offset NB test for many small perturbations against a large,
+stratified control set, and exact apeGLM shrinkage.
 
 **Added**
 
@@ -35,6 +37,34 @@ recovering counts, assigning guides, collapsing split genes, checking the file.
 * ``normalise_perturbation_labels(target_pattern=...)``: a regex with one
   capture group that takes the target gene out of a guide name without
   truncating hyphenated symbols such as ``NKX2-5`` or ``HLA-B``.
+* ``cx.tl.nb_offset_test``: the cell-level NB-GLM with a stratum covariate,
+  with the stratum effects fixed from one pass over the controls instead of
+  estimated jointly. Each perturbation is a one-parameter NB fit on its own
+  cells against the controls' per-stratum means (one pseudo-cell at the
+  pooled mean keeps a stratum's baseline above zero), at a control-only
+  dispersion or one given per gene; the cost is linear in the perturbed
+  cells, so a genome-wide screen whose perturbations have 20-40 cells spread
+  over hundreds of lane x donor strata, where the joint fit takes days, runs
+  in minutes. The result has ``nb_glm_test``'s layout and ``shrink_lfc``
+  accepts it (:ref:`nb-offset`).
+* ``cx.tl.shrink_lfc_arrays``: apeGLM shrinkage of fold changes given as
+  arrays, with ``exclude`` (entries kept as given and left out of the prior,
+  such as each perturbation's own target) and ``floor`` (a lower bound on a
+  fold change at the fitted-mean floor); returns the prior scale too.
+  ``crispyx.glm.cauchy_map`` is the posterior mode itself.
+* ``nb_glm_test``, ``nb_offset_test``, ``t_test`` and ``wilcoxon_test`` with
+  ``perturbations=[]`` write an empty result (0 x genes) instead of raising,
+  so a caller that splits perturbations between estimators needs no guard.
+  A file with no non-control group and no selection still raises.
+
+**Changed**
+
+* ``shrink_lfc(method="stats")`` takes each entry's apeGLM posterior mode in
+  closed form (the real roots of a cubic) instead of iterating damped Newton
+  steps until the slowest entry of a block converges: every entry is at the
+  exact optimum, and a result of 150 million entries shrinks in about half a
+  minute rather than ten. Values move by less than 1e-6 from the iterated
+  ones.
 
 **Fixed**
 

@@ -29,7 +29,9 @@ without materializing the full matrix.
 - Pseudobulk aggregation: average log expression and pseudobulk count matrices
 - Differential expression: t-test, Wilcoxon rank-sum (also batch-stratified),
   negative binomial GLM at cell level or on pseudo-bulk with covariates and
-  apeGLM log-fold-change shrinkage; covariate-adjusted residual effects
+  apeGLM log-fold-change shrinkage; a fixed-offset NB test for many small
+  perturbations against a large, stratified control set
+  (cx.tl.nb_offset_test); covariate-adjusted residual effects
 - Control checks: do the control guides agree, and may unassigned cells join
   the controls?
 - Memory-efficient PCA and KNN graph construction on backed AnnData

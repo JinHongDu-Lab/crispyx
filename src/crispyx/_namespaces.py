@@ -28,7 +28,9 @@ from .data import (
 from .de import (
     RankGenesGroupsResult,
     nb_glm_test,
+    nb_offset_test,
     shrink_lfc,
+    shrink_lfc_arrays,
     t_test,
     wilcoxon_test,
 )
@@ -1062,6 +1064,21 @@ class _ToolsNamespace:
             f"Unsupported differential expression method: {method}. "
             "Choose from 'wilcoxon', 't-test', or 'nb_glm'."
         )
+
+    def nb_offset_test(self, data: str | Path | ad.AnnData, **kwargs):
+        """Negative binomial test of each perturbation on its own cells, with
+        the controls as a fixed per-stratum baseline.
+
+        See :func:`crispyx.de.nb_offset_test`.
+        """
+        return nb_offset_test(data, **kwargs)
+
+    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None):
+        """apeGLM shrinkage of fold changes given as arrays, exactly.
+
+        See :func:`crispyx.de.shrink_lfc_arrays`.
+        """
+        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor)
 
     def shrink_lfc(
         self,

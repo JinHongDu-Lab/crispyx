@@ -52,7 +52,10 @@ from .data import (
 from .de import (
     RankGenesGroupsResult,
     nb_glm_test,
+    nb_offset_test,
     shrink_lfc,
+    shrink_lfc_arrays,
+    ShrunkLFC,
     t_test,
     wilcoxon_test,
 )
@@ -157,7 +160,10 @@ __all__ = [
     "t_test",
     "wilcoxon_test",
     "nb_glm_test",
+    "nb_offset_test",
     "shrink_lfc",
+    "shrink_lfc_arrays",
+    "ShrunkLFC",
     # Data utilities
     "AnnData",
     "ensure_gene_symbol_column",

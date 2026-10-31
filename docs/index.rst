@@ -40,7 +40,8 @@ Key features
 - **Pseudo-bulk aggregation** — average log expression and pseudo-bulk
   count matrices
 - **Differential expression** — t-test, Wilcoxon, NB-GLM (DESeq2 per
-  comparison) with apeGLM LFC shrinkage
+  comparison) with apeGLM LFC shrinkage, and a fixed-offset NB test for many
+  small perturbations against a stratified control set
 - **Control checks** — do the control guides agree, and may cells without a
   detected guide join them?
 - **Dimension reduction** — memory-efficient PCA and KNN on backed data
