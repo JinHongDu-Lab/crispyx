@@ -690,6 +690,42 @@ def _comparable_values(series: pd.Series) -> np.ndarray | None:
         return None
 
 
+def _write_profiles(handle: h5py.File, profiles: np.ndarray, shape: tuple[int, int]) -> str:
+    """Write the accumulated profiles as ``X``, a block of rows at a time so
+    they are never in memory whole: CSR when at most half the values are
+    non-zero (pseudo-bulk of many small units is mostly zeros, and dense a
+    screen's 170k units x 35k genes is 47 GB to write and to read in every
+    fit), dense otherwise (averages, bulk-like units). Returns a word for
+    the message."""
+    n_rows, n_cols = shape
+    blocks = list(_row_blocks(n_rows, n_cols))
+    nnz = sum(int(np.count_nonzero(profiles[sl])) for sl in blocks)
+    if n_rows == 0 or nnz > 0.5 * n_rows * n_cols:
+        out = _create_unfilled_array(handle, "X", shape, np.float64)
+        for sl in blocks:
+            out[sl] = profiles[sl]
+        return "dense"
+    grp = handle.create_group("X")
+    grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+    grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+    grp.attrs["shape"] = np.array([n_rows, n_cols], dtype=np.int64)
+    chunks = (min(262144, max(8192, nnz // 16)),) if nnz >= 8192 else None
+    data = grp.create_dataset("data", shape=(nnz,), dtype=np.float64, chunks=chunks)
+    indices = grp.create_dataset("indices", shape=(nnz,), dtype=np.int32, chunks=chunks)
+    indptr = grp.create_dataset("indptr", shape=(n_rows + 1,), dtype=np.int64)
+    indptr[0] = 0
+    offset = 0
+    for sl in blocks:
+        csr = sparse.csr_matrix(profiles[sl])
+        csr.sort_indices()
+        if csr.nnz:
+            data[offset:offset + csr.nnz] = csr.data
+            indices[offset:offset + csr.nnz] = csr.indices.astype(np.int32, copy=False)
+        indptr[sl.start + 1:sl.stop + 1] = csr.indptr[1:].astype(np.int64) + offset
+        offset += csr.nnz
+    return f"as CSR ({nnz / (n_rows * n_cols):.0%} non-zero)"
+
+
 @accepts_in_memory
 def aggregate_pseudobulk(
     data: str | Path | AnnData | ad.AnnData,
@@ -998,11 +1034,8 @@ def aggregate_pseudobulk(
             with _replace_on_success(resolved_output) as partial:
                 ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
                 with h5py.File(partial, "r+") as handle:
-                    # A block of rows at a time, so the profiles are never
-                    # in memory whole.
-                    out = _create_unfilled_array(handle, "X", (len(keys), backed.n_vars), np.float64)
-                    for sl in _row_blocks(len(keys), backed.n_vars):
-                        out[sl] = profiles[sl]
+                    stored = _write_profiles(handle, profiles, (len(keys), backed.n_vars))
+            _messages.vprint(verbose, "pb.aggregate", f"X written {stored}")
             profiles._mmap.close()  # type: ignore[attr-defined]
     finally:
         backed.file.close()
