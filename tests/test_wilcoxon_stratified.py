@@ -420,27 +420,29 @@ class TestWilcoxonResume:
         assert not out.with_suffix(".progress.json").exists()
 
     def test_resume_warns_that_a_conversion_is_rebuilt_each_restart(self, tmp_path):
-        """A resumable run on a converted copy rebuilds that copy on every
-        restart, so stream_on_fast_axis advises converting once."""
+        """A run that resumes from a checkpoint on a converted copy rebuilt
+        that copy for the restart, so stream_on_fast_axis advises converting
+        once; a first run, with nothing to resume, does not warn."""
         rng = np.random.default_rng(7)
         counts = rng.poisson(5, (80, 6))
         labels = ["control"] * 40 + ["pert_0"] * 40
         batch = [0, 1] * 40
         path, _ = _make_h5ad(tmp_path, counts, labels, batch)  # CSR: convertible
+        out = tmp_path / "resume_warning.h5ad"
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            wilcoxon_test(
-                path,
-                perturbation_column="perturbation",
-                control_label="control",
-                batch_column="batch",
-                output_path=tmp_path / "resume_warning.h5ad",
-                resume=True,
-                format_mismatch_policy="convert",
-                **_NO_FILTER,
-            )
-        assert [w for w in caught if "rebuilt from scratch" in str(w.message)]
+        def warned() -> bool:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                wilcoxon_test(
+                    path, perturbation_column="perturbation", control_label="control", batch_column="batch",
+                    output_path=out, format_mismatch_policy="convert", **_NO_FILTER,
+                )
+            out.unlink()
+            return any("rebuilt from scratch" in str(w.message) for w in caught)
+
+        assert not warned()
+        out.with_suffix(".progress.json").write_text('{"last_gene_chunk": 0}')
+        assert warned()
 
 
 if __name__ == "__main__":

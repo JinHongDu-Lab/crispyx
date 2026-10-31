@@ -929,7 +929,6 @@ class _ToolsNamespace:
         data_name: str | None = None,
         corr_method: str = "benjamini-hochberg",
         verbose: int | bool = True,
-        resume: bool = False,
         memory_limit_gb: float | None = None,
         force: bool = False,
         **kwargs,
@@ -965,7 +964,6 @@ class _ToolsNamespace:
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
-            resume=resume,
             memory_limit_gb=memory_limit_gb,
             force=force,
         )
@@ -974,7 +972,7 @@ class _ToolsNamespace:
             allowed = {
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
-                "checkpoint_interval",
+                "checkpoint_interval", "resume",
                 "batch_column",
                 "format_mismatch_policy",
             }
@@ -1013,7 +1011,7 @@ class _ToolsNamespace:
                 "min_total_count",
                 "chunk_size",
                 "n_jobs",
-                "checkpoint_interval",
+                "checkpoint_interval", "resume",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -1037,7 +1035,7 @@ class _ToolsNamespace:
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
                 "n_jobs",
-                "checkpoint_interval",
+                "checkpoint_interval", "resume",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:

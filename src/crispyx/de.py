@@ -90,6 +90,7 @@ from ._checkpoint import (
     _row_blocks,
 )
 from . import _messages
+from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
@@ -663,11 +664,12 @@ def _de_fingerprint(
 def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
     """A checkpoint's identity: the result ``fingerprint`` without
     ``scanpy_format``, which only changes the final write, plus the result
-    schema the saved values are in (a run interrupted by an older layout is
-    restarted, not finished in the new one) and ``extra``, what the saved
-    progress also depends on (e.g. the gene chunk width it is counted in)."""
+    schema the saved values are in and the crispyx version that computed
+    them (a run interrupted under an older layout or release is restarted,
+    not finished by this one), and ``extra``, what the saved progress also
+    depends on (e.g. the gene chunk width it is counted in)."""
     params = {k: v for k, v in fingerprint["params"].items() if k != "scanpy_format"}
-    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], **extra}
+    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], "crispyx": __version__, **extra}
 
 
 # Disk a DE run needs beside its output: the resumable partial arrays plus
@@ -1012,7 +1014,7 @@ def t_test(
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
     verbose: int | bool = True,
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     scanpy_format: bool = False,
@@ -1101,11 +1103,14 @@ def t_test(
     verbose
         If True, show a progress bar for perturbation processing. Requires tqdm.
     resume
-        If True, continue an interrupted run from its last checkpoint,
-        skipping the perturbations it had finished.
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished. Only a
+        checkpoint from this crispyx version and a call with the same input
+        and result-affecting parameters is used (``n_jobs`` and
+        ``memory_limit_gb`` may differ); any other is discarded with a
+        warning. Partial results live in a hidden ``.<output name>.resume``
+        directory until the output is written. False, or ``force=True``,
+        starts over.
     checkpoint_interval
         Number of perturbations between checkpoint saves. Auto-determined if None.
     corr_method
@@ -1182,6 +1187,7 @@ def t_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
 
     backed = read_backed(path)
     try:
@@ -1560,7 +1566,7 @@ def nb_glm_test(
     verbose: int | bool = True,
     profiling: bool = False,
     # ---- Resume/Memory parameters ----
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     memory_limit_gb: float | None = None,
     n_jobs: int | None = None,
@@ -1754,11 +1760,14 @@ def nb_glm_test(
         When False (default), ``adata.uns["profiling"]`` is set to ``"NA"`` to
         avoid profiling overhead in production.
     resume
-        If True, continue an interrupted run from its last checkpoint,
-        skipping the perturbations it had finished.
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished. Only a
+        checkpoint from this crispyx version and a call with the same input
+        and result-affecting parameters is used (``n_jobs`` and
+        ``memory_limit_gb`` may differ); any other is discarded with a
+        warning. Partial results live in a hidden ``.<output name>.resume``
+        directory until the output is written. False, or ``force=True``,
+        starts over.
     checkpoint_interval
         Number of perturbations to process between checkpoint saves. If None,
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
@@ -1881,6 +1890,7 @@ def nb_glm_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
 
     _storage_fmt = _storage_format_warning_csc(path, "nb_glm_test")
 
@@ -3897,7 +3907,7 @@ def wilcoxon_test(
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = True,
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
@@ -3996,13 +4006,15 @@ def wilcoxon_test(
     verbose
         If True, show a progress bar for gene chunk processing. Requires tqdm.
     resume
-        If True, continue an interrupted run from its last checkpoint, at the
-        first unfinished gene chunk (or perturbation batch, on the streaming
-        path). The resolved ``chunk_size`` is part of the call's identity, so
-        pass the same value (or leave both on auto with the same memory).
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, at the first unfinished gene chunk (or perturbation
+        batch, on the streaming path). Only a checkpoint from this crispyx
+        version and a call with the same input and result-affecting
+        parameters is used; any other is discarded with a warning. The
+        resolved ``chunk_size`` is part of the call's identity, so pass the
+        same value (or leave both on auto with the same memory). Partial
+        results live in a hidden ``.<output name>.resume`` directory until
+        the output is written. False, or ``force=True``, starts over.
     checkpoint_interval
         Number of gene chunks between checkpoint saves. If None, auto-determined
         based on dataset size.
@@ -4118,6 +4130,7 @@ def wilcoxon_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
     given_labels = perturbation_column if isinstance(perturbation_column, pd.Series) else None
     if given_labels is not None:
         perturbation_column = "perturbation" if given_labels.name is None else str(given_labels.name)
@@ -4195,7 +4208,7 @@ def wilcoxon_test(
     with stream_on_fast_axis(
         path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
         scratch_dir=output_path.parent, chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
+        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume and checkpoint_path.exists(),
     ) as stream_path:
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined.

@@ -890,7 +890,8 @@ def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = Tru
     An output is named after its input file by default, so with in-memory
     input ``output_path`` (or ``output_dir``) is required, unless
     ``output_required=False`` says ``fn`` writes nothing without one;
-    ``resume`` is refused, since it identifies a run by its input file.
+    ``resume=True`` passed explicitly is refused, since it identifies a run
+    by its input file; a ``resume`` left at its default is turned off.
     """
     if fn is None:
         return functools.partial(accepts_in_memory, output_required=output_required)
@@ -911,12 +912,14 @@ def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = Tru
                 f"{name}: an in-memory AnnData has no file to name the output after; "
                 "pass output_path."
             )
-        if given.get("resume"):
+        if kwargs.get("resume"):
             raise ValueError(
                 f"{name}: resume identifies a run by its input file, which an in-memory "
                 'AnnData does not have; save it with adata.write_h5ad("data.h5ad") and '
                 "pass the path to resume."
             )
+        if "resume" in signature.parameters:
+            kwargs["resume"] = False  # the scratch copy is new on every call
         # Room for the copy and one file derived from it (nb_glm_test's sorted copy).
         required = 2 * _anndata_nbytes(data)
         fallback = Path(output_path).parent if output_path is not None else Path(output_dir or ".")
