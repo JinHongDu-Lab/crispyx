@@ -7,12 +7,12 @@ from pathlib import Path
 import tempfile
 
 import anndata as ad
-import h5py
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
 
+import crispyx.data
 from crispyx import qc
 from crispyx.data import sort_by_perturbation
 
@@ -50,17 +50,14 @@ def test_qc_gene_filter_cache_is_removed_when_filling_it_fails(tmp_path, monkeyp
     assert not list(cache_root.glob("crispyx_qc_cache_*"))
 
 
-def test_sort_metadata_temp_file_is_removed_on_failure(tmp_path, monkeypatch):
+def test_a_failed_sort_leaves_no_file(tmp_path, monkeypatch):
     path = _write_counts(tmp_path / "counts.h5ad")
     output = tmp_path / "sorted.h5ad"
-    real_copy = h5py.Group.copy
 
-    def failing_copy(self, source, dest, *args, **kwargs):
-        if isinstance(source, str) and source == "obs":
-            raise RuntimeError("injected")
-        return real_copy(self, source, dest, *args, **kwargs)
+    def failing_write(*args, **kwargs):
+        raise RuntimeError("injected")
 
-    monkeypatch.setattr(h5py.Group, "copy", failing_copy)
+    monkeypatch.setattr(crispyx.data, "_write_band", failing_write)
     with pytest.raises(RuntimeError, match="injected"):
         sort_by_perturbation(path, "perturbation", "ctrl", output_path=output, force=True)
-    assert not output.with_suffix(".meta.h5ad").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["counts.h5ad"]

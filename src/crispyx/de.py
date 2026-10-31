@@ -921,6 +921,7 @@ def _sorted_input(
     input_labels: "np.ndarray | None",
     fn_name: str,
     verbose: int | bool,
+    memory_limit_gb: float | None,
 ) -> "tuple[Path, np.ndarray | None]":
     """``path``, or a perturbation-sorted copy of it when the file is large
     and its cells scattered (:func:`needs_sorting_for_nbglm`), with the
@@ -938,7 +939,7 @@ def _sorted_input(
     # made from this exact source.
     path = sort_by_perturbation(
         path, perturbation_column=perturbation_column, control_label=control_label,
-        output_path=path.parent / f"{path.stem}_sorted.h5ad", verbose=verbose,
+        output_path=path.parent / f"{path.stem}_sorted.h5ad", memory_limit_gb=memory_limit_gb, verbose=verbose,
     )
     if size_factors is not None:
         size_factors = size_factors[perturbation_sort_order(
@@ -1916,6 +1917,7 @@ def nb_glm_test(
     path, size_factors = _sorted_input(
         path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
         input_labels=input_labels if size_factors is not None else None, fn_name="nb_glm_test", verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
     )
 
     backed = read_backed(path)
@@ -3085,6 +3087,7 @@ def nb_offset_test(
     path, size_factors = _sorted_input(
         path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
         input_labels=input_labels if size_factors is not None else None, fn_name=name, verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
     )
 
     backed = read_backed(path)
