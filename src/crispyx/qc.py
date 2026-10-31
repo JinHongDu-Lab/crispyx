@@ -2438,28 +2438,36 @@ def check_perturbation_data(
         errors.append(f"obs has no column '{n_counts_column}'")
         n_counts_column = None
     totals = pd.to_numeric(obs[n_counts_column], errors="coerce").to_numpy(dtype=np.float64) if n_counts_column else None
+    # A CSC file (pp.convert_to_csc, for the Wilcoxon test) is sampled a
+    # window of genes at a time: a window of rows would read it whole.
+    by_column = layout_ok and get_matrix_storage_format(path) == "csc"
     backed = read_backed(path)
     try:
         n_obs = backed.n_obs
-        starts = np.unique(np.linspace(0, max(n_obs - window_size, 0), num=max(sample_windows, 1)).astype(np.int64))
+        length = backed.n_vars if by_column else n_obs
+        starts = np.unique(np.linspace(0, max(length - window_size, 0), num=max(sample_windows, 1)).astype(np.int64))
         non_integer = 0
         over_total = 0
         for start in starts if layout_ok else []:
-            stop = min(start + window_size, n_obs)
+            stop = min(start + window_size, length)
             if stop <= start:
                 continue
-            block = backed.X[start:stop]
+            block = backed.X[:, start:stop] if by_column else backed.X[start:stop]
             csr = _ensure_csr(block)
             values = csr.data
             if values.size and not (np.isfinite(values).all() and (values >= 0).all()
                                     and np.abs(values - np.rint(values)).max() <= 1e-6):
                 non_integer += 1
-            if totals is not None:
+            if totals is not None and not by_column:
                 sums = np.asarray(csr.sum(axis=1)).ravel()
                 known = np.isfinite(totals[start:stop])
                 over_total += int((sums[known] > totals[start:stop][known] * (1 + 1e-6) + 0.5).sum())
     finally:
         backed.file.close()
+    if totals is not None and by_column:
+        warnings_.append(f"X is stored as CSC, so the sampled row sums were not checked against '{n_counts_column}' "
+                         "(a row of a CSC file reads the whole matrix; the cell-level tests need CSR anyway: "
+                         "pp.convert_to_csr)")
     if non_integer:
         warnings_.append(f"X does not hold integer counts in {non_integer}/{len(starts)} sampled blocks; "
                          "nb_glm_test, pseudo-bulk sums and downsample_counts need counts "

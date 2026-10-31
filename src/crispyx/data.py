@@ -423,6 +423,17 @@ def read_backed(path: str | Path, mode: Literal["r", "r+"] = "r") -> ad.AnnData:
     return adata
 
 
+def _rows_as_slice(rows: np.ndarray) -> "slice | np.ndarray":
+    """``rows`` as a slice when they are consecutive ascending indices, else
+    as given. A slice of a backed CSR matrix is one read of its ``data`` and
+    ``indices``; an index array (anndata's ``get_compressed_vectors``) is
+    two or three reads per row, minutes of overhead over a million cells."""
+    rows = np.asarray(rows)
+    if rows.ndim == 1 and rows.size and rows.dtype.kind in "iu" and bool((np.diff(rows) == 1).all()):
+        return slice(int(rows[0]), int(rows[-1]) + 1)
+    return rows
+
+
 def read_rows_csc(path: str | Path, rows: np.ndarray, chunk_rows: int = 4096) -> sp.csc_matrix:
     """The rows ``rows`` (ascending) of ``path``'s ``X`` as an in-memory CSC
     matrix, in the file's dtype, without stored zeros.
@@ -440,7 +451,7 @@ def read_rows_csc(path: str | Path, rows: np.ndarray, chunk_rows: int = 4096) ->
 
         def chunks():
             for start in starts:
-                chunk = sp.csr_matrix(backed.X[rows[start:start + chunk_rows], :])
+                chunk = sp.csr_matrix(backed.X[_rows_as_slice(rows[start:start + chunk_rows]), :])
                 chunk.eliminate_zeros()
                 yield start, chunk
 

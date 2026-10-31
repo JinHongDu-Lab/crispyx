@@ -152,3 +152,50 @@ def test_an_unknown_gene_name_column_is_an_error(tmp_path):
     assert any("gene_name_column='symbol'" in m for m in _messages(issues, "warning"))
     issues = cx.pp.check_data(path, perturbation_column="perturbation", gene_name_column="symbol", verbose=False)
     assert not any("no column" in m for m in _messages(issues, "error"))
+
+
+def test_a_csc_file_is_sampled_by_gene_window(tmp_path, monkeypatch):
+    """A row window of a CSC file reads the whole matrix, so the sampled
+    windows are columns instead and the row-sum check is skipped, with a
+    warning that says so."""
+    import crispyx.qc as qc
+
+    n_cells, genes = 2000, [f"g{i}" for i in range(40)]
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(2.0, (n_cells, len(genes))).astype(np.float32)
+    counts[5, 3] = 0.5  # not a count
+    obs = pd.DataFrame({"perturbation": ["control"] * (n_cells // 2) + ["KO"] * (n_cells // 2),
+                        "n_counts": counts.sum(axis=1) - 100.0}, index=[f"c{i}" for i in range(n_cells)])
+    ad.AnnData(sp.csc_matrix(counts), obs=obs, var=pd.DataFrame(index=genes)).write(tmp_path / "csc.h5ad")
+    keys: list = []
+    real_read_backed = qc.read_backed
+
+    class _Recording:
+        def __init__(self, backed):
+            self._backed = backed
+
+        def __getattr__(self, name):
+            return getattr(self._backed, name)
+
+        @property
+        def X(self):
+            inner = self._backed.X
+
+            class _Proxy:
+                def __getitem__(self, key):
+                    keys.append(key)
+                    return inner[key]
+
+            return _Proxy()
+
+    monkeypatch.setattr(qc, "read_backed", lambda path, *a, **k: _Recording(real_read_backed(path, *a, **k)))
+    issues = cx.pp.check_data(tmp_path / "csc.h5ad", perturbation_column="perturbation", verbose=False)
+    assert keys and all(isinstance(key, tuple) and key[0] == slice(None) for key in keys), keys
+    assert not _messages(issues, "error")
+    warnings_ = _messages(issues, "warning")
+    assert any("does not hold integer counts" in w for w in warnings_)
+    assert any("stored as CSC" in w and "n_counts" in w for w in warnings_)
+    # the same matrix as CSR: rows are sampled and the totals are checked
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=genes)).write(tmp_path / "csr.h5ad")
+    issues = cx.pp.check_data(tmp_path / "csr.h5ad", perturbation_column="perturbation", verbose=False)
+    assert any("row sum above" in e for e in _messages(issues, "error"))

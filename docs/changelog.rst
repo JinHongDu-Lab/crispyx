@@ -61,7 +61,9 @@ stratified control set, and exact apeGLM shrinkage.
 * ``nb_glm_test``, ``nb_offset_test``, ``t_test`` and ``wilcoxon_test`` with
   ``perturbations=[]`` write an empty result (0 x genes) instead of raising,
   so a caller that splits perturbations between estimators needs no guard.
-  A file with no non-control group and no selection still raises.
+  A file with no non-control group and no selection still raises, and so
+  does a selection that names only the control label (a mistake that would
+  otherwise write, and cache, an empty result).
 
 **Changed**
 
@@ -76,7 +78,22 @@ stratified control set, and exact apeGLM shrinkage.
 * ``pb.aggregate`` writes ``X`` as CSR when at most half of its values are
   non-zero (summed units of a few cells over tens of thousands of genes)
   and dense otherwise; a genome-wide screen's pseudo-bulk of 170,000 units
-  was 47 GB dense and read in every fit.
+  was 47 GB dense and read in every fit. ``pb.effects`` takes such profiles
+  by column: read into memory as CSC when they fit half of
+  ``memory_limit_gb``, else through a temporary CSC copy, since a column
+  slice of a CSR file reads it whole.
+* ``nb_offset_test`` sizes each thread's dense cell block from its share of
+  a tenth of ``memory_limit_gb`` rather than giving every thread the whole
+  tenth, which committed ``n_jobs`` times the intended memory on a many-core
+  machine; and on a perturbation-sorted file it reads each perturbation's
+  cells, and the controls, as one slice of the matrix rather than row by
+  row (two or three HDF5 reads per cell, minutes over a million cells).
+  ``nb_glm_test``'s control pass and ``read_rows_csc`` read consecutive
+  rows the same way.
+* ``cx.pp.check_data`` samples a CSC file (``pp.convert_to_csc``) a window
+  of genes at a time: a window of rows read the whole matrix, eight times
+  over. The row-sum check against the recorded totals is skipped for such a
+  file, with a warning that says so.
 * ``shrink_lfc(method="stats")`` takes each entry's apeGLM posterior mode in
   closed form (the real roots of a cubic) instead of iterating damped Newton
   steps until the slowest entry of a block converges: every entry is at the
@@ -86,6 +103,22 @@ stratified control set, and exact apeGLM shrinkage.
 
 **Fixed**
 
+* ``nb_offset_test``'s control-only dispersion is unbiased over small
+  strata. The method-of-moments estimate takes each stratum's residuals
+  about the stratum's own baseline, which costs a degree of freedom per
+  stratum, but subtracted the full Poisson term; over hundreds of strata of
+  two to five controls the raw estimate fell to the floor (0.04 for a true
+  0.3 with two controls per stratum), the trend was fitted through it, and
+  every z-score was inflated. The expectation now carries the per-stratum
+  correction (the ``(n-1)/n`` of a sample variance, with size factors), and
+  a stratum of one control contributes nothing.
+* ``pb.effects`` failed on the CSR profiles ``pb.aggregate`` now writes for
+  mostly-zero units (``ValueError: setting an array element with a
+  sequence``), whether aggregated in the same call or given as a saved file.
+* The Scanpy-style readers (``pl.rank_genes_groups_df``,
+  ``pl.materialize_rank_genes_groups`` and the plots on them) left
+  ``logfoldchanges`` out of an ``nb_offset_test`` result, whose fold changes
+  are stored as ``X`` like ``nb_glm_test``'s.
 * Every function that writes an ``.h5ad`` output now writes it beside the
   final name as a hidden partial file (``.<name>.<pid>-<host>.partial``) and
   renames it into place only once the write is complete and its sparse

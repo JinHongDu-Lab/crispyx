@@ -6,6 +6,7 @@ import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
@@ -56,3 +57,39 @@ def test_profiles_without_genes_are_written_dense(tmp_path):
     with h5py.File(tmp_path / "pb.h5", "w") as f:
         assert _write_profiles(f, np.zeros((3, 0)), (3, 0)) == "dense"
         assert f["X"].shape == (3, 0)
+
+
+def _effects_reference(bulk_path, aggregate_batches):
+    bulk = ad.read_h5ad(bulk_path)
+    X = bulk.X.toarray() if sp.issparse(bulk.X) else np.asarray(bulk.X)
+    labels, units = bulk.obs["perturbation"].astype(str).to_numpy(), bulk.obs["unit"].astype(str).to_numpy()
+    control_of = {u: i for i, u in zip(np.flatnonzero(labels == "control"), units[labels == "control"])}
+    targets = np.flatnonzero(labels == "KO")
+    per_batch = np.stack([X[i] - X[control_of[units[i]]] for i in targets])
+    if not aggregate_batches:
+        return per_batch
+    n = bulk.obs["n_cells"].to_numpy()
+    weights = np.array([n[i] * n[control_of[units[i]]] / (n[i] + n[control_of[units[i]]]) for i in targets])
+    return (weights[:, None] * per_batch).sum(axis=0, keepdims=True) / weights.sum()
+
+
+@pytest.mark.parametrize("aggregate_batches", [False, True])
+def test_effects_run_on_the_sparse_pseudobulk(tmp_path, aggregate_batches):
+    """pb.effects takes gene blocks (column slices) of the profiles; from a
+    CSR file that read failed, and would have read the file whole per block."""
+    _cells(tmp_path / "cells.h5ad")
+    common = dict(perturbation_column="perturbation", batch_column="unit", aggregate_batches=aggregate_batches,
+                  verbose=False, force=True)
+    from_cells = cx.pb.effects(tmp_path / "cells.h5ad", method="sum", min_cells=1, bulk_output_path=tmp_path / "pb.h5ad",
+                               output_path=tmp_path / "effects.h5ad", **common)
+    with h5py.File(tmp_path / "pb.h5ad", "r") as f:
+        assert f["X"].attrs["encoding-type"] == b"csr_matrix"
+    expected = _effects_reference(tmp_path / "pb.h5ad", aggregate_batches)
+    np.testing.assert_allclose(ad.read_h5ad(from_cells.filename).X, expected, atol=1e-9)
+    # the saved sparse profiles as input, and too big for memory: through a temporary CSC copy
+    from_bulk = cx.pb.effects(tmp_path / "pb.h5ad", output_path=tmp_path / "effects2.h5ad", **common)
+    np.testing.assert_allclose(ad.read_h5ad(from_bulk.filename).X, expected, atol=1e-9)
+    on_disk = cx.pb.effects(tmp_path / "pb.h5ad", output_path=tmp_path / "effects3.h5ad", memory_limit_gb=1e-6,
+                            **common)
+    np.testing.assert_allclose(ad.read_h5ad(on_disk.filename).X, expected, atol=1e-9)
+    assert not list(tmp_path.glob("**/profiles_csc.h5ad"))

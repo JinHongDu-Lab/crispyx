@@ -53,6 +53,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    _rows_as_slice,
     write_obs,
     _replace_on_success,
     _validate_counts_chunk,
@@ -566,7 +567,8 @@ def _resolve_candidates(
         Explicit subset to test.  ``None`` means test all non-control groups;
         an empty selection tests nothing, and the caller writes an empty
         result, so a caller that splits perturbations between estimators
-        needs no guard.
+        needs no guard. A selection that names only the control label or
+        unlabelled cells is a mistake and raises.
 
     Returns
     -------
@@ -576,7 +578,8 @@ def _resolve_candidates(
     Raises
     ------
     ValueError
-        If the file holds no non-control group to test.
+        If the file holds no non-control group to test, or a non-empty
+        selection leaves none.
     """
     if perturbations is None:
         unique = pd.Index(labels).unique().tolist()
@@ -584,7 +587,14 @@ def _resolve_candidates(
         if not candidates:
             raise ValueError("No perturbation groups available for differential expression testing")
         return candidates
-    return [str(p) for p in perturbations if str(p) not in (control_label, UNLABELLED)]
+    requested = [str(p) for p in perturbations]
+    candidates = [p for p in requested if p not in (control_label, UNLABELLED)]
+    if requested and not candidates:
+        raise ValueError(
+            "No perturbation groups available for differential expression testing: the requested "
+            f"perturbations {requested[:5]} are only the control label '{control_label}' or unlabelled cells"
+        )
+    return candidates
 
 
 def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, np.ndarray]:
@@ -2194,7 +2204,7 @@ def nb_glm_test(
             def _control_blocks():
                 for start in range(0, control_rows.size, 4096):
                     rows = control_rows[start:start + 4096]
-                    yield np.arange(start, start + rows.size), backed.X[rows, :]
+                    yield np.arange(start, start + rows.size), backed.X[_rows_as_slice(rows), :]
 
             control_summary = summarize_controls(_control_blocks(), control_sf, n_genes)
         finally:
@@ -2657,10 +2667,19 @@ def _offset_baseline(
     send any count among the perturbed cells to the upper bound of the
     effect (with one stratum the pseudo-cell changes nothing). With
     ``dispersion=None`` the dispersion is the method-of-moments estimate
-    pooled over strata, ``sum (y - s mu_b)^2 = sum s mu_b + alpha sum s^2
-    mu_b^2``, for genes with a pooled mean of at least
+    pooled over strata, from ``E sum (y - s mu_b)^2`` over a stratum's
+    controls, for genes with a pooled mean of at least
     ``min_mean_for_dispersion`` counts per unit size factor, and the
-    parametric mean-dispersion trend through them for the others.
+    parametric mean-dispersion trend through them for the others. The
+    residuals are about the stratum's own mean ``mu_b = sum y / S`` (``S =
+    sum s``), which takes a degree of freedom from each stratum: with
+    ``Var y = s mu + alpha s^2 mu^2``, ``E sum (y - s mu_b)^2 = mu (S -
+    s2/S) + alpha mu^2 (s2 - 2 s3/S + s2^2/S^2)`` (``s2``, ``s3`` the sums
+    of ``s^2``, ``s^3``), the ``(n-1)/n`` of a sample variance when the
+    size factors are equal. Subtracting the full Poisson term ``mu S``
+    instead would bias ``alpha`` down by ``1/n_b`` per stratum, to the floor
+    across hundreds of small strata; a stratum of one control contributes
+    nothing.
     """
     s_all = np.asarray(size_factors, dtype=np.float64)
     sy = np.zeros((n_strata, n_genes))
@@ -2668,6 +2687,8 @@ def _offset_baseline(
     ssy = np.zeros((n_strata, n_genes)) if dispersion is None else None
     s1 = np.zeros(n_strata)
     s2 = np.zeros(n_strata)
+    s3 = np.zeros(n_strata)
+    n_per_stratum = np.zeros(n_strata, dtype=np.int64)
     nnz = np.zeros(n_genes, dtype=np.int64)
     total = np.zeros(n_genes)
     n_cells = 0
@@ -2684,6 +2705,8 @@ def _offset_baseline(
             ssy += (onehot @ (sp.diags(s) @ csr)).toarray()
         s1 += np.bincount(b, weights=s, minlength=n_strata)
         s2 += np.bincount(b, weights=s * s, minlength=n_strata)
+        s3 += np.bincount(b, weights=s * s * s, minlength=n_strata)
+        n_per_stratum += np.bincount(b, minlength=n_strata)
         nnz += np.bincount(csr.indices, minlength=n_genes)
         total += np.asarray(csr.sum(axis=0)).ravel()
         n_cells += rows.size
@@ -2695,11 +2718,15 @@ def _offset_baseline(
         final = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,)).astype(np.float64)
         raw = trend = np.full(n_genes, np.nan)
     else:
+        # A stratum of one control has no residual about its own mean (both
+        # its terms are zero in exact arithmetic) and is left out.
+        usable = has_controls & (n_per_stratum >= 2)
         with np.errstate(invalid="ignore", divide="ignore"):
-            mu = sy[has_controls] / s1[has_controls][:, None]
-            numerator = (syy[has_controls] - 2 * mu * ssy[has_controls] + mu ** 2 * s2[has_controls][:, None]
-                         - mu * s1[has_controls][:, None]).sum(axis=0)
-            raw = numerator / (mu ** 2 * s2[has_controls][:, None]).sum(axis=0)
+            S, S2, S3 = (x[usable][:, None] for x in (s1, s2, s3))
+            mu = sy[usable] / S
+            residual_ss = syy[usable] - 2 * mu * ssy[usable] + mu ** 2 * S2
+            numerator = (residual_ss - mu * (S - S2 / S)).sum(axis=0)
+            raw = numerator / (mu ** 2 * (S2 - 2 * S3 / S + S2 ** 2 / S ** 2)).sum(axis=0)
         raw = np.where(np.isfinite(raw), np.clip(raw, 1e-8, None), np.nan)
         genewise = (pooled >= min_mean_for_dispersion) & np.isfinite(raw)
         trend = fit_dispersion_trend(pooled, np.where(genewise, raw, np.nan))
@@ -3100,7 +3127,7 @@ def nb_offset_test(
             def control_blocks():
                 for start in range(0, control_rows.size, 4096):
                     rows = control_rows[start:start + 4096]
-                    yield rows, backed.X[rows, :]
+                    yield rows, backed.X[_rows_as_slice(rows), :]
 
             baseline = _offset_baseline(
                 control_blocks(), size_factors, stratum_codes, n_strata, n_genes, dispersion=dispersion,
@@ -3133,16 +3160,19 @@ def nb_offset_test(
     n_control = baseline.n_cells
     pts_rest = (baseline.nnz / max(n_control, 1)).astype(np.float32)
 
+    # Each perturbation's rows: a slice of a file sorted by perturbation
+    # (one read of the matrix's data and indices), else their indices.
     unsorted = [label for label in candidates if label not in boundaries]
     row_indices = _group_row_indices(labels, unsorted) if unsorted else {}
     group_rows = {
-        label: np.arange(*boundaries[label]) if label in boundaries else row_indices[label] for label in candidates
+        label: slice(*boundaries[label]) if label in boundaries else row_indices[label] for label in candidates
     }
     # A fit holds a block of cells dense in about five cells x genes arrays
-    # (baseline, mean, weight, their products); a block takes a tenth of
-    # the budget, so the threads' blocks fit beside the baseline.
-    block_cells = int(max(16, min(65536, budget * 0.1 / (n_genes * 8 * 5))))
+    # (baseline, mean, weight, their products), and every thread fits at
+    # once: the threads' blocks together take a tenth of the budget, so
+    # they fit beside the baseline.
     n_threads = max(1, _resolve_n_jobs(n_jobs))
+    block_cells = int(max(16, min(65536, budget * 0.1 / (n_threads * n_genes * 8 * 5))))
 
     n_groups = len(candidates)
     shape = (n_groups, n_genes)
@@ -3276,6 +3306,8 @@ def nb_offset_test(
                 y = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
                 y.sum_duplicates()
                 y.eliminate_zeros()
+                if isinstance(rows, slice):
+                    rows = np.arange(rows.start, rows.stop)
                 yield delayed(fit_or_fail)(label, y, rows)
 
         with _create_progress_context(n_groups, name, verbose) as pbar:

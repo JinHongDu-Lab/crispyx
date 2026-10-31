@@ -80,3 +80,20 @@ def test_rank_genes_groups_and_readers_report_the_stored_values(screen, tmp_path
             full = f["uns/rank_genes_groups/full"]
             np.testing.assert_array_equal(full["pts_rest"][()], np.asarray(direct.pts_rest))
             np.testing.assert_array_equal(full["logfoldchanges"][()], direct.logfoldchanges)
+
+
+def test_an_nb_offset_result_materialises_its_log_fold_changes(screen, tmp_path):
+    """nb_offset_test stores the log fold change as X like nb_glm_test
+    (de._RESULT_KEYS); the Scanpy readers took only nb_glm's X."""
+    direct = cx.tl.nb_offset_test(
+        screen / "counts.h5ad", perturbation_column="perturbation", control_label="control",
+        output_path=tmp_path / "offset.h5ad", verbose=False, min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0,
+        min_mean_pert=0, min_total_count=0,
+    )
+    row = list(direct.groups).index("A")
+    df = cx.pl.rank_genes_groups_df(direct.result_path, group="A")
+    genes = list(direct.genes)
+    idx = np.array([genes.index(name) for name in df["names"]])
+    np.testing.assert_array_equal(df["logfoldchanges"].to_numpy(), direct.logfoldchanges[row, idx])
+    rgg = cx.pl.materialize_rank_genes_groups(direct.result_path, n_genes=5).uns["rank_genes_groups"]
+    assert "logfoldchanges" in rgg

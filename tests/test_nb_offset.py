@@ -287,3 +287,100 @@ def test_nb_glm_covariate_path_reports_its_fits_and_timing(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "2 fits of up to 2 perturbation(s) with the 300 controls" in out
     assert "first fit took" in out and "1 more with 1 worker(s)" in out
+
+
+def test_the_dispersion_is_unbiased_over_many_small_strata():
+    """The residuals are about each stratum's own baseline, which costs a
+    degree of freedom per stratum: subtracting the full Poisson term biased
+    alpha down by 1/n_b, to the floor over hundreds of two-cell strata."""
+    from crispyx.de import _offset_baseline
+
+    rng = np.random.default_rng(3)
+    alpha, n_genes = 0.3, 400
+    for n_strata, per_stratum in ((300, 2), (200, 3), (6, 500)):
+        n = n_strata * per_stratum
+        strata = np.repeat(np.arange(n_strata), per_stratum)
+        s = np.exp(rng.normal(0, 0.4, n))
+        base = np.exp(rng.uniform(np.log(1), np.log(20), n_genes))
+        mu = s[:, None] * base[None, :] * np.exp(rng.normal(0, 0.5, (n_strata, n_genes))[strata])
+        y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)).astype(np.float64)
+        baseline = _offset_baseline(
+            iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, n_strata, n_genes, dispersion=None,
+        )
+        assert 0.2 < np.median(baseline.dispersion_raw) < 0.4, (n_strata, per_stratum)
+    # a stratum of one control contributes nothing: alone, no dispersion is estimable
+    baseline = _offset_baseline(
+        iter([(np.arange(3), sp.csr_matrix(y[:3]))]), s[:3], np.arange(3), 3, n_genes, dispersion=None,
+    )
+    assert np.isnan(baseline.dispersion_raw).all()
+
+
+def test_a_selection_of_only_the_control_raises(tmp_path):
+    _screen(tmp_path / "s.h5ad", n_genes=12, n_pert=2)
+    for fn in (cx.nb_glm_test, cx.tl.nb_offset_test):
+        with pytest.raises(ValueError, match="No perturbation groups"):
+            fn(tmp_path / "s.h5ad", perturbation_column="perturbation", control_label="control",
+               perturbations=["control"], output_path=tmp_path / "x.h5ad", verbose=False)
+
+
+class _RecordingBacked:
+    """A backed AnnData whose ``X`` records how each read indexes it."""
+
+    def __init__(self, backed, keys: list):
+        self._backed, self._keys = backed, keys
+
+    def __getattr__(self, name):
+        return getattr(self._backed, name)
+
+    @property
+    def X(self):
+        inner, keys = self._backed.X, self._keys
+
+        class _Proxy:
+            def __getitem__(self, key):
+                keys.append(key)
+                return inner[key]
+
+            def __getattr__(self, name):
+                return getattr(inner, name)
+
+        return _Proxy()
+
+
+def test_a_sorted_input_is_read_one_slice_per_group(tmp_path, monkeypatch):
+    """A slice of a backed CSR matrix is one read of its data and indices;
+    an index array is reads per row, minutes over a million cells."""
+    import crispyx.de as de
+
+    _screen(tmp_path / "s.h5ad", n_ctrl=300, n_pert=3)
+    monkeypatch.setattr(de, "needs_sorting_for_nbglm", lambda *a, **k: True)
+    keys: list = []
+    real_read_backed = de.read_backed
+    monkeypatch.setattr(de, "read_backed", lambda path, *a, **k: _RecordingBacked(real_read_backed(path, *a, **k), keys))
+    result = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", strata="stratum", **NO_FILTERS)
+    assert (tmp_path / "s_sorted.h5ad").exists() and np.isfinite(result.X).any()
+    rows = [key[0] if isinstance(key, tuple) else key for key in keys]
+    assert rows and all(isinstance(row, slice) for row in rows), [type(r) for r in rows]
+    # the unsorted file's scattered groups are still read by index
+    unsorted = _run(tmp_path / "s_sorted.h5ad", tmp_path / "off2.h5ad", strata="stratum", **NO_FILTERS)
+    np.testing.assert_allclose(result.X, unsorted.X, equal_nan=True)
+
+
+def test_the_cell_block_is_shared_between_the_threads(tmp_path, monkeypatch):
+    """Every thread fits a block at once, so a thread's block is its share
+    of the tenth of the budget, not the whole tenth n_threads times over."""
+    import crispyx.de as de
+
+    _screen(tmp_path / "s.h5ad", n_ctrl=200, n_pert=2, n_genes=60)
+    seen: list[int] = []
+    real = de._fit_offset_group
+
+    def recording(*args, block_cells, **kwargs):
+        seen.append(block_cells)
+        return real(*args, block_cells=block_cells, **kwargs)
+
+    monkeypatch.setattr(de, "_fit_offset_group", recording)
+    budget_gb = 60 * 8 * 5 * 4096 * 10 / 1e9  # a tenth of it holds 4096 cells of 60 genes in five arrays
+    _run(tmp_path / "s.h5ad", tmp_path / "one.h5ad", memory_limit_gb=budget_gb, n_jobs=1, **NO_FILTERS)
+    _run(tmp_path / "s.h5ad", tmp_path / "four.h5ad", memory_limit_gb=budget_gb, n_jobs=4, **NO_FILTERS)
+    assert seen[0] == 4096 and seen[-1] == 1024, seen

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NamedTuple, Sequence, get_args
 
@@ -26,10 +27,13 @@ from .data import (
     accepts_in_memory,
     AnnData,
     calculate_optimal_chunk_size,
+    convert_to_csc,
     ensure_gene_symbol_column,
+    get_matrix_storage_format,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    read_rows_csc,
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
@@ -60,7 +64,13 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    return [label for label in unique if label not in (control_label, UNLABELLED)]
+    candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
+    if perturbations is not None and unique and not candidates:
+        raise ValueError(
+            f"No perturbation groups available: the requested perturbations {unique[:5]} are only the "
+            f"control label '{control_label}' or unlabelled cells"
+        )
+    return candidates
 
 
 def _densify_block(block) -> np.ndarray:
@@ -1057,6 +1067,37 @@ def _has_pseudobulk_marker(path: Path) -> bool:
         backed.file.close()
 
 
+@contextmanager
+def _profiles_by_column(bulk: ad.AnnData, path: Path, memory_limit_gb: float | None, verbose: int | bool):
+    """``bulk``'s profiles as a matrix whose column slices are cheap.
+
+    The backed matrix itself when the file is dense or CSC. A CSR file
+    (:func:`aggregate_pseudobulk` writes mostly-zero profiles as CSR, and a
+    column slice of a backed CSR matrix reads the whole file) is read into
+    memory as CSC when its non-zeros fit half the budget, else converted
+    to a temporary CSC file for the duration of the block.
+    """
+    if get_matrix_storage_format(path) != "csr":
+        yield bulk.X
+        return
+    with h5py.File(path, "r") as handle:
+        nnz = int(handle["X/data"].shape[0])
+    if nnz * 12 <= 0.5 * _resolve_memory_limit_bytes(memory_limit_gb):
+        _messages.vprint(verbose, "pb.effects", f"reading the {bulk.n_obs} CSR profiles into memory by column")
+        yield read_rows_csc(path, np.arange(bulk.n_obs))
+        return
+    with tempfile.TemporaryDirectory(prefix="cx_pb_effects_csc_") as tmpdir:
+        csc_path = Path(tmpdir) / "profiles_csc.h5ad"
+        _messages.vprint(verbose, "pb.effects", f"the {bulk.n_obs} CSR profiles exceed the memory budget; "
+                                                "writing a temporary CSC copy")
+        convert_to_csc(path, output_path=csc_path, memory_limit_gb=memory_limit_gb, verbose=False).close()
+        csc = read_backed(csc_path)
+        try:
+            yield csc.X
+        finally:
+            csc.file.close()
+
+
 @accepts_in_memory
 def compute_pseudobulk_effects(
     data: str | Path | AnnData | ad.AnnData,
@@ -1273,7 +1314,8 @@ def compute_pseudobulk_effects(
             gene_chunk = min(512, max(bulk.n_vars, 1))
             # Each block of genes goes straight into the output's (rows,
             # gene block) HDF5 chunks, so no step holds a whole matrix.
-            with _replace_on_success(resolved_output) as partial:
+            with _replace_on_success(resolved_output) as partial, \
+                    _profiles_by_column(bulk, bulk_path, memory_limit_gb, verbose) as profiles:
                 ad.AnnData(obs=obs, var=bulk.var.copy(), uns=uns).write(partial)
                 with h5py.File(partial, "r+") as handle:
                     shape = (n_output, bulk.n_vars)
@@ -1284,7 +1326,7 @@ def compute_pseudobulk_effects(
                     )
                     for start in range(0, bulk.n_vars, gene_chunk):
                         end = min(start + gene_chunk, bulk.n_vars)
-                        source = np.asarray(bulk.X[:, start:end], dtype=np.float64)
+                        source = _densify_block(profiles[:, start:end])
                         target_chunk = source[target_rows_arr]
                         reference_chunk = source[control_rows_arr]
                         if aggregate_batches:

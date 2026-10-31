@@ -75,8 +75,10 @@ to weeks for thousands of perturbations.
 effects taken from the controls rather than estimated jointly. One pass over
 the control cells gives each stratum's mean per gene (counts per unit size
 factor) and, unless ``dispersion`` is given, a control-only dispersion per
-gene (method of moments pooled over strata, the parametric trend below 0.5
-counts per cell). Each perturbation is then a one-parameter negative binomial
+gene (method of moments pooled over strata, each stratum's residuals about
+its own mean corrected for the degree of freedom that mean costs, so strata
+of two or three controls do not pull the estimate to the floor; the
+parametric trend below 0.5 counts per cell). Each perturbation is then a one-parameter negative binomial
 fit on its own cells, ``y_i ~ NB(s_i m_bg exp(beta), alpha_g)``, by Fisher
 scoring; the cost is linear in the perturbed cells, however many controls
 there are.
