@@ -700,7 +700,7 @@ def _write_profiles(handle: h5py.File, profiles: np.ndarray, shape: tuple[int, i
     n_rows, n_cols = shape
     blocks = list(_row_blocks(n_rows, n_cols))
     nnz = sum(int(np.count_nonzero(profiles[sl])) for sl in blocks)
-    if n_rows == 0 or nnz > 0.5 * n_rows * n_cols:
+    if n_rows * n_cols == 0 or nnz > 0.5 * n_rows * n_cols:
         out = _create_unfilled_array(handle, "X", shape, np.float64)
         for sl in blocks:
             out[sl] = profiles[sl]

@@ -2124,6 +2124,15 @@ def _dominant_guide(counts: np.ndarray, *, min_umi: int, min_ratio: float) -> np
     return np.where(ok, idx, -1)
 
 
+def _check_guide_names(names: np.ndarray, n_guides: int) -> None:
+    """Before any cell is read: the guide names fit the columns, and there
+    is at least one column to pick from."""
+    if n_guides == 0:
+        raise ValueError("guide_counts has no guide columns")
+    if len(names) != n_guides:
+        raise ValueError(f"{len(names)} guide names for {n_guides} columns")
+
+
 def assign_guides(
     guide_counts: "str | Path | ad.AnnData | AnnData | np.ndarray | sp.spmatrix",
     guide_names: "Iterable[str] | None" = None,
@@ -2181,7 +2190,7 @@ def assign_guides(
         try:
             names = np.asarray(backed.var_names, dtype=object) if guide_names is None else np.asarray(list(guide_names), dtype=object)
             index = backed.obs_names.copy()
-            n_guides = backed.n_vars
+            _check_guide_names(names, backed.n_vars)
             calls = np.empty(backed.n_obs, dtype=np.int64)
             row = 0
             for _, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=True):
@@ -2200,14 +2209,12 @@ def assign_guides(
             if guide_names is None:
                 raise ValueError("guide_names is required when guide_counts is a bare array")
             names = np.asarray(list(guide_names), dtype=object)
-        n_guides = matrix.shape[1]
+        _check_guide_names(names, matrix.shape[1])
         calls = np.empty(matrix.shape[0], dtype=np.int64)
         for start in range(0, matrix.shape[0], chunk_size):
             block = matrix[start:start + chunk_size]
             block = block.toarray() if sp.issparse(block) else np.asarray(block)
             calls[start:start + block.shape[0]] = _dominant_guide(block, min_umi=min_umi, min_ratio=min_ratio)
-    if len(names) != n_guides:
-        raise ValueError(f"{len(names)} guide names for {n_guides} columns")
 
     assigned = calls >= 0
     values = names[np.maximum(calls, 0)].astype(object)
@@ -2327,6 +2334,9 @@ def check_perturbation_data(
     warnings_: list[str] = []
     obs = load_obs(path)
     var = load_var(path)
+    if gene_name_column is not None and gene_name_column not in var.columns:
+        errors.append(f"var has no column '{gene_name_column}' (columns: {_examples(var.columns, 8)})")
+        gene_name_column = None  # the checks below run as if none were given
 
     # --- labels ---------------------------------------------------------------
     if perturbation_column not in obs.columns:
@@ -2349,8 +2359,7 @@ def check_perturbation_data(
             errors.append(f"no cell carries the control label {control!r}")
         targets = unique[unique != control] if control is not None else unique
         var_names = pd.Index(var.index.astype(str))
-        gene_col = gene_name_column if gene_name_column in var.columns else None
-        symbols = pd.Index(var[gene_col].astype(str)) if gene_col else var_names
+        symbols = pd.Index(var[gene_name_column].astype(str)) if gene_name_column else var_names
         measured = pd.Index(symbols).union(var_names)
 
         upper = targets.str.upper()
@@ -2408,7 +2417,7 @@ def check_perturbation_data(
         warnings_.append(f"{len(made_unique)} var_names look like var_names_make_unique suffixes of other var_names, "
                          "so one symbol sits on several rows: pp.collapse_genes(by=...) sums them; "
                          + _examples(made_unique))
-    if gene_name_column is not None and gene_name_column in var.columns:
+    if gene_name_column is not None:
         symbols_all = pd.Index(var[gene_name_column].astype(str))
         repeated = symbols_all[symbols_all.duplicated()].unique()
         if len(repeated):

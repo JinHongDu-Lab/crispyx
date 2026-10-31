@@ -676,8 +676,8 @@ def _copy_extra_slots(
     (``None`` means "copy unchanged", i.e. cell/gene identity doesn't
     change -- the case for :func:`downsample_counts`).
 
-    Shared by :func:`write_filtered_subset` and :func:`downsample_counts` so
-    the two don't independently re-implement (and risk drifting out of sync
+    Shared by :func:`write_filtered_subset` and :func:`_copy_slots_unchanged`
+    so they don't independently re-implement (and risk drifting out of sync
     on) the same slot-preservation logic. All keys are written through one
     shared file handle rather than one open/close per key.
     """
@@ -706,6 +706,40 @@ def _copy_extra_slots(
             if gene_mask is not None:
                 mat = mat[gene_mask][:, gene_mask]
             write_varp_to_h5ad(f, key, mat)
+
+
+def _copy_slots_unchanged(
+    source_path: "str | Path",
+    dest: "str | Path",
+    *,
+    layer_keys: Sequence[str],
+    obsm_keys: Sequence[str],
+    varm_keys: Sequence[str],
+    obsp_keys: Sequence[str],
+    varp_keys: Sequence[str],
+) -> None:
+    """Carry the named layers/obsm/varm/obsp/varp of ``source_path`` into
+    ``dest`` unchanged: the transforms that rewrite ``X`` alone, keeping
+    every cell and gene (:func:`normalize_total_log1p`,
+    :func:`downsample_counts`, :func:`recover_counts`), copy their slots
+    through here. Layers are copied as HDF5 objects, so no value is
+    re-serialised."""
+    if layer_keys:
+        with h5py.File(source_path, "r") as src, h5py.File(dest, "r+") as dst:
+            dst_layers = dst.require_group("layers")
+            for key in layer_keys:
+                if key in dst_layers:
+                    del dst_layers[key]
+                src.copy(src[f"layers/{key}"], dst_layers, name=key)
+    if obsm_keys or varm_keys or obsp_keys or varp_keys:
+        backed = read_backed(source_path)
+        try:
+            _copy_extra_slots(
+                dest, source=backed, obsm_keys=obsm_keys, varm_keys=varm_keys,
+                obsp_keys=obsp_keys, varp_keys=varp_keys, cell_mask=None, gene_mask=None,
+            )
+        finally:
+            backed.file.close()
 
 
 class _ElemMapping(Mapping):
@@ -2878,28 +2912,10 @@ def _normalize_total_log1p_impl(
         )
 
     def _copy_slots(dest: Path) -> None:
-        if layer_keys:
-            with h5py.File(source_path, "r") as src, h5py.File(dest, "r+") as dst:
-                dst_layers = dst.require_group("layers")
-                for key in layer_keys:
-                    if key in dst_layers:
-                        del dst_layers[key]
-                    src.copy(src[f"layers/{key}"], dst_layers, name=key)
-        if obsm_keys or varm_keys or obsp_keys or varp_keys:
-            backed_slots = read_backed(source_path)
-            try:
-                _copy_extra_slots(
-                    dest,
-                    source=backed_slots,
-                    obsm_keys=obsm_keys,
-                    varm_keys=varm_keys,
-                    obsp_keys=obsp_keys,
-                    varp_keys=varp_keys,
-                    cell_mask=None,
-                    gene_mask=None,
-                )
-            finally:
-                backed_slots.file.close()
+        _copy_slots_unchanged(
+            source_path, dest, layer_keys=layer_keys, obsm_keys=obsm_keys,
+            varm_keys=varm_keys, obsp_keys=obsp_keys, varp_keys=varp_keys,
+        )
 
     if total_nnz == 0:
         with _replace_on_success(output_path) as partial:
@@ -3276,35 +3292,11 @@ def downsample_counts(
                 grp.create_dataset("indptr", data=indptr)
                 grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        # layers/obsm/varm/obsp/varp are untouched by this transform (only X's
-        # counts are thinned; cell/gene identity, order, and count never change),
-        # but still need to be carried through explicitly since the output is a
-        # new file, not an in-place edit of the source. Layers are copied with a
-        # direct HDF5 object copy rather than _stream_write_matrix_subset: with
-        # an identity mask there is no filtering to do, so a native copy avoids
-        # paying for a counting pass plus a full re-serialize of every value.
-        if layer_keys:
-            with h5py.File(source_path, "r") as src, h5py.File(partial, "r+") as dst:
-                dst_layers = dst.require_group("layers")
-                for key in layer_keys:
-                    if key in dst_layers:
-                        del dst_layers[key]
-                    src.copy(src[f"layers/{key}"], dst_layers, name=key)
-        if obsm_keys or varm_keys or obsp_keys or varp_keys:
-            backed = read_backed(source_path)
-            try:
-                _copy_extra_slots(
-                    partial,
-                    source=backed,
-                    obsm_keys=obsm_keys,
-                    varm_keys=varm_keys,
-                    obsp_keys=obsp_keys,
-                    varp_keys=varp_keys,
-                    cell_mask=None,
-                    gene_mask=None,
-                )
-            finally:
-                backed.file.close()
+        # Only X's counts are thinned; every other slot is carried through.
+        _copy_slots_unchanged(
+            source_path, partial, layer_keys=layer_keys, obsm_keys=obsm_keys,
+            varm_keys=varm_keys, obsp_keys=obsp_keys, varp_keys=varp_keys,
+        )
 
     _messages.print_done(
         verbose, "pp.downsample_counts",
@@ -3315,7 +3307,8 @@ def downsample_counts(
 
 def _recover_counts_block(csr: sp.csr_matrix, n_counts: np.ndarray | None, *, context: str) -> np.ndarray:
     """The integer counts behind one CSR block of ``log1p(normalize_total(counts))``
-    values, as float32 in the block's own order; see :func:`recover_counts`."""
+    values, as float32 in the block's own order; see :func:`recover_counts`.
+    ``csr`` holds no stored zeros: one would be a cell's smallest value."""
     values = np.expm1(csr.data.astype(np.float64))
     if values.size == 0:
         return values.astype(np.float32)
@@ -3383,8 +3376,8 @@ def recover_counts(
     all fail rather than yield rounded nonsense. A matrix that already holds
     integer counts is refused too.
 
-    ``X`` is written as float32 CSR with the source's sparsity pattern.
-    ``layers``/``obsm``/``varm``/``obsp``/``varp``/``uns`` are carried
+    ``X`` is written as float32 CSR with the source's sparsity pattern, less
+    any stored zeros. ``layers``/``obsm``/``varm``/``obsp``/``varp``/``uns`` are carried
     through unchanged; a source ``.raw`` is dropped with a warning.
     ``uns["crispyx_recover_counts"]`` records how the factor was found.
 
@@ -3464,7 +3457,9 @@ def recover_counts(
         scratch_dir=output_path.parent, chunk_size=chunk_size, verbose=verbose,
     ) as stream_path:
         # First pass: the output has the source's sparsity pattern, so its
-        # row pointers are known before any value is recovered.
+        # row pointers are known before any value is recovered. A stored
+        # zero is dropped in both passes: left in, it would be a cell's
+        # smallest value and its scale 1/0.
         row_nnz = np.zeros(n_obs, dtype=np.int64)
         backed = read_backed(stream_path)
         try:
@@ -3474,6 +3469,7 @@ def recover_counts(
                 backed, axis=0, chunk_size=chunk_size, convert_to_dense=False, warn_slow_axis=False,
             ):
                 csr = _ensure_csr(block)
+                csr.eliminate_zeros()
                 if first and csr.nnz and _looks_like_counts(csr.data):
                     raise ValueError(
                         f"{name}: X already holds integer counts; there is nothing to recover."
@@ -3517,6 +3513,7 @@ def recover_counts(
                             warn_slow_axis=False,
                         ):
                             csr = _ensure_csr(block)
+                            csr.eliminate_zeros()
                             totals = None if n_counts is None else n_counts[row:row + csr.shape[0]]
                             values = _recover_counts_block(csr, totals, context=name)
                             nnz = values.shape[0]
@@ -3530,22 +3527,10 @@ def recover_counts(
                 finally:
                     backed.file.close()
 
-            if layer_keys:
-                with h5py.File(source_path, "r") as src, h5py.File(partial, "r+") as dst:
-                    dst_layers = dst.require_group("layers")
-                    for key in layer_keys:
-                        if key in dst_layers:
-                            del dst_layers[key]
-                        src.copy(src[f"layers/{key}"], dst_layers, name=key)
-            if obsm_keys or varm_keys or obsp_keys or varp_keys:
-                backed = read_backed(source_path)
-                try:
-                    _copy_extra_slots(
-                        partial, source=backed, obsm_keys=obsm_keys, varm_keys=varm_keys,
-                        obsp_keys=obsp_keys, varp_keys=varp_keys, cell_mask=None, gene_mask=None,
-                    )
-                finally:
-                    backed.file.close()
+            _copy_slots_unchanged(
+                source_path, partial, layer_keys=layer_keys, obsm_keys=obsm_keys,
+                varm_keys=varm_keys, obsp_keys=obsp_keys, varp_keys=varp_keys,
+            )
 
     _messages.print_done(verbose, name, f"{n_obs} cells × {n_vars} genes, {total_nnz} counts recovered")
     return AnnData(output_path)
@@ -3554,12 +3539,24 @@ def recover_counts(
 def _gene_groups(var: pd.DataFrame, by: "str | pd.Series | Sequence", *, context: str) -> tuple[np.ndarray, pd.DataFrame]:
     """The group of every source gene (``-1`` for a dropped one) and the
     ``var`` table of the collapsed genes, one row per group in the order the
-    groups first appear."""
+    groups first appear. A Series ``by`` is aligned to ``var`` by its index,
+    any other sequence by position."""
     by_column = by if isinstance(by, str) else None
     if by_column is not None:
         if by_column not in var.columns:
             raise KeyError(f"{context}: var has no column '{by_column}'. Available: {list(var.columns)}")
         keys = var[by_column]
+    elif isinstance(by, pd.Series):
+        index = pd.Index(by.index.astype(str))
+        if index.has_duplicates:
+            raise ValueError(f"{context}: the index of `by` names some genes more than once")
+        missing = var.index.difference(index)
+        if len(missing):
+            raise KeyError(
+                f"{context}: `by` has no key for {len(missing)} of {len(var)} genes (first: {missing[:3].tolist()}); "
+                "index a Series by var_names, or pass a list or array for one key per gene in var order"
+            )
+        keys = pd.Series(by.to_numpy(), index=index).reindex(var.index)
     else:
         values = np.asarray(by, dtype=object)
         if len(values) != len(var):
@@ -3630,7 +3627,9 @@ def collapse_genes(
     output_path
         Path for the output h5ad file. If None, derived from ``data_name``.
     by
-        A ``var`` column name, or one key per source gene (aligned to ``var``).
+        A ``var`` column name, a Series indexed by ``var_names`` (aligned by
+        index; every gene must have an entry), or a list or array with one
+        key per source gene in ``var`` order.
     chunk_size
         Number of cells per streamed block.
     data_name

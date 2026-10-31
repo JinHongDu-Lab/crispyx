@@ -48,3 +48,11 @@ def test_nb_glm_runs_on_the_sparse_pseudobulk(tmp_path):
                             output_path=tmp_path / "glm.h5ad", verbose=False, min_pct_ctrl=0, min_pct_pert=0,
                             min_mean_ctrl=0, min_mean_pert=0)
     assert np.isfinite(np.asarray(result.pvalues)).sum() > 100
+
+
+def test_profiles_without_genes_are_written_dense(tmp_path):
+    from crispyx.pseudobulk import _write_profiles
+
+    with h5py.File(tmp_path / "pb.h5", "w") as f:
+        assert _write_profiles(f, np.zeros((3, 0)), (3, 0)) == "dense"
+        assert f["X"].shape == (3, 0)

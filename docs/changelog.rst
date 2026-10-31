@@ -20,7 +20,8 @@ stratified control set, and exact apeGLM shrinkage.
   counts (at least ``min_umi`` UMIs and ``min_ratio`` times the runner-up),
   ``NA`` otherwise, from an array, an AnnData or an h5ad streamed in blocks.
 * ``cx.pp.collapse_genes``: sums the rows of ``var`` that are one gene under
-  a caller-supplied key (a ``var`` column, or one key per gene), streamed,
+  a caller-supplied key (a ``var`` column, a Series indexed by ``var_names``,
+  or one key per gene in ``var`` order), streamed,
   dropping rows whose key is missing: Ensembl IDs that share a symbol,
   ``_PAR_Y`` copies beside their X copies, ``var_names_make_unique`` suffixes,
   rows of two annotation releases after a concatenation. ``var`` columns that

@@ -138,3 +138,17 @@ def test_split_genes_are_reported(tmp_path):
     warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", verbose=False), "warning")
     assert any("3 var_names look like var_names_make_unique suffixes" in m and "'NKX2-5-1'" in m for m in warnings)
     assert not any("_PAR_Y" in m for m in warnings)
+
+
+def test_an_unknown_gene_name_column_is_an_error(tmp_path):
+    genes = ["ENSG00000183072", "ENSG00000136574", "ENSG00000089225", "ENSG00000234745", "ENSG00000141510", "ENSG00000197616"]
+    path = _write(tmp_path / "x.h5ad", ["control", "GATA4"] * 6, genes=genes)
+    var = cx.load_var(path)
+    var["symbol"] = ["A", "B", "C", "D", "E", "F"]
+    cx.write_var(path, var)
+    issues = cx.pp.check_data(path, perturbation_column="perturbation", gene_name_column="symbols", verbose=False)
+    assert any("no column 'symbols'" in m for m in _messages(issues, "error"))
+    # the rest of the checks run as without the column: the Ensembl-ID warning still names the right one
+    assert any("gene_name_column='symbol'" in m for m in _messages(issues, "warning"))
+    issues = cx.pp.check_data(path, perturbation_column="perturbation", gene_name_column="symbol", verbose=False)
+    assert not any("no column" in m for m in _messages(issues, "error"))

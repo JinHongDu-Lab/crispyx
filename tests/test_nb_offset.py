@@ -109,6 +109,23 @@ def test_cells_of_strata_without_controls_are_left_out(tmp_path):
     got = ad.read_h5ad(result.result_path)
     assert np.isnan(got.X[got.obs_names.get_loc("p1")]).all()
     assert np.isfinite(got.X[got.obs_names.get_loc("p2")]).sum() > 40
+    # the filters and pts describe the fitted cells, not the ones left out
+    counts = ad.read_h5ad(tmp_path / "s.h5ad").X.toarray()
+    fitted = ((obs["perturbation"] == "p2") & (obs["stratum"] != "orphan")).to_numpy()
+    np.testing.assert_allclose(got.layers["pts"][got.obs_names.get_loc("p2")], (counts[fitted] > 0).mean(axis=0),
+                               rtol=1e-6)
+
+
+def test_a_csc_file_is_warned_about(tmp_path):
+    _screen(tmp_path / "s.h5ad", n_ctrl=300, n_pert=3)
+    a = ad.read_h5ad(tmp_path / "s.h5ad")
+    ad.AnnData(sp.csc_matrix(a.X), obs=a.obs, var=a.var).write(tmp_path / "csc.h5ad")
+    with pytest.warns(UserWarning, match="CSC format"):
+        result = cx.tl.nb_offset_test(
+            tmp_path / "csc.h5ad", perturbation_column="perturbation", control_label="control", strata="stratum",
+            output_path=tmp_path / "off.h5ad", verbose=False, **NO_FILTERS,
+        )
+    assert np.isfinite(ad.read_h5ad(result.result_path).X).any()
 
 
 def test_result_is_independent_of_the_cell_block_size(tmp_path):

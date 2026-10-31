@@ -103,3 +103,20 @@ def test_in_memory_anndata_is_accepted(tmp_path):
     del adata.layers["copy"], adata.varm["loadings"]
     out = cx.pp.collapse_genes(adata, output_path=tmp_path / "out.h5ad", by="symbol", verbose=False)
     np.testing.assert_array_equal(ad.read_h5ad(out.filename).X.toarray(), _expected(counts))
+
+
+def test_a_key_series_is_aligned_by_its_index(tmp_path):
+    src, counts = _write(tmp_path / "src.h5ad")
+    keys = pd.Series(SYMBOLS, index=GENES)
+    with pytest.warns(UserWarning):
+        out = cx.pp.collapse_genes(src, output_path=tmp_path / "out.h5ad", by=keys.iloc[::-1], verbose=False)
+    got = ad.read_h5ad(out.filename)
+    assert list(got.var_names) == ["A", "B", "D", "F"]
+    np.testing.assert_array_equal(got.X.toarray(), _expected(counts))
+    with pytest.raises(KeyError, match="no key for 1 of 7 genes"):
+        cx.pp.collapse_genes(src, output_path=tmp_path / "o.h5ad", by=keys.iloc[1:], verbose=False)
+    with pytest.raises(KeyError, match="index a Series by var_names"):  # a RangeIndex is not var_names
+        cx.pp.collapse_genes(src, output_path=tmp_path / "o.h5ad", by=pd.Series(SYMBOLS), verbose=False)
+    with pytest.raises(ValueError, match="more than once"):
+        cx.pp.collapse_genes(src, output_path=tmp_path / "o.h5ad", by=pd.concat([keys, keys.iloc[:1]]), verbose=False)
+    assert not (tmp_path / "o.h5ad").exists()

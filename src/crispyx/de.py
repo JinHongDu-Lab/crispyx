@@ -883,6 +883,23 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
 # Shared helpers for public DE functions
 # ---------------------------------------------------------------------------
 
+def _storage_format_warning_csc(path: Path, fn_name: str) -> str:
+    """The on-disk format of ``path``'s matrix, with a warning when it is
+    CSC: the cell-level tests read rows (size factors, the controls, each
+    perturbation's cells), and a row slice of a CSC file reads the whole
+    matrix."""
+    storage_format = get_matrix_storage_format(path)
+    if storage_format == "csc":
+        _messages.emit(
+            f"The input file '{path.name}' stores its matrix in CSC format. "
+            f"{fn_name} reads rows (size factors, the controls, each "
+            "perturbation's cells), which re-reads a CSC matrix in full every "
+            "time. Convert it to CSR (cx.pp.convert_to_csr) for much better performance.",
+            UserWarning,
+        )
+    return storage_format
+
+
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
@@ -1821,18 +1838,7 @@ def nb_glm_test(
     )):
         return r
 
-    # Warn if the on-disk matrix is stored in CSC format – row-slicing
-    # (used by size-factor computation and control-matrix loading) is
-    # extremely slow on CSC.  Recommend the CSR standardized file.
-    _storage_fmt = get_matrix_storage_format(path)
-    if _storage_fmt == "csc":
-        _messages.emit(
-            f"The input file '{path.name}' stores its matrix in CSC format. "
-            "NB-GLM performs row-wise access (size factors, control matrix, "
-            "per-perturbation slices) which is very slow on CSC. "
-            "Use the CSR-format standardized file for much better performance.",
-            UserWarning,
-        )
+    _storage_fmt = _storage_format_warning_csc(path, "nb_glm_test")
 
     # A negative binomial fit to normalised or log-transformed values runs and
     # returns plausible-looking nonsense, so refuse it up front. Such data is
@@ -2332,16 +2338,16 @@ def nb_glm_test(
             share_mb = usable_mb / workers - fit_sparse_mb - 500
             return int(min(n_genes, max(_MIN_BLOCK_GENES, share_mb * 1e6 * 0.5 / block_cell_bytes)))
 
-        workers = max(1, min(effective_n_jobs, max_workers_by_size, n_fits))
+        # The reason named is the cap that binds: the fits or the dataset
+        # size before memory, memory when the loop lowers the count further.
+        cap = max(1, min(effective_n_jobs, max_workers_by_size, n_fits))
+        limit_reason = "perturbation_count" if n_fits <= max_workers_by_size else "small_dataset"
+        workers = cap
         while workers > 1 and usable_mb / workers - fit_sparse_mb - 500 < 2 * min_block_mb:
             workers -= 1
+        if workers < cap:
+            limit_reason = "memory"
         if workers < effective_n_jobs:
-            if workers == n_fits and n_fits < max_workers_by_size:
-                limit_reason = "perturbation_count"
-            elif workers == max_workers_by_size:
-                limit_reason = "small_dataset"
-            else:
-                limit_reason = "memory"
             logger.info(
                 f"Memory-aware limiting: {effective_n_jobs} -> {workers} workers "
                 f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, usable: {usable_mb:.0f}MB, "
@@ -2978,7 +2984,7 @@ def nb_offset_test(
     if (existing := _try_load_existing_de_result(output_path, force=force, verbose=verbose, fingerprint=fingerprint)):
         return existing
 
-    storage_format = get_matrix_storage_format(path)
+    storage_format = _storage_format_warning_csc(path, name)
     backed = read_backed(path)
     try:
         sample = backed.X[:, :256] if storage_format == "csc" else backed.X[:1024]
@@ -3164,6 +3170,13 @@ def nb_offset_test(
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
     def fit(label: str, y: sp.csr_matrix, rows: np.ndarray) -> dict:
+        # The cells without a baseline leave before the filters and ``pts``
+        # are computed, so both describe the cells that are fitted.
+        keep = has_baseline_cell[rows]
+        if not keep.any():
+            raise ValueError(f"every cell of '{label}' is in a stratum or level without controls")
+        if not keep.all():
+            y, rows = y[keep], rows[keep]
         s, codes = size_factors[rows], stratum_codes[rows]
         n_pert = y.shape[0]
         expr_counts = y.getnnz(axis=0)
@@ -3175,11 +3188,6 @@ def nb_offset_test(
             min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert, min_cells_ctrl=min_cells_ctrl,
             min_cells_pert=min_cells_pert, min_total_count=min_total_count,
         )
-        keep = has_baseline_cell[rows]
-        if not keep.any():
-            raise ValueError(f"every cell of '{label}' is in a stratum or level without controls")
-        if not keep.all():
-            y, s, codes, rows = y[keep], s[keep], codes[keep], rows[keep]
         if design_all is None:
             def base_of(sl: slice) -> np.ndarray:
                 return s[sl, None] * baseline.mean[codes[sl]]

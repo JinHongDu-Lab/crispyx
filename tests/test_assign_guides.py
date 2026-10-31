@@ -70,3 +70,19 @@ def test_summary_is_printed(capsys):
     cx.pp.assign_guides(UMIS, GUIDES)
     out = capsys.readouterr().out
     assert "3/7 cells assigned" in out and "4 unassigned" in out
+
+
+def test_names_and_columns_are_checked_before_any_cell_is_read(tmp_path, monkeypatch):
+    import crispyx.qc
+
+    path = tmp_path / "guides.h5ad"
+    ad.AnnData(sp.csr_matrix(UMIS), var=pd.DataFrame(index=GUIDES)).write(path)
+
+    def no_cells(*args, **kwargs):
+        raise AssertionError("a block of cells was read before the names were checked")
+
+    monkeypatch.setattr(crispyx.qc, "_dominant_guide", no_cells)
+    with pytest.raises(ValueError, match="2 guide names for 3 columns"):
+        cx.pp.assign_guides(path, ["a", "b"], verbose=False)
+    with pytest.raises(ValueError, match="no guide columns"):
+        cx.pp.assign_guides(UMIS[:, :0], [], verbose=False)

@@ -1,5 +1,7 @@
+import logging
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -1170,6 +1172,31 @@ def test_a_confounded_perturbation_does_not_stop_a_parallel_run(tmp_path, caplog
     assert np.all(np.isnan(result["KD5"].statistic))
     for k in range(1, 5):
         assert np.isfinite(result[f"KD{k}"].statistic).any()
+
+
+@pytest.mark.skipif(joblib.cpu_count() < 4, reason="the worker limit only shows with 4 cores to limit")
+def test_the_worker_limit_log_names_the_cap_that_binds(tmp_path, caplog, monkeypatch):
+    """Six perturbations in fits of two on four cores: the three fits cap the
+    workers, and a resumed run with nothing left to fit says so too rather
+    than blaming memory."""
+    from crispyx import de
+
+    path, _ = _dense_screen(tmp_path / "counts.h5ad", ["ctrl"] * 40 + [f"KO{k}" for k in range(6) for _ in range(12)])
+    kw = {**_NB_KW, "n_jobs": 4, "targets_per_fit": 2, "output_path": tmp_path / "de.h5ad"}
+    caplog.set_level(logging.INFO, logger="crispyx.de")
+
+    def failing_stamp(*args, **kwargs):
+        raise RuntimeError("killed while finishing")
+
+    with monkeypatch.context() as m:
+        m.setattr(de, "write_stamp", failing_stamp)
+        with pytest.raises(RuntimeError):
+            nb_glm_test(path, **kw)
+    assert "4 -> 3 workers (reason: perturbation_count" in caplog.text
+    caplog.clear()
+    nb_glm_test(path, resume=True, **kw)
+    assert "4 -> 1 workers (reason: perturbation_count" in caplog.text
+    assert "reason: memory" not in caplog.text
 
 
 def test_build_design_matrix_drops_levels_absent_from_the_subset():

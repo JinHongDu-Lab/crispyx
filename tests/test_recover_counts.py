@@ -87,3 +87,20 @@ def test_unknown_totals_column_and_bad_totals_raise(tmp_path):
     cx.write_obs(src, obs)
     with pytest.raises(ValueError, match="non-negative, finite totals"):
         cx.pp.recover_counts(src, output_path=tmp_path / "o.h5ad", n_counts_column="n_counts", verbose=False)
+
+
+def test_stored_zeros_are_not_taken_for_a_cells_smallest_value(tmp_path):
+    """A CSR whose data keeps explicit zeros (a subset, some writers) must
+    not scale a cell by 1/0 and write inf/NaN counts."""
+    counts = _counts()
+    totals = counts.sum(axis=1)
+    x = np.log1p(np.divide(counts * 1e4, totals[:, None], out=np.zeros_like(counts), where=totals[:, None] > 0))
+    stored = (x != 0) | (np.arange(x.shape[1]) == 0)  # column 0 stored in every row, zero or not
+    rows, cols = np.nonzero(stored)
+    csr = sp.csr_matrix((x[rows, cols].astype(np.float32), (rows, cols)), shape=x.shape)
+    assert csr.nnz > np.count_nonzero(x)
+    ad.AnnData(csr, var=pd.DataFrame(index=[f"g{j}" for j in range(x.shape[1])])).write(tmp_path / "log.h5ad")
+    out = cx.pp.recover_counts(tmp_path / "log.h5ad", output_path=tmp_path / "counts.h5ad", verbose=False)
+    got = ad.read_h5ad(out.filename).X
+    assert got.nnz == np.count_nonzero(counts) and np.isfinite(got.data).all()
+    np.testing.assert_array_equal(got.toarray(), counts)
