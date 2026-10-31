@@ -4,7 +4,7 @@ Changelog
 Version 0.2.5
 -------------
 
-*Unreleased.* Utilities for preparing a published screen for analysis
+*Released 2026-10-31.* Utilities for preparing a published screen for analysis
 (recovering counts, assigning guides, collapsing split genes, checking the
 file), a fixed-offset NB test for many small perturbations against a large,
 stratified control set, and exact apeGLM shrinkage.
