@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Version 0.2.6
+-------------
+
+*Unreleased.* Faster sorting and offset fits on genome-wide screens, and long DE runs that resume by default.
+
+**Changed**
+
+* ``cx.tl.t_test``, ``cx.tl.wilcoxon_test`` and ``cx.tl.nb_glm_test`` resume an interrupted run by default (``resume=True``): rerunning a killed call continues from its checkpoint. A checkpoint is used only when it comes from the same crispyx version, input file and result-affecting arguments (``n_jobs`` and ``memory_limit_gb`` may differ); ``resume=False`` or ``force=True`` starts over. An in-memory AnnData does not resume unless asked, and ``rank_genes_groups`` passes ``resume`` through to the method. ``batch_process`` keeps ``resume=False``.
+* ``sort_by_perturbation`` reads its source in order and copies each row to its place, rather than gathering each output chunk's rows from across the file: a scattered 400k-cell gzip file sorts in 1.5 s instead of 84 s, with identical output. When the sorted matrix does not fit half of the new ``memory_limit_gb`` it is written in row bands, one sequential pass over the source each; a CSC source is read by columns. The sort shows a progress bar, and ``nb_glm_test`` and ``nb_offset_test`` pass their memory limit to it.
+* ``cx.tl.nb_offset_test`` iterates only the tested genes that have not converged, instead of every gene of the matrix until the slowest converges: about twice as fast when the filters keep half the genes, with results unchanged to 1e-7.
+
 Version 0.2.5
 -------------
 
