@@ -2773,63 +2773,79 @@ def _design_baseline(
 
 
 def _fit_offset_group(
-    y: sp.csr_matrix, base_of: "Callable[[slice], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
+    y: sp.csr_matrix, base_of: "Callable[[slice, np.ndarray], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
     *, min_mu: float, max_iter: int, tol: float, block_cells: int,
 ) -> dict:
     """One perturbation's cells against a baseline: for each gene the
     one-parameter NB fit of ``y_i ~ NB(base_i exp(beta), alpha_g)`` by Fisher
     scoring, from the Poisson start ``ln(sum y / sum base)``, where
-    ``base_of(cells)`` gives the cells' baseline means (size factor times the
-    control mean) as a dense block. ``beta`` is held above ``ln(min_mu) -
-    ln(mean baseline)`` (the fitted-mean floor) and below ``ETA_MAX``; its
-    standard error is one over the root of the Fisher information at the
-    optimum. The cells are taken ``block_cells`` at a time, so a large
-    perturbation is never dense at once. Returns natural-log ``lfc``, ``se``,
-    ``converged`` and ``intercept`` (the log of the cells' mean expected
-    count under the baseline), NaN off ``genes`` and where the baseline is
-    zero or undefined."""
+    ``base_of(cells, genes)`` gives the cells' baseline means (size factor
+    times the control mean) for those genes as a dense block. ``beta`` is
+    held above ``ln(min_mu) - ln(mean baseline)`` (the fitted-mean floor) and
+    below ``ETA_MAX``; its standard error is one over the root of the Fisher
+    information at the optimum. A gene whose step falls below ``tol`` is
+    final, and the iterations cover only the tested genes still moving, so
+    their cost follows those rather than every gene. The cells are taken
+    ``block_cells`` at a time, so a large perturbation is never dense at
+    once. Returns natural-log ``lfc``, ``se``, ``converged`` and
+    ``intercept`` (the log of the cells' mean expected count under the
+    baseline), NaN off ``genes`` and where the baseline is zero or
+    undefined."""
     n_cells, n_genes = y.shape
     blocks = [slice(start, min(start + block_cells, n_cells)) for start in range(0, n_cells, block_cells)]
-    bsum = np.zeros(n_genes)
+    genes = np.asarray(genes, dtype=np.intp)
+    bsum = np.zeros(len(genes))
     for sl in blocks:
-        bsum += base_of(sl).sum(axis=0)
+        bsum += base_of(sl, genes).sum(axis=0)
+    ok = np.isfinite(bsum) & (bsum > 0)
+    genes, bsum = genes[ok], bsum[ok]
+    if genes.size < n_genes:
+        y = y[:, genes].tocsr()  # column j of y is gene genes[j] from here on
     ysum = np.asarray(y.sum(axis=0)).ravel()
-    fit = np.zeros(n_genes, dtype=bool)
-    fit[genes] = True
-    fit &= np.isfinite(bsum) & (bsum > 0)
-    lo = np.full(n_genes, ETA_MIN)
-    with np.errstate(divide="ignore", invalid="ignore"):
+    lo = np.full(len(genes), ETA_MIN)
+    with np.errstate(divide="ignore"):
         if min_mu > 0:
-            lo = np.where(fit, np.log(min_mu) - np.log(bsum / n_cells), ETA_MIN)
-        beta = np.where(fit, np.clip(np.log(ysum / bsum), lo, ETA_MAX), 0.0)
-    converged = np.zeros(n_genes, dtype=bool)
-    info = np.zeros(n_genes)
+            lo = np.log(min_mu) - np.log(bsum / n_cells)
+        beta = np.clip(np.log(ysum / bsum), lo, ETA_MAX)
+    converged = np.zeros(len(genes), dtype=bool)
+    # The genes each iteration computes: narrowed to the unconverged ones
+    # once they are at most 3/4 of it, since gathering a new set of columns
+    # costs more than computing a few finished genes again.
+    work, cols, y_work = np.arange(len(genes)), genes, y
     for _ in range(max_iter):
-        score = np.zeros(n_genes)
-        info = np.zeros(n_genes)
+        moving = ~converged[work]
+        if not moving.any():
+            break
+        if moving.sum() <= 0.75 * work.size:
+            work, y_work = work[moving], y_work[:, np.flatnonzero(moving)].tocsr()
+            cols = genes[work]
+        a = alpha[cols]
+        score = np.zeros(work.size)
+        info = np.zeros(work.size)
         for sl in blocks:
-            mu = base_of(sl) * np.exp(beta)
-            w = 1.0 / (1.0 + alpha * mu)
-            score += np.asarray(y[sl].multiply(w).sum(axis=0)).ravel() - (mu * w).sum(axis=0)
+            mu = base_of(sl, cols) * np.exp(beta[work])
+            w = 1.0 / (1.0 + a * mu)
+            score += np.asarray(y_work[sl].multiply(w).sum(axis=0)).ravel() - (mu * w).sum(axis=0)
             info += (mu * w).sum(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            new = np.where(fit & (info > 0), np.clip(beta + score / info, lo, ETA_MAX), beta)
-        step = np.abs(new - beta)
-        beta = new
-        converged = fit & (step < tol)
-        if converged[fit].all():
-            break
-    info = np.zeros(n_genes)
+            new = np.where(info > 0, np.clip(beta[work] + score / info, lo[work], ETA_MAX), beta[work])
+        moving = ~converged[work]  # computed again, as narrowing may have changed work
+        update = work[moving]
+        converged[update] = np.abs(new[moving] - beta[update]) < tol
+        beta[update] = new[moving]
+    info = np.zeros(len(genes))
     for sl in blocks:
-        mu = base_of(sl) * np.exp(beta)
-        info += (mu / (1.0 + alpha * mu)).sum(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        se = np.where(fit & (info > 0), 1.0 / np.sqrt(info), np.nan)
-        intercept = np.where(fit, np.log(bsum / n_cells), np.nan)
-    return {
-        "lfc": np.where(fit, beta, np.nan), "se": se, "converged": converged, "intercept": intercept,
-        "n_fit": int(fit.sum()),
-    }
+        mu = base_of(sl, genes) * np.exp(beta)
+        info += (mu / (1.0 + alpha[genes] * mu)).sum(axis=0)
+    out = {key: np.full(n_genes, np.nan) for key in ("lfc", "se", "intercept")}
+    out["converged"] = np.zeros(n_genes, dtype=bool)
+    out["lfc"][genes] = beta
+    with np.errstate(divide="ignore"):
+        out["se"][genes] = np.where(info > 0, 1.0 / np.sqrt(info), np.nan)
+    out["intercept"][genes] = np.log(bsum / n_cells)
+    out["converged"][genes] = converged
+    out["n_fit"] = int(genes.size)
+    return out
 
 
 def _default_min_mu(sample, *, verbose: int | bool, name: str) -> float:
@@ -3241,14 +3257,18 @@ def nb_offset_test(
             min_cells_pert=min_cells_pert, min_total_count=min_total_count,
         )
         if design_all is None:
-            def base_of(sl: slice) -> np.ndarray:
-                return s[sl, None] * baseline.mean[codes[sl]]
+            means = {}  # the stratum means of the genes asked for, gathered once per gene set
+
+            def base_of(sl: slice, cols: np.ndarray) -> np.ndarray:
+                if means.get("cols") is not cols:
+                    means.update(cols=cols, table=baseline.mean.take(cols, axis=1))
+                return s[sl, None] * means["table"][codes[sl]]
         else:
             design_rows = design_all[rows]
 
-            def base_of(sl: slice) -> np.ndarray:
+            def base_of(sl: slice, cols: np.ndarray) -> np.ndarray:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    eta = np.clip(design_rows[sl] @ baseline.coef.T, ETA_MIN, ETA_MAX)
+                    eta = np.clip(design_rows[sl] @ baseline.coef[cols].T, ETA_MIN, ETA_MAX)
                 return s[sl, None] * np.maximum(np.exp(eta), min_mu)
         result = _fit_offset_group(
             y, base_of, baseline.dispersion, np.flatnonzero(valid), min_mu=min_mu, max_iter=max_iter, tol=tol,
