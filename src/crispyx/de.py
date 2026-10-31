@@ -3132,12 +3132,13 @@ def nb_offset_test(
 
 def _result_obs(candidates: list[str], perturbation_column: str) -> pd.DataFrame:
     """The ``obs`` of a DE result: one row per perturbation, the label as the
-    index and as the ``perturbation_column`` column (the same strings, so
-    anndata accepts the shared name; a list would type an empty column as
-    float)."""
+    index and as the ``perturbation_column`` column. The column is the index
+    itself, so the two agree in values and dtype even when empty (anndata
+    refuses the shared name otherwise; a list or array would type an empty
+    column differently)."""
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame(index=obs_index)
-    obs[perturbation_column] = obs_index.to_numpy()
+    obs[perturbation_column] = obs_index.copy()
     return obs
 
 
