@@ -85,6 +85,24 @@ The function uses format-aware streaming: CSC sources are read in
 column-chunks (axis=1) and scattered into CSR buffers; dense sources are
 read in row-chunks (axis=0).
 
+Sorting by perturbation
+-----------------------
+
+A CSR file reads a perturbation's cells quickly only when they sit together.
+When they are scattered through the file, each row is its own read, and a
+compressed file decompresses every HDF5 chunk a row touches, so a fit that
+needs a few gigabytes can read the whole file many times over. For that
+reason ``nb_glm_test`` and ``nb_offset_test`` check the input before reading
+it and, when it is large (360,000 cells and 100 perturbations or more) and
+scattered (under half of a perturbation's cells contiguous), write a copy
+sorted by perturbation next to the input (``<name>_sorted.h5ad``, the
+controls first) in one streaming pass, and run on that. The step is printed
+when ``verbose`` is on; the copy is reused by later runs on the same input,
+and passing it as the input skips the check. Sort once up front with
+``cx.data.sort_by_perturbation`` for a file under those thresholds that is
+still slow (a smaller screen on a network filesystem), or for a script of
+your own that reads the cells of each perturbation.
+
 NB-GLM then streams the CSR file:
 
 * Size factors are computed in blocks of ``chunk_size`` rows (2,048 by

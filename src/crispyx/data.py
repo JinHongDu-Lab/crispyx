@@ -5697,6 +5697,7 @@ def sort_by_perturbation(
     output_path: str | Path | None = None,
     chunk_size: int = 4096,
     force: bool = False,
+    verbose: int | bool = True,
 ) -> Path:
     """Sort cells by perturbation label for contiguous I/O access.
     
@@ -5722,7 +5723,9 @@ def sort_by_perturbation(
         Number of cells to process per chunk during streaming write.
     force
         If True, recreate sorted file even if it already exists.
-    
+    verbose
+        Print the file being written, or the existing copy reused.
+
     Returns
     -------
     Path
@@ -5751,7 +5754,8 @@ def sort_by_perturbation(
     files used by Wilcoxon do not need perturbation sorting.
     """
     import datetime
-    
+
+    name = "sort_by_perturbation"
     path = Path(path)
     
     # Determine output path
@@ -5770,7 +5774,7 @@ def sort_by_perturbation(
     if output_path.exists() and not force:
         reason = reuse_mismatch(output_path, "sorted", fingerprint)
         if reason is None:
-            logger.info(f"Using existing sorted file: {output_path}")
+            _messages.vprint(verbose, name, f"reusing the perturbation-sorted copy {output_path}")
             return output_path
         logger.info(f"Not reusing sorted file {output_path}: {reason}")
     
@@ -5846,7 +5850,7 @@ def sort_by_perturbation(
         context="sort_by_perturbation",
     )
 
-    logger.info(f"  Reordering {n_cells:,} cells into {len(label_order)} contiguous groups...")
+    _messages.print_saving(verbose, name, output_path)
 
     # Check if source is dense or sparse
     storage_format = get_matrix_storage_format(path)
@@ -5867,9 +5871,10 @@ def sort_by_perturbation(
             chunk_size=chunk_size,
         )
     
-    logger.info(f"Saved sorted dataset: {output_path}")
-    logger.info(f"  Perturbation groups: {len(label_order)} (control + {len(label_order) - 1} perturbations)")
-    
+    _messages.print_done(
+        verbose, name,
+        f"{n_cells:,} cells reordered into {len(label_order)} contiguous groups (the controls first)",
+    )
     return output_path
 
 

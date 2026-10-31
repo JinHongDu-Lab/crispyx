@@ -128,6 +128,18 @@ def test_a_csc_file_is_warned_about(tmp_path):
     assert np.isfinite(ad.read_h5ad(result.result_path).X).any()
 
 
+def test_the_sorting_step_is_printed(tmp_path, monkeypatch, capsys):
+    import crispyx.de as de
+
+    _screen(tmp_path / "s.h5ad", n_ctrl=300, n_pert=3)
+    monkeypatch.setattr(de, "needs_sorting_for_nbglm", lambda *a, **k: True)
+    cx.tl.nb_offset_test(tmp_path / "s.h5ad", perturbation_column="perturbation", control_label="control",
+                         strata="stratum", output_path=tmp_path / "off.h5ad", **NO_FILTERS)
+    out = capsys.readouterr().out
+    assert "[cx] nb_offset_test: the cells of each perturbation are scattered through s.h5ad" in out
+    assert "[cx] sort_by_perturbation: Saving → " in out and (tmp_path / "s_sorted.h5ad").exists()
+
+
 def test_result_is_independent_of_the_cell_block_size(tmp_path):
     _screen(tmp_path / "s.h5ad", n_pert=3, cells_per=200)
     big = _run(tmp_path / "s.h5ad", tmp_path / "a.h5ad", strata="stratum", **NO_FILTERS)

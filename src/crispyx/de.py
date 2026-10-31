@@ -900,6 +900,40 @@ def _storage_format_warning_csc(path: Path, fn_name: str) -> str:
     return storage_format
 
 
+def _sorted_input(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: "str | None",
+    size_factors: "np.ndarray | None",
+    input_labels: "np.ndarray | None",
+    fn_name: str,
+    verbose: int | bool,
+) -> "tuple[Path, np.ndarray | None]":
+    """``path``, or a perturbation-sorted copy of it when the file is large
+    and its cells scattered (:func:`needs_sorting_for_nbglm`), with the
+    given size factors reordered to follow their cells: ``input_labels``
+    are the labels in the input's row order, needed only with them."""
+    if not needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
+        return path, size_factors
+    _messages.vprint(
+        verbose, fn_name,
+        f"the cells of each perturbation are scattered through {path.name}, which makes reading "
+        "them slow; using a perturbation-sorted copy instead (written once, reused by later runs; "
+        "pass it as the input to skip this check)",
+    )
+    # sort_by_perturbation reuses an existing sorted copy only when it was
+    # made from this exact source.
+    path = sort_by_perturbation(
+        path, perturbation_column=perturbation_column, control_label=control_label,
+        output_path=path.parent / f"{path.stem}_sorted.h5ad", verbose=verbose,
+    )
+    if size_factors is not None:
+        size_factors = size_factors[perturbation_sort_order(
+            input_labels, control_label or resolve_control_label(input_labels, None))]
+    return path, size_factors
+
+
 def _try_load_existing_de_result(
     output_path: "Path",
     *,
@@ -1859,18 +1893,10 @@ def nb_glm_test(
     if min_mu is None:
         min_mu = _default_min_mu(sample, verbose=verbose, name="nb_glm_test")
 
-    if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
-        # sort_by_perturbation reuses an existing sorted copy only when it
-        # was made from this exact source.
-        path = sort_by_perturbation(
-            path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            output_path=path.parent / f"{path.stem}_sorted.h5ad",
-        )
-        if size_factors is not None:  # given in the input's row order
-            size_factors = size_factors[perturbation_sort_order(
-                input_labels, control_label or resolve_control_label(input_labels, None))]
+    path, size_factors = _sorted_input(
+        path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
+        input_labels=input_labels if size_factors is not None else None, fn_name="nb_glm_test", verbose=verbose,
+    )
 
     backed = read_backed(path)
     try:
@@ -3003,14 +3029,10 @@ def nb_offset_test(
     if min_mu is None:
         min_mu = _default_min_mu(sample, verbose=verbose, name=name)
 
-    if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
-        path = sort_by_perturbation(
-            path, perturbation_column=perturbation_column, control_label=control_label,
-            output_path=path.parent / f"{path.stem}_sorted.h5ad",
-        )
-        if size_factors is not None:
-            size_factors = size_factors[perturbation_sort_order(
-                input_labels, control_label or resolve_control_label(input_labels, None))]
+    path, size_factors = _sorted_input(
+        path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
+        input_labels=input_labels if size_factors is not None else None, fn_name=name, verbose=verbose,
+    )
 
     backed = read_backed(path)
     try:
