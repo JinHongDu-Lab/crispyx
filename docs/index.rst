@@ -33,10 +33,15 @@ Key features
 
 - **Streaming QC & preprocessing** — filter and normalise without loading
   the full matrix
+- **Data preparation** — normalise labels and take targets out of guide
+  names, assign guides, recover counts from log1p data, collapse genes split
+  over several rows, concatenate multi-file screens, and check a file before
+  analysis
 - **Pseudo-bulk aggregation** — average log expression and pseudo-bulk
   count matrices
 - **Differential expression** — t-test, Wilcoxon, NB-GLM (DESeq2 per
-  comparison) with apeGLM LFC shrinkage
+  comparison) with apeGLM LFC shrinkage, and a fixed-offset NB test for many
+  small perturbations against a stratified control set
 - **Control checks** — do the control guides agree, and may cells without a
   detected guide join them?
 - **Dimension reduction** — memory-efficient PCA and KNN on backed data

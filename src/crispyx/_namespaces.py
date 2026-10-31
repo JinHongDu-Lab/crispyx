@@ -19,6 +19,8 @@ from .data import (
     convert_to_csr,
     concat_h5ad,
     downsample_counts,
+    recover_counts,
+    collapse_genes,
     normalize_total_log1p,
     read_backed,
     resolve_data_path,
@@ -26,7 +28,9 @@ from .data import (
 from .de import (
     RankGenesGroupsResult,
     nb_glm_test,
+    nb_offset_test,
     shrink_lfc,
+    shrink_lfc_arrays,
     t_test,
     wilcoxon_test,
 )
@@ -56,6 +60,8 @@ from .pseudobulk import (
 )
 from .residual import ResidualNull, residual_effects
 from .qc import (
+    assign_guides,
+    check_perturbation_data,
     compare_controls,
     control_guide_correlation,
     filter_cells_by_gene_count,
@@ -209,6 +215,21 @@ class _PreprocessingNamespace:
         See :func:`crispyx.qc.control_guide_correlation`.
         """
         return control_guide_correlation(data, **kwargs)
+
+    def assign_guides(self, guide_counts, guide_names=None, **kwargs):
+        """The guide that dominates each cell's guide-capture counts, or NA.
+
+        See :func:`crispyx.qc.assign_guides`.
+        """
+        return assign_guides(guide_counts, guide_names, **kwargs)
+
+    def check_data(self, data, **kwargs):
+        """Check a screen's file for labels, genes and counts that would
+        mislead an analysis.
+
+        See :func:`crispyx.qc.check_perturbation_data`.
+        """
+        return check_perturbation_data(data, **kwargs)
 
     def convert_to_csc(
         self,
@@ -389,6 +410,60 @@ class _PreprocessingNamespace:
             chunk_size=chunk_size,
             data_name=data_name,
             random_state=random_state,
+            verbose=verbose,
+        )
+
+    def recover_counts(
+        self,
+        data: str | Path | ad.AnnData,
+        output_path: str | Path | None = None,
+        *,
+        n_counts_column: str | None = None,
+        chunk_size: int = 4096,
+        data_name: str | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        verbose: int | bool = True,
+    ) -> AnnData:
+        """Recover the integer counts behind a ``log1p(normalize_total(counts))``
+        matrix, streamed.
+
+        See :func:`crispyx.data.recover_counts` for the full parameter
+        documentation.
+        """
+        return recover_counts(
+            data,
+            output_path,
+            n_counts_column=n_counts_column,
+            chunk_size=chunk_size,
+            data_name=data_name,
+            format_mismatch_policy=format_mismatch_policy,
+            verbose=verbose,
+        )
+
+    def collapse_genes(
+        self,
+        data: str | Path | ad.AnnData,
+        output_path: str | Path | None = None,
+        *,
+        by: "str | pd.Series | Sequence",
+        chunk_size: int = 4096,
+        data_name: str | None = None,
+        format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+        verbose: int | bool = True,
+    ) -> AnnData:
+        """Sum the rows of ``var`` that are one gene, under a caller-supplied
+        key, streamed.
+
+        See :func:`crispyx.data.collapse_genes` for the full parameter
+        documentation.
+        """
+        return collapse_genes(
+            data,
+            output_path,
+            by=by,
+            chunk_size=chunk_size,
+            data_name=data_name,
+            format_mismatch_policy=format_mismatch_policy,
             verbose=verbose,
         )
 
@@ -989,6 +1064,21 @@ class _ToolsNamespace:
             f"Unsupported differential expression method: {method}. "
             "Choose from 'wilcoxon', 't-test', or 'nb_glm'."
         )
+
+    def nb_offset_test(self, data: str | Path | ad.AnnData, **kwargs):
+        """Negative binomial test of each perturbation on its own cells, with
+        the controls as a fixed per-stratum baseline.
+
+        See :func:`crispyx.de.nb_offset_test`.
+        """
+        return nb_offset_test(data, **kwargs)
+
+    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None):
+        """apeGLM shrinkage of fold changes given as arrays, exactly.
+
+        See :func:`crispyx.de.shrink_lfc_arrays`.
+        """
+        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor)
 
     def shrink_lfc(
         self,

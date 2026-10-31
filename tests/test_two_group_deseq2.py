@@ -388,6 +388,22 @@ def test_given_size_factors_follow_their_cells_into_the_sorted_copy(tmp_path, mo
         np.testing.assert_allclose(sorted_[name].statistic, unsorted[name].statistic, rtol=1e-8, equal_nan=True)
 
 
+def test_the_sorting_step_is_printed_and_the_copy_reused(tmp_path, monkeypatch, capsys):
+    import crispyx.de as de
+
+    path, *_ = _three_targets(tmp_path, covariates=False)
+    monkeypatch.setattr(de, "needs_sorting_for_nbglm", lambda *a, **k: True)
+    kw = dict(perturbation_column="perturbation", control_label="ctrl", n_jobs=1)
+    de.nb_glm_test(path, output_path=tmp_path / "a.h5ad", **kw)
+    out = capsys.readouterr().out
+    assert "[cx] nb_glm_test: the cells of each perturbation are scattered through screen.h5ad" in out
+    assert "[cx] sort_by_perturbation: Saving → " in out and "cells reordered into 4 contiguous groups" in out
+    de.nb_glm_test(path, output_path=tmp_path / "b.h5ad", **kw)
+    assert "[cx] sort_by_perturbation: reusing the perturbation-sorted copy" in capsys.readouterr().out
+    de.nb_glm_test(path, output_path=tmp_path / "c.h5ad", verbose=False, **kw)
+    assert "sort" not in capsys.readouterr().out
+
+
 def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
     import crispyx as cx
 

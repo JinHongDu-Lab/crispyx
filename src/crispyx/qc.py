@@ -25,6 +25,9 @@ from .data import (
     h5ad_data_bytes,
     AnnData,
     _ensure_csr,
+    _replace_on_success,
+    check_sparse_layout,
+    detect_gene_symbol_column,
     calculate_optimal_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
@@ -1011,7 +1014,8 @@ def _qc_in_memory(
 
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    adata_filtered.write(output_path)
+    with _replace_on_success(output_path) as partial:
+        adata_filtered.write(partial)
     
     # Expand gene_cell_counts to original size
     gene_cell_counts_full = np.zeros(original_n_vars, dtype=np.int64)
@@ -2097,3 +2101,391 @@ def control_guide_correlation(
     corr = pd.DataFrame(np.corrcoef(deviation), index=names, columns=names)
     corr.attrs["n_cells"] = {name: int(np.sum(code == k)) for k, name in enumerate(names)}
     return corr
+
+
+# =============================================================================
+# Guide assignment
+# =============================================================================
+
+
+def _dominant_guide(counts: np.ndarray, *, min_umi: int, min_ratio: float) -> np.ndarray:
+    """Column of the dominant guide per row of a dense cells x guides block,
+    or -1 where no guide dominates."""
+    counts = np.asarray(counts)
+    if counts.shape[1] == 1:
+        top = counts[:, 0]
+        second = np.zeros(len(counts), dtype=counts.dtype)
+        idx = np.zeros(len(counts), dtype=np.int64)
+    else:
+        part = np.partition(counts, counts.shape[1] - 2, axis=1)
+        top, second = part[:, -1], part[:, -2]
+        idx = counts.argmax(axis=1)
+    ok = (top >= min_umi) & (top >= min_ratio * second) & (top > second)
+    return np.where(ok, idx, -1)
+
+
+def _check_guide_names(names: np.ndarray, n_guides: int) -> None:
+    """Before any cell is read: the guide names fit the columns, and there
+    is at least one column to pick from."""
+    if n_guides == 0:
+        raise ValueError("guide_counts has no guide columns")
+    if len(names) != n_guides:
+        raise ValueError(f"{len(names)} guide names for {n_guides} columns")
+
+
+def assign_guides(
+    guide_counts: "str | Path | ad.AnnData | AnnData | np.ndarray | sp.spmatrix",
+    guide_names: "Iterable[str] | None" = None,
+    *,
+    min_umi: int = 3,
+    min_ratio: float = 2.0,
+    chunk_size: int = 4096,
+    verbose: int | bool = True,
+) -> pd.Series:
+    """Assign each cell the guide that dominates its guide-capture counts.
+
+    A cell is assigned its most abundant guide when that guide has at least
+    ``min_umi`` UMIs and at least ``min_ratio`` times the UMIs of the
+    runner-up. Any other cell is unassigned (``pd.NA``): no guide detected, two
+    guides at similar counts, a multiplet. An unassigned cell is not a control;
+    whether such cells may join the controls is
+    :func:`compare_controls`'s question.
+
+    Parameters
+    ----------
+    guide_counts
+        The cells x guides UMI matrix: a dense or sparse array, an AnnData
+        whose ``X`` is that matrix (its ``var_names`` are the guides), or a
+        path to such an h5ad, which is streamed in blocks of ``chunk_size``
+        cells. Guide-capture counts from Cell Ranger are the ``CRISPR Guide
+        Capture`` features of its filtered matrix.
+    guide_names
+        The guides, one per column. Required for a bare array; taken from
+        ``var_names`` otherwise.
+    min_umi
+        Fewest UMIs the top guide needs. Default 3.
+    min_ratio
+        Smallest ratio of the top guide's UMIs to the runner-up's. Default 2.
+        A tie never dominates, whatever the ratio.
+    chunk_size
+        Cells per streamed block when ``guide_counts`` is a path.
+    verbose
+        Print how many cells were assigned.
+
+    Returns
+    -------
+    pd.Series
+        The assigned guide per cell, ``pd.NA`` where none dominates, indexed
+        by the cells (``obs_names`` where known).
+    """
+    if not isinstance(min_umi, (int, np.integer)) or min_umi < 1:
+        raise ValueError("min_umi must be a positive integer")
+    if not (min_ratio >= 1):
+        raise ValueError("min_ratio must be at least 1")
+
+    if isinstance(guide_counts, (str, Path, AnnData)) or (
+        isinstance(guide_counts, ad.AnnData) and guide_counts.isbacked
+    ):
+        backed = read_backed(resolve_data_path(guide_counts))
+        try:
+            names = np.asarray(backed.var_names, dtype=object) if guide_names is None else np.asarray(list(guide_names), dtype=object)
+            index = backed.obs_names.copy()
+            _check_guide_names(names, backed.n_vars)
+            calls = np.empty(backed.n_obs, dtype=np.int64)
+            row = 0
+            for _, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=True):
+                calls[row:row + block.shape[0]] = _dominant_guide(block, min_umi=min_umi, min_ratio=min_ratio)
+                row += block.shape[0]
+        finally:
+            backed.file.close()
+    else:
+        if isinstance(guide_counts, ad.AnnData):
+            matrix = guide_counts.X
+            index = guide_counts.obs_names.copy()
+            names = np.asarray(guide_counts.var_names, dtype=object) if guide_names is None else np.asarray(list(guide_names), dtype=object)
+        else:
+            matrix = guide_counts
+            index = pd.RangeIndex(matrix.shape[0])
+            if guide_names is None:
+                raise ValueError("guide_names is required when guide_counts is a bare array")
+            names = np.asarray(list(guide_names), dtype=object)
+        _check_guide_names(names, matrix.shape[1])
+        calls = np.empty(matrix.shape[0], dtype=np.int64)
+        for start in range(0, matrix.shape[0], chunk_size):
+            block = matrix[start:start + chunk_size]
+            block = block.toarray() if sp.issparse(block) else np.asarray(block)
+            calls[start:start + block.shape[0]] = _dominant_guide(block, min_umi=min_umi, min_ratio=min_ratio)
+
+    assigned = calls >= 0
+    values = names[np.maximum(calls, 0)].astype(object)
+    values[~assigned] = pd.NA
+    out = pd.Series(values, index=index, name="guide", dtype=object)
+    _messages.print_done(
+        verbose, "pp.assign_guides",
+        f"{int(assigned.sum())}/{len(calls)} cells assigned a guide "
+        f"(top guide >= {min_umi} UMIs and >= {min_ratio:g}x the runner-up); "
+        f"{int((~assigned).sum())} unassigned",
+    )
+    return out
+
+
+# =============================================================================
+# Perturbation-data checks
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Issue:
+    """One finding of :func:`check_perturbation_data`: ``level`` is
+    ``"error"`` (the file will mislead an analysis) or ``"warning"`` (worth a
+    look)."""
+
+    level: Literal["error", "warning"]
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.level}: {self.message}"
+
+
+_CONTROL_SYNONYMS = (
+    r"^(ntc|nt|nc|neg|negative|non[-_ ]?target(ing)?|control|ctrl|scramble[d]?|"
+    r"safe[-_ ]?(target(ing)?|harbou?r)|gfp|empty|mock|no[-_ ]?guide|unassigned)"
+    r"([-_ .]?(control|ctrl|guide|sg)?[-_ .]?\d*)$"
+)
+_SPACER = r"[ACGT]{18,25}"
+_SEPARATORS = r"[\s|:;,/]"
+_ENSEMBL_ID = r"^ENS[A-Z]*G\d{11}"
+_MISSING_LABELS = frozenset({"", "nan", "none", "null", "na", "n/a"})
+
+
+def _examples(values, k: int = 5) -> str:
+    values = list(values)
+    shown = ", ".join(repr(str(v)) for v in values[:k])
+    return shown + (", ..." if len(values) > k else "")
+
+
+def check_perturbation_data(
+    data: "str | Path | ad.AnnData | AnnData",
+    *,
+    perturbation_column: str,
+    control_label: str | None = None,
+    gene_name_column: str | None = None,
+    n_counts_column: str | None = None,
+    sample_windows: int = 8,
+    window_size: int = 256,
+    verbose: int | bool = True,
+) -> list[Issue]:
+    """Check a perturbation screen's file for the mistakes that mislead an
+    analysis without making it fail.
+
+    Reads ``obs``, ``var`` and ``sample_windows`` evenly spaced blocks of
+    ``window_size`` rows of ``X``, never the whole matrix. Each check catches a
+    mistake that has happened in practice when a published screen was
+    prepared:
+
+    * a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP``,
+      ``safe-targeting`` ...) left as a perturbation beside the control label,
+      so its cells are tested instead of serving as controls;
+    * labels that are still guide names: a 18-25 nt spacer, a separator or
+      whitespace, an underscore;
+    * labels that differ only by case, which split one target in two;
+    * many labels and none hyphenated, the mark of symbols truncated at the
+      first hyphen (``NKX2-5`` to ``NKX2``);
+    * labels missing from ``var`` (targets not measured; expected for a
+      non-coding library, a sign of a renamed gene otherwise);
+    * cells without a label; no cell with the control label;
+    * duplicate gene names, gene names that are Ensembl IDs while a symbol
+      column exists;
+    * ``X`` not holding integer counts, or cells whose row sum exceeds their
+      recorded total (``n_counts_column``);
+    * inconsistent compressed-sparse pointers (:func:`crispyx.data.check_sparse_layout`).
+
+    Parameters
+    ----------
+    data
+        Path to the h5ad file, or a backed AnnData.
+    perturbation_column
+        ``obs`` column with the perturbation labels.
+    control_label
+        The control label; inferred as in :func:`crispyx.data.resolve_control_label`
+        when omitted (an ambiguous inference is itself an error).
+    gene_name_column
+        ``var`` column with gene symbols, if ``var_names`` are not symbols.
+    n_counts_column
+        ``obs`` column with each cell's total count, if any; ``n_counts`` or
+        ``total_counts`` is used when present and this is omitted.
+    sample_windows, window_size
+        How much of ``X`` to read: ``sample_windows`` blocks of ``window_size``
+        rows, evenly spaced.
+    verbose
+        Print each issue.
+
+    Returns
+    -------
+    list[Issue]
+        Every finding, errors first. Empty when the file passes. Pass the
+        list to :func:`raise_on_errors` to stop a pipeline on an error.
+    """
+    from .data import load_obs, load_var, resolve_control_label
+
+    name = "pp.check_data"
+    path = resolve_data_path(data)
+    errors: list[str] = []
+    warnings_: list[str] = []
+    obs = load_obs(path)
+    var = load_var(path)
+    if gene_name_column is not None and gene_name_column not in var.columns:
+        errors.append(f"var has no column '{gene_name_column}' (columns: {_examples(var.columns, 8)})")
+        gene_name_column = None  # the checks below run as if none were given
+
+    # --- labels ---------------------------------------------------------------
+    if perturbation_column not in obs.columns:
+        errors.append(f"obs has no column '{perturbation_column}' (columns: {_examples(obs.columns, 8)})")
+        labels = None
+    else:
+        raw = obs[perturbation_column]
+        missing = raw.isna() | raw.astype(str).str.strip().str.lower().isin(_MISSING_LABELS)
+        if missing.any():
+            warnings_.append(f"{int(missing.sum())} cells have no perturbation label")
+        labels = raw[~missing].astype(str)
+    if labels is not None:
+        unique = pd.Index(pd.unique(labels.to_numpy()))
+        try:
+            control = resolve_control_label(unique, control_label, verbose=False)
+        except ValueError as exc:
+            errors.append(str(exc))
+            control = None
+        if control is not None and not (labels == control).any():
+            errors.append(f"no cell carries the control label {control!r}")
+        targets = unique[unique != control] if control is not None else unique
+        var_names = pd.Index(var.index.astype(str))
+        symbols = pd.Index(var[gene_name_column].astype(str)) if gene_name_column else var_names
+        measured = pd.Index(symbols).union(var_names)
+
+        upper = targets.str.upper()
+        if upper.duplicated().any():
+            errors.append("labels differing only by case split one target in two: "
+                          + _examples(targets[upper.duplicated(keep=False)]))
+        synonyms = targets[targets.str.match(_CONTROL_SYNONYMS, case=False)]
+        if len(synonyms):
+            also_genes = synonyms[synonyms.isin(measured)]
+            real = synonyms[~synonyms.isin(measured)]
+            if len(real):
+                errors.append(f"control synonyms used as perturbations beside {control!r}: "
+                              + _examples(real) + " (their cells are tested, not used as controls)")
+            if len(also_genes):
+                warnings_.append("labels that read like a control but are also measured genes: "
+                                 + _examples(also_genes) + " (CTRL is a gene; make sure these are targets)")
+        spacers = targets[targets.str.contains(_SPACER, regex=True)]
+        if len(spacers):
+            errors.append(f"{len(spacers)} labels contain a guide spacer sequence: " + _examples(spacers))
+        separators = targets[targets.str.contains(_SEPARATORS, regex=True)]
+        if len(separators):
+            errors.append(f"{len(separators)} labels contain whitespace or a separator (raw guide names? "
+                          "combinations?): " + _examples(separators))
+        underscored = targets[targets.str.contains("_", regex=False) & ~targets.isin(measured)]
+        if len(underscored):
+            warnings_.append(f"{len(underscored)} labels contain an underscore and are not measured genes "
+                             "(guide names?): " + _examples(underscored))
+        if len(targets) > 500 and not targets.str.contains("-", regex=False).any():
+            warnings_.append(f"{len(targets)} labels and none hyphenated: symbols truncated at '-' "
+                             "(NKX2-5 to NKX2, HLA-B to HLA)?")
+        flagged = synonyms.union(spacers).union(separators).union(underscored)
+        absent = targets[~targets.isin(measured) & ~targets.isin(flagged)]
+        if len(absent):
+            warnings_.append(f"{len(absent)}/{len(targets)} labels name no gene in var "
+                             "(non-coding targets, or renamed genes): " + _examples(absent))
+
+    # --- genes ----------------------------------------------------------------
+    var_names = pd.Index(var.index.astype(str))
+    if var_names.duplicated().any():
+        errors.append("duplicate var_names: " + _examples(var_names[var_names.duplicated()]))
+    elif var_names.str.upper().duplicated().any():
+        warnings_.append("var_names differing only by case: "
+                         + _examples(var_names[var_names.str.upper().duplicated(keep=False)]))
+    if len(var_names) and var_names.str.match(_ENSEMBL_ID).mean() > 0.5 and gene_name_column is None:
+        symbol_column = detect_gene_symbol_column(path, verbose=False)
+        hint = f"; pass gene_name_column='{symbol_column}'" if symbol_column else ""
+        warnings_.append("var_names are Ensembl IDs, so results are reported by ID" + hint)
+    par_y = var_names[var_names.str.endswith("_PAR_Y") & var_names.str.replace(r"_PAR_Y$", "", regex=True).isin(var_names)]
+    if len(par_y):
+        warnings_.append(f"{len(par_y)} genes have a _PAR_Y row beside their X row, so their counts are split: "
+                         "pp.collapse_genes(by=var_names without the suffix) sums them; " + _examples(par_y))
+    suffixed = var_names[var_names.str.match(r"^.+-\d+$")]
+    made_unique = suffixed[suffixed.str.replace(r"-\d+$", "", regex=True).isin(var_names)]
+    if len(made_unique):
+        warnings_.append(f"{len(made_unique)} var_names look like var_names_make_unique suffixes of other var_names, "
+                         "so one symbol sits on several rows: pp.collapse_genes(by=...) sums them; "
+                         + _examples(made_unique))
+    if gene_name_column is not None:
+        symbols_all = pd.Index(var[gene_name_column].astype(str))
+        repeated = symbols_all[symbols_all.duplicated()].unique()
+        if len(repeated):
+            warnings_.append(f"{len(repeated)} symbols in '{gene_name_column}' sit on more than one row, so results "
+                             f"by symbol split their counts: pp.collapse_genes(by='{gene_name_column}') sums them; "
+                             + _examples(repeated))
+
+    # --- X ----------------------------------------------------------------------
+    try:
+        check_sparse_layout(path)
+        layout_ok = True
+    except ValueError as exc:
+        errors.append(str(exc))
+        layout_ok = False  # reading rows of a broken matrix would fail on its pointers
+    if n_counts_column is None:
+        n_counts_column = next((c for c in ("n_counts", "total_counts") if c in obs.columns), None)
+    elif n_counts_column not in obs.columns:
+        errors.append(f"obs has no column '{n_counts_column}'")
+        n_counts_column = None
+    totals = pd.to_numeric(obs[n_counts_column], errors="coerce").to_numpy(dtype=np.float64) if n_counts_column else None
+    # A CSC file (pp.convert_to_csc, for the Wilcoxon test) is sampled a
+    # window of genes at a time: a window of rows would read it whole.
+    by_column = layout_ok and get_matrix_storage_format(path) == "csc"
+    backed = read_backed(path)
+    try:
+        n_obs = backed.n_obs
+        length = backed.n_vars if by_column else n_obs
+        starts = np.unique(np.linspace(0, max(length - window_size, 0), num=max(sample_windows, 1)).astype(np.int64))
+        non_integer = 0
+        over_total = 0
+        for start in starts if layout_ok else []:
+            stop = min(start + window_size, length)
+            if stop <= start:
+                continue
+            block = backed.X[:, start:stop] if by_column else backed.X[start:stop]
+            csr = _ensure_csr(block)
+            values = csr.data
+            if values.size and not (np.isfinite(values).all() and (values >= 0).all()
+                                    and np.abs(values - np.rint(values)).max() <= 1e-6):
+                non_integer += 1
+            if totals is not None and not by_column:
+                sums = np.asarray(csr.sum(axis=1)).ravel()
+                known = np.isfinite(totals[start:stop])
+                over_total += int((sums[known] > totals[start:stop][known] * (1 + 1e-6) + 0.5).sum())
+    finally:
+        backed.file.close()
+    if totals is not None and by_column:
+        warnings_.append(f"X is stored as CSC, so the sampled row sums were not checked against '{n_counts_column}' "
+                         "(a row of a CSC file reads the whole matrix; the cell-level tests need CSR anyway: "
+                         "pp.convert_to_csr)")
+    if non_integer:
+        warnings_.append(f"X does not hold integer counts in {non_integer}/{len(starts)} sampled blocks; "
+                         "nb_glm_test, pseudo-bulk sums and downsample_counts need counts "
+                         "(pp.recover_counts undoes log1p(normalize_total))")
+    if over_total:
+        errors.append(f"{over_total} sampled cells have a row sum above their '{n_counts_column}' "
+                      "(wrong total, or X is not the matrix the totals describe)")
+
+    issues = [Issue("error", m) for m in errors] + [Issue("warning", m) for m in warnings_]
+    for issue in issues:
+        _messages.vprint(verbose, name, str(issue))
+    _messages.print_done(verbose, name, f"{len(errors)} errors, {len(warnings_)} warnings")
+    return issues
+
+
+def raise_on_errors(issues: "Iterable[Issue]", *, context: str = "check_perturbation_data") -> None:
+    """Raise ``ValueError`` listing every ``error``-level issue, if any."""
+    errors = [issue for issue in issues if issue.level == "error"]
+    if errors:
+        raise ValueError(f"{context}: {len(errors)} error(s):\n" + "\n".join(f"- {e.message}" for e in errors))
+

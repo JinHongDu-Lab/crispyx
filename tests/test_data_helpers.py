@@ -478,3 +478,12 @@ def test_chunk_starts_rejects_a_mask_of_the_wrong_length():
 
     with pytest.raises(ValueError, match="selected has 5 entries for an axis of 10"):
         chunk_starts(10, 3, selected=np.ones(5, dtype=bool))
+
+
+def test_rows_as_slice_turns_consecutive_rows_into_one_slice():
+    from crispyx.data import _rows_as_slice
+
+    assert _rows_as_slice(np.arange(10, 15)) == slice(10, 15)
+    assert _rows_as_slice(np.array([7])) == slice(7, 8)
+    for rows in (np.array([1, 2, 4]), np.array([3, 2, 1]), np.array([], dtype=np.int64), np.array([True, False])):
+        assert not isinstance(_rows_as_slice(rows), slice) and np.array_equal(_rows_as_slice(rows), rows)

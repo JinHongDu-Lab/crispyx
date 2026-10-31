@@ -374,13 +374,14 @@ class TestStaleScratchSweep:
 
 
 def test_partial_name_of_a_scratch_copy_stays_sweepable(tmp_path):
-    """The converter writes ``<name>.partial`` beside its target; for a
-    dot-prefixed scratch copy that must not become ``..cx_*`` -- the sweep's
-    pattern (and the user's eye) would both miss it."""
+    """The converter writes ``<name>.<pid>-<host>.partial`` beside its
+    target; for a dot-prefixed scratch copy that must not become ``..cx_*`` --
+    the sweep's pattern (and the user's eye) would both miss it."""
     from crispyx.data import _replace_on_success
 
     target = tmp_path / f".cx_demo_1234-{_HOST_TAG}_abc.csc.h5ad"
     with _replace_on_success(target) as partial:
-        assert partial.name == f".cx_demo_1234-{_HOST_TAG}_abc.csc.h5ad.partial"
-        partial.write_bytes(b"x")
+        assert partial.name.startswith(f".cx_demo_1234-{_HOST_TAG}_abc.csc.h5ad.")
+        assert partial.name.endswith(".partial")
+        ad.AnnData(sp.csr_matrix((2, 2), dtype=np.float32)).write(partial)  # the rename checks the layout
     assert target.exists()

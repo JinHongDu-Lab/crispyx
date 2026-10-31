@@ -53,6 +53,7 @@ from .data import (
     stream_on_fast_axis,
     validate_format_mismatch_policy,
     _read_h5_1d,
+    _rows_as_slice,
     write_obs,
     _replace_on_success,
     _validate_counts_chunk,
@@ -66,6 +67,8 @@ from .glm import (
     summarize_controls,
     shrink_lfc_apeglm,
     shrink_lfc_apeglm_from_stats,
+    cauchy_map,
+    fit_dispersion_trend,
     _estimate_apeglm_prior_scale,
     _apeglm_prior_scale_from_blocks,
 )
@@ -91,6 +94,7 @@ from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reus
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
+from ._irls import ETA_MAX, ETA_MIN
 from ._size_factors import (
     _validate_size_factors,
     _library_size_factors,
@@ -118,13 +122,13 @@ _RESULT_KEYS: dict[str, dict[str, str | None]] = {
         "statistics": "layers/z_score",
         "pvalues": "layers/pvalue",
         "pvalues_adj": "layers/pvalue_adj",
-        "logfoldchanges": "X" if method == "nb_glm" else "layers/logfoldchanges",
+        "logfoldchanges": "X" if method in ("nb_glm", "nb_offset") else "layers/logfoldchanges",
         "pts": "layers/pts",
         "u_statistics": "layers/u_statistic" if method == "wilcoxon" else None,
         "auc": "X" if method == "wilcoxon" else None,
         "mean_difference": "X" if method == "t_test" else None,
     }
-    for method in ("t_test", "nb_glm", "wilcoxon")
+    for method in ("t_test", "nb_glm", "nb_offset", "wilcoxon")
 }
 
 
@@ -560,7 +564,11 @@ def _resolve_candidates(
     control_label : str
         Control group label to exclude.
     perturbations : iterable of str or None
-        Explicit subset to test.  ``None`` means test all non-control groups.
+        Explicit subset to test.  ``None`` means test all non-control groups;
+        an empty selection tests nothing, and the caller writes an empty
+        result, so a caller that splits perturbations between estimators
+        needs no guard. A selection that names only the control label or
+        unlabelled cells is a mistake and raises.
 
     Returns
     -------
@@ -570,15 +578,22 @@ def _resolve_candidates(
     Raises
     ------
     ValueError
-        If no candidate groups remain after filtering.
+        If the file holds no non-control group to test, or a non-empty
+        selection leaves none.
     """
     if perturbations is None:
         unique = pd.Index(labels).unique().tolist()
-    else:
-        unique = [str(p) for p in perturbations]
-    candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
-    if not candidates:
-        raise ValueError("No perturbation groups available for differential expression testing")
+        candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
+        if not candidates:
+            raise ValueError("No perturbation groups available for differential expression testing")
+        return candidates
+    requested = [str(p) for p in perturbations]
+    candidates = [p for p in requested if p not in (control_label, UNLABELLED)]
+    if requested and not candidates:
+        raise ValueError(
+            "No perturbation groups available for differential expression testing: the requested "
+            f"perturbations {requested[:5]} are only the control label '{control_label}' or unlabelled cells"
+        )
     return candidates
 
 
@@ -615,6 +630,22 @@ _OPERATIONAL_ARGS = frozenset({
     "format_mismatch_policy", "memory_limit_gb",
     "cell_chunk_size", "chunk_size",
 })
+
+
+#: Dense ``cells x genes`` arrays a fit with covariates holds at once for a
+#: gene block (counts, means, weights and work arrays; measured at 3-8 times
+#: the block on synthetic designs), and the smallest block worth a worker.
+_DENSE_ARRAYS_PER_FIT = 8
+_MIN_BLOCK_GENES = 64
+
+
+def _format_duration(seconds: float) -> str:
+    """``12 s``, ``3.5 min`` or ``2.1 h``."""
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def _de_fingerprint(
@@ -861,6 +892,57 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
 # ---------------------------------------------------------------------------
 # Shared helpers for public DE functions
 # ---------------------------------------------------------------------------
+
+def _storage_format_warning_csc(path: Path, fn_name: str) -> str:
+    """The on-disk format of ``path``'s matrix, with a warning when it is
+    CSC: the cell-level tests read rows (size factors, the controls, each
+    perturbation's cells), and a row slice of a CSC file reads the whole
+    matrix."""
+    storage_format = get_matrix_storage_format(path)
+    if storage_format == "csc":
+        _messages.emit(
+            f"The input file '{path.name}' stores its matrix in CSC format. "
+            f"{fn_name} reads rows (size factors, the controls, each "
+            "perturbation's cells), which re-reads a CSC matrix in full every "
+            "time. Convert it to CSR (cx.pp.convert_to_csr) for much better performance.",
+            UserWarning,
+        )
+    return storage_format
+
+
+def _sorted_input(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: "str | None",
+    size_factors: "np.ndarray | None",
+    input_labels: "np.ndarray | None",
+    fn_name: str,
+    verbose: int | bool,
+) -> "tuple[Path, np.ndarray | None]":
+    """``path``, or a perturbation-sorted copy of it when the file is large
+    and its cells scattered (:func:`needs_sorting_for_nbglm`), with the
+    given size factors reordered to follow their cells: ``input_labels``
+    are the labels in the input's row order, needed only with them."""
+    if not needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
+        return path, size_factors
+    _messages.vprint(
+        verbose, fn_name,
+        f"the cells of each perturbation are scattered through {path.name}, which makes reading "
+        "them slow; using a perturbation-sorted copy instead (written once, reused by later runs; "
+        "pass it as the input to skip this check)",
+    )
+    # sort_by_perturbation reuses an existing sorted copy only when it was
+    # made from this exact source.
+    path = sort_by_perturbation(
+        path, perturbation_column=perturbation_column, control_label=control_label,
+        output_path=path.parent / f"{path.stem}_sorted.h5ad", verbose=verbose,
+    )
+    if size_factors is not None:
+        size_factors = size_factors[perturbation_sort_order(
+            input_labels, control_label or resolve_control_label(input_labels, None))]
+    return path, size_factors
+
 
 def _try_load_existing_de_result(
     output_path: "Path",
@@ -1205,8 +1287,7 @@ def t_test(
     eff_checkpoint_interval = _get_checkpoint_interval(n_groups, checkpoint_interval)
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
 
-    obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    obs = _result_obs(candidates, perturbation_column)
     # pts_rest describes the control arm, so it is one per-gene vector, not a
     # per-comparison matrix.
     var = pd.DataFrame({"pts_rest": control_pts.astype(np.float32)}, index=gene_symbols)
@@ -1801,18 +1882,7 @@ def nb_glm_test(
     )):
         return r
 
-    # Warn if the on-disk matrix is stored in CSC format – row-slicing
-    # (used by size-factor computation and control-matrix loading) is
-    # extremely slow on CSC.  Recommend the CSR standardized file.
-    _storage_fmt = get_matrix_storage_format(path)
-    if _storage_fmt == "csc":
-        _messages.emit(
-            f"The input file '{path.name}' stores its matrix in CSC format. "
-            "NB-GLM performs row-wise access (size factors, control matrix, "
-            "per-perturbation slices) which is very slow on CSC. "
-            "Use the CSR-format standardized file for much better performance.",
-            UserWarning,
-        )
+    _storage_fmt = _storage_format_warning_csc(path, "nb_glm_test")
 
     # A negative binomial fit to normalised or log-transformed values runs and
     # returns plausible-looking nonsense, so refuse it up front. Such data is
@@ -1830,35 +1900,13 @@ def nb_glm_test(
     finally:
         backed.file.close()
     _validate_counts_chunk(sample, context="nb_glm_test")
-    # DESeq2's floor of 0.5 on fitted means is a bulk-count setting. In sparse
-    # single-cell counts many genes have means below one; the floor then binds
-    # more often in the shallower group, which makes tests conservative and
-    # biases low-count genes when groups differ in depth (semi-synthetic
-    # screens in docs/notebooks/size_factor_comparison.ipynb). DESeq2 uses
-    # 1e-6 for single cells. The share of zero counts tells the two apart
-    # without a new knob: pseudo-bulk and bulk counts are mostly non-zero,
-    # single cells mostly zero.
     if min_mu is None:
-        n_values = sample.shape[0] * sample.shape[1]
-        nonzero = sample.nnz if sp.issparse(sample) else np.count_nonzero(sample)
-        zero_share = 1.0 - nonzero / max(n_values, 1)
-        min_mu = 1e-6 if zero_share >= 0.5 else 0.5
-        _messages.vprint(
-            verbose, "nb_glm_test", f"min_mu={min_mu:g} ({zero_share:.0%} of a sample of the counts are zero)"
-        )
+        min_mu = _default_min_mu(sample, verbose=verbose, name="nb_glm_test")
 
-    if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
-        # sort_by_perturbation reuses an existing sorted copy only when it
-        # was made from this exact source.
-        path = sort_by_perturbation(
-            path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            output_path=path.parent / f"{path.stem}_sorted.h5ad",
-        )
-        if size_factors is not None:  # given in the input's row order
-            size_factors = size_factors[perturbation_sort_order(
-                input_labels, control_label or resolve_control_label(input_labels, None))]
+    path, size_factors = _sorted_input(
+        path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
+        input_labels=input_labels if size_factors is not None else None, fn_name="nb_glm_test", verbose=verbose,
+    )
 
     backed = read_backed(path)
     try:
@@ -2156,7 +2204,7 @@ def nb_glm_test(
             def _control_blocks():
                 for start in range(0, control_rows.size, 4096):
                     rows = control_rows[start:start + 4096]
-                    yield np.arange(start, start + rows.size), backed.X[rows, :]
+                    yield np.arange(start, start + rows.size), backed.X[_rows_as_slice(rows), :]
 
             control_summary = summarize_controls(_control_blocks(), control_sf, n_genes)
         finally:
@@ -2192,8 +2240,7 @@ def nb_glm_test(
     # The result file: one row per perturbation, written as each is fitted
     # =====================================================================
     shrunk = lfc_shrinkage_type == "apeglm"
-    obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    obs = _result_obs(candidates, perturbation_column)
     var = pd.DataFrame({"pts_rest": pts_rest}, index=pd.Index(gene_symbols).astype(str))
     # X holds the LFC (shrunk or not), in lfc_base. shrink_lfc needs the
     # ln-scale MLE values; with a log2 base they are kept as separate *_ln
@@ -2290,19 +2337,10 @@ def nb_glm_test(
         use_group_size = (
             int(np.percentile(pert_group_sizes, 95)) if len(pert_group_sizes) >= 10 else max_group_size
         )
-        # A fit's genes are dense a block at a time: its counts, means and the
-        # dispersion and IRLS work arrays, about 16 arrays of cells x genes.
-        # A block takes a tenth of the budget, so that several workers fit,
-        # and is sized for the largest fit.
-        largest_fit_cells = control_n + max_group_size * targets_per_fit
-        block_genes = int(min(n_genes, max(1, budget_gb * 1e9 * 0.1 / (largest_fit_cells * 8 * 16))))
         # Sparse sizes are nnz x 12 bytes (float64 data, int32 indices). A
-        # worker reads its perturbations' cells (CSR, then CSC) beside one
-        # block; the controls it shares with the parent.
+        # worker reads its perturbations' cells (CSR, then CSC); the
+        # controls it shares with the parent.
         fit_sparse_mb = use_group_size * targets_per_fit * nnz_per_cell * 12 * 2 / 1e6
-        block_mb = (control_n + use_group_size * targets_per_fit) * block_genes * 8 * 16 / 1e6
-        per_worker_mb = fit_sparse_mb + block_mb + 2000
-
         # The parent holds the sparse controls plus its own arrays. The
         # largest perturbation is sized on its own rather than by the p95
         # group above: its worker holds its counts however many cells it has
@@ -2313,12 +2351,7 @@ def nb_glm_test(
         # workers' threads, which number the cores asked for in all.
         irls_threads_mb = requested_n_jobs * 200
         base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + irls_threads_mb + 1000
-        available_mb = budget_gb * 1000
-        # Reserve 20% headroom for safety
-        usable_mb = available_mb * 0.8
-        remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
-        max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
-
+        usable_mb = budget_gb * 1000 * 0.8 - base_memory_mb  # 20% headroom
         # Dataset-size-aware caps
         full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
         if full_matrix_gb < 1.0:
@@ -2326,27 +2359,44 @@ def nb_glm_test(
             max_workers_by_size = max(4, n_groups // 2)
         else:
             max_workers_by_size = n_groups
+        # The workers are the cores asked for, each with an equal share of
+        # the budget left after the parent's arrays; a fit's dense gene
+        # block (_DENSE_ARRAYS_PER_FIT arrays of cells x genes) takes half
+        # the share. Fewer workers only when a share would not hold
+        # _MIN_BLOCK_GENES genes: a block sized to a fixed fraction of the
+        # budget would cap the pool at a handful of workers however many
+        # cores and gigabytes there are.
+        largest_fit_cells = control_n + max_group_size * targets_per_fit
+        block_cell_bytes = largest_fit_cells * 8 * _DENSE_ARRAYS_PER_FIT
+        min_block_mb = block_cell_bytes * _MIN_BLOCK_GENES / 1e6
 
-        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_fits)
-        if memory_limited_workers < effective_n_jobs:
-            if memory_limited_workers == n_fits and n_fits < max_workers_by_memory and n_fits < max_workers_by_size:
-                limit_reason = "perturbation_count"
-            elif memory_limited_workers == max_workers_by_memory:
-                limit_reason = "memory"
-            elif memory_limited_workers == max_workers_by_size:
-                limit_reason = "small_dataset"
-            else:
-                limit_reason = "perturbation_count"
+        def block_genes_for(workers: int) -> int:
+            share_mb = usable_mb / workers - fit_sparse_mb - 500
+            return int(min(n_genes, max(_MIN_BLOCK_GENES, share_mb * 1e6 * 0.5 / block_cell_bytes)))
+
+        # The reason named is the cap that binds: the fits or the dataset
+        # size before memory, memory when the loop lowers the count further.
+        cap = max(1, min(effective_n_jobs, max_workers_by_size, n_fits))
+        limit_reason = "perturbation_count" if n_fits <= max_workers_by_size else "small_dataset"
+        workers = cap
+        while workers > 1 and usable_mb / workers - fit_sparse_mb - 500 < 2 * min_block_mb:
+            workers -= 1
+        if workers < cap:
+            limit_reason = "memory"
+        if workers < effective_n_jobs:
             logger.info(
-                f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
-                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
-                f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
+                f"Memory-aware limiting: {effective_n_jobs} -> {workers} workers "
+                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, usable: {usable_mb:.0f}MB, "
+                f"per fit: {fit_sparse_mb:.0f}MB sparse + {block_cell_bytes * block_genes_for(workers) / 1e6:.0f}MB dense block)"
             )
-            effective_n_jobs = memory_limited_workers
+            effective_n_jobs = workers
     effective_n_jobs = max(1, effective_n_jobs)
 
     # For small number of perturbations to run, run sequentially to avoid overhead.
     use_parallel = n_fits >= 2 and (n_to_run >= 4 or targets_per_fit > 1) and effective_n_jobs > 1 and not two_group
+    if not two_group:
+        # A sequential run fits in the parent, with the whole budget.
+        block_genes = block_genes_for(effective_n_jobs if use_parallel else 1)
 
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
         """One perturbation against the control summary; same result as the
@@ -2395,6 +2445,14 @@ def nb_glm_test(
         logger.info(f"Fitting {n_to_run}/{n_groups} remaining perturbations with {effective_n_jobs} workers...")
     else:
         logger.info(f"Fitting {n_groups} perturbations with {effective_n_jobs} workers...")
+    if not two_group:
+        _messages.vprint(
+            verbose, "nb_glm_test",
+            f"{n_fits} fits of up to {targets_per_fit} perturbation(s) with the {control_n} controls, "
+            f"{effective_n_jobs if use_parallel else 1} at a time, {block_genes} genes per dense block",
+        )
+    fits_started = time.monotonic()
+    fits_done = 0
         
     # Track completed labels during this run
     newly_completed = list(completed_labels)  # Start with already completed
@@ -2469,6 +2527,7 @@ def nb_glm_test(
                     raise ValueError(by_label[label]["error"])
                 return by_label[label]
 
+            nonlocal fits_done
             try:
                 by_label, error = {candidates[r["group_idx"]]: r for r in compute()}, None
             except Exception as e:
@@ -2476,6 +2535,18 @@ def nb_glm_test(
             for label in labels_in_fit:
                 if label in unfinished:
                     _record(label, lambda label=label: fitted(label))
+            fits_done += 1
+            if fits_done == 1 and n_fits > 1:
+                # The first fit's wall time says what the run will cost, so
+                # a multi-day run is visible before it is committed to.
+                per_fit = time.monotonic() - fits_started
+                workers = effective_n_jobs if use_parallel else 1
+                remaining = (n_fits - 1) * per_fit / workers
+                _messages.vprint(
+                    verbose, "nb_glm_test",
+                    f"first fit took {_format_duration(per_fit)}; {n_fits - 1} more with {workers} worker(s): "
+                    f"about {_format_duration(remaining)} remaining",
+                )
 
         def _fit_or_fail(**kwargs) -> list[dict]:
             try:
@@ -2559,10 +2630,724 @@ def nb_glm_test(
     )
 
 
-def _wilcoxon_obs(candidates: list[str], perturbation_column: str) -> pd.DataFrame:
-    """The ``obs`` of a Wilcoxon result: one row per perturbation."""
+# =============================================================================
+# Fixed-offset NB test: each perturbation on its own cells, the controls as
+# a per-stratum baseline
+# =============================================================================
+
+@dataclass(frozen=True)
+class _OffsetBaseline:
+    """The control cells of a screen reduced to what :func:`nb_offset_test`
+    needs: per stratum and gene the baseline mean ``mean[b, g]`` (NaN for a
+    stratum without controls), the per-gene dispersion to test at, and the
+    controls' per-gene expressing-cell counts and totals for the filters."""
+
+    mean: np.ndarray            # (strata, genes)
+    has_controls: np.ndarray    # (strata,)
+    pooled_mean: np.ndarray     # (genes,): sum y / sum s over every control
+    dispersion: np.ndarray      # (genes,)
+    dispersion_raw: np.ndarray  # (genes,)
+    dispersion_trend: np.ndarray  # (genes,)
+    nnz: np.ndarray             # (genes,)
+    total: np.ndarray           # (genes,)
+    n_cells: int
+
+
+def _offset_baseline(
+    blocks, size_factors: np.ndarray, strata: np.ndarray, n_strata: int, n_genes: int,
+    *, dispersion: "float | np.ndarray | None", min_mean_for_dispersion: float = 0.5,
+) -> _OffsetBaseline:
+    """One pass over the control cells.
+
+    ``blocks`` yields ``(rows, csr)``: positions into ``size_factors`` /
+    ``strata`` and those cells' counts. The baseline of stratum ``b`` is
+    ``(sum y + m_g) / (sum s + 1)`` over its controls, one pseudo-cell at the
+    pooled control mean ``m_g``: a stratum whose controls happen to have no
+    count of a gene then gives a small baseline instead of zero, which would
+    send any count among the perturbed cells to the upper bound of the
+    effect (with one stratum the pseudo-cell changes nothing). With
+    ``dispersion=None`` the dispersion is the method-of-moments estimate
+    pooled over strata, from ``E sum (y - s mu_b)^2`` over a stratum's
+    controls, for genes with a pooled mean of at least
+    ``min_mean_for_dispersion`` counts per unit size factor, and the
+    parametric mean-dispersion trend through them for the others. The
+    residuals are about the stratum's own mean ``mu_b = sum y / S`` (``S =
+    sum s``), which takes a degree of freedom from each stratum: with
+    ``Var y = s mu + alpha s^2 mu^2``, ``E sum (y - s mu_b)^2 = mu (S -
+    s2/S) + alpha mu^2 (s2 - 2 s3/S + s2^2/S^2)`` (``s2``, ``s3`` the sums
+    of ``s^2``, ``s^3``), the ``(n-1)/n`` of a sample variance when the
+    size factors are equal. Subtracting the full Poisson term ``mu S``
+    instead would bias ``alpha`` down by ``1/n_b`` per stratum, to the floor
+    across hundreds of small strata; a stratum of one control contributes
+    nothing.
+    """
+    s_all = np.asarray(size_factors, dtype=np.float64)
+    sy = np.zeros((n_strata, n_genes))
+    syy = np.zeros((n_strata, n_genes)) if dispersion is None else None
+    ssy = np.zeros((n_strata, n_genes)) if dispersion is None else None
+    s1 = np.zeros(n_strata)
+    s2 = np.zeros(n_strata)
+    s3 = np.zeros(n_strata)
+    n_per_stratum = np.zeros(n_strata, dtype=np.int64)
+    nnz = np.zeros(n_genes, dtype=np.int64)
+    total = np.zeros(n_genes)
+    n_cells = 0
+    for rows, block in blocks:
+        csr = sp.csr_matrix(block, dtype=np.float64)
+        csr.sum_duplicates()
+        csr.eliminate_zeros()
+        rows = np.asarray(rows)
+        b, s = strata[rows], s_all[rows]
+        onehot = sp.csr_matrix((np.ones(rows.size), (b, np.arange(rows.size))), shape=(n_strata, rows.size))
+        sy += (onehot @ csr).toarray()
+        if dispersion is None:
+            syy += (onehot @ csr.multiply(csr)).toarray()
+            ssy += (onehot @ (sp.diags(s) @ csr)).toarray()
+        s1 += np.bincount(b, weights=s, minlength=n_strata)
+        s2 += np.bincount(b, weights=s * s, minlength=n_strata)
+        s3 += np.bincount(b, weights=s * s * s, minlength=n_strata)
+        n_per_stratum += np.bincount(b, minlength=n_strata)
+        nnz += np.bincount(csr.indices, minlength=n_genes)
+        total += np.asarray(csr.sum(axis=0)).ravel()
+        n_cells += rows.size
+    has_controls = s1 > 0
+    pooled = sy.sum(axis=0) / s1.sum()
+    mean = np.full((n_strata, n_genes), np.nan)
+    mean[has_controls] = (sy[has_controls] + pooled) / (s1[has_controls] + 1.0)[:, None]
+    if dispersion is not None:
+        final = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,)).astype(np.float64)
+        raw = trend = np.full(n_genes, np.nan)
+    else:
+        # A stratum of one control has no residual about its own mean (both
+        # its terms are zero in exact arithmetic) and is left out.
+        usable = has_controls & (n_per_stratum >= 2)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            S, S2, S3 = (x[usable][:, None] for x in (s1, s2, s3))
+            mu = sy[usable] / S
+            residual_ss = syy[usable] - 2 * mu * ssy[usable] + mu ** 2 * S2
+            numerator = (residual_ss - mu * (S - S2 / S)).sum(axis=0)
+            raw = numerator / (mu ** 2 * (S2 - 2 * S3 / S + S2 ** 2 / S ** 2)).sum(axis=0)
+        raw = np.where(np.isfinite(raw), np.clip(raw, 1e-8, None), np.nan)
+        genewise = (pooled >= min_mean_for_dispersion) & np.isfinite(raw)
+        trend = fit_dispersion_trend(pooled, np.where(genewise, raw, np.nan))
+        final = np.where(genewise, raw, trend)
+    return _OffsetBaseline(
+        mean=mean, has_controls=has_controls, pooled_mean=pooled, dispersion=final, dispersion_raw=raw,
+        dispersion_trend=trend, nnz=nnz, total=total, n_cells=n_cells,
+    )
+
+
+@dataclass(frozen=True)
+class _DesignBaseline:
+    """The controls fitted once on a covariate design: per gene the
+    coefficients (NaN where the fit did not converge), the dispersion to
+    test at, and the controls' per-gene counts for the filters."""
+
+    coef: np.ndarray            # (genes, columns)
+    dispersion: np.ndarray
+    dispersion_raw: np.ndarray
+    dispersion_trend: np.ndarray
+    nnz: np.ndarray
+    total: np.ndarray
+    n_cells: int
+
+
+def _design_baseline(
+    control_counts: sp.csc_matrix, size_factors: np.ndarray, design: np.ndarray,
+    *, dispersion: "float | np.ndarray | None", min_mu: float, block_genes: int,
+) -> _DesignBaseline:
+    """The controls' GLM on ``design`` (intercept first), with DESeq2's
+    dispersion steps on the controls alone unless ``dispersion`` is given:
+    :func:`~crispyx.glm.fit_glm_deseq2` with no coefficient under test. Its
+    fitted means are the baseline of any cell with the same covariates."""
+    fit = fit_glm_deseq2(
+        design, [control_counts], size_factors, 0, dispersion=dispersion, shrink=True, min_mu=min_mu,
+        block_genes=block_genes,
+    )
+    coef = np.where(fit.coef_converged[:, None], fit.coef, np.nan)
+    return _DesignBaseline(
+        coef=coef, dispersion=fit.dispersion, dispersion_raw=fit.genewise_dispersion, dispersion_trend=fit.trend,
+        nnz=np.asarray(control_counts.getnnz(axis=0)).ravel(),
+        total=np.asarray(control_counts.sum(axis=0), dtype=np.float64).ravel(), n_cells=control_counts.shape[0],
+    )
+
+
+def _fit_offset_group(
+    y: sp.csr_matrix, base_of: "Callable[[slice], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
+    *, min_mu: float, max_iter: int, tol: float, block_cells: int,
+) -> dict:
+    """One perturbation's cells against a baseline: for each gene the
+    one-parameter NB fit of ``y_i ~ NB(base_i exp(beta), alpha_g)`` by Fisher
+    scoring, from the Poisson start ``ln(sum y / sum base)``, where
+    ``base_of(cells)`` gives the cells' baseline means (size factor times the
+    control mean) as a dense block. ``beta`` is held above ``ln(min_mu) -
+    ln(mean baseline)`` (the fitted-mean floor) and below ``ETA_MAX``; its
+    standard error is one over the root of the Fisher information at the
+    optimum. The cells are taken ``block_cells`` at a time, so a large
+    perturbation is never dense at once. Returns natural-log ``lfc``, ``se``,
+    ``converged`` and ``intercept`` (the log of the cells' mean expected
+    count under the baseline), NaN off ``genes`` and where the baseline is
+    zero or undefined."""
+    n_cells, n_genes = y.shape
+    blocks = [slice(start, min(start + block_cells, n_cells)) for start in range(0, n_cells, block_cells)]
+    bsum = np.zeros(n_genes)
+    for sl in blocks:
+        bsum += base_of(sl).sum(axis=0)
+    ysum = np.asarray(y.sum(axis=0)).ravel()
+    fit = np.zeros(n_genes, dtype=bool)
+    fit[genes] = True
+    fit &= np.isfinite(bsum) & (bsum > 0)
+    lo = np.full(n_genes, ETA_MIN)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if min_mu > 0:
+            lo = np.where(fit, np.log(min_mu) - np.log(bsum / n_cells), ETA_MIN)
+        beta = np.where(fit, np.clip(np.log(ysum / bsum), lo, ETA_MAX), 0.0)
+    converged = np.zeros(n_genes, dtype=bool)
+    info = np.zeros(n_genes)
+    for _ in range(max_iter):
+        score = np.zeros(n_genes)
+        info = np.zeros(n_genes)
+        for sl in blocks:
+            mu = base_of(sl) * np.exp(beta)
+            w = 1.0 / (1.0 + alpha * mu)
+            score += np.asarray(y[sl].multiply(w).sum(axis=0)).ravel() - (mu * w).sum(axis=0)
+            info += (mu * w).sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            new = np.where(fit & (info > 0), np.clip(beta + score / info, lo, ETA_MAX), beta)
+        step = np.abs(new - beta)
+        beta = new
+        converged = fit & (step < tol)
+        if converged[fit].all():
+            break
+    info = np.zeros(n_genes)
+    for sl in blocks:
+        mu = base_of(sl) * np.exp(beta)
+        info += (mu / (1.0 + alpha * mu)).sum(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        se = np.where(fit & (info > 0), 1.0 / np.sqrt(info), np.nan)
+        intercept = np.where(fit, np.log(bsum / n_cells), np.nan)
+    return {
+        "lfc": np.where(fit, beta, np.nan), "se": se, "converged": converged, "intercept": intercept,
+        "n_fit": int(fit.sum()),
+    }
+
+
+def _default_min_mu(sample, *, verbose: int | bool, name: str) -> float:
+    """DESeq2's floor on fitted means, chosen from the share of zeros in a
+    sample of the counts: 1e-6 when at least half are zero (single cells),
+    0.5 otherwise (pseudo-bulk, bulk). DESeq2's 0.5 is a bulk setting; in
+    sparse single-cell counts it binds more often in the shallower group,
+    which makes tests conservative and biases low-count genes when the
+    groups differ in depth (docs/notebooks/size_factor_comparison.ipynb)."""
+    n_values = sample.shape[0] * sample.shape[1]
+    nonzero = sample.nnz if sp.issparse(sample) else np.count_nonzero(sample)
+    zero_share = 1.0 - nonzero / max(n_values, 1)
+    min_mu = 1e-6 if zero_share >= 0.5 else 0.5
+    _messages.vprint(verbose, name, f"min_mu={min_mu:g} ({zero_share:.0%} of a sample of the counts are zero)")
+    return min_mu
+
+
+@accepts_in_memory
+def nb_offset_test(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
+    control_label: str | None = None,
+    reference: str | None = None,
+    strata: str | None = None,
+    covariates: Iterable[str] | None = None,
+    gene_name_column: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    size_factors: ArrayLike | None = None,
+    size_factor_method: Literal["libsize", "geomeans", "deseq2"] = "libsize",
+    dispersion: float | ArrayLike | None = None,
+    min_mu: float | None = None,
+    max_iter: int = 50,
+    tol: float = 1e-6,
+    chunk_size: int = 2048,
+    min_cells_expressed: int = 0,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
+    min_cells_ctrl: int = 1,
+    min_cells_pert: int = 1,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.005,
+    min_total_count: float = 1.0,
+    lfc_base: Literal["log2", "ln"] = "log2",
+    corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
+    data_name: str | None = None,
+    output_path: str | Path | None = None,
+    scanpy_format: bool = False,
+    verbose: int | bool = True,
+    memory_limit_gb: float | None = None,
+    n_jobs: int | None = None,
+    force: bool = False,
+) -> RankGenesGroupsResult:
+    """Negative binomial test of each perturbation on its own cells, with the
+    controls as a fixed per-stratum baseline.
+
+    For gene *g* in a cell *i* of stratum *b*, the model is
+    ``y_i ~ NB(s_i m_bg exp(beta), alpha_g)``: ``m_bg`` is the control cells'
+    mean in the stratum (counts per unit size factor), fixed from one pass
+    over the controls, and ``beta`` is the one parameter fitted per
+    perturbation and gene, on the perturbation's cells only. This is the
+    cell-level :func:`nb_glm_test` with ``covariates=[strata]`` whose
+    stratum effects are taken from the controls rather than estimated
+    jointly, which they dominate anyway when every stratum holds thousands
+    of control cells against a perturbation's handful: on such screens the
+    two agree to a few percent in ``beta`` and its standard error
+    (:doc:`/nb_glm`). The difference is cost. The joint fit holds every
+    control cell in each fit and solves a design with one column per stratum
+    (hundreds, for lane x donor); this fit reads the controls once and then
+    each perturbation's own cells, so a genome-wide screen whose
+    perturbations have 20-40 cells spread one per stratum, where no
+    pseudo-bulk unit can be formed and the joint fit takes days, runs in
+    minutes.
+
+    The baseline comes in two forms. With ``strata``, one categorical
+    column, it is the closed form: the stratum's control mean
+    ``(sum y + m_g) / (sum s + 1)``, one pseudo-cell at the pooled control
+    mean ``m_g``, so that a stratum whose controls happen to have no count
+    of a gene gives a small baseline rather than zero (which would send any
+    count among the perturbed cells to the upper bound of ``beta``); no
+    design matrix is built, so it suits hundreds of thousands of cells over
+    hundreds of lane x donor strata. The dispersion is then ``dispersion``
+    as given (one value, or one per gene), or the method-of-moments estimate
+    from the controls pooled over strata, with the parametric
+    mean-dispersion trend for genes below 0.5 counts per unit size factor.
+    With ``covariates``, any design (one-hot levels and continuous terms
+    such as the log cells per pseudo-bulk unit), the controls' GLM on
+    ``~ covariates`` is fitted once with DESeq2's dispersion steps on the
+    controls alone (:func:`~crispyx.glm.fit_glm_deseq2`), and each cell's
+    baseline is its fitted control mean, floored at ``min_mu``. This is the
+    pseudo-bulk analogue of the stratum baseline: ``nb_glm_test`` with the
+    same covariates refits the whole control set in every fit of
+    ``targets_per_fit`` perturbations, here it is fitted once. Cells whose
+    stratum or level has no control carry no baseline and are left out,
+    with a warning. ``beta`` is fitted by Fisher scoring from its Poisson
+    start, held above the fitted-mean floor implied by ``min_mu`` and below
+    ``exp(20)``; its standard error is the Wald one at the optimum.
+
+    The result has the layout of :func:`nb_glm_test`'s (``X`` the fold
+    change in ``lfc_base``, ``standard_error``, ``z_score``, ``pvalue``,
+    ``pvalue_adj``, ``intercept``, ``dispersion``, ``pts``, ``converged``),
+    so :func:`shrink_lfc` and every reader of an NB-GLM result accept it;
+    ``uns["method"]`` is ``"nb_offset"``. The expression filters are
+    :func:`nb_glm_test`'s, with the same defaults. An existing output is
+    reused when it was computed from the same input and arguments
+    (:ref:`auto-reload`).
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file of raw counts, or a backed AnnData. An
+        in-memory AnnData is streamed from a temporary copy; ``output_path``
+        is then required.
+    perturbation_column, groupby
+        obs column with the perturbation labels (``groupby`` is Scanpy's name
+        for it).
+    control_label, reference
+        The control label (``reference`` is Scanpy's name); inferred from
+        common patterns when None.
+    strata
+        obs column of the stratum each cell belongs to (10x lane, donor, or
+        their combination as one string column). None, without
+        ``covariates``, fits one stratum, the plain two-group comparison.
+    covariates
+        obs columns of the controls' design instead of ``strata`` (not
+        both): string or categorical columns are one-hot encoded, numeric
+        ones enter as they are. The controls' design must have full rank.
+    gene_name_column
+        var column with gene symbols; None uses ``var_names``.
+    perturbations
+        The perturbations to test; None tests every non-control label. An
+        empty list writes an empty result.
+    size_factors, size_factor_method
+        As in :func:`nb_glm_test`: per-cell factors as given, or computed
+        once for all cells by the method.
+    dispersion
+        The NB dispersion to test at, one value or one per gene (e.g. a
+        control-only estimate). None estimates it from the controls as
+        described above.
+    min_mu
+        Floor on fitted means, as in :func:`nb_glm_test`; None chooses 1e-6
+        for single cells and 0.5 for pseudo-bulk from the share of zeros.
+    max_iter, tol
+        Fisher-scoring iterations and the step below which a gene counts as
+        converged.
+    chunk_size
+        Cells read per block when computing size factors.
+    min_cells_expressed, min_pct_ctrl, min_pct_pert, min_cells_ctrl, min_cells_pert, min_mean_ctrl, min_mean_pert, min_total_count
+        :func:`nb_glm_test`'s expression filters, with its defaults.
+    lfc_base
+        ``"log2"`` (default) or ``"ln"`` for ``X`` and ``standard_error``.
+    corr_method
+        ``"benjamini-hochberg"`` or ``"bonferroni"``, per perturbation.
+    data_name, output_path
+        The output file: ``output_path`` as given, else beside the input
+        with the ``nb_offset`` suffix or ``data_name``.
+    scanpy_format
+        Also write Scanpy's ``uns["rank_genes_groups"]``.
+    verbose
+        Print progress.
+    memory_limit_gb
+        Bounds the cells a fit holds dense at a time, and with
+        ``covariates`` the genes the control fit holds dense at a time
+        (``None``: the memory available). The baseline itself is
+        ``strata x genes`` floats, or with ``covariates`` the controls'
+        sparse counts plus ``genes x columns`` coefficients.
+    n_jobs
+        Perturbations fitted concurrently, in threads (None or -1: all
+        cores). The controls are read once, each perturbation's cells once.
+    force
+        Recompute even when a reusable output exists.
+
+    Returns
+    -------
+    RankGenesGroupsResult
+        One row per perturbation; see :func:`nb_glm_test`.
+    """
+    name = "nb_offset_test"
+    if perturbations is not None:
+        perturbations = [str(p) for p in perturbations]
+    covariates = list(covariates or [])
+    if strata is not None and covariates:
+        raise ValueError(f"{name}: give strata or covariates, not both (a stratum column can be one of the covariates)")
+    call_args = dict(locals())
+    call_args.pop("name")
+    perturbation_column, control_label = resolve_group_reference_aliases(
+        perturbation_column=perturbation_column, groupby=groupby, control_label=control_label,
+        reference=reference, fn_name=name,
+    )
+    if min_mu is not None and min_mu < 0:
+        raise ValueError(f"min_mu must be >= 0, got {min_mu}")
+    if size_factors is None and size_factor_method not in _SIZE_FACTOR_METHODS:
+        raise ValueError(f"size_factor_method must be 'libsize', 'geomeans' or 'deseq2', not {size_factor_method!r}")
+    if dispersion is not None:
+        dispersion = np.asarray(dispersion, dtype=np.float64)
+        if not np.isfinite(dispersion).all() or (dispersion <= 0).any():
+            raise ValueError(f"{name}: dispersion must be positive and finite")
+
+    path = resolve_data_path(data)
+    output_path = resolve_output_path(path, suffix="nb_offset", data_name=data_name, output_path=output_path)
+    fingerprint = _de_fingerprint(
+        path, call_args, method="nb_offset", perturbation_column=perturbation_column, control_label=control_label,
+    )
+    if (existing := _try_load_existing_de_result(output_path, force=force, verbose=verbose, fingerprint=fingerprint)):
+        return existing
+
+    storage_format = _storage_format_warning_csc(path, name)
+    backed = read_backed(path)
+    try:
+        sample = backed.X[:, :256] if storage_format == "csc" else backed.X[:1024]
+        for column in (perturbation_column, strata, *covariates):
+            if column is not None and column not in backed.obs.columns:
+                raise KeyError(f"Column '{column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}")
+        if size_factors is not None:
+            size_factors = _validate_size_factors(size_factors, backed.n_obs)
+            input_labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        n_genes = backed.n_vars
+        if dispersion is not None and dispersion.ndim and dispersion.shape != (n_genes,):
+            raise ValueError(f"{name}: dispersion has shape {dispersion.shape}; expected one value or ({n_genes},)")
+    finally:
+        backed.file.close()
+    _validate_counts_chunk(sample, context=name)
+    if min_mu is None:
+        min_mu = _default_min_mu(sample, verbose=verbose, name=name)
+
+    path, size_factors = _sorted_input(
+        path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
+        input_labels=input_labels if size_factors is not None else None, fn_name=name, verbose=verbose,
+    )
+
+    backed = read_backed(path)
+    try:
+        gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
+        labels = label_strings(backed.obs[perturbation_column])
+        control_label = resolve_control_label(list(labels), control_label)
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        control_mask = labels == control_label
+        control_rows = np.flatnonzero(control_mask)
+        if control_rows.size == 0:
+            raise ValueError("Control group contains no cells")
+        observed = set(pd.unique(labels))
+        for label in candidates:
+            if label not in observed:
+                raise ValueError(f"Perturbation '{label}' contains no cells")
+        if strata is None:
+            stratum_codes, stratum_names = np.zeros(labels.size, dtype=np.int64), np.array(["all"])
+        else:
+            stratum_codes, stratum_names = pd.factorize(backed.obs[strata].astype(str).to_numpy())
+            stratum_codes = stratum_codes.astype(np.int64)
+        design_all = None
+        if covariates:
+            # The controls' design, with the same columns for every cell. A
+            # level of a categorical covariate that no control falls in is
+            # not estimable: the cells in it carry no baseline, and the level
+            # is replaced by one with controls before the one-hot encoding
+            # (their rows are never fitted), so the reference level and
+            # every column have controls and the design keeps full rank.
+            frame = backed.obs[covariates].copy()
+            unsupported_cell = np.zeros(labels.size, dtype=bool)
+            for column in covariates:
+                series = frame[column]
+                if series.dtype.kind in {"O", "U"} or isinstance(series.dtype, pd.CategoricalDtype):
+                    values = series.astype(str).to_numpy()
+                    missing = ~np.isin(values, np.unique(values[control_rows]))
+                    if missing.any():
+                        unsupported_cell |= missing
+                        values = values.copy()
+                        values[missing] = values[control_rows[0]]
+                    frame[column] = values
+            design_all, columns = build_design_matrix(
+                frame, covariate_columns=covariates, perturbation_indicator=np.zeros(labels.size), intercept=True,
+            )
+            keep_column = np.arange(design_all.shape[1]) != columns.index("perturbation")
+            design_all = np.ascontiguousarray(design_all[:, keep_column])
+            columns = [c for c, k in zip(columns, keep_column) if k]
+            check_full_rank(design_all[control_rows], columns, f"{name}, the controls' design")
+        boundaries = {}
+        if "sorting_metadata" in backed.uns:
+            metadata = backed.uns["sorting_metadata"]
+            if metadata.get("sorted_by") == perturbation_column:
+                boundaries = metadata.get("perturbation_boundaries", {}) or {}
+    finally:
+        backed.file.close()
+    n_strata = len(stratum_names)
+    if size_factors is None:
+        size_factors = _global_size_factors(path, size_factor_method, chunk_size, labels, control_label)
+    size_factors = np.asarray(size_factors, dtype=np.float64)
+
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    # One pass over the controls: the baseline, the dispersion, the filters' counts.
+    if design_all is None:
+        backed = read_backed(path)
+        try:
+            def control_blocks():
+                for start in range(0, control_rows.size, 4096):
+                    rows = control_rows[start:start + 4096]
+                    yield rows, backed.X[_rows_as_slice(rows), :]
+
+            baseline = _offset_baseline(
+                control_blocks(), size_factors, stratum_codes, n_strata, n_genes, dispersion=dispersion,
+            )
+        finally:
+            backed.file.close()
+        has_baseline_cell = baseline.has_controls[stratum_codes]
+        no_baseline = f"{int((~baseline.has_controls).sum())} of {n_strata} strata have no control cell"
+    else:
+        # The controls' counts sparse in memory (as nb_glm_test's covariate
+        # path holds them), fitted a block of genes at a time within half
+        # the budget: _DENSE_ARRAYS_PER_FIT dense arrays of controls x genes.
+        control_counts = read_rows_csc(path, control_rows)
+        block_genes = int(min(n_genes, max(_MIN_BLOCK_GENES, budget * 0.5 / (control_rows.size * 8 * _DENSE_ARRAYS_PER_FIT))))
+        _messages.vprint(verbose, name, f"fitting the {control_rows.size} controls on {design_all.shape[1]} columns, "
+                                        f"{block_genes} genes at a time")
+        baseline = _design_baseline(
+            control_counts, size_factors[control_rows], design_all[control_rows], dispersion=dispersion,
+            min_mu=min_mu, block_genes=block_genes,
+        )
+        del control_counts
+        has_baseline_cell = ~unsupported_cell
+        no_baseline = "some covariate levels have no control cell"
+    drop_file_cache(path)
+    orphan_cells = int((~has_baseline_cell & ~control_mask).sum())
+    if orphan_cells:
+        _messages.warn(
+            name, f"{no_baseline}; their {orphan_cells} perturbed cells carry no baseline and are left out of the fits.",
+        )
+    n_control = baseline.n_cells
+    pts_rest = (baseline.nnz / max(n_control, 1)).astype(np.float32)
+
+    # Each perturbation's rows: a slice of a file sorted by perturbation
+    # (one read of the matrix's data and indices), else their indices.
+    unsorted = [label for label in candidates if label not in boundaries]
+    row_indices = _group_row_indices(labels, unsorted) if unsorted else {}
+    group_rows = {
+        label: slice(*boundaries[label]) if label in boundaries else row_indices[label] for label in candidates
+    }
+    # A fit holds a block of cells dense in about five cells x genes arrays
+    # (baseline, mean, weight, their products), and every thread fits at
+    # once: the threads' blocks together take a tenth of the budget, so
+    # they fit beside the baseline.
+    n_threads = max(1, _resolve_n_jobs(n_jobs))
+    block_cells = int(max(16, min(65536, budget * 0.1 / (n_threads * n_genes * 8 * 5))))
+
+    n_groups = len(candidates)
+    shape = (n_groups, n_genes)
+    _messages.print_disk_estimate(
+        verbose, name, warn_if_disk_space_low(_nb_glm_disk_bytes(*shape), output_path, context=name),
+    )
+    obs = _result_obs(candidates, perturbation_column)
+    var = pd.DataFrame({"pts_rest": pts_rest}, index=pd.Index(gene_symbols).astype(str))
+    layers = {"z_score": np.float64, "pvalue": np.float64, "pvalue_adj": np.float64, "intercept": np.float64,
+              "standard_error": np.float64}
+    if lfc_base == "log2":
+        layers["logfoldchange_raw_ln"] = np.float64
+        layers["standard_error_ln"] = np.float64
+    layers.update(dispersion=np.float64, dispersion_raw=np.float64, dispersion_trend=np.float64)
+    layers["converged"] = np.bool_
+    layers["pts"] = np.float32
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run = _resumable_result(
+        output_path, output_path.with_suffix(".progress.json"),
+        fingerprint=_checkpoint_fingerprint(fingerprint), resume=False, obs=obs, var=var,
+        uns={
+            "lfc_base": lfc_base,
+            "method": "nb_offset",
+            "control_label": control_label,
+            "perturbation_column": perturbation_column,
+            "strata": strata if strata is not None else "",
+            "covariates": covariates,
+            "n_strata": int(n_strata),
+            "pvalue_correction": corr_method,
+            "size_factors": size_factors,
+            "size_factor_method": size_factor_method,
+            "original_dataset_path": str(path),
+            "min_mu": float(min_mu),
+            "dispersion_source": "given" if dispersion is not None else "controls",
+            "de_filter": {
+                "min_cells_expressed": int(min_cells_expressed),
+                "min_pct_ctrl": float(min_pct_ctrl),
+                "min_pct_pert": float(min_pct_pert),
+                "min_mean_ctrl": float(min_mean_ctrl),
+                "min_mean_pert": float(min_mean_pert),
+            },
+        },
+        x_dtype=np.float64, layers=layers,
+    )
+    out = {key: run.file[key] for key in ["X", *(f"layers/{layer}" for layer in layers)]}
+    lfc_scale = np.log(2) if lfc_base == "log2" else 1.0
+    candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
+
+    def fit(label: str, y: sp.csr_matrix, rows: np.ndarray) -> dict:
+        # The cells without a baseline leave before the filters and ``pts``
+        # are computed, so both describe the cells that are fitted.
+        keep = has_baseline_cell[rows]
+        if not keep.any():
+            raise ValueError(f"every cell of '{label}' is in a stratum or level without controls")
+        if not keep.all():
+            y, rows = y[keep], rows[keep]
+        s, codes = size_factors[rows], stratum_codes[rows]
+        n_pert = y.shape[0]
+        expr_counts = y.getnnz(axis=0)
+        total = np.asarray(y.sum(axis=0)).ravel()
+        valid = _nb_glm_testable_genes(
+            pert_expr_counts=expr_counts, pert_total=total, n_pert=n_pert,
+            control_expr_counts=baseline.nnz, control_total=baseline.total, n_control=n_control,
+            min_cells_expressed=min_cells_expressed, min_pct_ctrl=min_pct_ctrl, min_pct_pert=min_pct_pert,
+            min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert, min_cells_ctrl=min_cells_ctrl,
+            min_cells_pert=min_cells_pert, min_total_count=min_total_count,
+        )
+        if design_all is None:
+            def base_of(sl: slice) -> np.ndarray:
+                return s[sl, None] * baseline.mean[codes[sl]]
+        else:
+            design_rows = design_all[rows]
+
+            def base_of(sl: slice) -> np.ndarray:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    eta = np.clip(design_rows[sl] @ baseline.coef.T, ETA_MIN, ETA_MAX)
+                return s[sl, None] * np.maximum(np.exp(eta), min_mu)
+        result = _fit_offset_group(
+            y, base_of, baseline.dispersion, np.flatnonzero(valid), min_mu=min_mu, max_iter=max_iter, tol=tol,
+            block_cells=block_cells,
+        )
+        tested = np.isfinite(result["lfc"]) & np.isfinite(result["se"]) & (result["se"] > 0)
+        lfc = np.where(tested, result["lfc"], np.nan)
+        se = np.where(tested, result["se"], np.nan)
+        with np.errstate(invalid="ignore"):
+            statistic = lfc / se
+        return {
+            "label": label, "n_tested": int(tested.sum()), "lfc": lfc, "se": se, "statistic": statistic,
+            "pvalue": np.where(tested, 2.0 * norm.sf(np.abs(statistic)), np.nan),
+            "intercept": np.where(tested, result["intercept"], np.nan),
+            "converged": tested & result["converged"], "pts": (expr_counts / max(n_pert, 1)).astype(np.float32),
+        }
+
+    def write(res: dict) -> None:
+        idx = candidate_to_idx[res["label"]]
+        out["X"][idx] = res["lfc"] / lfc_scale
+        out["layers/z_score"][idx] = res["statistic"]
+        out["layers/pvalue"][idx] = res["pvalue"]
+        out["layers/intercept"][idx] = res["intercept"]
+        out["layers/standard_error"][idx] = res["se"] / lfc_scale
+        if lfc_base == "log2":
+            out["layers/logfoldchange_raw_ln"][idx] = res["lfc"]
+            out["layers/standard_error_ln"][idx] = res["se"]
+        out["layers/dispersion"][idx] = baseline.dispersion
+        out["layers/dispersion_raw"][idx] = baseline.dispersion_raw
+        out["layers/dispersion_trend"][idx] = baseline.dispersion_trend
+        out["layers/converged"][idx] = res["converged"]
+        out["layers/pts"][idx] = res["pts"]
+
+    def write_failed(label: str) -> None:
+        idx = candidate_to_idx[label]
+        for dataset in out.values():
+            dataset[idx] = np.nan if dataset.dtype.kind == "f" else 0
+
+    def fit_or_fail(label: str, y: sp.csr_matrix, rows: np.ndarray) -> tuple[str, "dict | Exception"]:
+        try:
+            return label, fit(label, y, rows)
+        except Exception as exc:  # reported per perturbation; the run goes on
+            return label, exc
+
+    failed: list[str] = []
+    n_tested_list: list[int] = []
+    backed = read_backed(path)
+    try:
+        def tasks():
+            # The rows are read here, in the caller's thread, as each task is
+            # dispatched (joblib pre-dispatches two per thread), and fitted in
+            # the pool: numpy releases the GIL in the fits' array work.
+            for label in candidates:
+                rows = group_rows[label]
+                y = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
+                y.sum_duplicates()
+                y.eliminate_zeros()
+                if isinstance(rows, slice):
+                    rows = np.arange(rows.start, rows.stop)
+                yield delayed(fit_or_fail)(label, y, rows)
+
+        with _create_progress_context(n_groups, name, verbose) as pbar:
+            results = Parallel(n_jobs=n_threads, backend="threading", return_as="generator_unordered")(tasks())
+            for label, res in results:
+                if isinstance(res, Exception):
+                    logger.error(f"Failed perturbation {label}: {res}")
+                    failed.append(label)
+                    write_failed(label)
+                else:
+                    write(res)
+                    n_tested_list.append(res["n_tested"])
+                    _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
+                pbar.update(1)
+    finally:
+        backed.file.close()
+    _print_de_summary(verbose, name, n_groups - len(failed), n_groups, n_tested_list, n_genes)
+    if failed:
+        _messages.warn(
+            name,
+            f"{len(failed)} perturbation(s) failed and are NaN in the result (each error is logged): "
+            f"{failed[:5]}{'...' if len(failed) > 5 else ''}",
+        )
+    _messages.print_saving(verbose, name, output_path)
+    return _finish_result(
+        run, output_path, obs=obs, method="nb_offset", corr_method=corr_method, scanpy_format=scanpy_format,
+        fingerprint=fingerprint,
+    )
+
+
+def _result_obs(candidates: list[str], perturbation_column: str) -> pd.DataFrame:
+    """The ``obs`` of a DE result: one row per perturbation, the label as the
+    index and as the ``perturbation_column`` column. The column is the index
+    itself, so the two agree in values and dtype even when empty (anndata
+    refuses the shared name otherwise; a list or array would type an empty
+    column differently)."""
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    return pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    obs = pd.DataFrame(index=obs_index)
+    obs[perturbation_column] = obs_index.copy()
+    return obs
 
 
 def _wilcoxon_resumable_result(
@@ -2590,7 +3375,7 @@ def _wilcoxon_resumable_result(
     )
     return _resumable_result(
         output_path, checkpoint_path, fingerprint=fingerprint, resume=resume,
-        obs=_wilcoxon_obs(candidates, perturbation_column), var=var,
+        obs=_result_obs(candidates, perturbation_column), var=var,
         uns=_wilcoxon_uns(
             control_label=control_label, perturbation_column=perturbation_column,
             tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
@@ -3063,7 +3848,7 @@ def _wilcoxon_test_stratified(
         ),
     }
     return _finish_result(
-        run, output_path, obs=_wilcoxon_obs(candidates, perturbation_column), method="wilcoxon",
+        run, output_path, obs=_result_obs(candidates, perturbation_column), method="wilcoxon",
         corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
         uns=stratified_diagnostics,
     )
@@ -3366,6 +4151,21 @@ def wilcoxon_test(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
 
+    if n_groups == 0:
+        # An explicit empty selection: the empty result, with no pass over X
+        # (``var["pts_rest"]`` is NaN, since the controls were not read).
+        run = _wilcoxon_resumable_result(
+            output_path, checkpoint_path, candidates=[], gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column, control_label=control_label, tie_correct=tie_correct,
+            corr_method=corr_method, resume=False, fingerprint=_checkpoint_fingerprint(fingerprint),
+            chunk_size=chunk_size or 1, batch_column=batch_column,
+        )
+        run.file["var/pts_rest"][...] = np.nan
+        return _finish_result(
+            run, output_path, obs=_result_obs([], perturbation_column), method="wilcoxon",
+            corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
+        )
+
     # =========================================================================
     # Dispatch. Every path streams gene chunks (axis=1), which on a CSR source
     # re-reads the whole matrix once per chunk; stream_on_fast_axis resolves
@@ -3498,7 +4298,7 @@ def _wilcoxon_test_standard(
 
         # Pre-build flat perturbation indices and row offsets once
         # (avoids rebuilding inside the per-chunk stacking loop).
-        all_pert_flat_idx = np.concatenate([pert_idx[label] for label in candidates])
+        all_pert_flat_idx = np.concatenate([pert_idx[label] for label in candidates] or [np.empty(0, dtype=np.intp)])
         total_pert_cells = len(all_pert_flat_idx)
         pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
         for idx, label in enumerate(candidates):
@@ -3770,7 +4570,7 @@ def _wilcoxon_test_standard(
     if int(verbose) >= 1:
         print(f"[cx] wilcoxon_test: Saving \u2192 {output_path}")
     return _finish_result(
-        run, output_path, obs=_wilcoxon_obs(candidates, perturbation_column), method="wilcoxon",
+        run, output_path, obs=_result_obs(candidates, perturbation_column), method="wilcoxon",
         corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
     )
 
@@ -3949,10 +4749,16 @@ def shrink_lfc(
         uns = handle["uns"]
         layer_names = set(handle["layers"])
         # Validate that this is an NB-GLM result
-        if _uns_value(uns, "method") != "nb_glm" or "standard_error" not in layer_names:
+        result_method = _uns_value(uns, "method")
+        if result_method not in ("nb_glm", "nb_offset") or "standard_error" not in layer_names:
             raise ValueError(
-                f"Input file '{path}' is not an nb_glm_test result "
-                "(expected uns['method'] == 'nb_glm' and a 'standard_error' layer)."
+                f"Input file '{path}' is not an nb_glm_test or nb_offset_test result "
+                "(expected uns['method'] of 'nb_glm' or 'nb_offset' and a 'standard_error' layer)."
+            )
+        if result_method == "nb_offset" and method == "full":
+            raise ValueError(
+                "method='full' refits the NB-GLM on its design; an nb_offset_test result has none. "
+                "Use method='stats'."
             )
         control_label = _uns_value(uns, "control_label", "control")
         perturbation_column = _uns_value(uns, "perturbation_column", "perturbation")
@@ -4247,6 +5053,88 @@ def shrink_lfc(
         f"Output: {output_path}"
     )
     return RankGenesGroupsResult(output_path)
+
+
+@dataclass(frozen=True)
+class ShrunkLFC:
+    """:func:`shrink_lfc_arrays`'s result: the shrunk fold changes, their
+    posterior standard errors (the MLE's where an entry was excluded) and the
+    Cauchy prior scale used."""
+
+    lfc: np.ndarray
+    se: np.ndarray
+    prior_scale: float
+
+
+def shrink_lfc_arrays(
+    lfc: ArrayLike,
+    se: ArrayLike,
+    *,
+    prior_scale: float | None = None,
+    exclude: ArrayLike | None = None,
+    floor: ArrayLike | None = None,
+) -> ShrunkLFC:
+    """apeGLM shrinkage of fold changes given as arrays, exactly.
+
+    The array-level form of :func:`shrink_lfc`, for effects that did not
+    come from one ``nb_glm_test`` file: several results combined, a subset,
+    or another estimator's output with a standard error. Each entry's
+    posterior mode under a Cauchy prior of scale ``prior_scale`` on the
+    natural-log fold change is :func:`~crispyx.glm.cauchy_map`, in closed
+    form; the prior scale, when not given, is PyDESeq2's estimate from every
+    finite entry that is not excluded (``apeglm_prior_scale`` in a
+    ``shrink_lfc`` result). The posterior standard error is one over the
+    root of the curvature at the mode, as in ``shrink_lfc``.
+
+    Parameters
+    ----------
+    lfc, se
+        Natural-log fold changes and their standard errors, arrays of one
+        shape (``nb_glm_test`` with ``lfc_base="ln"``, or the ``*_ln``
+        layers of a log2 result). An entry with a non-finite value in
+        either is NaN in the result; ``se == 0`` is returned unshrunk.
+    prior_scale
+        The Cauchy prior's scale; None estimates it from the data.
+    exclude
+        Boolean mask of entries kept as given (after ``floor``) and left out
+        of the prior-scale estimate, such as each perturbation's own target
+        gene, where a knockdown is expected and a prior centred on zero is
+        wrong.
+    floor
+        A lower bound applied to ``lfc`` before anything else, broadcast to
+        its shape (NaN where none). A fold change at the fitted-mean floor
+        (every count zero in the perturbed cells: -7 on pseudo-bulk with
+        ``min_mu=0.01``, -12 to -16 on cells with 1e-6) is a bound, not a
+        measurement; ``ln(0.5 / expected count)``, the strongest knockdown
+        zero counts can show, is a sensible floor for an excluded target.
+
+    Returns
+    -------
+    ShrunkLFC
+        ``lfc``, ``se`` and ``prior_scale``.
+    """
+    lfc = np.array(lfc, dtype=np.float64)
+    se = np.asarray(se, dtype=np.float64)
+    if se.shape != lfc.shape:
+        raise ValueError(f"shrink_lfc_arrays: se has shape {se.shape}, lfc {lfc.shape}")
+    if floor is not None:
+        bound = np.broadcast_to(np.asarray(floor, dtype=np.float64), lfc.shape)
+        lfc = np.where(np.isfinite(bound), np.maximum(lfc, bound), lfc)
+    excluded = (np.zeros(lfc.shape, dtype=bool) if exclude is None
+                else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape))
+    valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
+    if prior_scale is None:
+        pick = valid & ~excluded & (se > 0)
+        prior_scale = _estimate_apeglm_prior_scale(lfc[pick], se[pick]) if pick.any() else 1.0
+    prior_scale = float(prior_scale)
+    mode = cauchy_map(lfc, se, prior_scale)
+    out_lfc = np.where(valid, np.where(excluded, lfc, mode), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = prior_scale ** 2 + out_lfc ** 2
+        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_lfc ** 2) / denominator ** 2
+        post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
+    out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
+    return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale)
 
 
 # ---------------------------------------------------------------------------

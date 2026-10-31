@@ -30,10 +30,15 @@ distance outlier replacement is not done (see :ref:`pydeseq2-parity`).
   controls) take 6.3 h and 2.8 GB on 32 cores.
 * **With covariates** (or ``lfc_shrinkage_type="apeglm"``, or
   ``targets_per_fit > 1``), each comparison is fitted on all its cells. The
-  controls are held sparse and the genes are fitted a block at a time, the
-  block sized from ``memory_limit_gb``, so memory grows with the cells times
-  the block rather than times every gene. The time still grows with the
-  number of controls.
+  controls are held sparse and shared by the workers, which are the cores
+  asked for, each with an equal share of ``memory_limit_gb``; a fit holds
+  its genes dense a block at a time, the block sized to half that share, so
+  memory grows with the cells times the block rather than times every gene.
+  The time still grows with the number of controls, and every fit refits
+  them: the first fit's wall time and the number of fits are printed at
+  ``verbose=1``, so a multi-day run is visible before it is committed to.
+  Where the controls are many and the perturbations small,
+  :ref:`nb_offset_test <nb-offset>` fits the controls once.
 * ``dispersion=<value>`` fixes one dispersion for every gene;
   ``shrink_dispersion=False`` tests at the gene-wise estimates.
 
@@ -52,6 +57,75 @@ With covariates and many control units this is much faster: about 0.3 s per
 target with ``k=50`` against 20 s one at a time, on the genome-wide CD4+
 T-cell pseudo-bulk of Zhu *et al.* (2026, *Cell*), who fitted 50 targets per
 model (see :doc:`notebooks/residual_effects_genomewide_zhu`).
+
+.. _nb-offset:
+
+Many small perturbations against a stratified control set
+----------------------------------------------------------
+
+A genome-wide screen pooled over many 10x lanes and donors can leave each
+perturbation with 20-40 cells spread about one per stratum, so that no
+pseudo-bulk unit of five cells can be formed and every perturbation falls
+back to the cell level. There ``nb_glm_test(covariates=["stratum"])`` holds
+every control cell in each fit and solves a design with one column per
+stratum: with hundreds of thousands of controls and hundreds of strata, days
+to weeks for thousands of perturbations.
+
+:func:`crispyx.tl.nb_offset_test` fits the same model with the stratum
+effects taken from the controls rather than estimated jointly. One pass over
+the control cells gives each stratum's mean per gene (counts per unit size
+factor) and, unless ``dispersion`` is given, a control-only dispersion per
+gene (method of moments pooled over strata, each stratum's residuals about
+its own mean corrected for the degree of freedom that mean costs, so strata
+of two or three controls do not pull the estimate to the floor; the
+parametric trend below 0.5 counts per cell). Each perturbation is then a one-parameter negative binomial
+fit on its own cells, ``y_i ~ NB(s_i m_bg exp(beta), alpha_g)``, by Fisher
+scoring; the cost is linear in the perturbed cells, however many controls
+there are.
+
+.. code-block:: python
+
+   result = cx.tl.nb_offset_test(
+       "data/counts.h5ad",
+       perturbation_column="perturbation",
+       control_label="control",
+       strata="stratum",            # e.g. lane x donor, one string column
+       dispersion=None,             # or a per-gene array from the controls
+   )
+   shrunk = cx.shrink_lfc(result.result_path)   # the result has nb_glm_test's layout
+
+``strata`` is the closed form for one categorical column and builds no
+design matrix. For any other design, such as pseudo-bulk units with a
+stratum and the log cells per unit, ``covariates`` fits the controls' GLM
+once, with DESeq2's dispersion steps on the controls alone, and takes each
+unit's baseline from it; ``nb_glm_test`` with the same covariates refits the
+whole control set in every fit of ``targets_per_fit`` perturbations, which
+on a screen of 10,000 perturbations, 7,000 control units and 90 strata is
+about 45 minutes per fit of 50.
+
+.. code-block:: python
+
+   result = cx.tl.nb_offset_test(
+       "data/pseudobulk.h5ad",
+       perturbation_column="perturbation",
+       control_label="control",
+       covariates=["stratum", "log10_n_cells"],
+       size_factor_method="deseq2",
+   )
+
+When each stratum holds thousands of control cells against a perturbation's
+handful, the controls dominate the stratum effects and the two fits agree:
+on a targeted iPSC-derived screen with every perturbation on the cell
+fallback, genes with a control mean of at least 0.5 counts per cell gave
+``beta`` correlation 0.9992, median \|Δbeta\| 0.0035 and a median standard
+error ratio of 0.99; over all tested genes the offset standard error is
+larger at low counts (median ratio 1.15), where ``nb_glm_test`` shrinks
+each comparison's dispersion toward its trend and the offset test uses the
+control estimate. A stratum whose controls happen to have no count of a gene
+gets one pseudo-cell at the pooled control mean, so a single count among the
+perturbed cells does not send ``beta`` to its upper bound (the joint fit's
+stratum coefficient diverges there). Cells of a stratum without any control
+carry no baseline and are left out, with a warning.
 
 Other options
 -------------
@@ -149,7 +223,8 @@ screens. Null pairs are expected at \|z\| > 3 in 0.27 % and at p < 0.05 in
   the standard errors.
 * With covariates, a cell-level fit holds every control cell in memory, dense.
   A hundred thousand control cells or more need hundreds of gigabytes, so
-  ``nb_glm_test`` raises ``MemoryError``; use pseudo-bulk there.
+  ``nb_glm_test`` raises ``MemoryError``; use pseudo-bulk there, or, where no
+  pseudo-bulk unit can be formed, :ref:`nb_offset_test <nb-offset>`.
 
 .. _size-factors:
 
@@ -296,3 +371,30 @@ You can also use ``cx.tl.shrink_lfc()`` for API consistency with other tools:
        result.result_path,
        prior_scale_mode="global",
    )
+
+The default ``method="stats"`` takes each entry's posterior mode from its
+MLE and standard error in closed form (:func:`crispyx.glm.cauchy_map`: the
+real roots of a cubic, the one with the lowest objective), so a result of a
+hundred million entries shrinks in under a minute and every entry is at the
+exact optimum.
+
+For effects that did not come from one ``nb_glm_test`` file (several results
+combined, a subset, another estimator's output with a standard error),
+:func:`crispyx.tl.shrink_lfc_arrays` applies the same shrinkage to arrays
+and returns the prior scale it used. Two arguments handle a case the prior
+gets wrong: under a genome-wide prior scale (0.02 on a screen of thousands
+of perturbations), apeGLM acts like a threshold, taking \|z\| of 3-5 to about
+zero, and that also zeroes each perturbation's own knockdown, where a shift
+is expected. ``exclude`` keeps those entries as given and leaves them out of
+the prior estimate; ``floor`` raises a fold change at the fitted-mean floor
+(every count zero in the perturbed cells: -7 on pseudo-bulk with
+``min_mu=0.01``, -12 to -16 on cells) to a stated bound such as
+``ln(0.5 / expected count)``, the strongest knockdown zero counts can show.
+
+.. code-block:: python
+
+   ln_lfc = result.result["layers/logfoldchange_raw_ln"]   # or X with lfc_base="ln"
+   ln_se = result.result["layers/standard_error_ln"]
+   own_target = np.zeros(ln_lfc.shape, dtype=bool)         # each row's target gene column
+   shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target)
+   shrunk.lfc, shrunk.se, shrunk.prior_scale

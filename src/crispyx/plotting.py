@@ -300,7 +300,8 @@ def _materialize_rank_genes_groups_from_layers(
         lfc_layer = pick_layer(["logfoldchange", "logfoldchanges"])
         if lfc_layer is not None:
             rows["logfoldchanges"] = layer_row(lfc_layer)
-        elif backed.uns.get("method") == "nb_glm":
+        elif backed.uns.get("method") in ("nb_glm", "nb_offset"):
+            # the NB tests store the log fold change as X (de._RESULT_KEYS)
             rows["logfoldchanges"] = x_row
         for metric, options in (("pvals", ["pvalue", "pvals"]), ("pvals_adj", ["pvalue_adj", "pvals_adj"]), ("pts", ["pts"])):
             name = pick_layer(options)

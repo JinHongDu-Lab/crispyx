@@ -280,7 +280,7 @@ def test_csc_inputs(tmp_path, monkeypatch, policy):
     @contextlib.contextmanager
     def counting(*args, **kwargs):
         with original(*args, **kwargs) as path:
-            open_copies.append(sum(1 for p in out.iterdir() if p.name != ".x.h5ad.partial"))
+            open_copies.append(sum(1 for p in out.iterdir() if not p.name.endswith(".partial")))
             yield path
 
     monkeypatch.setattr(cx.data, "stream_on_fast_axis", counting)

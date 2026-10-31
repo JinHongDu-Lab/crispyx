@@ -122,7 +122,10 @@ def test_conversion_evicts_its_output_as_it_writes(tmp_path, monkeypatch, target
     out = tmp_path / "out.h5ad"
     CONVERT[target](src, output_path=out, chunk_size=7, memory_limit_gb=1e-6, verbose=False).close()
     _assert_canonical(out, dense, target)
-    written = [moved for name, moved in reported if name == ".out.h5ad.partial"]
+    written = [
+        moved for name, moved in reported
+        if name.startswith(".out.h5ad.") and name.endswith(".partial")
+    ]
     assert len(written) > 1
     assert sum(written) == np.count_nonzero(dense) * (dense.itemsize + 4)
 

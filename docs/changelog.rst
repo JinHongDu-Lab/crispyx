@@ -1,6 +1,147 @@
 Changelog
 =========
 
+Version 0.2.5
+-------------
+
+*Released 2026-10-31.* Utilities for preparing a published screen for analysis
+(recovering counts, assigning guides, collapsing split genes, checking the
+file), a fixed-offset NB test for many small perturbations against a large,
+stratified control set, and exact apeGLM shrinkage.
+
+**Added**
+
+* ``cx.pp.recover_counts``: the integer counts behind a matrix published as
+  ``log1p(normalize_total(counts))``, streamed. Each cell's scale factor is
+  its recorded total over its ``expm1`` sum (``n_counts_column``), or one
+  over its smallest non-zero value; a value that does not come out an integer
+  makes the call raise rather than round.
+* ``cx.pp.assign_guides``: the guide that dominates each cell's guide-capture
+  counts (at least ``min_umi`` UMIs and ``min_ratio`` times the runner-up),
+  ``NA`` otherwise, from an array, an AnnData or an h5ad streamed in blocks.
+* ``cx.pp.collapse_genes``: sums the rows of ``var`` that are one gene under
+  a caller-supplied key (a ``var`` column, a Series indexed by ``var_names``,
+  or one key per gene in ``var`` order), streamed,
+  dropping rows whose key is missing: Ensembl IDs that share a symbol,
+  ``_PAR_Y`` copies beside their X copies, ``var_names_make_unique`` suffixes,
+  rows of two annotation releases after a concatenation. ``var`` columns that
+  agree within every group are kept; ``n_source_genes`` records the rows per
+  gene.
+* ``cx.pp.check_data`` (``crispyx.qc.check_perturbation_data``): checks a
+  screen's file for the mistakes that mislead an analysis without failing it
+  (control synonyms left as perturbations, labels that are still guide names,
+  labels differing only by case, truncated hyphenated symbols, targets absent
+  from ``var``, duplicate gene names, genes split over several rows,
+  non-integer counts, row sums above the recorded totals, inconsistent
+  sparse pointers) and returns a list of ``Issue`` with a level;
+  ``raise_on_errors`` stops a pipeline on an error.
+* ``normalise_perturbation_labels(target_pattern=...)``: a regex with one
+  capture group that takes the target gene out of a guide name without
+  truncating hyphenated symbols such as ``NKX2-5`` or ``HLA-B``.
+* ``cx.tl.nb_offset_test``: the cell-level NB-GLM with a stratum covariate,
+  with the stratum effects fixed from one pass over the controls instead of
+  estimated jointly. Each perturbation is a one-parameter NB fit on its own
+  cells against the controls' per-stratum means (one pseudo-cell at the
+  pooled mean keeps a stratum's baseline above zero), at a control-only
+  dispersion or one given per gene; the cost is linear in the perturbed
+  cells, so a genome-wide screen whose perturbations have 20-40 cells spread
+  over hundreds of lane x donor strata, where the joint fit takes days, runs
+  in minutes. The result has ``nb_glm_test``'s layout and ``shrink_lfc``
+  accepts it (:ref:`nb-offset`). With ``covariates`` instead of ``strata``
+  the controls' GLM on any design (one-hot levels and continuous terms such
+  as the log cells per pseudo-bulk unit) is fitted once, with DESeq2's
+  dispersion steps on the controls alone, and each unit's baseline is its
+  fitted control mean: the pseudo-bulk analogue, where ``nb_glm_test`` with
+  the same covariates refits the control set in every fit.
+* ``cx.tl.shrink_lfc_arrays``: apeGLM shrinkage of fold changes given as
+  arrays, with ``exclude`` (entries kept as given and left out of the prior,
+  such as each perturbation's own target) and ``floor`` (a lower bound on a
+  fold change at the fitted-mean floor); returns the prior scale too.
+  ``crispyx.glm.cauchy_map`` is the posterior mode itself.
+* ``nb_glm_test``, ``nb_offset_test``, ``t_test`` and ``wilcoxon_test`` with
+  ``perturbations=[]`` write an empty result (0 x genes) instead of raising,
+  so a caller that splits perturbations between estimators needs no guard.
+  A file with no non-control group and no selection still raises, and so
+  does a selection that names only the control label (a mistake that would
+  otherwise write, and cache, an empty result).
+
+**Changed**
+
+* ``nb_glm_test`` with covariates sizes its worker pool from the cores asked
+  for, each with an equal share of ``memory_limit_gb``, and its dense gene
+  block from half that share (measured at 3-8 dense arrays of cells x
+  genes per fit, not the 16 assumed). The block was sized to a tenth of the
+  budget and then counted against every worker, which capped the pool at a
+  handful of workers however many cores and gigabytes there were. At
+  ``verbose=1`` the number of fits, and after the first fit its wall time
+  and the time remaining at that rate, are printed.
+* ``pb.aggregate`` writes ``X`` as CSR when at most half of its values are
+  non-zero (summed units of a few cells over tens of thousands of genes)
+  and dense otherwise; a genome-wide screen's pseudo-bulk of 170,000 units
+  was 47 GB dense and read in every fit. ``pb.effects`` takes such profiles
+  by column: read into memory as CSC when they fit half of
+  ``memory_limit_gb``, else through a temporary CSC copy, since a column
+  slice of a CSR file reads it whole.
+* ``nb_offset_test`` sizes each thread's dense cell block from its share of
+  a tenth of ``memory_limit_gb`` rather than giving every thread the whole
+  tenth, which committed ``n_jobs`` times the intended memory on a many-core
+  machine; and on a perturbation-sorted file it reads each perturbation's
+  cells, and the controls, as one slice of the matrix rather than row by
+  row (two or three HDF5 reads per cell, minutes over a million cells).
+  ``nb_glm_test``'s control pass and ``read_rows_csc`` read consecutive
+  rows the same way.
+* ``cx.pp.check_data`` samples a CSC file (``pp.convert_to_csc``) a window
+  of genes at a time: a window of rows read the whole matrix, eight times
+  over. The row-sum check against the recorded totals is skipped for such a
+  file, with a warning that says so.
+* ``shrink_lfc(method="stats")`` takes each entry's apeGLM posterior mode in
+  closed form (the real roots of a cubic) instead of iterating damped Newton
+  steps until the slowest entry of a block converges: every entry is at the
+  exact optimum, and a result of 150 million entries shrinks in about half a
+  minute rather than ten. Values move by less than 1e-6 from the iterated
+  ones.
+
+**Fixed**
+
+* ``nb_offset_test``'s control-only dispersion is unbiased over small
+  strata. The method-of-moments estimate takes each stratum's residuals
+  about the stratum's own baseline, which costs a degree of freedom per
+  stratum, but subtracted the full Poisson term; over hundreds of strata of
+  two to five controls the raw estimate fell to the floor (0.04 for a true
+  0.3 with two controls per stratum), the trend was fitted through it, and
+  every z-score was inflated. The expectation now carries the per-stratum
+  correction (the ``(n-1)/n`` of a sample variance, with size factors), and
+  a stratum of one control contributes nothing.
+* ``pb.effects`` failed on the CSR profiles ``pb.aggregate`` now writes for
+  mostly-zero units (``ValueError: setting an array element with a
+  sequence``), whether aggregated in the same call or given as a saved file.
+* The Scanpy-style readers (``pl.rank_genes_groups_df``,
+  ``pl.materialize_rank_genes_groups`` and the plots on them) left
+  ``logfoldchanges`` out of an ``nb_offset_test`` result, whose fold changes
+  are stored as ``X`` like ``nb_glm_test``'s.
+* Every function that writes an ``.h5ad`` output now writes it beside the
+  final name as a hidden partial file (``.<name>.<pid>-<host>.partial``) and
+  renames it into place only once the write is complete and its sparse
+  ``X`` pointers are consistent. A run that fails or is killed midway
+  (``normalize_total_log1p``, ``downsample_counts``, ``qc_summary``,
+  ``pb.normalized_effects`` used to fill their output in place) leaves the
+  previous output untouched instead of a truncated file a later call could
+  reuse, and two jobs writing the same output no longer rename each other's
+  half-written file into place. ``cx.data.check_sparse_layout`` performs the
+  pointer check on any file.
+
+**Documentation**
+
+* The README, :doc:`index`, :doc:`comparison`, :doc:`faq`, :doc:`installation`
+  and ``llms.txt`` state what crispyx does in the same terms, and stale
+  claims are gone: the NB-GLM is no longer described as a simplified model
+  without covariates, its agreement with PyDESeq2 is quoted from
+  :doc:`nb_glm` (z correlation 0.997-0.9999) rather than as an LFC
+  correlation of 0.97, the "2x faster" figure is replaced by a measured
+  time, memory is described as set by ``memory_limit_gb`` rather than by
+  dataset size, and a version that never existed is no longer cited in
+  :doc:`data_preparation`.
+
 Version 0.2.4
 -------------
 

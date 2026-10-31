@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NamedTuple, Sequence, get_args
 
@@ -26,10 +27,13 @@ from .data import (
     accepts_in_memory,
     AnnData,
     calculate_optimal_chunk_size,
+    convert_to_csc,
     ensure_gene_symbol_column,
+    get_matrix_storage_format,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    read_rows_csc,
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
@@ -60,7 +64,13 @@ def _resolve_candidates(
         unique = pd.Index(labels).unique().tolist()
     else:
         unique = [str(p) for p in perturbations]
-    return [label for label in unique if label not in (control_label, UNLABELLED)]
+    candidates = [label for label in unique if label not in (control_label, UNLABELLED)]
+    if perturbations is not None and unique and not candidates:
+        raise ValueError(
+            f"No perturbation groups available: the requested perturbations {unique[:5]} are only the "
+            f"control label '{control_label}' or unlabelled cells"
+        )
+    return candidates
 
 
 def _densify_block(block) -> np.ndarray:
@@ -586,7 +596,8 @@ def compute_normalized_effects(
     _messages.print_disk_estimate(verbose, log_name, _disk_estimate)
     _messages.vprint(verbose, log_name, f"{len(candidates)} perturbations × {n_genes} genes")
     _messages.print_saving(verbose, log_name, resolved_output)
-    adata.write(resolved_output)
+    with _replace_on_success(resolved_output) as partial:
+        adata.write(partial)
     return AnnData(resolved_output)
 
 
@@ -687,6 +698,42 @@ def _comparable_values(series: pd.Series) -> np.ndarray | None:
         return pd.factorize(series, use_na_sentinel=False)[0]
     except TypeError:  # unhashable values (lists, dicts) in an object column
         return None
+
+
+def _write_profiles(handle: h5py.File, profiles: np.ndarray, shape: tuple[int, int]) -> str:
+    """Write the accumulated profiles as ``X``, a block of rows at a time so
+    they are never in memory whole: CSR when at most half the values are
+    non-zero (pseudo-bulk of many small units is mostly zeros, and dense a
+    screen's 170k units x 35k genes is 47 GB to write and to read in every
+    fit), dense otherwise (averages, bulk-like units). Returns a word for
+    the message."""
+    n_rows, n_cols = shape
+    blocks = list(_row_blocks(n_rows, n_cols))
+    nnz = sum(int(np.count_nonzero(profiles[sl])) for sl in blocks)
+    if n_rows * n_cols == 0 or nnz > 0.5 * n_rows * n_cols:
+        out = _create_unfilled_array(handle, "X", shape, np.float64)
+        for sl in blocks:
+            out[sl] = profiles[sl]
+        return "dense"
+    grp = handle.create_group("X")
+    grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+    grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+    grp.attrs["shape"] = np.array([n_rows, n_cols], dtype=np.int64)
+    chunks = (min(262144, max(8192, nnz // 16)),) if nnz >= 8192 else None
+    data = grp.create_dataset("data", shape=(nnz,), dtype=np.float64, chunks=chunks)
+    indices = grp.create_dataset("indices", shape=(nnz,), dtype=np.int32, chunks=chunks)
+    indptr = grp.create_dataset("indptr", shape=(n_rows + 1,), dtype=np.int64)
+    indptr[0] = 0
+    offset = 0
+    for sl in blocks:
+        csr = sparse.csr_matrix(profiles[sl])
+        csr.sort_indices()
+        if csr.nnz:
+            data[offset:offset + csr.nnz] = csr.data
+            indices[offset:offset + csr.nnz] = csr.indices.astype(np.int32, copy=False)
+        indptr[sl.start + 1:sl.stop + 1] = csr.indptr[1:].astype(np.int64) + offset
+        offset += csr.nnz
+    return f"as CSR ({nnz / (n_rows * n_cols):.0%} non-zero)"
 
 
 @accepts_in_memory
@@ -997,11 +1044,8 @@ def aggregate_pseudobulk(
             with _replace_on_success(resolved_output) as partial:
                 ad.AnnData(obs=obs, var=var, uns=uns).write(partial)
                 with h5py.File(partial, "r+") as handle:
-                    # A block of rows at a time, so the profiles are never
-                    # in memory whole.
-                    out = _create_unfilled_array(handle, "X", (len(keys), backed.n_vars), np.float64)
-                    for sl in _row_blocks(len(keys), backed.n_vars):
-                        out[sl] = profiles[sl]
+                    stored = _write_profiles(handle, profiles, (len(keys), backed.n_vars))
+            _messages.vprint(verbose, "pb.aggregate", f"X written {stored}")
             profiles._mmap.close()  # type: ignore[attr-defined]
     finally:
         backed.file.close()
@@ -1021,6 +1065,37 @@ def _has_pseudobulk_marker(path: Path) -> bool:
         return bool(marker.get("is_pseudobulk", False))
     finally:
         backed.file.close()
+
+
+@contextmanager
+def _profiles_by_column(bulk: ad.AnnData, path: Path, memory_limit_gb: float | None, verbose: int | bool):
+    """``bulk``'s profiles as a matrix whose column slices are cheap.
+
+    The backed matrix itself when the file is dense or CSC. A CSR file
+    (:func:`aggregate_pseudobulk` writes mostly-zero profiles as CSR, and a
+    column slice of a backed CSR matrix reads the whole file) is read into
+    memory as CSC when its non-zeros fit half the budget, else converted
+    to a temporary CSC file for the duration of the block.
+    """
+    if get_matrix_storage_format(path) != "csr":
+        yield bulk.X
+        return
+    with h5py.File(path, "r") as handle:
+        nnz = int(handle["X/data"].shape[0])
+    if nnz * 12 <= 0.5 * _resolve_memory_limit_bytes(memory_limit_gb):
+        _messages.vprint(verbose, "pb.effects", f"reading the {bulk.n_obs} CSR profiles into memory by column")
+        yield read_rows_csc(path, np.arange(bulk.n_obs))
+        return
+    with tempfile.TemporaryDirectory(prefix="cx_pb_effects_csc_") as tmpdir:
+        csc_path = Path(tmpdir) / "profiles_csc.h5ad"
+        _messages.vprint(verbose, "pb.effects", f"the {bulk.n_obs} CSR profiles exceed the memory budget; "
+                                                "writing a temporary CSC copy")
+        convert_to_csc(path, output_path=csc_path, memory_limit_gb=memory_limit_gb, verbose=False).close()
+        csc = read_backed(csc_path)
+        try:
+            yield csc.X
+        finally:
+            csc.file.close()
 
 
 @accepts_in_memory
@@ -1239,7 +1314,8 @@ def compute_pseudobulk_effects(
             gene_chunk = min(512, max(bulk.n_vars, 1))
             # Each block of genes goes straight into the output's (rows,
             # gene block) HDF5 chunks, so no step holds a whole matrix.
-            with _replace_on_success(resolved_output) as partial:
+            with _replace_on_success(resolved_output) as partial, \
+                    _profiles_by_column(bulk, bulk_path, memory_limit_gb, verbose) as profiles:
                 ad.AnnData(obs=obs, var=bulk.var.copy(), uns=uns).write(partial)
                 with h5py.File(partial, "r+") as handle:
                     shape = (n_output, bulk.n_vars)
@@ -1250,7 +1326,7 @@ def compute_pseudobulk_effects(
                     )
                     for start in range(0, bulk.n_vars, gene_chunk):
                         end = min(start + gene_chunk, bulk.n_vars)
-                        source = np.asarray(bulk.X[:, start:end], dtype=np.float64)
+                        source = _densify_block(profiles[:, start:end])
                         target_chunk = source[target_rows_arr]
                         reference_chunk = source[control_rows_arr]
                         if aggregate_batches:

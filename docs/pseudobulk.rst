@@ -40,7 +40,11 @@ profile, so donor-level covariates (sex, age, disease) arrive with the
 profiles; columns that vary within a profile (a per-cell QC metric) are left
 out and listed at ``verbose=1``. A description of the aggregation is under
 ``uns['crispyx_pseudobulk']``, and the input and arguments it was computed
-from under ``uns['crispyx']``.
+from under ``uns['crispyx']``. ``X`` is written as CSR when at most half of
+its values are non-zero (summed units of a few cells each, over tens of
+thousands of genes), and dense otherwise, so a genome-wide screen's
+pseudo-bulk is a fraction of the dense size to write and to read in every
+fit.
 
 ``perturbations`` restricts which profiles are returned. A profile is kept when
 any of its grouping values matches, so the argument selects on whichever column
