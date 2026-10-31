@@ -89,7 +89,7 @@ there are.
 
 When each stratum holds thousands of control cells against a perturbation's
 handful, the controls dominate the stratum effects and the two fits agree:
-on a targeted iPSC-cardiomyocyte screen with every perturbation on the cell
+on a targeted iPSC-derived screen with every perturbation on the cell
 fallback, genes with a control mean of at least 0.5 counts per cell gave
 ``beta`` correlation 0.9992, median \|Δbeta\| 0.0035 and a median standard
 error ratio of 0.99; over all tested genes the offset standard error is
