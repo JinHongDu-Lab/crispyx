@@ -30,10 +30,15 @@ distance outlier replacement is not done (see :ref:`pydeseq2-parity`).
   controls) take 6.3 h and 2.8 GB on 32 cores.
 * **With covariates** (or ``lfc_shrinkage_type="apeglm"``, or
   ``targets_per_fit > 1``), each comparison is fitted on all its cells. The
-  controls are held sparse and the genes are fitted a block at a time, the
-  block sized from ``memory_limit_gb``, so memory grows with the cells times
-  the block rather than times every gene. The time still grows with the
-  number of controls.
+  controls are held sparse and shared by the workers, which are the cores
+  asked for, each with an equal share of ``memory_limit_gb``; a fit holds
+  its genes dense a block at a time, the block sized to half that share, so
+  memory grows with the cells times the block rather than times every gene.
+  The time still grows with the number of controls, and every fit refits
+  them: the first fit's wall time and the number of fits are printed at
+  ``verbose=1``, so a multi-day run is visible before it is committed to.
+  Where the controls are many and the perturbations small,
+  :ref:`nb_offset_test <nb-offset>` fits the controls once.
 * ``dispersion=<value>`` fixes one dispersion for every gene;
   ``shrink_dispersion=False`` tests at the gene-wise estimates.
 
@@ -86,6 +91,25 @@ there are.
        dispersion=None,             # or a per-gene array from the controls
    )
    shrunk = cx.shrink_lfc(result.result_path)   # the result has nb_glm_test's layout
+
+``strata`` is the closed form for one categorical column and builds no
+design matrix. For any other design, such as pseudo-bulk units with a
+stratum and the log cells per unit, ``covariates`` fits the controls' GLM
+once, with DESeq2's dispersion steps on the controls alone, and takes each
+unit's baseline from it; ``nb_glm_test`` with the same covariates refits the
+whole control set in every fit of ``targets_per_fit`` perturbations, which
+on a screen of 10,000 perturbations, 7,000 control units and 90 strata is
+about 45 minutes per fit of 50.
+
+.. code-block:: python
+
+   result = cx.tl.nb_offset_test(
+       "data/pseudobulk.h5ad",
+       perturbation_column="perturbation",
+       control_label="control",
+       covariates=["stratum", "log10_n_cells"],
+       size_factor_method="deseq2",
+   )
 
 When each stratum holds thousands of control cells against a perturbation's
 handful, the controls dominate the stratum effects and the two fits agree:

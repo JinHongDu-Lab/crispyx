@@ -622,6 +622,22 @@ _OPERATIONAL_ARGS = frozenset({
 })
 
 
+#: Dense ``cells x genes`` arrays a fit with covariates holds at once for a
+#: gene block (counts, means, weights and work arrays; measured at 3-8 times
+#: the block on synthetic designs), and the smallest block worth a worker.
+_DENSE_ARRAYS_PER_FIT = 8
+_MIN_BLOCK_GENES = 64
+
+
+def _format_duration(seconds: float) -> str:
+    """``12 s``, ``3.5 min`` or ``2.1 h``."""
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
 def _de_fingerprint(
     path: Path, call_args: dict, method: str, *, perturbation_column: str, control_label: str | None,
 ) -> dict:
@@ -2279,19 +2295,10 @@ def nb_glm_test(
         use_group_size = (
             int(np.percentile(pert_group_sizes, 95)) if len(pert_group_sizes) >= 10 else max_group_size
         )
-        # A fit's genes are dense a block at a time: its counts, means and the
-        # dispersion and IRLS work arrays, about 16 arrays of cells x genes.
-        # A block takes a tenth of the budget, so that several workers fit,
-        # and is sized for the largest fit.
-        largest_fit_cells = control_n + max_group_size * targets_per_fit
-        block_genes = int(min(n_genes, max(1, budget_gb * 1e9 * 0.1 / (largest_fit_cells * 8 * 16))))
         # Sparse sizes are nnz x 12 bytes (float64 data, int32 indices). A
-        # worker reads its perturbations' cells (CSR, then CSC) beside one
-        # block; the controls it shares with the parent.
+        # worker reads its perturbations' cells (CSR, then CSC); the
+        # controls it shares with the parent.
         fit_sparse_mb = use_group_size * targets_per_fit * nnz_per_cell * 12 * 2 / 1e6
-        block_mb = (control_n + use_group_size * targets_per_fit) * block_genes * 8 * 16 / 1e6
-        per_worker_mb = fit_sparse_mb + block_mb + 2000
-
         # The parent holds the sparse controls plus its own arrays. The
         # largest perturbation is sized on its own rather than by the p95
         # group above: its worker holds its counts however many cells it has
@@ -2302,12 +2309,7 @@ def nb_glm_test(
         # workers' threads, which number the cores asked for in all.
         irls_threads_mb = requested_n_jobs * 200
         base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + irls_threads_mb + 1000
-        available_mb = budget_gb * 1000
-        # Reserve 20% headroom for safety
-        usable_mb = available_mb * 0.8
-        remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
-        max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
-
+        usable_mb = budget_gb * 1000 * 0.8 - base_memory_mb  # 20% headroom
         # Dataset-size-aware caps
         full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
         if full_matrix_gb < 1.0:
@@ -2315,27 +2317,44 @@ def nb_glm_test(
             max_workers_by_size = max(4, n_groups // 2)
         else:
             max_workers_by_size = n_groups
+        # The workers are the cores asked for, each with an equal share of
+        # the budget left after the parent's arrays; a fit's dense gene
+        # block (_DENSE_ARRAYS_PER_FIT arrays of cells x genes) takes half
+        # the share. Fewer workers only when a share would not hold
+        # _MIN_BLOCK_GENES genes: a block sized to a fixed fraction of the
+        # budget would cap the pool at a handful of workers however many
+        # cores and gigabytes there are.
+        largest_fit_cells = control_n + max_group_size * targets_per_fit
+        block_cell_bytes = largest_fit_cells * 8 * _DENSE_ARRAYS_PER_FIT
+        min_block_mb = block_cell_bytes * _MIN_BLOCK_GENES / 1e6
 
-        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_fits)
-        if memory_limited_workers < effective_n_jobs:
-            if memory_limited_workers == n_fits and n_fits < max_workers_by_memory and n_fits < max_workers_by_size:
+        def block_genes_for(workers: int) -> int:
+            share_mb = usable_mb / workers - fit_sparse_mb - 500
+            return int(min(n_genes, max(_MIN_BLOCK_GENES, share_mb * 1e6 * 0.5 / block_cell_bytes)))
+
+        workers = max(1, min(effective_n_jobs, max_workers_by_size, n_fits))
+        while workers > 1 and usable_mb / workers - fit_sparse_mb - 500 < 2 * min_block_mb:
+            workers -= 1
+        if workers < effective_n_jobs:
+            if workers == n_fits and n_fits < max_workers_by_size:
                 limit_reason = "perturbation_count"
-            elif memory_limited_workers == max_workers_by_memory:
-                limit_reason = "memory"
-            elif memory_limited_workers == max_workers_by_size:
+            elif workers == max_workers_by_size:
                 limit_reason = "small_dataset"
             else:
-                limit_reason = "perturbation_count"
+                limit_reason = "memory"
             logger.info(
-                f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
-                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
-                f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
+                f"Memory-aware limiting: {effective_n_jobs} -> {workers} workers "
+                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, usable: {usable_mb:.0f}MB, "
+                f"per fit: {fit_sparse_mb:.0f}MB sparse + {block_cell_bytes * block_genes_for(workers) / 1e6:.0f}MB dense block)"
             )
-            effective_n_jobs = memory_limited_workers
+            effective_n_jobs = workers
     effective_n_jobs = max(1, effective_n_jobs)
 
     # For small number of perturbations to run, run sequentially to avoid overhead.
     use_parallel = n_fits >= 2 and (n_to_run >= 4 or targets_per_fit > 1) and effective_n_jobs > 1 and not two_group
+    if not two_group:
+        # A sequential run fits in the parent, with the whole budget.
+        block_genes = block_genes_for(effective_n_jobs if use_parallel else 1)
 
     def _fit_two_group_worker(group_idx: int, label: str, backed_x, rows) -> dict:
         """One perturbation against the control summary; same result as the
@@ -2384,6 +2403,14 @@ def nb_glm_test(
         logger.info(f"Fitting {n_to_run}/{n_groups} remaining perturbations with {effective_n_jobs} workers...")
     else:
         logger.info(f"Fitting {n_groups} perturbations with {effective_n_jobs} workers...")
+    if not two_group:
+        _messages.vprint(
+            verbose, "nb_glm_test",
+            f"{n_fits} fits of up to {targets_per_fit} perturbation(s) with the {control_n} controls, "
+            f"{effective_n_jobs if use_parallel else 1} at a time, {block_genes} genes per dense block",
+        )
+    fits_started = time.monotonic()
+    fits_done = 0
         
     # Track completed labels during this run
     newly_completed = list(completed_labels)  # Start with already completed
@@ -2458,6 +2485,7 @@ def nb_glm_test(
                     raise ValueError(by_label[label]["error"])
                 return by_label[label]
 
+            nonlocal fits_done
             try:
                 by_label, error = {candidates[r["group_idx"]]: r for r in compute()}, None
             except Exception as e:
@@ -2465,6 +2493,18 @@ def nb_glm_test(
             for label in labels_in_fit:
                 if label in unfinished:
                     _record(label, lambda label=label: fitted(label))
+            fits_done += 1
+            if fits_done == 1 and n_fits > 1:
+                # The first fit's wall time says what the run will cost, so
+                # a multi-day run is visible before it is committed to.
+                per_fit = time.monotonic() - fits_started
+                workers = effective_n_jobs if use_parallel else 1
+                remaining = (n_fits - 1) * per_fit / workers
+                _messages.vprint(
+                    verbose, "nb_glm_test",
+                    f"first fit took {_format_duration(per_fit)}; {n_fits - 1} more with {workers} worker(s): "
+                    f"about {_format_duration(remaining)} remaining",
+                )
 
         def _fit_or_fail(**kwargs) -> list[dict]:
             try:
@@ -2638,34 +2678,66 @@ def _offset_baseline(
     )
 
 
+@dataclass(frozen=True)
+class _DesignBaseline:
+    """The controls fitted once on a covariate design: per gene the
+    coefficients (NaN where the fit did not converge), the dispersion to
+    test at, and the controls' per-gene counts for the filters."""
+
+    coef: np.ndarray            # (genes, columns)
+    dispersion: np.ndarray
+    dispersion_raw: np.ndarray
+    dispersion_trend: np.ndarray
+    nnz: np.ndarray
+    total: np.ndarray
+    n_cells: int
+
+
+def _design_baseline(
+    control_counts: sp.csc_matrix, size_factors: np.ndarray, design: np.ndarray,
+    *, dispersion: "float | np.ndarray | None", min_mu: float, block_genes: int,
+) -> _DesignBaseline:
+    """The controls' GLM on ``design`` (intercept first), with DESeq2's
+    dispersion steps on the controls alone unless ``dispersion`` is given:
+    :func:`~crispyx.glm.fit_glm_deseq2` with no coefficient under test. Its
+    fitted means are the baseline of any cell with the same covariates."""
+    fit = fit_glm_deseq2(
+        design, [control_counts], size_factors, 0, dispersion=dispersion, shrink=True, min_mu=min_mu,
+        block_genes=block_genes,
+    )
+    coef = np.where(fit.coef_converged[:, None], fit.coef, np.nan)
+    return _DesignBaseline(
+        coef=coef, dispersion=fit.dispersion, dispersion_raw=fit.genewise_dispersion, dispersion_trend=fit.trend,
+        nnz=np.asarray(control_counts.getnnz(axis=0)).ravel(),
+        total=np.asarray(control_counts.sum(axis=0), dtype=np.float64).ravel(), n_cells=control_counts.shape[0],
+    )
+
+
 def _fit_offset_group(
-    y: sp.csr_matrix, s: np.ndarray, strata: np.ndarray, baseline: _OffsetBaseline, genes: np.ndarray,
+    y: sp.csr_matrix, base_of: "Callable[[slice], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
     *, min_mu: float, max_iter: int, tol: float, block_cells: int,
 ) -> dict:
-    """One perturbation's cells against the baseline: for each gene the
-    one-parameter NB fit of ``y_i ~ NB(s_i mean[b(i), g] exp(beta), alpha_g)``
-    by Fisher scoring, from the Poisson start ``ln(sum y / sum s mean)``.
-    ``beta`` is held above ``ln(min_mu) - ln(mean baseline)`` (the fitted-mean
-    floor) and below ``ETA_MAX``; its standard error is one over the root of
-    the Fisher information at the optimum. The cells are taken
-    ``block_cells`` at a time, so a large perturbation is never dense at once.
-    Returns natural-log ``lfc``, ``se``, ``converged`` and ``intercept`` (the
-    log of the cells' mean expected count under the baseline), NaN off
-    ``genes`` and where the baseline is zero."""
+    """One perturbation's cells against a baseline: for each gene the
+    one-parameter NB fit of ``y_i ~ NB(base_i exp(beta), alpha_g)`` by Fisher
+    scoring, from the Poisson start ``ln(sum y / sum base)``, where
+    ``base_of(cells)`` gives the cells' baseline means (size factor times the
+    control mean) as a dense block. ``beta`` is held above ``ln(min_mu) -
+    ln(mean baseline)`` (the fitted-mean floor) and below ``ETA_MAX``; its
+    standard error is one over the root of the Fisher information at the
+    optimum. The cells are taken ``block_cells`` at a time, so a large
+    perturbation is never dense at once. Returns natural-log ``lfc``, ``se``,
+    ``converged`` and ``intercept`` (the log of the cells' mean expected
+    count under the baseline), NaN off ``genes`` and where the baseline is
+    zero or undefined."""
     n_cells, n_genes = y.shape
-    alpha = baseline.dispersion
     blocks = [slice(start, min(start + block_cells, n_cells)) for start in range(0, n_cells, block_cells)]
-
-    def base_of(sl: slice) -> np.ndarray:
-        return s[sl, None] * baseline.mean[strata[sl]]
-
     bsum = np.zeros(n_genes)
     for sl in blocks:
         bsum += base_of(sl).sum(axis=0)
     ysum = np.asarray(y.sum(axis=0)).ravel()
     fit = np.zeros(n_genes, dtype=bool)
     fit[genes] = True
-    fit &= bsum > 0
+    fit &= np.isfinite(bsum) & (bsum > 0)
     lo = np.full(n_genes, ETA_MIN)
     with np.errstate(divide="ignore", invalid="ignore"):
         if min_mu > 0:
@@ -2725,6 +2797,7 @@ def nb_offset_test(
     control_label: str | None = None,
     reference: str | None = None,
     strata: str | None = None,
+    covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     size_factors: ArrayLike | None = None,
@@ -2773,19 +2846,29 @@ def nb_offset_test(
     pseudo-bulk unit can be formed and the joint fit takes days, runs in
     minutes.
 
-    The baseline of a stratum is ``(sum y + m_g) / (sum s + 1)`` over its
-    controls: one pseudo-cell at the pooled control mean ``m_g``, so that a
-    stratum whose controls happen to have no count of a gene gives a small
-    baseline rather than zero (which would send any count among the
-    perturbed cells to the upper bound of ``beta``). Cells of a stratum
-    without any control carry no baseline and are left out, with a warning.
-    The dispersion is fixed per gene: ``dispersion`` as given (one value, or
-    one per gene), or estimated from the controls by the method of moments
-    pooled over strata, with the parametric mean-dispersion trend standing in
-    for genes below 0.5 counts per unit size factor. ``beta`` is fitted by
-    Fisher scoring from its Poisson start, held above the fitted-mean floor
-    implied by ``min_mu`` and below ``exp(20)``; its standard error is the
-    Wald one at the optimum.
+    The baseline comes in two forms. With ``strata``, one categorical
+    column, it is the closed form: the stratum's control mean
+    ``(sum y + m_g) / (sum s + 1)``, one pseudo-cell at the pooled control
+    mean ``m_g``, so that a stratum whose controls happen to have no count
+    of a gene gives a small baseline rather than zero (which would send any
+    count among the perturbed cells to the upper bound of ``beta``); no
+    design matrix is built, so it suits hundreds of thousands of cells over
+    hundreds of lane x donor strata. The dispersion is then ``dispersion``
+    as given (one value, or one per gene), or the method-of-moments estimate
+    from the controls pooled over strata, with the parametric
+    mean-dispersion trend for genes below 0.5 counts per unit size factor.
+    With ``covariates``, any design (one-hot levels and continuous terms
+    such as the log cells per pseudo-bulk unit), the controls' GLM on
+    ``~ covariates`` is fitted once with DESeq2's dispersion steps on the
+    controls alone (:func:`~crispyx.glm.fit_glm_deseq2`), and each cell's
+    baseline is its fitted control mean, floored at ``min_mu``. This is the
+    pseudo-bulk analogue of the stratum baseline: ``nb_glm_test`` with the
+    same covariates refits the whole control set in every fit of
+    ``targets_per_fit`` perturbations, here it is fitted once. Cells whose
+    stratum or level has no control carry no baseline and are left out,
+    with a warning. ``beta`` is fitted by Fisher scoring from its Poisson
+    start, held above the fitted-mean floor implied by ``min_mu`` and below
+    ``exp(20)``; its standard error is the Wald one at the optimum.
 
     The result has the layout of :func:`nb_glm_test`'s (``X`` the fold
     change in ``lfc_base``, ``standard_error``, ``z_score``, ``pvalue``,
@@ -2810,8 +2893,12 @@ def nb_offset_test(
         common patterns when None.
     strata
         obs column of the stratum each cell belongs to (10x lane, donor, or
-        their combination as one string column). None fits one stratum, the
-        plain two-group comparison.
+        their combination as one string column). None, without
+        ``covariates``, fits one stratum, the plain two-group comparison.
+    covariates
+        obs columns of the controls' design instead of ``strata`` (not
+        both): string or categorical columns are one-hot encoded, numeric
+        ones enter as they are. The controls' design must have full rank.
     gene_name_column
         var column with gene symbols; None uses ``var_names``.
     perturbations
@@ -2846,8 +2933,11 @@ def nb_offset_test(
     verbose
         Print progress.
     memory_limit_gb
-        Bounds the cells a fit holds dense at a time (``None``: the memory
-        available). The baseline itself is ``strata x genes`` floats.
+        Bounds the cells a fit holds dense at a time, and with
+        ``covariates`` the genes the control fit holds dense at a time
+        (``None``: the memory available). The baseline itself is
+        ``strata x genes`` floats, or with ``covariates`` the controls'
+        sparse counts plus ``genes x columns`` coefficients.
     n_jobs
         Perturbations fitted concurrently, in threads (None or -1: all
         cores). The controls are read once, each perturbation's cells once.
@@ -2862,6 +2952,9 @@ def nb_offset_test(
     name = "nb_offset_test"
     if perturbations is not None:
         perturbations = [str(p) for p in perturbations]
+    covariates = list(covariates or [])
+    if strata is not None and covariates:
+        raise ValueError(f"{name}: give strata or covariates, not both (a stratum column can be one of the covariates)")
     call_args = dict(locals())
     call_args.pop("name")
     perturbation_column, control_label = resolve_group_reference_aliases(
@@ -2889,7 +2982,7 @@ def nb_offset_test(
     backed = read_backed(path)
     try:
         sample = backed.X[:, :256] if storage_format == "csc" else backed.X[:1024]
-        for column in (perturbation_column, strata):
+        for column in (perturbation_column, strata, *covariates):
             if column is not None and column not in backed.obs.columns:
                 raise KeyError(f"Column '{column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}")
         if size_factors is not None:
@@ -2932,6 +3025,33 @@ def nb_offset_test(
         else:
             stratum_codes, stratum_names = pd.factorize(backed.obs[strata].astype(str).to_numpy())
             stratum_codes = stratum_codes.astype(np.int64)
+        design_all = None
+        if covariates:
+            # The controls' design, with the same columns for every cell. A
+            # level of a categorical covariate that no control falls in is
+            # not estimable: the cells in it carry no baseline, and the level
+            # is replaced by one with controls before the one-hot encoding
+            # (their rows are never fitted), so the reference level and
+            # every column have controls and the design keeps full rank.
+            frame = backed.obs[covariates].copy()
+            unsupported_cell = np.zeros(labels.size, dtype=bool)
+            for column in covariates:
+                series = frame[column]
+                if series.dtype.kind in {"O", "U"} or isinstance(series.dtype, pd.CategoricalDtype):
+                    values = series.astype(str).to_numpy()
+                    missing = ~np.isin(values, np.unique(values[control_rows]))
+                    if missing.any():
+                        unsupported_cell |= missing
+                        values = values.copy()
+                        values[missing] = values[control_rows[0]]
+                    frame[column] = values
+            design_all, columns = build_design_matrix(
+                frame, covariate_columns=covariates, perturbation_indicator=np.zeros(labels.size), intercept=True,
+            )
+            keep_column = np.arange(design_all.shape[1]) != columns.index("perturbation")
+            design_all = np.ascontiguousarray(design_all[:, keep_column])
+            columns = [c for c, k in zip(columns, keep_column) if k]
+            check_full_rank(design_all[control_rows], columns, f"{name}, the controls' design")
         boundaries = {}
         if "sorting_metadata" in backed.uns:
             metadata = backed.uns["sorting_metadata"]
@@ -2944,27 +3064,43 @@ def nb_offset_test(
         size_factors = _global_size_factors(path, size_factor_method, chunk_size, labels, control_label)
     size_factors = np.asarray(size_factors, dtype=np.float64)
 
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
     # One pass over the controls: the baseline, the dispersion, the filters' counts.
-    backed = read_backed(path)
-    try:
-        def control_blocks():
-            for start in range(0, control_rows.size, 4096):
-                rows = control_rows[start:start + 4096]
-                yield rows, backed.X[rows, :]
+    if design_all is None:
+        backed = read_backed(path)
+        try:
+            def control_blocks():
+                for start in range(0, control_rows.size, 4096):
+                    rows = control_rows[start:start + 4096]
+                    yield rows, backed.X[rows, :]
 
-        baseline = _offset_baseline(
-            control_blocks(), size_factors, stratum_codes, n_strata, n_genes, dispersion=dispersion,
+            baseline = _offset_baseline(
+                control_blocks(), size_factors, stratum_codes, n_strata, n_genes, dispersion=dispersion,
+            )
+        finally:
+            backed.file.close()
+        has_baseline_cell = baseline.has_controls[stratum_codes]
+        no_baseline = f"{int((~baseline.has_controls).sum())} of {n_strata} strata have no control cell"
+    else:
+        # The controls' counts sparse in memory (as nb_glm_test's covariate
+        # path holds them), fitted a block of genes at a time within half
+        # the budget: _DENSE_ARRAYS_PER_FIT dense arrays of controls x genes.
+        control_counts = read_rows_csc(path, control_rows)
+        block_genes = int(min(n_genes, max(_MIN_BLOCK_GENES, budget * 0.5 / (control_rows.size * 8 * _DENSE_ARRAYS_PER_FIT))))
+        _messages.vprint(verbose, name, f"fitting the {control_rows.size} controls on {design_all.shape[1]} columns, "
+                                        f"{block_genes} genes at a time")
+        baseline = _design_baseline(
+            control_counts, size_factors[control_rows], design_all[control_rows], dispersion=dispersion,
+            min_mu=min_mu, block_genes=block_genes,
         )
-    finally:
-        backed.file.close()
+        del control_counts
+        has_baseline_cell = ~unsupported_cell
+        no_baseline = "some covariate levels have no control cell"
     drop_file_cache(path)
-    without_controls = ~baseline.has_controls
-    orphan_cells = int((without_controls[stratum_codes] & ~control_mask).sum())
+    orphan_cells = int((~has_baseline_cell & ~control_mask).sum())
     if orphan_cells:
         _messages.warn(
-            name,
-            f"{int(without_controls.sum())} of {n_strata} strata have no control cell; their {orphan_cells} "
-            "perturbed cells carry no baseline and are left out of the fits.",
+            name, f"{no_baseline}; their {orphan_cells} perturbed cells carry no baseline and are left out of the fits.",
         )
     n_control = baseline.n_cells
     pts_rest = (baseline.nnz / max(n_control, 1)).astype(np.float32)
@@ -2974,7 +3110,6 @@ def nb_offset_test(
     group_rows = {
         label: np.arange(*boundaries[label]) if label in boundaries else row_indices[label] for label in candidates
     }
-    budget = _resolve_memory_limit_bytes(memory_limit_gb)
     # A fit holds a block of cells dense in about five cells x genes arrays
     # (baseline, mean, weight, their products); a block takes a tenth of
     # the budget, so the threads' blocks fit beside the baseline.
@@ -3006,6 +3141,7 @@ def nb_offset_test(
             "control_label": control_label,
             "perturbation_column": perturbation_column,
             "strata": strata if strata is not None else "",
+            "covariates": covariates,
             "n_strata": int(n_strata),
             "pvalue_correction": corr_method,
             "size_factors": size_factors,
@@ -3039,13 +3175,23 @@ def nb_offset_test(
             min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert, min_cells_ctrl=min_cells_ctrl,
             min_cells_pert=min_cells_pert, min_total_count=min_total_count,
         )
-        keep = baseline.has_controls[codes]
+        keep = has_baseline_cell[rows]
         if not keep.any():
-            raise ValueError(f"every cell of '{label}' is in a stratum without controls")
+            raise ValueError(f"every cell of '{label}' is in a stratum or level without controls")
         if not keep.all():
-            y, s, codes = y[keep], s[keep], codes[keep]
+            y, s, codes, rows = y[keep], s[keep], codes[keep], rows[keep]
+        if design_all is None:
+            def base_of(sl: slice) -> np.ndarray:
+                return s[sl, None] * baseline.mean[codes[sl]]
+        else:
+            design_rows = design_all[rows]
+
+            def base_of(sl: slice) -> np.ndarray:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    eta = np.clip(design_rows[sl] @ baseline.coef.T, ETA_MIN, ETA_MAX)
+                return s[sl, None] * np.maximum(np.exp(eta), min_mu)
         result = _fit_offset_group(
-            y, s, codes, baseline, np.flatnonzero(valid), min_mu=min_mu, max_iter=max_iter, tol=tol,
+            y, base_of, baseline.dispersion, np.flatnonzero(valid), min_mu=min_mu, max_iter=max_iter, tol=tol,
             block_cells=block_cells,
         )
         tested = np.isfinite(result["lfc"]) & np.isfinite(result["se"]) & (result["se"] > 0)

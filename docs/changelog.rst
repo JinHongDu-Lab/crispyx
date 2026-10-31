@@ -46,7 +46,12 @@ stratified control set, and exact apeGLM shrinkage.
   cells, so a genome-wide screen whose perturbations have 20-40 cells spread
   over hundreds of lane x donor strata, where the joint fit takes days, runs
   in minutes. The result has ``nb_glm_test``'s layout and ``shrink_lfc``
-  accepts it (:ref:`nb-offset`).
+  accepts it (:ref:`nb-offset`). With ``covariates`` instead of ``strata``
+  the controls' GLM on any design (one-hot levels and continuous terms such
+  as the log cells per pseudo-bulk unit) is fitted once, with DESeq2's
+  dispersion steps on the controls alone, and each unit's baseline is its
+  fitted control mean: the pseudo-bulk analogue, where ``nb_glm_test`` with
+  the same covariates refits the control set in every fit.
 * ``cx.tl.shrink_lfc_arrays``: apeGLM shrinkage of fold changes given as
   arrays, with ``exclude`` (entries kept as given and left out of the prior,
   such as each perturbation's own target) and ``floor`` (a lower bound on a
@@ -59,6 +64,18 @@ stratified control set, and exact apeGLM shrinkage.
 
 **Changed**
 
+* ``nb_glm_test`` with covariates sizes its worker pool from the cores asked
+  for, each with an equal share of ``memory_limit_gb``, and its dense gene
+  block from half that share (measured at 3-8 dense arrays of cells x
+  genes per fit, not the 16 assumed). The block was sized to a tenth of the
+  budget and then counted against every worker, which capped the pool at a
+  handful of workers however many cores and gigabytes there were. At
+  ``verbose=1`` the number of fits, and after the first fit its wall time
+  and the time remaining at that rate, are printed.
+* ``pb.aggregate`` writes ``X`` as CSR when at most half of its values are
+  non-zero (summed units of a few cells over tens of thousands of genes)
+  and dense otherwise; a genome-wide screen's pseudo-bulk of 170,000 units
+  was 47 GB dense and read in every fit.
 * ``shrink_lfc(method="stats")`` takes each entry's apeGLM posterior mode in
   closed form (the real roots of a cubic) instead of iterating damped Newton
   steps until the slowest entry of a block converges: every entry is at the

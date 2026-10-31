@@ -181,3 +181,80 @@ def test_an_empty_selection_writes_an_empty_result_for_every_test(tmp_path):
     with pytest.raises(ValueError, match="No perturbation groups"):
         cx.nb_glm_test(tmp_path / "s.h5ad", perturbation_column="perturbation", control_label="control",
                        output_path=tmp_path / "none.h5ad", verbose=False)
+
+
+def _units(path: Path, *, n_ctrl=1500, n_strata=8, n_pert=8, units_per=12, n_genes=50, alpha=0.2, seed=5):
+    """Pseudo-bulk-like units: a stratum and a continuous covariate (log cells
+    per unit) shape every unit's mean; the controls are many, the
+    perturbations few units each."""
+    rng = np.random.default_rng(seed)
+    n = n_ctrl + n_pert * units_per
+    strata = rng.integers(0, n_strata, n)
+    logn = rng.normal(1.0, 0.3, n)
+    labels = np.array(["control"] * n_ctrl + [f"p{k}" for k in range(n_pert) for _ in range(units_per)])
+    base = np.exp(rng.uniform(np.log(1), np.log(50), n_genes))
+    stratum_effect = rng.normal(0, 0.4, (n_strata, n_genes))
+    slope = rng.normal(0.8, 0.2, n_genes)
+    beta = np.zeros((n_pert, n_genes))
+    beta[:, :15] = rng.normal(0, 0.8, (n_pert, 15))
+    pert = np.full(n, -1)
+    pert[n_ctrl:] = np.repeat(np.arange(n_pert), units_per)
+    effect = np.where(pert[:, None] >= 0, beta[np.maximum(pert, 0)], 0.0)
+    mu = base[None, :] * np.exp(stratum_effect[strata] + slope[None, :] * (logn[:, None] - 1.0) + effect)
+    counts = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "stratum": [f"s{b}" for b in strata], "logn": logn},
+                       index=[f"u{i}" for i in range(n)])
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])).write(path)
+    return beta
+
+
+def test_covariates_fit_the_controls_once_and_agree_with_the_joint_glm(tmp_path):
+    beta = _units(tmp_path / "u.h5ad")
+    offset = _run(tmp_path / "u.h5ad", tmp_path / "off.h5ad", covariates=["stratum", "logn"], dispersion=0.2,
+                  lfc_base="ln", min_mu=0.5, **NO_FILTERS)
+    joint = ad.read_h5ad(cx.nb_glm_test(
+        tmp_path / "u.h5ad", perturbation_column="perturbation", control_label="control",
+        covariates=["stratum", "logn"], dispersion=0.2, lfc_base="ln", min_mu=0.5,
+        output_path=tmp_path / "glm.h5ad", verbose=False, **NO_FILTERS,
+    ).result_path)
+    ok = np.isfinite(offset.X) & np.isfinite(joint.X)
+    assert ok.mean() > 0.95
+    assert np.median(np.abs(offset.X - joint.X)[ok]) < 0.05
+    assert 0.9 < np.median((offset.layers["standard_error"] / joint.layers["standard_error"])[ok]) < 1.1
+    assert np.corrcoef(offset.X[:, :15][ok[:, :15]], beta[:, :15][ok[:, :15]])[0, 1] > 0.9
+    assert list(offset.uns["covariates"]) == ["stratum", "logn"] and offset.uns["strata"] == ""
+    # the dispersion estimated from the controls alone is near the truth
+    estimated = _run(tmp_path / "u.h5ad", tmp_path / "est.h5ad", covariates=["stratum", "logn"], min_mu=0.5,
+                     **NO_FILTERS)
+    assert 0.1 < np.median(estimated.layers["dispersion"][0]) < 0.4
+    assert estimated.uns["dispersion_source"] == "controls"
+
+
+def test_covariate_levels_without_controls_drop_their_cells_and_both_designs_raise(tmp_path):
+    _units(tmp_path / "u.h5ad")
+    obs = cx.load_obs(tmp_path / "u.h5ad")
+    obs["stratum"] = obs["stratum"].astype(str)
+    obs.loc[obs["perturbation"] == "p1", "stratum"] = "orphan"
+    cx.write_obs(tmp_path / "u.h5ad", obs)
+    with pytest.warns(UserWarning, match="no control cell"):
+        result = cx.tl.nb_offset_test(
+            tmp_path / "u.h5ad", perturbation_column="perturbation", control_label="control",
+            covariates=["stratum", "logn"], output_path=tmp_path / "off.h5ad", verbose=False, **NO_FILTERS,
+        )
+    got = ad.read_h5ad(result.result_path)
+    assert np.isnan(got.X[got.obs_names.get_loc("p1")]).all()
+    assert np.isfinite(got.X[got.obs_names.get_loc("p0")]).sum() > 40
+    with pytest.raises(ValueError, match="not both"):
+        cx.tl.nb_offset_test(tmp_path / "u.h5ad", perturbation_column="perturbation", control_label="control",
+                             strata="stratum", covariates=["logn"], output_path=tmp_path / "x.h5ad", verbose=False)
+
+
+def test_nb_glm_covariate_path_reports_its_fits_and_timing(tmp_path, capsys):
+    _units(tmp_path / "u.h5ad", n_ctrl=300, n_pert=4, units_per=10, n_genes=20)
+    cx.nb_glm_test(
+        tmp_path / "u.h5ad", perturbation_column="perturbation", control_label="control", covariates=["stratum"],
+        targets_per_fit=2, dispersion=0.2, output_path=tmp_path / "glm.h5ad", verbose=True, n_jobs=1, **NO_FILTERS,
+    )
+    out = capsys.readouterr().out
+    assert "2 fits of up to 2 perturbation(s) with the 300 controls" in out
+    assert "first fit took" in out and "1 more with 1 worker(s)" in out
