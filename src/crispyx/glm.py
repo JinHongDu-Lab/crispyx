@@ -429,6 +429,54 @@ def _apeglm_prior_scale_from_blocks(blocks, init_scale: float = 1.0) -> float:
     return min(np.sqrt(scale_sq), 1.0)
 
 
+#: Entries solved per block in :func:`cauchy_map`, so its dozen temporaries
+#: stay around 300 MB however large the arrays are.
+_CAUCHY_MAP_BLOCK = 1 << 22
+
+
+def cauchy_map(mle: ArrayLike, se: ArrayLike, prior_scale: "float | ArrayLike") -> np.ndarray:
+    """The apeGLM posterior mode from an estimate and its standard error,
+    in closed form.
+
+    The mode minimises ``(b - mle)^2 / (2 se^2) + ln(1 + (b / prior_scale)^2)``,
+    a normal likelihood under a Cauchy prior. Its stationary points are the
+    real roots of the cubic ``b^3 - mle b^2 + (prior_scale^2 + 2 se^2) b -
+    mle prior_scale^2``: one root (Cardano's formula) or three (the
+    trigonometric form), of which the one with the lowest objective is the
+    mode. Elementwise over arrays of any shape, a block at a time;
+    ``prior_scale`` is a scalar or broadcasts to ``mle``. An entry with a
+    non-finite ``mle`` or ``se`` is NaN; ``se == 0`` returns ``mle``.
+    """
+    m_all = np.asarray(mle, dtype=np.float64)
+    out = np.full(m_all.shape, np.nan)
+    m_flat = m_all.reshape(-1)
+    v_flat = np.broadcast_to(np.asarray(se, dtype=np.float64), m_all.shape).reshape(-1)
+    scale = np.asarray(prior_scale, dtype=np.float64)
+    s2_flat = None if scale.ndim == 0 else np.broadcast_to(scale, m_all.shape).reshape(-1)
+    out_flat = out.reshape(-1)
+    for start in range(0, m_flat.size, _CAUCHY_MAP_BLOCK):
+        sl = slice(start, start + _CAUCHY_MAP_BLOCK)
+        m, v = m_flat[sl], v_flat[sl] ** 2
+        s2 = float(scale) ** 2 if s2_flat is None else s2_flat[sl] ** 2
+        valid = np.isfinite(m) & np.isfinite(v) & (s2 > 0)
+        a2, a1, a0 = -m, s2 + 2 * v, -m * s2
+        p = a1 - a2 ** 2 / 3
+        q = 2 * a2 ** 3 / 27 - a2 * a1 / 3 + a0
+        disc = (q / 2) ** 2 + (p / 3) ** 3
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            sq = np.sqrt(np.maximum(disc, 0))
+            one = np.cbrt(-q / 2 + sq) + np.cbrt(-q / 2 - sq)
+            r = 2 * np.sqrt(np.maximum(-p / 3, 0))
+            cos_arg = np.divide(3 * q, p * r, out=np.zeros_like(q), where=(p * r) != 0)
+            phi = np.arccos(np.clip(cos_arg, -1, 1)) / 3
+            roots = [np.where(disc > 0, one, r * np.cos(phi - 2 * np.pi * k / 3)) - a2 / 3 for k in range(3)]
+            objective = [np.where(v > 0, (b - m) ** 2 / (2 * v), 0.0) + np.log1p(b ** 2 / s2) for b in roots]
+        best = np.argmin(np.stack([np.where(np.isfinite(o), o, np.inf) for o in objective]), axis=0)
+        mode = np.choose(best, roots)
+        out_flat[sl] = np.where(valid, np.where(v > 0, mode, m), np.nan)
+    return out
+
+
 def _fit_gene_apeglm_lbfgsb(
     y: np.ndarray,
     design_matrix: np.ndarray,
@@ -788,8 +836,6 @@ def shrink_lfc_apeglm_from_stats(
     *,
     base_mean: np.ndarray | None = None,
     prior_scale: float | None = None,
-    max_iter: int = 100,
-    tol: float = 1e-8,
     use_gene_specific_prior: bool = True,
     hybrid_fallback: bool = True,
     hybrid_mle_se_threshold: float = 3.0,
@@ -800,24 +846,18 @@ def shrink_lfc_apeglm_from_stats(
     This is a memory-efficient, fully vectorized version of apeGLM shrinkage
     that uses pre-computed MLE coefficients and standard errors without
     requiring access to the full count matrix. It applies a Cauchy prior and
-    finds the MAP estimate using a damped Newton-Raphson optimization across
-    all genes simultaneously.
+    takes the posterior mode
 
-    Accuracy improvements (v2):
-
-    1. Gene-specific prior scales based on expression level (sqrt(base_mean)).
-    2. Moment-corrected SE using observed Fisher information approximation.
-    3. Hybrid fallback: marks genes with ``abs(MLE)/SE`` > threshold or low
-       expression for full NB-GLM re-fitting to achieve Eff rho >= 0.98.
-
-    The posterior mode is found by solving
     ``beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }``
-    which is the negative log posterior with a Cauchy prior.
 
-    This implementation uses a robust damped Newton method with Hessian
-    clamping to ensure convergence even when the standard Hessian becomes
-    negative (which can happen when ``abs(beta)`` > prior_scale). This matches
-    PyDESeq2's behavior which uses L-BFGS-B for robustness.
+    in closed form, gene by gene, with :func:`cauchy_map` (the real roots of
+    a cubic; the one with the lowest objective), so every gene is at the
+    exact optimum in a few array passes.
+
+    Also: gene-specific prior scales based on expression level
+    (``sqrt(base_mean)``), and a hybrid-fallback mask marking genes with
+    ``abs(MLE)/SE`` above a threshold or low expression for full NB-GLM
+    re-fitting.
     
     Parameters
     ----------
@@ -835,10 +875,6 @@ def shrink_lfc_apeglm_from_stats(
     prior_scale
         Base scale parameter for Cauchy prior. If None, estimated adaptively.
         When use_gene_specific_prior=True, this is scaled per-gene.
-    max_iter
-        Maximum iterations for optimization.
-    tol
-        Convergence tolerance.
     use_gene_specific_prior
         If True, scale prior_scale by 1/sqrt(base_mean) per gene. This accounts
         for the fact that lowly-expressed genes have higher variance and should
@@ -858,7 +894,7 @@ def shrink_lfc_apeglm_from_stats(
     shrunk_se
         Posterior standard errors (n_genes,).
     converged
-        Boolean array indicating convergence for each gene (n_genes,).
+        True for every gene with finite statistics (the mode is exact).
     needs_full_refit
         Boolean array indicating genes that need full NB-GLM re-fitting (n_genes,).
         Only populated when hybrid_fallback=True, otherwise all False.
@@ -904,88 +940,11 @@ def shrink_lfc_apeglm_from_stats(
             needs_full_refit = needs_full_refit | (valid_mask & (base_mean < hybrid_base_mean_threshold))
         # For hybrid genes, we still compute stats approximation but mark for later refinement
     
-    # Pre-compute variance for valid genes
-    var_mle = np.where(valid_mask, mle_se ** 2, 1.0)  # Avoid div by zero
-    
-    # Apply moment correction to SE when xtwx_diag is provided
-    # This uses observed Fisher information instead of expected
-    if xtwx_diag is not None:
-        xtwx_diag = np.asarray(xtwx_diag, dtype=np.float64).ravel()
-        # Observed Fisher information correction: SE_corrected = SE * sqrt(expected/observed)
-        # For now, we use the provided xtwx_diag directly for posterior SE calculation
-        # This will be used after optimization
-    
-    # Initialize beta at zero (strong shrinkage initialization)
-    # This is more robust than starting at MLE for large |MLE|
-    beta = np.zeros_like(mle_lfc)
-    
-    # Track which genes are still active (not yet converged)
-    active = valid_mask.copy()
-    
-    # Objective function: f(beta) = (beta - mle)^2 / (2*var) + log(1 + (beta/s)^2)
-    def compute_objective(b):
-        return 0.5 * (b - mle_lfc)**2 / var_mle + np.log1p((b / gene_prior_scale)**2)
-    
-    # Damped Newton-Raphson with line search
-    for iteration in range(max_iter):
-        if not np.any(active):
-            break
-        
-        # Gradient: (beta - mle) / var + 2*beta / (s^2 + beta^2)
-        denom = prior_scale_sq + beta ** 2
-        grad = np.where(active,
-            (beta - mle_lfc) / var_mle + 2 * beta / denom,
-            0.0)
-        
-        # Hessian: 1/var + 2*(s^2 - beta^2) / (s^2 + beta^2)^2
-        hess_raw = 1.0 / var_mle + 2 * (prior_scale_sq - beta**2) / (denom**2)
-        
-        # CRITICAL FIX: Clamp Hessian to be positive definite
-        # When |beta| > s, the Cauchy Hessian becomes negative.
-        # We use the absolute value of the Hessian, which is equivalent to
-        # using gradient descent when the Hessian is negative (moving in 
-        # the direction that reduces the objective).
-        # Additionally, add a small regularization term for stability.
-        min_hess = 1.0 / (var_mle + prior_scale_sq)  # Minimum positive Hessian
-        hess = np.where(active,
-            np.maximum(np.abs(hess_raw), min_hess),
-            1.0)
-        
-        # Newton step (direction)
-        step = grad / hess
-        
-        # Line search with backtracking to ensure objective decreases
-        # This makes the algorithm globally convergent
-        alpha = np.ones(n_genes)  # Step size
-        f_old = compute_objective(beta)
-        
-        for _ in range(10):  # Max 10 backtracking iterations
-            beta_new = np.where(active, beta - alpha * step, beta)
-            f_new = compute_objective(beta_new)
-            
-            # Armijo condition: f(new) < f(old) - c * alpha * grad * step
-            # We use c=0.1 for relaxed condition
-            armijo_ok = f_new <= f_old - 0.1 * alpha * grad * step
-            
-            # Update step size for genes that don't satisfy Armijo
-            needs_backtrack = active & ~armijo_ok
-            if not np.any(needs_backtrack):
-                break
-            alpha = np.where(needs_backtrack, alpha * 0.5, alpha)
-        
-        beta_new = np.where(active, beta - alpha * step, beta)
-        
-        # Check convergence per gene
-        change = np.abs(beta_new - beta)
-        newly_converged = active & (change < tol)
-        converged |= newly_converged
-        active &= ~newly_converged
-        
-        beta = beta_new
-    
-    # Mark all remaining as converged (may have hit max_iter)
-    converged[active] = True  # They stopped updating even if not at tolerance
-    
+    var_mle = np.where(valid_mask, mle_se ** 2, 1.0)  # a unit variance where invalid keeps the SE finite
+    beta = np.where(valid_mask, cauchy_map(np.where(valid_mask, mle_lfc, 0.0), np.where(valid_mask, mle_se, 1.0),
+                                           gene_prior_scale), 0.0)
+    converged |= valid_mask
+
     # Compute posterior SE from inverse Hessian at MAP
     denom = prior_scale_sq + beta ** 2
     cauchy_hess = 2 * (prior_scale_sq - beta**2) / (denom**2)
