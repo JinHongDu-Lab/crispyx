@@ -826,6 +826,7 @@ def _wilcoxon_uns(
     perturbation_column: str,
     tie_correct: bool,
     corr_method: str,
+    distribution: str = "normal",
     batch_column: str | None = None,
     stratified_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -835,6 +836,7 @@ def _wilcoxon_uns(
         "control_label": control_label,
         "perturbation_column": perturbation_column,
         "tie_correct": bool(tie_correct),
+        "distribution": distribution,
         "pvalue_correction": corr_method,
         "stratified": batch_column is not None,
     }
@@ -3414,6 +3416,7 @@ def _wilcoxon_resumable_result(
     fingerprint: dict,
     chunk_size: int,
     batch_column: str | None = None,
+    distribution: str = "normal",
 ) -> ResumableRun:
     """The result file a Wilcoxon run fills one gene chunk at a time: the
     AUC in ``X``, the test's layers, and the control arm's detection rate as
@@ -3428,7 +3431,7 @@ def _wilcoxon_resumable_result(
         obs=_result_obs(candidates, perturbation_column), var=var,
         uns=_wilcoxon_uns(
             control_label=control_label, perturbation_column=perturbation_column,
-            tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
+            tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column, distribution=distribution,
         ),
         x_dtype=np.float64,
         layers={
@@ -3468,6 +3471,7 @@ def _wilcoxon_test_stratified(
     min_mean_ctrl: float,
     min_mean_pert: float,
     tie_correct: bool,
+    distribution: str,
     corr_method: str,
     output_path: Path,
     checkpoint_path: Path,
@@ -3501,7 +3505,7 @@ def _wilcoxon_test_stratified(
     run = _wilcoxon_resumable_result(
         output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
         perturbation_column=perturbation_column, control_label=control_label,
-        tie_correct=tie_correct, corr_method=corr_method, resume=resume,
+        tie_correct=tie_correct, corr_method=corr_method, resume=resume, distribution=distribution,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="stratified", chunk_size=int(chunk_size)),
         chunk_size=chunk_size,
         batch_column=batch_column,
@@ -3785,6 +3789,7 @@ def _wilcoxon_test_stratified(
                         pert_ptr,
                         valid_masks_2d,
                         tie_correct,
+                        distribution == "hypergeometric",
                         valid_u,
                         valid_z,
                         valid_p,
@@ -3922,6 +3927,7 @@ def wilcoxon_test(
     min_mean_pert: float = 0.005,
     chunk_size: int | None = None,
     tie_correct: bool = True,
+    distribution: Literal["normal", "hypergeometric"] = "normal",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     data_name: str | None = None,
     output_path: str | Path | None = None,
@@ -4012,6 +4018,20 @@ def wilcoxon_test(
     tie_correct
         Whether to apply tie correction to the U statistic. Default True for
         more accurate p-values when ties are present in the data.
+    distribution
+        The rank-sum test's null distribution. ``"normal"`` (default) is the
+        normal approximation, as in Scanpy. It fails where few cells
+        express a gene: almost every value is tied at zero, the count of
+        expressing cells that fall in the group is hypergeometric and very
+        skewed, and the normal tail is too thin by orders of magnitude (one
+        expressing cell of 232 against 3 of 30,000 controls: p 3e-8, against
+        a permutation p near 0.01), which makes such genes significant in
+        groups of control cells. ``"hypergeometric"`` keeps that count's
+        exact distribution in each stratum, with the rank sum given the
+        count normal, and comes within a small factor of the permutation
+        p-value. It differs from ``"normal"`` only where the count's
+        variance, summed over strata, is below 100; ``z_score`` and the AUC
+        are the same under both. It needs ``tie_correct=True``.
     corr_method
         Method for p-value correction: "benjamini-hochberg" or "bonferroni".
     data_name
@@ -4133,6 +4153,10 @@ def wilcoxon_test(
         fn_name="wilcoxon_test",
     )
     validate_format_mismatch_policy(format_mismatch_policy)
+    if distribution not in ("normal", "hypergeometric"):
+        raise ValueError(f"wilcoxon_test: distribution must be 'normal' or 'hypergeometric', got {distribution!r}")
+    if distribution == "hypergeometric" and not tie_correct:
+        raise ValueError("wilcoxon_test: distribution='hypergeometric' conditions on the ties; it needs tie_correct=True")
 
     path = resolve_data_path(data)
     output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
@@ -4211,7 +4235,7 @@ def wilcoxon_test(
             output_path, checkpoint_path, candidates=[], gene_symbols=gene_symbols,
             perturbation_column=perturbation_column, control_label=control_label, tie_correct=tie_correct,
             corr_method=corr_method, resume=False, fingerprint=_checkpoint_fingerprint(fingerprint),
-            chunk_size=chunk_size or 1, batch_column=batch_column,
+            chunk_size=chunk_size or 1, batch_column=batch_column, distribution=distribution,
         )
         run.file["var/pts_rest"][...] = np.nan
         return _finish_result(
@@ -4249,6 +4273,7 @@ def wilcoxon_test(
                 min_mean_ctrl=min_mean_ctrl,
                 min_mean_pert=min_mean_pert,
                 tie_correct=tie_correct,
+                distribution=distribution,
                 corr_method=corr_method,
                 output_path=output_path,
                 checkpoint_path=checkpoint_path,
@@ -4274,6 +4299,7 @@ def wilcoxon_test(
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
             tie_correct=tie_correct,
+            distribution=distribution,
             corr_method=corr_method,
             output_path=output_path,
             checkpoint_path=checkpoint_path,
@@ -4301,6 +4327,7 @@ def _wilcoxon_test_standard(
     min_mean_ctrl: float,
     min_mean_pert: float,
     tie_correct: bool,
+    distribution: str,
     corr_method: str,
     output_path: Path,
     checkpoint_path: Path,
@@ -4332,7 +4359,7 @@ def _wilcoxon_test_standard(
     run = _wilcoxon_resumable_result(
         output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
         perturbation_column=perturbation_column, control_label=control_label,
-        tie_correct=tie_correct, corr_method=corr_method, resume=resume,
+        tie_correct=tie_correct, corr_method=corr_method, resume=resume, distribution=distribution,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="standard", chunk_size=int(chunk_size)),
         chunk_size=chunk_size,
     )
@@ -4526,6 +4553,7 @@ def _wilcoxon_test_standard(
                         pert_row_offsets,
                         valid_masks_2d,
                         tie_correct,
+                        distribution == "hypergeometric",
                         _ZERO_PARTITION_THRESHOLD,
                         valid_u,
                         valid_z,

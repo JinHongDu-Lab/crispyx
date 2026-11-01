@@ -4,11 +4,13 @@ Changelog
 Version 0.2.6
 -------------
 
-*Unreleased.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, and shrinkage toward each gene's shared response.
+*Unreleased.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, shrinkage toward each gene's shared response, and a Wilcoxon null that holds for genes few cells express.
 
 **Added**
 
 * ``cx.tl.shrink_lfc_arrays(centre="pooled", n_cells=)``: shrinks each perturbation's fold change toward its gene's pooled fold change across the perturbations, ``ln(sum_p n_p exp(lfc_p) / sum_p n_p)``, rather than toward zero, so noise goes to the response the perturbations share instead of removing it. The cell-count weights keep the centre unbiased for lowly expressed genes, where a precision-weighted mean drifts upward; upward fold changes with a standard error above 5 are left out, and a mean shift pools only the entries within three standard errors of the centre, so a few strong effects do not lift it while a shared response stays in. The result's ``centre`` holds it.
+
+* ``cx.tl.wilcoxon_test(distribution="hypergeometric")``: a rank-sum null that keeps the group's count of expressing cells hypergeometric in each stratum, with the rank sum given that count normal. For genes that few cells express, the default normal approximation gives p-values orders of magnitude too small (one expressing cell of 60 against 3 of 3,000 controls: 9e-4 against a permutation p of 0.08), which made groups of control cells as significant as real perturbations; the new null comes within about 1.5x of the permutation p-value, pooled or batch-stratified. The default stays ``"normal"`` (Scanpy's); ``z_score`` and the AUC are the same under both, and ``uns["distribution"]`` records the choice.
 
 **Changed**
 

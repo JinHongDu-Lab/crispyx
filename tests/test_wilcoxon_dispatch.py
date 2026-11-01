@@ -146,7 +146,7 @@ def test_presorted_kernel_matches_scipy_ranks(n_ctrl, n_pert, n_genes, sparsity,
     out[2] = 1.0
     _wilcoxon_batch_perts_presorted_numba(
         ctrl, flat, offsets, n_nz, n_z, _compute_ctrl_tie_sums(flat, offsets, n_nz),
-        pert, np.array([0, n_pert]), valid[None, :], tie_correct, 0.5, *out,
+        pert, np.array([0, n_pert]), valid[None, :], tie_correct, False, 0.5, *out,
     )
     expected = _reference_rank_test(ctrl, pert, valid, tie_correct)
     for name, a, e in zip(("u", "z", "p", "auc"), out[:, 0], expected):

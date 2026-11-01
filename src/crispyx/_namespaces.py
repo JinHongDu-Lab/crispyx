@@ -971,7 +971,7 @@ class _ToolsNamespace:
         if normalised == "wilcoxon":
             allowed = {
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
-                "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
+                "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct", "distribution",
                 "checkpoint_interval", "resume",
                 "batch_column",
                 "format_mismatch_policy",
