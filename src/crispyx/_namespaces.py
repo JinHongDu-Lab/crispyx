@@ -181,7 +181,9 @@ class _PreprocessingNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+        cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
+        memory_limit_gb: float | None = None,
+        sort_by_perturbation: bool = False,
         verbose: int | bool = True,
     ):
         result = quality_control_summary(
@@ -197,6 +199,8 @@ class _PreprocessingNamespace:
             data_name=data_name,
             output_path=output_path,
             cache_mode=cache_mode,
+            memory_limit_gb=memory_limit_gb,
+            sort_by_perturbation=sort_by_perturbation,
             verbose=verbose,
         )
         return result.filtered

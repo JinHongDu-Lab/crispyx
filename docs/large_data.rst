@@ -101,7 +101,10 @@ when ``verbose`` is on; the copy is reused by later runs on the same input,
 and passing it as the input skips the check. Sort once up front with
 ``cx.data.sort_by_perturbation`` for a file under those thresholds that is
 still slow (a smaller screen on a network filesystem), or for a script of
-your own that reads the cells of each perturbation.
+your own that reads the cells of each perturbation. When the file goes
+through QC first, ``cx.pp.qc_summary(..., sort_by_perturbation=True)`` writes
+the filtered file in that order directly, from the same passes over the
+source, so no separate sort is needed.
 
 NB-GLM then streams the CSR file:
 

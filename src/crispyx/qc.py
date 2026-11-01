@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Dict, Iterable, Literal, Tuple, Union
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from anndata.io import write_elem
 
 from . import _messages
 from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache
@@ -41,9 +43,30 @@ from .data import (
     load_obs,
     load_var,
     write_obs,
+    perturbation_sort_order,
+    sorting_metadata,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _kept_order(labels: np.ndarray, cell_mask: np.ndarray, control_label: str, sort: bool) -> np.ndarray | None:
+    """The kept cells' order in the output: perturbation order (controls
+    first) when ``sort``, else None for the source's order."""
+    return perturbation_sort_order(labels[cell_mask], control_label) if sort else None
+
+
+def _stamp_sorted(
+    output_path: Path, kept_labels: np.ndarray, order: np.ndarray, *, perturbation_column: str,
+    control_label: str, source_path: Path,
+) -> None:
+    """Record in a filtered file written in ``order`` that its cells are in
+    perturbation order, as :func:`~crispyx.data.sort_by_perturbation` does."""
+    with h5py.File(output_path, "r+") as handle:
+        write_elem(handle["uns"], "sorting_metadata", sorting_metadata(
+            kept_labels[order], order, perturbation_column=perturbation_column, control_label=control_label,
+            original_path=source_path,
+        ))
 
 
 @dataclass
@@ -227,9 +250,13 @@ class _DiskChunkCache:
         ------
         tuple
             (filtered_data, filtered_indices, n_cells_in_chunk)
+
+        Each call is a fresh pass over the cache: a writer that places rows
+        in a new order reads it once per band.
         """
         for handle in (self._data_file, self._indices_file):
-            handle.close()
+            if handle is not None:
+                handle.close()
         self._data_file = self._indices_file = None
         drop_file_cache(self._data_path)
         drop_file_cache(self._indices_path)
@@ -905,6 +932,7 @@ def _qc_in_memory(
     control_label: str,
     gene_name_column: str | None,
     output_path: Path,
+    sort_by_perturbation: bool = False,
 ) -> QualityControlResult:
     """Fast in-memory QC for small datasets (Option A).
     
@@ -1012,6 +1040,15 @@ def _qc_in_memory(
         if isinstance(adata_filtered.obs[_col].dtype, pd.CategoricalDtype):
             adata_filtered.obs[_col] = adata_filtered.obs[_col].cat.remove_unused_categories()
 
+    if sort_by_perturbation:
+        kept_labels = adata_filtered.obs[perturbation_column].astype(str).to_numpy()
+        order = perturbation_sort_order(kept_labels, control_label)
+        adata_filtered = adata_filtered[order].copy()
+        adata_filtered.uns["sorting_metadata"] = sorting_metadata(
+            kept_labels[order], order, perturbation_column=perturbation_column, control_label=control_label,
+            original_path=Path(path),
+        )
+
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with _replace_on_success(output_path) as partial:
@@ -1056,6 +1093,8 @@ def _qc_column_oriented(
     chunk_size: int,
     output_path: Path,
     verbose: int | bool = True,
+    sort_by_perturbation: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> QualityControlResult:
     """Column-oriented QC for large CSC datasets (Option B).
     
@@ -1164,6 +1203,7 @@ def _qc_column_oriented(
     gene_mask = gene_cell_counts >= min_cells_per_gene
     
     # Write filtered subset using existing function
+    order = _kept_order(labels, combined_cell_mask, control_label, sort_by_perturbation)
     write_filtered_subset(
         path,
         cell_mask=combined_cell_mask,
@@ -1171,7 +1211,12 @@ def _qc_column_oriented(
         output_path=output_path,
         chunk_size=chunk_size,
         var_assignments={"gene_symbols": gene_names[gene_mask]},
+        row_order=order,
+        memory_limit_gb=memory_limit_gb,
     )
+    if order is not None:
+        _stamp_sorted(output_path, labels[combined_cell_mask], order, perturbation_column=perturbation_column,
+                      control_label=control_label, source_path=Path(path))
     
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)
@@ -1205,6 +1250,8 @@ def _qc_row_oriented(
     cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
     delta_threshold: float = 0.3,
     verbose: int | bool = True,
+    sort_by_perturbation: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> QualityControlResult:
     """Row-oriented streaming QC for large CSR/dense datasets.
     
@@ -1344,6 +1391,7 @@ def _qc_row_oriented(
     
     gene_mask = gene_filter_result.gene_mask
     
+    order = _kept_order(labels, combined_cell_mask, control_label, sort_by_perturbation)
     try:
         write_filtered_subset(
             path,
@@ -1356,10 +1404,15 @@ def _qc_row_oriented(
             total_nnz=gene_filter_result.total_nnz,
             data_dtype=gene_filter_result.data_dtype,
             chunk_cache=chunk_cache,
+            row_order=order,
+            memory_limit_gb=memory_limit_gb,
         )
     finally:
         if chunk_cache is not None:
             chunk_cache.cleanup()
+    if order is not None:
+        _stamp_sorted(output_path, labels[combined_cell_mask], order, perturbation_column=perturbation_column,
+                      control_label=control_label, source_path=Path(path))
 
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)
@@ -1661,6 +1714,7 @@ def quality_control_summary(
     cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
     delta_threshold: float = 0.3,
     force_streaming: bool = False,
+    sort_by_perturbation: bool = False,
     verbose: int | bool = True,
 ) -> QualityControlResult:
     """Run QC with automatic strategy selection for optimal performance.
@@ -1715,6 +1769,13 @@ def quality_control_summary(
     force_streaming
         If True, always use streaming path regardless of data size.
         Useful for testing or memory-constrained environments.
+    sort_by_perturbation
+        Write the filtered file with its cells in perturbation order, the
+        controls first, as :func:`~crispyx.data.sort_by_perturbation` would
+        (``uns["sorting_metadata"]`` included), so ``nb_glm_test`` and
+        ``nb_offset_test`` read each perturbation as one block without a
+        separate sort. The kept cells are placed from the same passes over
+        the source, in bands that fit half of ``memory_limit_gb``.
         
     Returns
     -------
@@ -1723,6 +1784,10 @@ def quality_control_summary(
         is None), and QC statistics.
     """
     path = resolve_data_path(data)
+    if cache_mode not in ("memory", "disk", "none"):
+        raise ValueError(f"qc_summary: cache_mode must be 'memory', 'disk' or 'none', got {cache_mode!r}")
+    if sort_by_perturbation and output_dir is None and output_path is None:
+        raise ValueError("qc_summary: sort_by_perturbation orders the filtered file; give output_path")
     _messages.print_reading(verbose, "pp.qc_summary", path)
     
     # Read metadata and resolve control label
@@ -1829,7 +1894,7 @@ def quality_control_summary(
             verbose, "pp.qc_summary",
             f"Strategy — in-memory ({file_size_gb:.1f} GB, estimated {estimated_memory_gb:.1f} GB in memory)",
         )
-        result = _qc_in_memory(path, **common_kwargs)
+        result = _qc_in_memory(path, sort_by_perturbation=sort_by_perturbation, **common_kwargs)
     
     elif storage_format == 'csc':
         # Option B: Column-oriented for large CSC
@@ -1841,7 +1906,10 @@ def quality_control_summary(
             f"Strategy — column-streaming ({file_size_gb:.1f} GB, estimated "
             f"{estimated_memory_gb:.1f} GB in memory{_chunk_note})",
         )
-        result = _qc_column_oriented(path, chunk_size=chunk_size, verbose=verbose, **common_kwargs)
+        result = _qc_column_oriented(
+            path, chunk_size=chunk_size, verbose=verbose, sort_by_perturbation=sort_by_perturbation,
+            memory_limit_gb=memory_limit_gb, **common_kwargs,
+        )
     
     else:
         # Row-oriented streaming for large CSR/dense
@@ -1859,6 +1927,8 @@ def quality_control_summary(
             cache_mode=cache_mode,
             delta_threshold=delta_threshold,
             verbose=verbose,
+            sort_by_perturbation=sort_by_perturbation,
+            memory_limit_gb=memory_limit_gb,
             **common_kwargs,
         )
 

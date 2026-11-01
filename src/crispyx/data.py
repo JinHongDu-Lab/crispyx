@@ -681,6 +681,7 @@ def _copy_extra_slots(
     varp_keys: Sequence[str],
     cell_mask: np.ndarray | None,
     gene_mask: np.ndarray | None,
+    row_order: np.ndarray | None = None,
 ) -> None:
     """Copy obsm/varm/obsp/varp from ``source`` (a backed AnnData, or
     :class:`_H5Slots` of an open h5ad) into ``output_path``, subsetting by ``cell_mask``/``gene_mask`` when given
@@ -699,6 +700,8 @@ def _copy_extra_slots(
             arr = np.asarray(source.obsm[key])
             if cell_mask is not None:
                 arr = arr[cell_mask]
+            if row_order is not None:
+                arr = arr[row_order]
             write_obsm_to_h5ad(f, key, arr)
         for key in varm_keys:
             arr = np.asarray(source.varm[key])
@@ -710,6 +713,8 @@ def _copy_extra_slots(
             mat = mat.tocsr() if sp.issparse(mat) else np.asarray(mat)
             if cell_mask is not None:
                 mat = mat[cell_mask][:, cell_mask]
+            if row_order is not None:
+                mat = mat[row_order][:, row_order]
             write_obsp_to_h5ad(f, key, mat)
         for key in varp_keys:
             mat = source.varp[key]
@@ -1945,9 +1950,16 @@ def _stream_write_matrix_subset(
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
     context: str,
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     """Stream the rows of ``segments``, one after another, into the CSR
     matrix ``dest_group`` (``X`` or a layer) of ``output_path``.
+
+    With ``row_order`` (the selected rows' positions, in the order they are
+    to be written), the rows are written in that order instead: placed by
+    :func:`_transpose_in_bands` from passes over the rows in source order,
+    in bands that fit half of ``memory_limit_gb``.
 
     A counting pass sizes ``data``/``indices``/``indptr`` once; the rows are
     then written in order without holding the matrix. One segment is
@@ -2005,8 +2017,9 @@ def _stream_write_matrix_subset(
             grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
             return
 
+        out_nnz = row_nnz if row_order is None else row_nnz[row_order]
         indptr = np.zeros(n_obs + 1, dtype=np.int64)
-        np.cumsum(row_nnz, out=indptr[1:])
+        np.cumsum(out_nnz, out=indptr[1:])
 
         # ~1 MB HDF5 chunks (8K to 256K elements), written from a buffer of
         # two chunks to keep the number of writes down.
@@ -2027,52 +2040,102 @@ def _stream_write_matrix_subset(
         grp.create_dataset("indptr", data=indptr)
         grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        offset = 0
-        data_buffer: list[np.ndarray] = []
-        indices_buffer: list[np.ndarray] = []
-        buffer_nnz = 0
-        evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
+        if row_order is None:
+            offset = 0
+            data_buffer: list[np.ndarray] = []
+            indices_buffer: list[np.ndarray] = []
+            buffer_nnz = 0
+            evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
 
-        def flush() -> None:
-            nonlocal offset, data_buffer, indices_buffer, buffer_nnz
-            if buffer_nnz:
-                data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
-                indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
-                offset += buffer_nnz
-                evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
-            data_buffer, indices_buffer, buffer_nnz = [], [], 0
+            def flush() -> None:
+                nonlocal offset, data_buffer, indices_buffer, buffer_nnz
+                if buffer_nnz:
+                    data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
+                    indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
+                    offset += buffer_nnz
+                    evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
+                data_buffer, indices_buffer, buffer_nnz = [], [], 0
 
-        def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
-            nonlocal buffer_nnz
-            if len(chunk_data):
-                data_buffer.append(chunk_data)
-                indices_buffer.append(chunk_indices)
-                buffer_nnz += len(chunk_data)
-                if buffer_nnz >= write_buffer_size:
-                    flush()
+            def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
+                nonlocal buffer_nnz
+                if len(chunk_data):
+                    data_buffer.append(chunk_data)
+                    indices_buffer.append(chunk_indices)
+                    buffer_nnz += len(chunk_data)
+                    if buffer_nnz >= write_buffer_size:
+                        flush()
 
+            if chunk_cache is not None:
+                # Cached CSR chunks of X (avoids re-reading the source matrix).
+                for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
+                    segments[0].gene_indices, data_dtype
+                ):
+                    append(filtered_data, filtered_indices)
+            else:
+                for segment in segments:
+                    for block in _segment_blocks(segment, chunk_size):
+                        if sp.issparse(block):
+                            csr = _ensure_csr(block, dtype=data_dtype)
+                            if not csr.has_sorted_indices:
+                                csr = csr.copy()
+                                csr.sort_indices()
+                            append(csr.data, csr.indices.astype(np.int32, copy=False))
+                        else:
+                            # Dense: numba-accelerated direct extraction.
+                            chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
+                                block, data_dtype
+                            )
+                            append(chunk_data, chunk_indices)
+            flush()
+
+    if row_order is not None:
+        _place_rows_in_order(
+            segments, dest_group=dest_group, n_vars=n_vars, output_path=output_path, chunk_size=chunk_size,
+            row_nnz=row_nnz, data_dtype=data_dtype, chunk_cache=chunk_cache, context=context,
+            row_order=row_order, indptr=indptr, memory_limit_gb=memory_limit_gb,
+        )
+
+
+def _place_rows_in_order(
+    segments: Sequence[_RowSegment], *, dest_group: str, n_vars: int, output_path: Path, chunk_size: int,
+    row_nnz: np.ndarray, data_dtype: np.dtype, chunk_cache: Any, context: str, row_order: np.ndarray,
+    indptr: np.ndarray, memory_limit_gb: float | None,
+) -> None:
+    """Fill :func:`_stream_write_matrix_subset`'s pre-sized ``dest_group``
+    with the selected rows in ``row_order``, as :func:`sort_by_perturbation`
+    places a source's rows."""
+    n_obs = row_order.shape[0]
+    dest = np.empty(n_obs, dtype=np.int64)
+    dest[row_order] = np.arange(n_obs)
+
+    def rows_in_source_order():
+        major0 = 0
         if chunk_cache is not None:
-            # Cached CSR chunks of X (avoids re-reading the source matrix).
-            for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
-                segments[0].gene_indices, data_dtype
-            ):
-                append(filtered_data, filtered_indices)
-        else:
-            for segment in segments:
-                for block in _segment_blocks(segment, chunk_size):
-                    if sp.issparse(block):
-                        csr = _ensure_csr(block, dtype=data_dtype)
-                        if not csr.has_sorted_indices:
-                            csr = csr.copy()
-                            csr.sort_indices()
-                        append(csr.data, csr.indices.astype(np.int32, copy=False))
-                    else:
-                        # Dense: numba-accelerated direct extraction.
-                        chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
-                            block, data_dtype
-                        )
-                        append(chunk_data, chunk_indices)
-        flush()
+            for data, indices, n_cells in chunk_cache.iter_filtered_chunks(segments[0].gene_indices, data_dtype):
+                chunk_indptr = np.zeros(n_cells + 1, dtype=np.int64)
+                np.cumsum(row_nnz[major0:major0 + n_cells], out=chunk_indptr[1:])
+                yield major0, sp.csr_matrix((data, indices, chunk_indptr), shape=(n_cells, n_vars))
+                major0 += n_cells
+            return
+        for segment in segments:
+            for block in _segment_blocks(segment, chunk_size):
+                csr = _ensure_csr(block, dtype=data_dtype) if sp.issparse(block) else sp.csr_matrix(
+                    np.asarray(block), dtype=data_dtype)
+                yield major0, csr
+                major0 += csr.shape[0]
+
+    minor_dtype = np.dtype(np.int32)
+    bands = _contiguous_bands(
+        row_nnz[row_order], per_item_bytes=np.dtype(data_dtype).itemsize + minor_dtype.itemsize,
+        budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
+    )
+    _transpose_in_bands(
+        output_path, output_path, source_path=segments[0].source_path,
+        chunks=lambda: _keyed_by_destination(rows_in_source_order(), dest, 0, n_obs),
+        n_chunks=-(-n_obs // chunk_size), bands=bands, indptr=indptr, value_dtype=np.dtype(data_dtype),
+        minor_dtype=minor_dtype, fn_name=context, band_kind="row", verbose=False, group=dest_group, label=context,
+    )
+
 
 
 def write_filtered_subset(
@@ -2088,6 +2151,8 @@ def write_filtered_subset(
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
     format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     """Stream a filtered AnnData view to disk without materialising ``X``.
 
@@ -2130,6 +2195,15 @@ def write_filtered_subset(
         What to do when ``X`` is CSC, which streaming by rows re-reads in
         full for every chunk; see :func:`stream_on_fast_axis`. A temporary
         CSR copy goes beside ``output_path``. Layers are streamed as stored.
+    row_order
+        The kept cells' order in the output, as positions among them (e.g.
+        :func:`perturbation_sort_order` of their labels); None keeps the
+        source's order. ``X``, the layers, ``obs``, ``obsm`` and ``obsp``
+        follow it, placed from passes over the source in its own order.
+    memory_limit_gb
+        With ``row_order``, bounds the reordered rows held before they are
+        written (half of it; ``None``: of the memory available), as in
+        :func:`sort_by_perturbation`.
     """
 
     source_path = Path(source_path)
@@ -2149,6 +2223,8 @@ def write_filtered_subset(
             data_dtype=data_dtype,
             chunk_cache=chunk_cache,
             format_mismatch_policy=format_mismatch_policy,
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
 
@@ -2165,9 +2241,13 @@ def _write_filtered_subset(
     data_dtype: np.dtype | None,
     chunk_cache: Any,
     format_mismatch_policy: str,
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     meta = _read_h5ad_metadata(source_path)
     obs = meta["obs"].iloc[cell_mask].copy()
+    if row_order is not None:
+        obs = obs.iloc[row_order]
     var = meta["var"].iloc[gene_mask].copy()
     obs.index = obs.index.astype(str)
     var.index = var.index.astype(str)
@@ -2232,6 +2312,8 @@ def _write_filtered_subset(
             data_dtype=data_dtype,
             chunk_cache=chunk_cache,
             context="write_filtered_subset (X)",
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
     for key in layer_keys:
@@ -2242,6 +2324,8 @@ def _write_filtered_subset(
             output_path=output_path,
             chunk_size=chunk_size,
             context=f"write_filtered_subset (layers/{key})",
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
     if obsm_keys or varm_keys or obsp_keys or varp_keys:
@@ -2255,6 +2339,7 @@ def _write_filtered_subset(
                 varp_keys=varp_keys,
                 cell_mask=cell_mask,
                 gene_mask=gene_mask,
+                row_order=row_order,
             )
 
 
@@ -5708,6 +5793,34 @@ def perturbation_sort_order(labels: np.ndarray, control_label: str) -> np.ndarra
     return np.argsort(keys, kind="stable")
 
 
+def sorting_metadata(
+    sorted_labels: np.ndarray, sort_indices: np.ndarray, *, perturbation_column: str, control_label: str,
+    original_path: Path,
+) -> dict:
+    """``uns["sorting_metadata"]`` of a file whose cells are in perturbation
+    order: each label's ``[start, end)`` rows, the column and control, and
+    the order itself for files under 100,000 cells (``sort_indices``, rows
+    of the unsorted cells)."""
+    import datetime
+
+    boundaries: dict[str, list[int]] = {}
+    if sorted_labels.size:
+        starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
+        stops = np.r_[starts[1:], sorted_labels.size]
+        boundaries = {str(sorted_labels[a]): [int(a), int(b)] for a, b in zip(starts, stops)}
+    metadata = {
+        "original_path": str(original_path),
+        "sorted_by": perturbation_column,
+        "control_label": control_label,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "n_perturbations": len(boundaries),
+        "perturbation_boundaries": boundaries,
+    }
+    if len(sort_indices) < 100000:
+        metadata["sort_order"] = np.asarray(sort_indices).tolist()
+    return metadata
+
+
 def sort_by_perturbation(
     path: str | Path,
     perturbation_column: str = "perturbation",
@@ -5779,8 +5892,6 @@ def sort_by_perturbation(
     benefits row-wise (per-perturbation) access patterns used by NB-GLM. CSC
     files used by Wilcoxon do not need perturbation sorting.
     """
-    import datetime
-
     name = "sort_by_perturbation"
     path = Path(path)
     
@@ -5827,22 +5938,7 @@ def sort_by_perturbation(
         
         sort_indices = perturbation_sort_order(labels, control_label)
         label_order = [control_label] + sorted(set(labels) - {control_label})
-        
-        # Compute perturbation boundaries
-        sorted_labels = labels[sort_indices]
-        boundaries = {}
-        current_label = None
-        start_idx = 0
-        
-        for i, label in enumerate(sorted_labels):
-            if label != current_label:
-                if current_label is not None:
-                    boundaries[current_label] = [start_idx, i]  # Use list, not tuple
-                current_label = label
-                start_idx = i
-        if current_label is not None:
-            boundaries[current_label] = [start_idx, len(sorted_labels)]  # Use list, not tuple
-        
+
         # Read obs and var
         obs_sorted = backed.obs.iloc[sort_indices].copy()
         var = backed.var.copy()
@@ -5853,20 +5949,10 @@ def sort_by_perturbation(
     finally:
         backed.file.close()
     
-    # Add sorting metadata - convert all to h5ad-compatible types
-    # Note: boundaries values are [start, end] lists (tuples not serializable)
-    sorting_metadata = {
-        "original_path": str(path),
-        "sorted_by": perturbation_column,
-        "control_label": control_label,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "n_perturbations": len(label_order),
-        "perturbation_boundaries": boundaries,  # Dict[str, List[int]]
-    }
-    # Don't store full sort_order for large datasets (memory waste)
-    if len(sort_indices) < 100000:
-        sorting_metadata["sort_order"] = sort_indices.tolist()
-    uns["sorting_metadata"] = sorting_metadata
+    uns["sorting_metadata"] = sorting_metadata(
+        labels[sort_indices], sort_indices, perturbation_column=perturbation_column,
+        control_label=control_label, original_path=path,
+    )
     uns[_PROVENANCE_KEY] = stamp("sorted", fingerprint)
     
     # Create output file
