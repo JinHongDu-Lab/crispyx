@@ -340,3 +340,78 @@ class TestFilteringMessaging:
         with pytest.warns(UserWarning):
             filter_cells_by_gene_count(path, min_genes=1, verbose=False)
         assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+@pytest.mark.parametrize("strategy", ["memory", *_STRATEGIES, "row-disk-banded"])
+def test_sort_by_perturbation_writes_the_kept_cells_in_perturbation_order(tmp_path, monkeypatch, fmt, strategy):
+    import crispyx.data
+    from crispyx.data import needs_sorting_for_nbglm, perturbation_sort_order
+
+    path = _make_uneven_screen(tmp_path / f"{fmt}.h5ad", fmt)
+    with_slots = ad.read_h5ad(path)
+    with_slots.layers["counts"] = sp.csr_matrix(with_slots.X) * 2
+    with_slots.obsm["embedding"] = np.arange(with_slots.n_obs * 2, dtype=float).reshape(-1, 2)
+    with_slots.write_h5ad(path)
+    kw = dict(perturbation_column="perturbation", control_label="NTC", gene_name_column=None,
+              min_genes=4, min_cells_per_perturbation=15, min_cells_per_gene=20, sort_by_perturbation=True)
+    out = tmp_path / "sorted.h5ad"
+    if strategy == "memory":
+        result = _qc_in_memory(path, output_path=out, **kw)
+    else:
+        if strategy == "row-disk-banded":  # several row bands, one pass over the source each
+            monkeypatch.setattr(crispyx.data, "_conversion_buffer_budget_bytes", lambda _limit: 4_000)
+            strategy = "row-disk-delta"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = _STRATEGIES[strategy](path, out, **kw)
+    source = ad.read_h5ad(path)
+    kept = source[result.cell_mask][:, result.gene_mask]
+    order = perturbation_sort_order(kept.obs["perturbation"].astype(str).to_numpy(), "NTC")
+    reference = kept[order]
+    written = ad.read_h5ad(out)
+    pd.testing.assert_index_equal(written.obs_names, reference.obs_names)
+    np.testing.assert_array_equal(sp.csr_matrix(written.X).toarray(), sp.csr_matrix(reference.X).toarray())
+    np.testing.assert_array_equal(sp.csr_matrix(written.layers["counts"]).toarray(),
+                                  sp.csr_matrix(reference.layers["counts"]).toarray())
+    np.testing.assert_array_equal(written.obsm["embedding"], reference.obsm["embedding"])
+    labels = written.obs["perturbation"].astype(str).to_numpy()
+    assert labels[0] == "NTC" and (np.diff(pd.factorize(labels)[0]) >= 0).all()   # each group one block
+    metadata = written.uns["sorting_metadata"]
+    assert metadata["sorted_by"] == "perturbation" and metadata["control_label"] == "NTC"
+    assert list(metadata["perturbation_boundaries"]["NTC"]) == [0, int((labels == "NTC").sum())]
+    assert not needs_sorting_for_nbglm(out, "perturbation", min_cells=1, min_perturbations=1)
+
+
+def test_qc_summary_checks_cache_mode_and_needs_an_output_to_sort(tmp_path):
+    path = _make_uneven_screen(tmp_path / "csr.h5ad", "csr")
+    with pytest.raises(ValueError, match="cache_mode"):
+        quality_control_summary(path, perturbation_column="perturbation", cache_mode="memmap",
+                                output_path=tmp_path / "o.h5ad", verbose=False)
+    with pytest.raises(ValueError, match="output_path"):
+        quality_control_summary(path, perturbation_column="perturbation", sort_by_perturbation=True, verbose=False)
+
+
+@pytest.mark.parametrize("strategy", ["memory", *_STRATEGIES])
+def test_filtering_a_sorted_file_rebuilds_its_row_ranges(tmp_path, strategy):
+    """A filter keeps a sorted file's order, so its row ranges are rebuilt
+    from the kept cells rather than copied from the source."""
+    from crispyx.data import sort_by_perturbation
+
+    path = sort_by_perturbation(_make_uneven_screen(tmp_path / "raw.h5ad", "csr"), "perturbation", "NTC",
+                                output_path=tmp_path / "sorted.h5ad", verbose=False)
+    kw = dict(perturbation_column="perturbation", control_label="NTC", gene_name_column=None,
+              min_genes=4, min_cells_per_perturbation=15, min_cells_per_gene=20)
+    out = tmp_path / "filtered.h5ad"
+    if strategy == "memory":
+        result = _qc_in_memory(path, output_path=out, **kw)
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = _STRATEGIES[strategy](path, out, **kw)
+    assert not result.cell_mask.all()
+    labels = ad.read_h5ad(out).obs["perturbation"].astype(str).to_numpy()
+    boundaries = ad.read_h5ad(out).uns["sorting_metadata"]["perturbation_boundaries"]
+    assert set(boundaries) == set(labels)
+    for label, (start, stop) in boundaries.items():
+        assert (labels[start:stop] == label).all() and stop - start == (labels == label).sum()

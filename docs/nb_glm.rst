@@ -34,7 +34,10 @@ distance outlier replacement is not done (see :ref:`pydeseq2-parity`).
   asked for, each with an equal share of ``memory_limit_gb``; a fit holds
   its genes dense a block at a time, the block sized to half that share, so
   memory grows with the cells times the block rather than times every gene.
-  The time still grows with the number of controls, and every fit refits
+  A one-hot covariate (strata, batches) costs the dispersion search little:
+  its Cox-Reid term goes through the Schur complement of those columns, so
+  hundreds of levels do not mean factorising a matrix of hundreds of columns
+  at every step. The time still grows with the number of controls, and every fit refits
   them: the first fit's wall time and the number of fits are printed at
   ``verbose=1``, so a multi-day run is visible before it is committed to.
   Where the controls are many and the perturbations small,
@@ -78,7 +81,7 @@ factor) and, unless ``dispersion`` is given, a control-only dispersion per
 gene (method of moments pooled over strata, each stratum's residuals about
 its own mean corrected for the degree of freedom that mean costs, so strata
 of two or three controls do not pull the estimate to the floor; the
-parametric trend below 0.5 counts per cell). Each perturbation is then a one-parameter negative binomial
+parametric trend ``a0 + a1 / mean`` fitted above 0.5 counts per cell and used below it, flat when the genes above show no rise toward low means: below that mean the gene-wise moment estimates are too noisy, about half clipping at zero with a few thousand controls). Each perturbation is then a one-parameter negative binomial
 fit on its own cells, ``y_i ~ NB(s_i m_bg exp(beta), alpha_g)``, by Fisher
 scoring; the cost is linear in the perturbed cells, however many controls
 there are.
@@ -121,10 +124,13 @@ fallback, genes with a control mean of at least 0.5 counts per cell gave
 error ratio of 0.99; over all tested genes the offset standard error is
 larger at low counts (median ratio 1.15), where ``nb_glm_test`` shrinks
 each comparison's dispersion toward its trend and the offset test uses the
-control estimate. A stratum whose controls happen to have no count of a gene
-gets one pseudo-cell at the pooled control mean, so a single count among the
-perturbed cells does not send ``beta`` to its upper bound (the joint fit's
-stratum coefficient diverges there). Cells of a stratum without any control
+control estimate. A stratum's control mean has a prior worth one count at
+the pooled control mean, ``m (sum y + 1) / (m sum s + 1)``: a rare gene that
+happens to have no count among a stratum's controls stays near the pooled
+mean, so a single count among the perturbed cells does not send ``beta``
+toward its upper bound (the joint fit's stratum coefficient diverges there),
+while a gene that the controls' depth shows is absent from a stratum keeps a
+small baseline there. Cells of a stratum without any control
 carry no baseline and are left out, with a warning.
 
 Other options
@@ -398,3 +404,49 @@ the prior estimate; ``floor`` raises a fold change at the fitted-mean floor
    own_target = np.zeros(ln_lfc.shape, dtype=bool)         # each row's target gene column
    shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target)
    shrunk.lfc, shrunk.se, shrunk.prior_scale
+
+On a screen where most perturbations move a gene the same way, a prior
+centred on zero removes that shared response along with the noise.
+``centre="pooled"`` treats the arrays as perturbations x genes and shrinks
+each entry toward its gene's pooled fold change,
+``ln(sum_p n_p exp(lfc_p) / sum_p n_p)`` with ``n_cells`` as the weights
+``n_p``, and estimates the prior scale from the deviations. The weights must
+not depend on the estimates: for a lowly expressed gene, a perturbation that
+by chance has more reads has both a higher fold change and a smaller standard
+error, so an inverse-variance mean of the fold changes is biased upward, and
+on a real screen this made three quarters of the genes look up-regulated.
+Two kinds of entry are left out of the centre: upward fold changes with a
+standard error above 5 (where the dispersion is large, zero counts hardly
+constrain a fit, and a single count lifts it far above the mean count it
+reflects), and entries more than three standard errors from the centre,
+found by iterating from the pool of every entry, so that a few strong
+effects do not lift it while a response every perturbation shares stays in.
+The pool also needs the perturbations with no count of a gene, at the
+fitted-mean floor; the tests' default ``min_cells_pert=1`` leaves them NaN,
+which keeps only the perturbations that happened to have a count of a rare
+gene, so fit with ``min_cells_pert=0`` for a pooled centre. Those entries
+are bounds, not estimates (about -7 to -16 on cells, standard error of 100
+or more); the result's ``pts`` layer, the fraction of the perturbation's cells
+expressing the gene, is 0 exactly there, so ``pts > 0`` tells them apart
+without a threshold on the standard error.
+
+.. code-block:: python
+
+   labels = input_obs["perturbation"]                       # the counts file's obs
+   cells = labels.value_counts().reindex(result.result.obs_names).to_numpy()
+   shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target,
+                                    centre="pooled", n_cells=cells)
+   shrunk.centre                                            # per gene
+   estimable = np.isfinite(ln_lfc) & (result.result.layers["pts"] > 0)
+
+:func:`crispyx.tl.shrink_lfc` takes the same ``exclude``, ``floor``,
+``centre`` and ``n_cells`` on a result file (with the default
+``method="stats"``), reading it a block of rows at a time; ``exclude`` may be
+a scipy sparse matrix, and the pooled centre is written to
+``var["shrinkage_centre"]``:
+
+.. code-block:: python
+
+   own_target = scipy.sparse.csr_matrix(own_target)        # one True per row
+   shrunk = cx.tl.shrink_lfc(result.result_path, exclude=own_target,
+                             centre="pooled", n_cells=cells)

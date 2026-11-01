@@ -282,8 +282,8 @@ HPC / SLURM tips
 ~~~~~~~~~~~~~~~~~
 
 * Set ``memory_limit_gb`` to your SLURM ``--mem`` allocation.
-* Use ``resume=True`` and ``checkpoint_interval=10`` for long jobs that may
-  be preempted.
+* A preempted DE job continues where it stopped when resubmitted (``resume``
+  is on by default); ``checkpoint_interval=10`` saves progress more often.
 * ``drop_file_cache()`` is called automatically to prevent cgroup-cached
   pages from counting toward memory limits.
 
@@ -316,8 +316,9 @@ interrupted removes its partial file; a run killed outright (``SIGKILL``, an
 out-of-memory kill, a scheduler timeout) cannot, and leaves it for you to
 delete. Either way, whatever was at the output path before is still there. The
 resumable functions (``t_test``, ``wilcoxon_test``, ``nb_glm_test``,
-``batch_process``) keep their work file instead, so ``resume=True`` can
-continue it.
+``nb_offset_test``, ``batch_process``) keep their work file instead, so a rerun
+can continue it
+(by default for the DE tests, with ``resume=True`` for ``batch_process``).
 
 My DE result is loaded instantly on the second call — is that expected?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

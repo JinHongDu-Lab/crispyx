@@ -1,6 +1,35 @@
 Changelog
 =========
 
+Version 0.2.6
+-------------
+
+*Released 2026-11-01.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, shrinkage toward each gene's shared response, and a Wilcoxon null that holds for genes few cells express.
+
+**Added**
+
+* ``cx.tl.shrink_lfc_arrays(centre="pooled", n_cells=)``: shrinks each perturbation's fold change toward its gene's pooled fold change across the perturbations, ``ln(sum_p n_p exp(lfc_p) / sum_p n_p)``, rather than toward zero, so noise goes to the response the perturbations share instead of removing it. The cell-count weights keep the centre unbiased for lowly expressed genes, where a precision-weighted mean drifts upward; upward fold changes with a standard error above 5 are left out, and a mean shift pools only the entries within three standard errors of the centre, so a few strong effects do not lift it while a shared response stays in. The result's ``centre`` holds it.
+
+* ``cx.pp.qc_summary(sort_by_perturbation=True)`` writes the filtered file with its cells in perturbation order, the controls first, with ``uns["sorting_metadata"]`` as ``sort_by_perturbation`` writes it, so ``nb_glm_test`` and ``nb_offset_test`` read it without a separate sort. The kept rows of ``X`` and every layer are placed from the same passes over the source (in row bands within half of ``memory_limit_gb``), and ``obs``, ``obsm`` and ``obsp`` follow. ``cx.pp.qc_summary`` also takes ``memory_limit_gb``.
+* ``cx.tl.shrink_lfc`` on a result file takes ``exclude``, ``floor``, ``centre`` and ``n_cells`` as ``shrink_lfc_arrays`` does, a block of rows at a time (``method="stats"``, with the global or a per-comparison prior); ``exclude`` may be any scipy sparse matrix, and the pooled centre goes to ``var["shrinkage_centre"]`` (dropped when a pooled result is re-shrunk toward zero). ``method="stats"`` now computes the same closed form as ``shrink_lfc_arrays``: the same fold changes and SEs as before, except that an entry with a non-finite fold change or SE is NaN rather than passed through, and the hybrid-fallback log line is gone.
+* ``cx.tl.wilcoxon_test(distribution="hypergeometric")``: a rank-sum null that keeps the group's count of expressing cells hypergeometric in each stratum, with the rank sum given that count normal. For genes that few cells express, the default normal approximation gives p-values orders of magnitude too small (one expressing cell of 60 against 3 of 3,000 controls: 9e-4 against a permutation p of 0.08), which made groups of control cells as significant as real perturbations; the new null comes within about 1.5x of the permutation p-value, pooled or batch-stratified. The default stays ``"normal"`` (Scanpy's); ``z_score`` and the AUC are the same under both, and ``uns["distribution"]`` records the choice.
+
+**Changed**
+
+* ``cx.tl.t_test``, ``cx.tl.wilcoxon_test``, ``cx.tl.nb_glm_test`` and ``cx.tl.nb_offset_test`` resume an interrupted run by default (``resume=True``; ``nb_offset_test`` gains ``resume`` and ``checkpoint_interval``, saving the perturbations it has finished): rerunning a killed call continues from its checkpoint. A checkpoint is used only when it comes from the same crispyx version, input file and result-affecting arguments (``n_jobs`` and ``memory_limit_gb`` may differ); ``resume=False`` or ``force=True`` starts over. An in-memory AnnData does not resume unless asked, and ``rank_genes_groups`` passes ``resume`` through to the method. ``batch_process`` keeps ``resume=False``.
+* ``sort_by_perturbation`` reads its source in order and copies each row to its place, rather than gathering each output chunk's rows from across the file: a scattered 400k-cell gzip file sorts in 1.5 s instead of 84 s, with identical output. When the sorted matrix does not fit half of the new ``memory_limit_gb`` it is written in row bands, one sequential pass over the source each or, where page cache counts against the memory limit (a Slurm job), one pass spilling the later bands to disk, as the format converters do; a CSC source is read by columns, and a dense one in order like a sparse one. The sort shows a progress bar, and ``nb_glm_test`` and ``nb_offset_test`` pass their memory limit to it.
+* ``cx.tl.nb_offset_test`` with ``strata``: a stratum's control mean has a prior worth one count at the pooled control mean, ``m (sum y + 1) / (m sum s + 1)``, instead of one cell. A rare gene that happens to have no count among a stratum's controls stays near the pooled mean rather than hundreds of times below it, which with the large dispersion of such genes let a single count among the perturbed cells raise the fold change by 6-10 (ln) with a standard error above 5; a gene the controls' depth shows to be absent from a stratum still gets a small baseline there.
+* ``cx.tl.nb_glm_test`` with covariates takes the Cox-Reid adjustment of its dispersion search through the Schur complement of the design's one-hot block (strata, batches) instead of factorising the whole ``XᵀWX`` at every grid point of every gene: the search costs the strata times the other columns squared rather than the columns cubed, about 30 times faster at 600 strata, with the same dispersions to the search's tolerance.
+* ``cx.tl.nb_offset_test`` iterates only the tested genes that have not converged, instead of every gene of the matrix until the slowest converges: about twice as fast when the filters keep half the genes, with results unchanged to 1e-7.
+
+**Fixed**
+
+* A file filtered from one sorted by perturbation (``cx.pp.qc_summary`` without ``sort_by_perturbation``, a subsample or another cell filter) kept the source's ``uns["sorting_metadata"]`` row ranges, so ``nb_glm_test`` and ``nb_offset_test`` read each perturbation's cells from the source's row positions and fitted the wrong cells without warning. The ranges are now rebuilt from the kept cells, and dropped if they are no longer contiguous.
+* DE results written by an earlier release are recomputed rather than reused (result layout 4): ``nb_offset_test``'s stratum baselines and the saturated-fit convergence below change their values.
+* The NB IRLS fits judged convergence on the deviance change relative to the deviance floored at 1e-8, so a saturated fit (deviance near zero, e.g. ``nb_offset_test``'s controls with one unit per covariate level) never converged on rounding noise and its genes came back NaN; the change is now relative to ``|deviance| + 0.1``, DESeq2's ratio.
+* ``cx.tl.nb_offset_test`` raises when the controls leave no residual degrees of freedom for their dispersion (as many control units as design columns, or no stratum with two controls) and ``dispersion`` is not given, instead of returning dispersions at the search's bound.
+* ``cx.pp.qc_summary`` passed ``cache_mode="memmap"`` by default, which no QC path recognises, so the row-oriented path ran without its chunk cache and read the source again to write the filtered file. It now defaults to ``"disk"`` as ``quality_control_summary`` does, and an unknown ``cache_mode`` raises.
+
 Version 0.2.5
 -------------
 

@@ -80,6 +80,44 @@ For effect sizes and standard errors to go with the stratified p-values, and how
 this compares with the other ways of adjusting for batches, see
 :doc:`covariate_adjustment`.
 
+Genes expressed in few cells
+----------------------------
+
+The Wilcoxon p-value is, by default, Scanpy's normal approximation. It fails
+for a gene that few cells express: almost every value is tied at zero, the
+count of expressing cells that fall in the group is hypergeometric and very
+skewed, and the normal tail is far too thin. On a simulated group of 60
+cells against 3,000 controls:
+
+==========================================  ========  ==============  ===========
+Expressing cells (group / controls)         normal    hypergeometric  permutation
+==========================================  ========  ==============  ===========
+1 / 3                                       9.0e-04   7.0e-02         7.6e-02
+2 / 3                                       8.3e-10   1.4e-03         2.1e-03
+3 / 20                                      1.2e-04   4.9e-03         6.1e-03
+4 / 60                                      1.3e-02   2.7e-02         2.8e-02
+==========================================  ========  ==============  ===========
+
+So groups made of control cells get as many significant genes as real
+perturbations. A filter on expressing cells does not cure it: three cells of
+a group against 20 controls still gets p 1e-4 rather than 6e-3.
+``distribution="hypergeometric"`` keeps that count's exact distribution in
+each stratum, with the rank sum given the count normal, and comes within a
+factor of about 1.5 of the permutation p-value, pooled or with
+``batch_column``:
+
+.. code-block:: python
+
+   result = cx.tl.wilcoxon_test(
+       "screen_csc.h5ad", perturbation_column="perturbation", control_label="control",
+       distribution="hypergeometric",
+   )
+
+It changes the p-value only where the count's variance, summed over strata,
+is below 100, and leaves ``z_score`` and the AUC as they are. It costs
+nothing on the pooled test and about twice the rank-test time with
+``batch_column``. The default stays ``"normal"``, which matches Scanpy.
+
 Permutation nulls without copying the data
 ------------------------------------------
 

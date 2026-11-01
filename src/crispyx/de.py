@@ -66,7 +66,6 @@ from .glm import (
     fit_two_group_deseq2,
     summarize_controls,
     shrink_lfc_apeglm,
-    shrink_lfc_apeglm_from_stats,
     cauchy_map,
     fit_dispersion_trend,
     _estimate_apeglm_prior_scale,
@@ -90,6 +89,7 @@ from ._checkpoint import (
     _row_blocks,
 )
 from . import _messages
+from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
@@ -663,11 +663,12 @@ def _de_fingerprint(
 def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
     """A checkpoint's identity: the result ``fingerprint`` without
     ``scanpy_format``, which only changes the final write, plus the result
-    schema the saved values are in (a run interrupted by an older layout is
-    restarted, not finished in the new one) and ``extra``, what the saved
-    progress also depends on (e.g. the gene chunk width it is counted in)."""
+    schema the saved values are in and the crispyx version that computed
+    them (a run interrupted under an older layout or release is restarted,
+    not finished by this one), and ``extra``, what the saved progress also
+    depends on (e.g. the gene chunk width it is counted in)."""
     params = {k: v for k, v in fingerprint["params"].items() if k != "scanpy_format"}
-    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], **extra}
+    return {**fingerprint, "params": params, "schema": SCHEMAS["de_result"], "crispyx": __version__, **extra}
 
 
 # Disk a DE run needs beside its output: the resumable partial arrays plus
@@ -824,6 +825,7 @@ def _wilcoxon_uns(
     perturbation_column: str,
     tie_correct: bool,
     corr_method: str,
+    distribution: str = "normal",
     batch_column: str | None = None,
     stratified_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -833,6 +835,7 @@ def _wilcoxon_uns(
         "control_label": control_label,
         "perturbation_column": perturbation_column,
         "tie_correct": bool(tie_correct),
+        "distribution": distribution,
         "pvalue_correction": corr_method,
         "stratified": batch_column is not None,
     }
@@ -919,6 +922,7 @@ def _sorted_input(
     input_labels: "np.ndarray | None",
     fn_name: str,
     verbose: int | bool,
+    memory_limit_gb: float | None,
 ) -> "tuple[Path, np.ndarray | None]":
     """``path``, or a perturbation-sorted copy of it when the file is large
     and its cells scattered (:func:`needs_sorting_for_nbglm`), with the
@@ -936,7 +940,7 @@ def _sorted_input(
     # made from this exact source.
     path = sort_by_perturbation(
         path, perturbation_column=perturbation_column, control_label=control_label,
-        output_path=path.parent / f"{path.stem}_sorted.h5ad", verbose=verbose,
+        output_path=path.parent / f"{path.stem}_sorted.h5ad", memory_limit_gb=memory_limit_gb, verbose=verbose,
     )
     if size_factors is not None:
         size_factors = size_factors[perturbation_sort_order(
@@ -1012,7 +1016,7 @@ def t_test(
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     n_jobs: int | None = None,
     verbose: int | bool = True,
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     scanpy_format: bool = False,
@@ -1101,11 +1105,14 @@ def t_test(
     verbose
         If True, show a progress bar for perturbation processing. Requires tqdm.
     resume
-        If True, continue an interrupted run from its last checkpoint,
-        skipping the perturbations it had finished.
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished. Only a
+        checkpoint from this crispyx version and a call with the same input
+        and result-affecting parameters is used (``n_jobs`` and
+        ``memory_limit_gb`` may differ); any other is discarded with a
+        warning. Partial results live in a hidden ``.<output name>.resume``
+        directory until the output is written. False, or ``force=True``,
+        starts over.
     checkpoint_interval
         Number of perturbations between checkpoint saves. Auto-determined if None.
     corr_method
@@ -1182,6 +1189,7 @@ def t_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
 
     backed = read_backed(path)
     try:
@@ -1560,7 +1568,7 @@ def nb_glm_test(
     verbose: int | bool = True,
     profiling: bool = False,
     # ---- Resume/Memory parameters ----
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     memory_limit_gb: float | None = None,
     n_jobs: int | None = None,
@@ -1713,7 +1721,13 @@ def nb_glm_test(
         populated for every gene, so a pair expressed in 0% of perturbed and
         95% of control cells is plainly visible there. ``lfc_shrinkage_type``
         does not change this: an excluded pair is dropped before any fit, so
-        it stays ``NaN`` under ``"apeglm"`` as well.
+        it stays ``NaN`` under ``"apeglm"`` as well. With either set to
+        ``0`` such a pair is fitted, and its fold change is the fitted-mean
+        bound (about -7 to -16 on cells, with a standard error of 100 or more, or
+        the upper bound when the controls have no count), not an estimate.
+        ``pts`` and ``pts_rest`` mark it, with no extra layer:
+        ``np.isfinite(X) & (pts > 0) & (pts_rest > 0)`` is the estimable
+        pairs.
     lfc_shrinkage_type
         Type of log-fold change shrinkage to apply.
 
@@ -1754,11 +1768,14 @@ def nb_glm_test(
         When False (default), ``adata.uns["profiling"]`` is set to ``"NA"`` to
         avoid profiling overhead in production.
     resume
-        If True, continue an interrupted run from its last checkpoint,
-        skipping the perturbations it had finished.
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished. Only a
+        checkpoint from this crispyx version and a call with the same input
+        and result-affecting parameters is used (``n_jobs`` and
+        ``memory_limit_gb`` may differ); any other is discarded with a
+        warning. Partial results live in a hidden ``.<output name>.resume``
+        directory until the output is written. False, or ``force=True``,
+        starts over.
     checkpoint_interval
         Number of perturbations to process between checkpoint saves. If None,
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
@@ -1881,6 +1898,7 @@ def nb_glm_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
 
     _storage_fmt = _storage_format_warning_csc(path, "nb_glm_test")
 
@@ -1906,6 +1924,7 @@ def nb_glm_test(
     path, size_factors = _sorted_input(
         path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
         input_labels=input_labels if size_factors is not None else None, fn_name="nb_glm_test", verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
     )
 
     backed = read_backed(path)
@@ -2661,11 +2680,17 @@ def _offset_baseline(
 
     ``blocks`` yields ``(rows, csr)``: positions into ``size_factors`` /
     ``strata`` and those cells' counts. The baseline of stratum ``b`` is
-    ``(sum y + m_g) / (sum s + 1)`` over its controls, one pseudo-cell at the
-    pooled control mean ``m_g``: a stratum whose controls happen to have no
-    count of a gene then gives a small baseline instead of zero, which would
-    send any count among the perturbed cells to the upper bound of the
-    effect (with one stratum the pseudo-cell changes nothing). With
+    ``m_g (sum y + 1) / (m_g sum s + 1)`` over its controls: the stratum's
+    mean with a prior worth one count at the pooled control mean ``m_g``
+    (one stratum: exactly ``m_g``). A stratum whose controls have no count
+    of a gene departs from ``m_g`` only as far as its expected count
+    ``m_g sum s`` says that is informative: a gene expressed in other donors
+    only stays small, while a rare gene that happens to miss a stratum's
+    controls stays near ``m_g``. A prior worth one cell instead put such a
+    stratum at ``m_g / (sum s + 1)``, hundreds of times too low, and with the
+    large dispersion of a rare gene, where zero counts carry little
+    information, one count among the perturbed cells then raised ``beta`` by
+    6-10 with a standard error above 5. With
     ``dispersion=None`` the dispersion is the method-of-moments estimate
     pooled over strata, from ``E sum (y - s mu_b)^2`` over a stratum's
     controls, for genes with a pooled mean of at least
@@ -2713,7 +2738,7 @@ def _offset_baseline(
     has_controls = s1 > 0
     pooled = sy.sum(axis=0) / s1.sum()
     mean = np.full((n_strata, n_genes), np.nan)
-    mean[has_controls] = (sy[has_controls] + pooled) / (s1[has_controls] + 1.0)[:, None]
+    mean[has_controls] = pooled * (sy[has_controls] + 1.0) / (pooled * s1[has_controls][:, None] + 1.0)
     if dispersion is not None:
         final = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,)).astype(np.float64)
         raw = trend = np.full(n_genes, np.nan)
@@ -2773,63 +2798,79 @@ def _design_baseline(
 
 
 def _fit_offset_group(
-    y: sp.csr_matrix, base_of: "Callable[[slice], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
+    y: sp.csr_matrix, base_of: "Callable[[slice, np.ndarray], np.ndarray]", alpha: np.ndarray, genes: np.ndarray,
     *, min_mu: float, max_iter: int, tol: float, block_cells: int,
 ) -> dict:
     """One perturbation's cells against a baseline: for each gene the
     one-parameter NB fit of ``y_i ~ NB(base_i exp(beta), alpha_g)`` by Fisher
     scoring, from the Poisson start ``ln(sum y / sum base)``, where
-    ``base_of(cells)`` gives the cells' baseline means (size factor times the
-    control mean) as a dense block. ``beta`` is held above ``ln(min_mu) -
-    ln(mean baseline)`` (the fitted-mean floor) and below ``ETA_MAX``; its
-    standard error is one over the root of the Fisher information at the
-    optimum. The cells are taken ``block_cells`` at a time, so a large
-    perturbation is never dense at once. Returns natural-log ``lfc``, ``se``,
-    ``converged`` and ``intercept`` (the log of the cells' mean expected
-    count under the baseline), NaN off ``genes`` and where the baseline is
-    zero or undefined."""
+    ``base_of(cells, genes)`` gives the cells' baseline means (size factor
+    times the control mean) for those genes as a dense block. ``beta`` is
+    held above ``ln(min_mu) - ln(mean baseline)`` (the fitted-mean floor) and
+    below ``ETA_MAX``; its standard error is one over the root of the Fisher
+    information at the optimum. A gene whose step falls below ``tol`` is
+    final, and the iterations cover only the tested genes still moving, so
+    their cost follows those rather than every gene. The cells are taken
+    ``block_cells`` at a time, so a large perturbation is never dense at
+    once. Returns natural-log ``lfc``, ``se``, ``converged`` and
+    ``intercept`` (the log of the cells' mean expected count under the
+    baseline), NaN off ``genes`` and where the baseline is zero or
+    undefined."""
     n_cells, n_genes = y.shape
     blocks = [slice(start, min(start + block_cells, n_cells)) for start in range(0, n_cells, block_cells)]
-    bsum = np.zeros(n_genes)
+    genes = np.asarray(genes, dtype=np.intp)
+    bsum = np.zeros(len(genes))
     for sl in blocks:
-        bsum += base_of(sl).sum(axis=0)
+        bsum += base_of(sl, genes).sum(axis=0)
+    ok = np.isfinite(bsum) & (bsum > 0)
+    genes, bsum = genes[ok], bsum[ok]
+    if genes.size < n_genes:
+        y = y[:, genes].tocsr()  # column j of y is gene genes[j] from here on
     ysum = np.asarray(y.sum(axis=0)).ravel()
-    fit = np.zeros(n_genes, dtype=bool)
-    fit[genes] = True
-    fit &= np.isfinite(bsum) & (bsum > 0)
-    lo = np.full(n_genes, ETA_MIN)
-    with np.errstate(divide="ignore", invalid="ignore"):
+    lo = np.full(len(genes), ETA_MIN)
+    with np.errstate(divide="ignore"):
         if min_mu > 0:
-            lo = np.where(fit, np.log(min_mu) - np.log(bsum / n_cells), ETA_MIN)
-        beta = np.where(fit, np.clip(np.log(ysum / bsum), lo, ETA_MAX), 0.0)
-    converged = np.zeros(n_genes, dtype=bool)
-    info = np.zeros(n_genes)
+            lo = np.log(min_mu) - np.log(bsum / n_cells)
+        beta = np.clip(np.log(ysum / bsum), lo, ETA_MAX)
+    converged = np.zeros(len(genes), dtype=bool)
+    # The genes each iteration computes: narrowed to the unconverged ones
+    # once they are at most 3/4 of it, since gathering a new set of columns
+    # costs more than computing a few finished genes again.
+    work, cols, y_work = np.arange(len(genes)), genes, y
     for _ in range(max_iter):
-        score = np.zeros(n_genes)
-        info = np.zeros(n_genes)
+        moving = ~converged[work]
+        if not moving.any():
+            break
+        if moving.sum() <= 0.75 * work.size:
+            work, y_work = work[moving], y_work[:, np.flatnonzero(moving)].tocsr()
+            cols = genes[work]
+        a = alpha[cols]
+        score = np.zeros(work.size)
+        info = np.zeros(work.size)
         for sl in blocks:
-            mu = base_of(sl) * np.exp(beta)
-            w = 1.0 / (1.0 + alpha * mu)
-            score += np.asarray(y[sl].multiply(w).sum(axis=0)).ravel() - (mu * w).sum(axis=0)
+            mu = base_of(sl, cols) * np.exp(beta[work])
+            w = 1.0 / (1.0 + a * mu)
+            score += np.asarray(y_work[sl].multiply(w).sum(axis=0)).ravel() - (mu * w).sum(axis=0)
             info += (mu * w).sum(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            new = np.where(fit & (info > 0), np.clip(beta + score / info, lo, ETA_MAX), beta)
-        step = np.abs(new - beta)
-        beta = new
-        converged = fit & (step < tol)
-        if converged[fit].all():
-            break
-    info = np.zeros(n_genes)
+            new = np.where(info > 0, np.clip(beta[work] + score / info, lo[work], ETA_MAX), beta[work])
+        moving = ~converged[work]  # computed again, as narrowing may have changed work
+        update = work[moving]
+        converged[update] = np.abs(new[moving] - beta[update]) < tol
+        beta[update] = new[moving]
+    info = np.zeros(len(genes))
     for sl in blocks:
-        mu = base_of(sl) * np.exp(beta)
-        info += (mu / (1.0 + alpha * mu)).sum(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        se = np.where(fit & (info > 0), 1.0 / np.sqrt(info), np.nan)
-        intercept = np.where(fit, np.log(bsum / n_cells), np.nan)
-    return {
-        "lfc": np.where(fit, beta, np.nan), "se": se, "converged": converged, "intercept": intercept,
-        "n_fit": int(fit.sum()),
-    }
+        mu = base_of(sl, genes) * np.exp(beta)
+        info += (mu / (1.0 + alpha[genes] * mu)).sum(axis=0)
+    out = {key: np.full(n_genes, np.nan) for key in ("lfc", "se", "intercept")}
+    out["converged"] = np.zeros(n_genes, dtype=bool)
+    out["lfc"][genes] = beta
+    with np.errstate(divide="ignore"):
+        out["se"][genes] = np.where(info > 0, 1.0 / np.sqrt(info), np.nan)
+    out["intercept"][genes] = np.log(bsum / n_cells)
+    out["converged"][genes] = converged
+    out["n_fit"] = int(genes.size)
+    return out
 
 
 def _default_min_mu(sample, *, verbose: int | bool, name: str) -> float:
@@ -2882,6 +2923,8 @@ def nb_offset_test(
     verbose: int | bool = True,
     memory_limit_gb: float | None = None,
     n_jobs: int | None = None,
+    resume: bool = True,
+    checkpoint_interval: int | None = None,
     force: bool = False,
 ) -> RankGenesGroupsResult:
     """Negative binomial test of each perturbation on its own cells, with the
@@ -2907,15 +2950,25 @@ def nb_offset_test(
 
     The baseline comes in two forms. With ``strata``, one categorical
     column, it is the closed form: the stratum's control mean
-    ``(sum y + m_g) / (sum s + 1)``, one pseudo-cell at the pooled control
-    mean ``m_g``, so that a stratum whose controls happen to have no count
-    of a gene gives a small baseline rather than zero (which would send any
-    count among the perturbed cells to the upper bound of ``beta``); no
+    ``m_g (sum y + 1) / (m_g sum s + 1)``, with a prior worth one count at
+    the pooled control mean ``m_g``, so that a stratum whose controls happen
+    to have no count of a gene, where few were expected, stays near ``m_g``
+    rather than near zero (which would send a single count among the
+    perturbed cells to a large ``beta``), while a gene that many expected
+    counts show is absent from a stratum keeps a small baseline there; no
     design matrix is built, so it suits hundreds of thousands of cells over
     hundreds of lane x donor strata. The dispersion is then ``dispersion``
     as given (one value, or one per gene), or the method-of-moments estimate
     from the controls pooled over strata, with the parametric
-    mean-dispersion trend for genes below 0.5 counts per unit size factor.
+    mean-dispersion trend for genes below 0.5 counts per unit size factor:
+    ``a0 + a1 / mean`` fitted on the genes above, evaluated at each gene's
+    own mean, and flat (PyDESeq2's trimmed-mean fallback) when those genes
+    show no rise toward low means. Below that mean the gene-wise moment
+    estimates are too noisy to use: with a few thousand controls about half
+    of those under 0.1 counts clip at zero, so their median sits far below
+    the dispersion they estimate. The controls must leave residual degrees
+    of freedom for this estimate (a stratum with two controls; more control
+    units than design columns); otherwise pass ``dispersion``.
     With ``covariates``, any design (one-hot levels and continuous terms
     such as the log cells per pseudo-bulk unit), the controls' GLM on
     ``~ covariates`` is fitted once with DESeq2's dispersion steps on the
@@ -2934,7 +2987,10 @@ def nb_offset_test(
     ``pvalue_adj``, ``intercept``, ``dispersion``, ``pts``, ``converged``),
     so :func:`shrink_lfc` and every reader of an NB-GLM result accept it;
     ``uns["method"]`` is ``"nb_offset"``. The expression filters are
-    :func:`nb_glm_test`'s, with the same defaults. An existing output is
+    :func:`nb_glm_test`'s, with the same defaults; with
+    ``min_cells_pert=0`` a pair with no count among the perturbed cells is
+    fitted to the fitted-mean floor, and ``pts == 0`` marks it (a gene with
+    no control count has no baseline and stays NaN). An existing output is
     reused when it was computed from the same input and arguments
     (:ref:`auto-reload`).
 
@@ -3000,6 +3056,18 @@ def nb_offset_test(
     n_jobs
         Perturbations fitted concurrently, in threads (None or -1: all
         cores). The controls are read once, each perturbation's cells once.
+    resume
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished (the pass over
+        the controls is repeated). Only a checkpoint from this crispyx
+        version and a call with the same input and result-affecting
+        parameters is used (``n_jobs`` and ``memory_limit_gb`` may differ);
+        any other is discarded with a warning. Partial results live in a
+        hidden ``.<output name>.resume`` directory until the output is
+        written. False, or ``force=True``, starts over.
+    checkpoint_interval
+        Perturbations between checkpoint saves; None chooses one from the
+        number of perturbations.
     force
         Recompute even when a reusable output exists.
 
@@ -3036,6 +3104,7 @@ def nb_offset_test(
     )
     if (existing := _try_load_existing_de_result(output_path, force=force, verbose=verbose, fingerprint=fingerprint)):
         return existing
+    resume = resume and not force
 
     storage_format = _storage_format_warning_csc(path, name)
     backed = read_backed(path)
@@ -3059,6 +3128,7 @@ def nb_offset_test(
     path, size_factors = _sorted_input(
         path, perturbation_column=perturbation_column, control_label=control_label, size_factors=size_factors,
         input_labels=input_labels if size_factors is not None else None, fn_name=name, verbose=verbose,
+        memory_limit_gb=memory_limit_gb,
     )
 
     backed = read_backed(path)
@@ -3107,6 +3177,22 @@ def nb_offset_test(
             design_all = np.ascontiguousarray(design_all[:, keep_column])
             columns = [c for c, k in zip(columns, keep_column) if k]
             check_full_rank(design_all[control_rows], columns, f"{name}, the controls' design")
+        # The dispersion comes from the controls' residuals, which a saturated
+        # design (a column per control) or strata of single controls leave none of.
+        if dispersion is None:
+            if design_all is not None and control_rows.size <= design_all.shape[1]:
+                saturated = (f"{control_rows.size} control units against {design_all.shape[1]} columns of "
+                             f"~ {' + '.join(covariates)}")
+            elif design_all is None and np.bincount(stratum_codes[control_rows]).max() < 2:
+                saturated = "no stratum with two or more control cells"
+            else:
+                saturated = None
+            if saturated:
+                raise ValueError(
+                    f"{name}: the controls leave no residual degrees of freedom ({saturated}), so their "
+                    "dispersion cannot be estimated; pass dispersion=, or use nb_glm_test, which estimates it "
+                    "from every unit."
+                )
         boundaries = {}
         if "sorting_metadata" in backed.uns:
             metadata = backed.uns["sorting_metadata"]
@@ -3192,7 +3278,7 @@ def nb_offset_test(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run = _resumable_result(
         output_path, output_path.with_suffix(".progress.json"),
-        fingerprint=_checkpoint_fingerprint(fingerprint), resume=False, obs=obs, var=var,
+        fingerprint=_checkpoint_fingerprint(fingerprint), resume=resume, obs=obs, var=var,
         uns={
             "lfc_base": lfc_base,
             "method": "nb_offset",
@@ -3220,6 +3306,12 @@ def nb_offset_test(
     out = {key: run.file[key] for key in ["X", *(f"layers/{layer}" for layer in layers)]}
     lfc_scale = np.log(2) if lfc_base == "log2" else 1.0
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
+    completed: list[str] = list(run.progress.get("completed", []))
+    done = set(completed)
+    to_run = [label for label in candidates if label not in done]
+    if run.resumed:
+        _messages.vprint(verbose, name, f"Resuming: {len(completed)}/{n_groups} perturbations already done")
+    interval = _get_checkpoint_interval(n_groups, checkpoint_interval)
 
     def fit(label: str, y: sp.csr_matrix, rows: np.ndarray) -> dict:
         # The cells without a baseline leave before the filters and ``pts``
@@ -3241,14 +3333,18 @@ def nb_offset_test(
             min_cells_pert=min_cells_pert, min_total_count=min_total_count,
         )
         if design_all is None:
-            def base_of(sl: slice) -> np.ndarray:
-                return s[sl, None] * baseline.mean[codes[sl]]
+            means = {}  # the stratum means of the genes asked for, gathered once per gene set
+
+            def base_of(sl: slice, cols: np.ndarray) -> np.ndarray:
+                if means.get("cols") is not cols:
+                    means.update(cols=cols, table=baseline.mean.take(cols, axis=1))
+                return s[sl, None] * means["table"][codes[sl]]
         else:
             design_rows = design_all[rows]
 
-            def base_of(sl: slice) -> np.ndarray:
+            def base_of(sl: slice, cols: np.ndarray) -> np.ndarray:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    eta = np.clip(design_rows[sl] @ baseline.coef.T, ETA_MIN, ETA_MAX)
+                    eta = np.clip(design_rows[sl] @ baseline.coef[cols].T, ETA_MIN, ETA_MAX)
                 return s[sl, None] * np.maximum(np.exp(eta), min_mu)
         result = _fit_offset_group(
             y, base_of, baseline.dispersion, np.flatnonzero(valid), min_mu=min_mu, max_iter=max_iter, tol=tol,
@@ -3301,7 +3397,7 @@ def nb_offset_test(
             # The rows are read here, in the caller's thread, as each task is
             # dispatched (joblib pre-dispatches two per thread), and fitted in
             # the pool: numpy releases the GIL in the fits' array work.
-            for label in candidates:
+            for label in to_run:
                 rows = group_rows[label]
                 y = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
                 y.sum_duplicates()
@@ -3310,7 +3406,7 @@ def nb_offset_test(
                     rows = np.arange(rows.start, rows.stop)
                 yield delayed(fit_or_fail)(label, y, rows)
 
-        with _create_progress_context(n_groups, name, verbose) as pbar:
+        with _create_progress_context(len(to_run), name, verbose) as pbar:
             results = Parallel(n_jobs=n_threads, backend="threading", return_as="generator_unordered")(tasks())
             for label, res in results:
                 if isinstance(res, Exception):
@@ -3319,12 +3415,15 @@ def nb_offset_test(
                     write_failed(label)
                 else:
                     write(res)
+                    completed.append(label)
                     n_tested_list.append(res["n_tested"])
                     _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
                 pbar.update(1)
+                if (len(completed) + len(failed)) % interval == 0:
+                    run.save(total=n_groups, completed=completed, failed=failed)
     finally:
         backed.file.close()
-    _print_de_summary(verbose, name, n_groups - len(failed), n_groups, n_tested_list, n_genes)
+    _print_de_summary(verbose, name, len(completed), n_groups, n_tested_list, n_genes)
     if failed:
         _messages.warn(
             name,
@@ -3364,6 +3463,7 @@ def _wilcoxon_resumable_result(
     fingerprint: dict,
     chunk_size: int,
     batch_column: str | None = None,
+    distribution: str = "normal",
 ) -> ResumableRun:
     """The result file a Wilcoxon run fills one gene chunk at a time: the
     AUC in ``X``, the test's layers, and the control arm's detection rate as
@@ -3378,7 +3478,7 @@ def _wilcoxon_resumable_result(
         obs=_result_obs(candidates, perturbation_column), var=var,
         uns=_wilcoxon_uns(
             control_label=control_label, perturbation_column=perturbation_column,
-            tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column,
+            tie_correct=tie_correct, corr_method=corr_method, batch_column=batch_column, distribution=distribution,
         ),
         x_dtype=np.float64,
         layers={
@@ -3418,6 +3518,7 @@ def _wilcoxon_test_stratified(
     min_mean_ctrl: float,
     min_mean_pert: float,
     tie_correct: bool,
+    distribution: str,
     corr_method: str,
     output_path: Path,
     checkpoint_path: Path,
@@ -3451,7 +3552,7 @@ def _wilcoxon_test_stratified(
     run = _wilcoxon_resumable_result(
         output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
         perturbation_column=perturbation_column, control_label=control_label,
-        tie_correct=tie_correct, corr_method=corr_method, resume=resume,
+        tie_correct=tie_correct, corr_method=corr_method, resume=resume, distribution=distribution,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="stratified", chunk_size=int(chunk_size)),
         chunk_size=chunk_size,
         batch_column=batch_column,
@@ -3735,6 +3836,7 @@ def _wilcoxon_test_stratified(
                         pert_ptr,
                         valid_masks_2d,
                         tie_correct,
+                        distribution == "hypergeometric",
                         valid_u,
                         valid_z,
                         valid_p,
@@ -3872,12 +3974,13 @@ def wilcoxon_test(
     min_mean_pert: float = 0.005,
     chunk_size: int | None = None,
     tie_correct: bool = True,
+    distribution: Literal["normal", "hypergeometric"] = "normal",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     data_name: str | None = None,
     output_path: str | Path | None = None,
     output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
     verbose: int | bool = True,
-    resume: bool = False,
+    resume: bool = True,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
@@ -3962,6 +4065,20 @@ def wilcoxon_test(
     tie_correct
         Whether to apply tie correction to the U statistic. Default True for
         more accurate p-values when ties are present in the data.
+    distribution
+        The rank-sum test's null distribution. ``"normal"`` (default) is the
+        normal approximation, as in Scanpy. It fails where few cells
+        express a gene: almost every value is tied at zero, the count of
+        expressing cells that fall in the group is hypergeometric and very
+        skewed, and the normal tail is too thin by orders of magnitude (one
+        expressing cell of 232 against 3 of 30,000 controls: p 3e-8, against
+        a permutation p near 0.01), which makes such genes significant in
+        groups of control cells. ``"hypergeometric"`` keeps that count's
+        exact distribution in each stratum, with the rank sum given the
+        count normal, and comes within a small factor of the permutation
+        p-value. It differs from ``"normal"`` only where the count's
+        variance, summed over strata, is below 100; ``z_score`` and the AUC
+        are the same under both. It needs ``tie_correct=True``.
     corr_method
         Method for p-value correction: "benjamini-hochberg" or "bonferroni".
     data_name
@@ -3976,13 +4093,15 @@ def wilcoxon_test(
     verbose
         If True, show a progress bar for gene chunk processing. Requires tqdm.
     resume
-        If True, continue an interrupted run from its last checkpoint, at the
-        first unfinished gene chunk (or perturbation batch, on the streaming
-        path). The resolved ``chunk_size`` is part of the call's identity, so
-        pass the same value (or leave both on auto with the same memory).
-        Only a checkpoint from a call with the same input and
-        result-affecting parameters is used; partial results live in a hidden
-        ``.<output name>.resume`` directory until the output is written.
+        If True (default), continue an interrupted run from its last
+        checkpoint, at the first unfinished gene chunk (or perturbation
+        batch, on the streaming path). Only a checkpoint from this crispyx
+        version and a call with the same input and result-affecting
+        parameters is used; any other is discarded with a warning. The
+        resolved ``chunk_size`` is part of the call's identity, so pass the
+        same value (or leave both on auto with the same memory). Partial
+        results live in a hidden ``.<output name>.resume`` directory until
+        the output is written. False, or ``force=True``, starts over.
     checkpoint_interval
         Number of gene chunks between checkpoint saves. If None, auto-determined
         based on dataset size.
@@ -4081,6 +4200,10 @@ def wilcoxon_test(
         fn_name="wilcoxon_test",
     )
     validate_format_mismatch_policy(format_mismatch_policy)
+    if distribution not in ("normal", "hypergeometric"):
+        raise ValueError(f"wilcoxon_test: distribution must be 'normal' or 'hypergeometric', got {distribution!r}")
+    if distribution == "hypergeometric" and not tie_correct:
+        raise ValueError("wilcoxon_test: distribution='hypergeometric' conditions on the ties; it needs tie_correct=True")
 
     path = resolve_data_path(data)
     output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
@@ -4098,6 +4221,7 @@ def wilcoxon_test(
         fingerprint=fingerprint,
     )):
         return r
+    resume = resume and not force
     given_labels = perturbation_column if isinstance(perturbation_column, pd.Series) else None
     if given_labels is not None:
         perturbation_column = "perturbation" if given_labels.name is None else str(given_labels.name)
@@ -4158,7 +4282,7 @@ def wilcoxon_test(
             output_path, checkpoint_path, candidates=[], gene_symbols=gene_symbols,
             perturbation_column=perturbation_column, control_label=control_label, tie_correct=tie_correct,
             corr_method=corr_method, resume=False, fingerprint=_checkpoint_fingerprint(fingerprint),
-            chunk_size=chunk_size or 1, batch_column=batch_column,
+            chunk_size=chunk_size or 1, batch_column=batch_column, distribution=distribution,
         )
         run.file["var/pts_rest"][...] = np.nan
         return _finish_result(
@@ -4175,7 +4299,7 @@ def wilcoxon_test(
     with stream_on_fast_axis(
         path, axis=1, policy=format_mismatch_policy, fn_name="wilcoxon_test",
         scratch_dir=output_path.parent, chunk_size=chunk_size,
-        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume,
+        memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume and checkpoint_path.exists(),
     ) as stream_path:
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined.
@@ -4196,6 +4320,7 @@ def wilcoxon_test(
                 min_mean_ctrl=min_mean_ctrl,
                 min_mean_pert=min_mean_pert,
                 tie_correct=tie_correct,
+                distribution=distribution,
                 corr_method=corr_method,
                 output_path=output_path,
                 checkpoint_path=checkpoint_path,
@@ -4221,6 +4346,7 @@ def wilcoxon_test(
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
             tie_correct=tie_correct,
+            distribution=distribution,
             corr_method=corr_method,
             output_path=output_path,
             checkpoint_path=checkpoint_path,
@@ -4248,6 +4374,7 @@ def _wilcoxon_test_standard(
     min_mean_ctrl: float,
     min_mean_pert: float,
     tie_correct: bool,
+    distribution: str,
     corr_method: str,
     output_path: Path,
     checkpoint_path: Path,
@@ -4279,7 +4406,7 @@ def _wilcoxon_test_standard(
     run = _wilcoxon_resumable_result(
         output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
         perturbation_column=perturbation_column, control_label=control_label,
-        tie_correct=tie_correct, corr_method=corr_method, resume=resume,
+        tie_correct=tie_correct, corr_method=corr_method, resume=resume, distribution=distribution,
         fingerprint=_checkpoint_fingerprint(fingerprint, path="standard", chunk_size=int(chunk_size)),
         chunk_size=chunk_size,
     )
@@ -4473,6 +4600,7 @@ def _wilcoxon_test_standard(
                         pert_row_offsets,
                         valid_masks_2d,
                         tie_correct,
+                        distribution == "hypergeometric",
                         _ZERO_PARTITION_THRESHOLD,
                         valid_u,
                         valid_z,
@@ -4604,6 +4732,20 @@ def _apeglm_worker_count(
     )
 
 
+def _write_var_column(handle: h5py.File, name: str, values: np.ndarray | None) -> None:
+    """Write, replace or (``values`` None) remove column ``name`` of an open
+    h5ad file's ``var``."""
+    var = handle["var"]
+    if name in var:
+        del var[name]
+    order = [c.decode() if isinstance(c, bytes) else str(c) for c in var.attrs.get("column-order", [])]
+    order = [c for c in order if c != name]
+    if values is not None:
+        write_elem(var, name, np.asarray(values))
+        order.append(name)
+    var.attrs["column-order"] = np.array(order, dtype=h5py.string_dtype())
+
+
 def shrink_lfc(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -4616,6 +4758,10 @@ def shrink_lfc(
     batch_size: int = 128,
     profiling: bool = False,
     memory_limit_gb: float | None = None,
+    exclude: "ArrayLike | sp.spmatrix | None" = None,
+    floor: ArrayLike | None = None,
+    centre: Literal["zero", "pooled"] = "zero",
+    n_cells: ArrayLike | None = None,
     verbose: int | bool = True,
 ) -> RankGenesGroupsResult:
     """Apply apeGLM log-fold change shrinkage to existing NB-GLM results.
@@ -4624,7 +4770,7 @@ def shrink_lfc(
     coefficient. Two methods are available:
     
     - **stats** (default, recommended): Uses pre-computed MLE LFC and SE from
-      the h5ad file with vectorized Newton-Raphson optimization. ~35× faster
+      the h5ad file, with each posterior mode in closed form. ~35× faster
       than full and maintains consistency with stored MLE coefficients.
     - **full**: Re-loads original count data and runs per-gene L-BFGS-B
       optimization. May produce different results from stored MLE for lowly
@@ -4658,9 +4804,9 @@ def shrink_lfc(
         Shrinkage method to use:
         
         - ``"stats"`` (default): Fast vectorized shrinkage using pre-computed
-          MLE statistics. Uses Newton-Raphson optimization across all genes
-          simultaneously. ~35× faster than "full" and maintains consistency
-          with stored MLE coefficients.
+          MLE statistics: each entry's posterior mode in closed form, as
+          :func:`shrink_lfc_arrays`. ~35× faster than "full" and maintains
+          consistency with stored MLE coefficients.
         - ``"full"``: Full model re-fitting with L-BFGS-B per gene. Re-loads
           original count data. Note: May produce different results for lowly
           expressed genes due to min_mu clamping differences. Use "stats" for
@@ -4696,7 +4842,19 @@ def shrink_lfc(
         Optional memory budget in gigabytes. With ``method="full"``, the
         number of parallel workers is capped so that they fit in the budget
         (``None``, the default, uses the memory currently available).
-        ``method="stats"`` holds no per-worker data and ignores it.
+        ``method="stats"`` holds no per-worker data and ignores it, except
+        that the file's fold changes are read once, rather than a block at a
+        time per pass, when they fit a quarter of it.
+    exclude, floor, centre, n_cells
+        As in :func:`shrink_lfc_arrays`, over the file's perturbations x
+        genes (``method="stats"`` only; with ``"per_comparison"`` each
+        perturbation's prior scale comes from its own deviations).
+        ``exclude`` is a boolean array or scipy sparse matrix of that shape,
+        such as each perturbation's own target gene; ``floor`` broadcasts to
+        it on the natural-log scale (a column of one bound per perturbation);
+        ``n_cells`` gives one weight per perturbation for
+        ``centre="pooled"``, whose per-gene centre is written to
+        ``var["shrinkage_centre"]`` in the file's ``lfc_base``.
     verbose
         Print basic progress/completion messages. Defaults to ``True``.
 
@@ -4736,6 +4894,12 @@ def shrink_lfc(
     # Validate min_mu parameter
     if min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
+    if centre not in ("zero", "pooled"):
+        raise ValueError(f"shrink_lfc: centre must be 'zero' or 'pooled', got {centre!r}")
+    # The stats method shrinks with shrink_lfc_arrays' closed form, a block
+    # of rows at a time, and takes its options.
+    if method != "stats" and (exclude is not None or floor is not None or centre != "zero" or n_cells is not None):
+        raise ValueError("shrink_lfc: exclude, floor, centre and n_cells need method='stats'")
     
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -4773,7 +4937,7 @@ def shrink_lfc(
             f"Input file '{path}' lacks the 'dispersion' layer (results from crispyx before 0.2.3); "
             "re-run nb_glm_test."
         )
-    if "intercept" not in layer_names:
+    if method == "full" and "intercept" not in layer_names:
         raise ValueError(
             f"Input file '{path}' lacks 'intercept' layer. "
             "method='full' requires NB-GLM results from nb_glm_test v0.5.1+. "
@@ -4791,7 +4955,6 @@ def shrink_lfc(
         se_key = "layers/standard_error_ln" if "standard_error_ln" in layer_names else "layers/standard_error"
     else:
         raw_key, se_key = "layers/logfoldchange_raw_ln", "layers/standard_error_ln"
-    logger.info("Using fitted intercept from NB-GLM for shrinkage")
 
     if profiling and profiler is not None:
         profiler.snapshot("after_load")
@@ -4801,80 +4964,69 @@ def shrink_lfc(
     budget = _resolve_memory_limit_bytes(memory_limit_gb)
 
     def read_rows(handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
-        rows = {
-            "mle": handle[mle_key][sl], "raw": handle[raw_key][sl], "se": handle[se_key][sl],
-            "intercept": handle["layers/intercept"][sl],
-        }
-        rows["dispersion"] = handle["layers/dispersion"][sl]
+        rows = {"mle": handle[mle_key][sl], "raw": handle[raw_key][sl], "se": handle[se_key][sl]}
+        if method == "full":
+            rows["intercept"] = handle["layers/intercept"][sl]
+            rows["dispersion"] = handle["layers/dispersion"][sl]
         return rows
 
-    # Global prior scale from ALL perturbations' MLE LFCs: read once when the
-    # pairs fit a quarter of the budget, else re-read in blocks for each
-    # evaluation of the objective.
-    if n_groups * n_genes * 16 <= 0.25 * budget:
+    shape = (n_groups, n_genes)
+    if exclude is not None:  # a CSR matrix, row-sliceable, or a dense mask
+        exclude = exclude.tocsr() if sp.issparse(exclude) else np.broadcast_to(np.asarray(exclude, dtype=bool), shape)
+    if exclude is not None and exclude.shape != shape:
+        raise ValueError(f"shrink_lfc: exclude has shape {exclude.shape}, the result {shape}")
+    if floor is not None:
+        floor = np.broadcast_to(np.asarray(floor, dtype=np.float64), shape)
+    weights = np.ones(n_groups) if n_cells is None else np.asarray(n_cells, dtype=np.float64).reshape(-1)
+    if weights.shape != (n_groups,):
+        raise ValueError(f"shrink_lfc: n_cells has {weights.size} entries, the result {n_groups} perturbations")
+
+    def prepared(raw: np.ndarray, se: np.ndarray, sl: slice):
+        """A block's ln fold changes and SEs with ``floor`` and ``exclude``
+        applied: (lfc, se, valid, excluded, pick)."""
+        excluded = None
+        if exclude is not None:
+            excluded = exclude[sl].toarray().astype(bool) if sp.issparse(exclude) else np.asarray(exclude[sl])
+        lfc, valid, excluded, pick = _shrink_prepare(raw, se, excluded, None if floor is None else floor[sl])
+        return lfc, se, valid, excluded, pick
+
+    # The ln fold changes and SEs, prepared: read once when they fit a
+    # quarter of the budget, else re-read in blocks for each pass (the
+    # centre's mean shift, each evaluation of the prior's objective).
+    def read_blocks():
         with h5py.File(path, "r") as handle:
-            all_pairs = [(handle[raw_key][()], handle[se_key][()])]
-        prior_blocks = lambda: all_pairs  # noqa: E731
+            for sl in _row_blocks(n_groups, n_genes):
+                yield (sl, *prepared(handle[raw_key][sl], handle[se_key][sl], sl))
+    if n_groups * n_genes * 16 <= 0.25 * budget:
+        cached = list(read_blocks())
+        blocks = lambda: cached  # noqa: E731
     else:
-        def prior_blocks():
-            with h5py.File(path, "r") as handle:
-                for sl in _row_blocks(n_groups, n_genes):
-                    yield handle[raw_key][sl], handle[se_key][sl]
+        blocks = read_blocks
+    mu = None
+    if method == "stats" and centre == "pooled":
+        mu = _pooled_centre(
+            lambda: ((lfc, se, pick, weights[sl]) for sl, lfc, se, _, _, pick in blocks()), n_genes,
+        )
+
+    def prior_blocks():
+        for _, lfc, se, _, _, pick in blocks():
+            deviation = lfc if mu is None else lfc - mu
+            yield deviation[pick], se[pick]
     global_prior_scale = _apeglm_prior_scale_from_blocks(prior_blocks)
     del prior_blocks
     logger.info(f"Global prior scale for apeGLM: {global_prior_scale:.4f}")
 
-    total_converged = 0
-    total_genes_processed = 0
-    total_needs_refit = 0
-
-    def shrink_stats(rows: dict[str, np.ndarray], base_mean_proxy) -> tuple[np.ndarray, np.ndarray]:
-        nonlocal total_converged, total_genes_processed, total_needs_refit
-        shrunk_lfc = np.zeros_like(rows["raw"])
-        shrunk_se = np.zeros_like(rows["se"])
-        for i in range(rows["raw"].shape[0]):
-            mle_lfc_group, se_group = rows["raw"][i], rows["se"][i]
-            if prior_scale_mode == "per_comparison":
-                pert_prior_scale = _estimate_apeglm_prior_scale(mle_lfc_group, se_group)
-            else:
-                pert_prior_scale = global_prior_scale
-            # NOTE: use_gene_specific_prior=False for PyDESeq2 parity (gene-specific
-            # prior scaling is non-standard and causes accuracy regression)
-            shrunk_lfc[i], shrunk_se[i], converged, needs_refit = shrink_lfc_apeglm_from_stats(
-                mle_lfc=mle_lfc_group,
-                mle_se=se_group,
-                prior_scale=pert_prior_scale,
-                base_mean=base_mean_proxy,
-                use_gene_specific_prior=False,
-                hybrid_fallback=True,
-            )
-            total_converged += int(converged.sum())
-            total_genes_processed += n_genes
-            total_needs_refit += int(needs_refit.sum())
-        return shrunk_lfc, shrunk_se
-
     if method == "stats":
-        # Fast stats-based shrinkage using vectorized Newton-Raphson
-        # No need to load original dataset - uses pre-computed MLE stats
-        logger.info("Using fast stats-based shrinkage (method='stats')")
-        # base_mean proxy for the hybrid-fallback flag: intercept is
-        # ln(mu_control), so exp(mean intercept across perturbations)
-        # tracks each gene's expression level.
-        intercept_sum = np.zeros(n_genes)
-        intercept_count = np.zeros(n_genes)
-        with h5py.File(path, "r") as handle:
-            for sl in _row_blocks(n_groups, n_genes):
-                block = handle["layers/intercept"][sl]
-                finite = np.isfinite(block)
-                intercept_sum += np.where(finite, block, 0.0).sum(axis=0)
-                intercept_count += finite.sum(axis=0)
-        if intercept_count.any():
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean_intercept = intercept_sum / intercept_count
-            base_mean_proxy = np.exp(np.clip(mean_intercept, -20, 20))  # Clamp to avoid overflow
-        else:
-            base_mean_proxy = None
-        shrink_rows = lambda rows: shrink_stats(rows, base_mean_proxy)  # noqa: E731
+        def shrink_rows(rows: dict[str, np.ndarray], sl: slice) -> tuple[np.ndarray, np.ndarray]:
+            lfc, se, valid, excluded, pick = prepared(rows["raw"], rows["se"], sl)
+            if prior_scale_mode == "global":
+                return _shrink_entries(lfc, se, valid, excluded, global_prior_scale, mu)
+            deviation = lfc if mu is None else lfc - mu
+            shrunk_lfc, shrunk_se = zip(*(
+                _shrink_entries(lfc[i], se[i], valid[i], excluded[i], _prior_scale(deviation[i], se[i], pick[i]), mu)
+                for i in range(lfc.shape[0])
+            ))
+            return np.vstack(shrunk_lfc), np.vstack(shrunk_se)
         backed = None
     else:  # method == "full"
         # Full model re-fitting with L-BFGS-B per gene
@@ -4987,10 +5139,7 @@ def shrink_lfc(
                         _create_unfilled_array(layers, name, (n_groups, n_genes), np.float64)
                 for sl in _row_blocks(n_groups, n_genes):
                     rows = read_rows(out, sl)
-                    if method == "stats":
-                        shrunk_lfc, shrunk_se = shrink_rows(rows)
-                    else:
-                        shrunk_lfc, shrunk_se = shrink_rows(rows, sl.start)
+                    shrunk_lfc, shrunk_se = shrink_rows(rows, sl if method == "stats" else sl.start)
                     layers["logfoldchange_raw"][sl] = rows["mle"]
                     if lfc_base == "ln":
                         layers["standard_error_ln"][sl] = rows["se"]
@@ -5018,11 +5167,13 @@ def shrink_lfc(
                     }
                 else:
                     profiling_uns = "NA"
+                _write_var_column(out, "shrinkage_centre", None if mu is None else mu / lfc_scale)
                 for key, value in {
                     "lfc_shrinkage_type": "apeglm",
                     "apeglm_prior_scale": global_prior_scale,
                     "shrinkage_method": method,
                     "prior_scale_mode": prior_scale_mode,
+                    "shrinkage_centre": centre,
                     "profiling": profiling_uns,
                 }.items():
                     if key in uns_out:
@@ -5033,19 +5184,6 @@ def shrink_lfc(
         if backed is not None:
             backed.file.close()
 
-    # Log warning if many genes didn't converge
-    convergence_rate = total_converged / total_genes_processed if total_genes_processed > 0 else 1.0
-    if method == "stats" and convergence_rate < 0.95:
-        logger.warning(
-            f"Low convergence rate: {total_converged}/{total_genes_processed} "
-            f"({convergence_rate:.1%}) genes converged within max_iter. "
-            "Consider using method='full' for better accuracy."
-        )
-    if total_needs_refit > 0:
-        logger.info(
-            f"Hybrid fallback: {total_needs_refit} gene-perturbation pairs "
-            f"({total_needs_refit / (n_groups * n_genes):.1%}) flagged for potential accuracy improvement with method='full'"
-        )
     _messages.print_done(verbose, "shrink_lfc", f"{n_groups} perturbations × {n_genes} genes (method={method!r})")
     logger.info(
         f"Applied apeGLM LFC shrinkage (method={method}, prior_scale_mode={prior_scale_mode}) "
@@ -5055,15 +5193,93 @@ def shrink_lfc(
     return RankGenesGroupsResult(output_path)
 
 
+# shrink_lfc_arrays(centre="pooled") pools entries within this many standard
+# errors of the centre, and leaves out upward fold changes with a standard
+# error above the second.
+_CENTRE_MAX_Z = 3.0
+_CENTRE_MAX_UPWARD_SE = 5.0
+
+
+def _shrink_prepare(lfc: np.ndarray, se: np.ndarray, exclude: np.ndarray | None, floor: np.ndarray | None):
+    """One block of entries made ready to shrink: ``lfc`` raised to
+    ``floor`` (NaN: no bound), and the masks of valid, excluded and
+    prior-forming (valid, not excluded, ``se > 0``) entries."""
+    if floor is not None:
+        lfc = np.where(np.isfinite(floor), np.maximum(lfc, floor), lfc)
+    excluded = np.zeros(lfc.shape, dtype=bool) if exclude is None else exclude
+    valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
+    return lfc, valid, excluded, valid & ~excluded & (se > 0)
+
+
+def _pooled_centre(blocks, n_genes: int, *, max_iter: int = 50, tol: float = 1e-8) -> np.ndarray:
+    """Per gene, ``ln(sum w exp(lfc) / sum w)`` over the entries within
+    ``_CENTRE_MAX_Z`` standard errors of the result, leaving out upward fold
+    changes with a standard error above ``_CENTRE_MAX_UPWARD_SE``: a mean
+    shift from the pool of every such entry. ``blocks()`` yields ``(lfc,
+    se, pick, weights)`` row blocks afresh for each pass (``weights`` per
+    row). A gene with no entry left in its window keeps the previous value;
+    one with no entry at all is 0."""
+
+    def pool(centre):
+        num, den = np.zeros(n_genes), np.zeros(n_genes)
+        for lfc, se, pick, weights in blocks():
+            with np.errstate(invalid="ignore"):
+                use = pick & ~((se > _CENTRE_MAX_UPWARD_SE) & (lfc > 0))
+                if centre is not None:
+                    use &= np.abs(lfc - centre) < _CENTRE_MAX_Z * se
+            w = np.where(use, weights[:, None], 0.0)
+            num += (w * np.exp(np.minimum(np.where(use, lfc, 0.0), 20.0))).sum(axis=0)
+            den += w.sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(np.maximum(num, 1e-300) / den), den > 0
+
+    centre, has = pool(None)
+    centre = np.where(has, centre, 0.0)
+    for _ in range(max_iter):
+        new, has = pool(centre)
+        new = np.where(has, new, centre)
+        done = np.abs(new - centre).max(initial=0.0) < tol
+        centre = new
+        if done:
+            break
+    return centre
+
+
+def _prior_scale(deviation: np.ndarray, se: np.ndarray, pick: np.ndarray) -> float:
+    """PyDESeq2's Cauchy prior scale from the ``pick`` entries' deviations
+    from the centre (1 when there are none)."""
+    return _estimate_apeglm_prior_scale(deviation[pick], se[pick]) if pick.any() else 1.0
+
+
+def _shrink_entries(lfc, se, valid, excluded, prior_scale: float, mu: np.ndarray | None):
+    """The posterior mode and standard error of each entry under a Cauchy
+    prior of scale ``prior_scale`` centred on ``mu`` (zero when None);
+    excluded entries keep their fold change and standard error, invalid ones
+    are NaN, and ``se == 0`` keeps its standard error."""
+    deviation = lfc if mu is None else lfc - mu
+    mode = cauchy_map(deviation, se, prior_scale)
+    out_dev = np.where(valid, np.where(excluded, deviation, mode), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = prior_scale ** 2 + out_dev ** 2
+        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_dev ** 2) / denominator ** 2
+        post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
+    out_lfc = out_dev if mu is None else out_dev + mu
+    out_lfc = np.where(excluded & valid, lfc, out_lfc)
+    out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
+    return out_lfc, out_se
+
+
 @dataclass(frozen=True)
 class ShrunkLFC:
     """:func:`shrink_lfc_arrays`'s result: the shrunk fold changes, their
-    posterior standard errors (the MLE's where an entry was excluded) and the
-    Cauchy prior scale used."""
+    posterior standard errors (the MLE's where an entry was excluded), the
+    Cauchy prior scale used and, with ``centre="pooled"``, each gene's centre
+    (None when shrinking toward zero)."""
 
     lfc: np.ndarray
     se: np.ndarray
     prior_scale: float
+    centre: np.ndarray | None = None
 
 
 def shrink_lfc_arrays(
@@ -5073,6 +5289,8 @@ def shrink_lfc_arrays(
     prior_scale: float | None = None,
     exclude: ArrayLike | None = None,
     floor: ArrayLike | None = None,
+    centre: Literal["zero", "pooled"] = "zero",
+    n_cells: ArrayLike | None = None,
 ) -> ShrunkLFC:
     """apeGLM shrinkage of fold changes given as arrays, exactly.
 
@@ -5107,34 +5325,69 @@ def shrink_lfc_arrays(
         ``min_mu=0.01``, -12 to -16 on cells with 1e-6) is a bound, not a
         measurement; ``ln(0.5 / expected count)``, the strongest knockdown
         zero counts can show, is a sensible floor for an excluded target.
+    centre
+        What each fold change is shrunk toward. ``"zero"`` is apeGLM's
+        prior, as in :func:`shrink_lfc`. ``"pooled"`` takes ``lfc`` as
+        perturbations x genes and shrinks each entry toward its gene's pooled
+        fold change across the perturbations,
+        ``ln(sum_p n_p exp(lfc_p) / sum_p n_p)``: noise goes to the response
+        the perturbations share instead of removing it. The prior scale is
+        then estimated from the deviations from the centre. The weights
+        ``n_p`` do not depend on the estimates, so the centre is unbiased
+        where counts are low; a precision-weighted (1 / SE^2) mean is not,
+        since a perturbation that by chance has more reads of a lowly
+        expressed gene has both a higher fold change and a smaller SE, and a
+        median of the fold changes is biased downward. A fold change at the
+        fitted-mean floor counts as about zero in the sum. The centre leaves
+        out upward fold changes with ``se > 5``: where the dispersion is
+        large, zero counts hardly constrain a fit, so a single count lifts it
+        far above the mean count it reflects (a few such entries moved one
+        genome-wide screen's centre to +0.45). It then pools only the entries
+        within three standard errors of itself, found by iterating from the
+        pool of every entry (a mean shift), so the few perturbations that
+        move a gene on their own do not make the centre the log of an average
+        fold change, well above the typical one, while a response every
+        perturbation shares stays in. A screen against zero would drop such a
+        shared response wherever it is significant, and one against the
+        median would drop every count of a gene whose median sits at the
+        floor. Entries that are excluded, invalid or have ``se == 0`` are
+        left out of the centre too. The pool needs the perturbations with no
+        count of a gene as well, at the fitted-mean floor: the DE tests'
+        default ``min_cells_pert=1`` leaves them NaN, which keeps only the
+        perturbations that happened to have a count of a rare gene and biases
+        its centre upward, so fit with ``min_cells_pert=0``.
+    n_cells
+        With ``centre="pooled"``, the cells behind each row (the weights
+        ``n_p``); None weighs the rows equally.
 
     Returns
     -------
     ShrunkLFC
-        ``lfc``, ``se`` and ``prior_scale``.
+        ``lfc``, ``se``, ``prior_scale`` and ``centre``.
     """
     lfc = np.array(lfc, dtype=np.float64)
     se = np.asarray(se, dtype=np.float64)
     if se.shape != lfc.shape:
         raise ValueError(f"shrink_lfc_arrays: se has shape {se.shape}, lfc {lfc.shape}")
-    if floor is not None:
-        bound = np.broadcast_to(np.asarray(floor, dtype=np.float64), lfc.shape)
-        lfc = np.where(np.isfinite(bound), np.maximum(lfc, bound), lfc)
-    excluded = (np.zeros(lfc.shape, dtype=bool) if exclude is None
-                else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape))
-    valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
+    if centre not in ("zero", "pooled"):
+        raise ValueError(f"shrink_lfc_arrays: centre must be 'zero' or 'pooled', got {centre!r}")
+    bound = None if floor is None else np.broadcast_to(np.asarray(floor, dtype=np.float64), lfc.shape)
+    excluded = None if exclude is None else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape)
+    lfc, valid, excluded, pick = _shrink_prepare(lfc, se, excluded, bound)
+    mu = None
+    if centre == "pooled":
+        if lfc.ndim != 2:
+            raise ValueError(f"shrink_lfc_arrays: centre='pooled' needs perturbations x genes, got shape {lfc.shape}")
+        weights = (np.ones(lfc.shape[0]) if n_cells is None
+                   else np.asarray(n_cells, dtype=np.float64).reshape(-1))
+        if weights.shape != (lfc.shape[0],):
+            raise ValueError(f"shrink_lfc_arrays: n_cells has {weights.size} entries, lfc {lfc.shape[0]} rows")
+        mu = _pooled_centre(lambda: [(lfc, se, pick, weights)], lfc.shape[1])
     if prior_scale is None:
-        pick = valid & ~excluded & (se > 0)
-        prior_scale = _estimate_apeglm_prior_scale(lfc[pick], se[pick]) if pick.any() else 1.0
+        prior_scale = _prior_scale(lfc if mu is None else lfc - mu, se, pick)
     prior_scale = float(prior_scale)
-    mode = cauchy_map(lfc, se, prior_scale)
-    out_lfc = np.where(valid, np.where(excluded, lfc, mode), np.nan)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        denominator = prior_scale ** 2 + out_lfc ** 2
-        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_lfc ** 2) / denominator ** 2
-        post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
-    out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
-    return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale)
+    out_lfc, out_se = _shrink_entries(lfc, se, valid, excluded, prior_scale, mu)
+    return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale, centre=mu)
 
 
 # ---------------------------------------------------------------------------

@@ -253,6 +253,8 @@ def fingerprint_difference(previous: dict, current: dict) -> str | None:
         return "the input file has changed since"
     if previous.get("inputs") != current.get("inputs"):
         return "an input file has changed since"
+    if previous.get("crispyx") != current.get("crispyx"):
+        return f"it was written by crispyx {previous.get('crispyx', 'before 0.2.6')}"
     old_params = previous.get("params", {})
     new_params = current.get("params", {})
     for name in sorted(set(old_params) | set(new_params)):

@@ -181,7 +181,9 @@ class _PreprocessingNamespace:
         data_name: str | None = None,
         output_path: str | Path | None = None,
         output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
-        cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
+        cache_mode: Literal['memory', 'disk', 'none'] = 'disk',
+        memory_limit_gb: float | None = None,
+        sort_by_perturbation: bool = False,
         verbose: int | bool = True,
     ):
         result = quality_control_summary(
@@ -197,6 +199,8 @@ class _PreprocessingNamespace:
             data_name=data_name,
             output_path=output_path,
             cache_mode=cache_mode,
+            memory_limit_gb=memory_limit_gb,
+            sort_by_perturbation=sort_by_perturbation,
             verbose=verbose,
         )
         return result.filtered
@@ -929,7 +933,6 @@ class _ToolsNamespace:
         data_name: str | None = None,
         corr_method: str = "benjamini-hochberg",
         verbose: int | bool = True,
-        resume: bool = False,
         memory_limit_gb: float | None = None,
         force: bool = False,
         **kwargs,
@@ -965,7 +968,6 @@ class _ToolsNamespace:
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
-            resume=resume,
             memory_limit_gb=memory_limit_gb,
             force=force,
         )
@@ -973,8 +975,8 @@ class _ToolsNamespace:
         if normalised == "wilcoxon":
             allowed = {
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
-                "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
-                "checkpoint_interval",
+                "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct", "distribution",
+                "checkpoint_interval", "resume",
                 "batch_column",
                 "format_mismatch_policy",
             }
@@ -1013,7 +1015,7 @@ class _ToolsNamespace:
                 "min_total_count",
                 "chunk_size",
                 "n_jobs",
-                "checkpoint_interval",
+                "checkpoint_interval", "resume",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -1037,7 +1039,7 @@ class _ToolsNamespace:
                 "min_cells_expressed", "min_pct_ctrl", "min_pct_pert",
                 "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
                 "n_jobs",
-                "checkpoint_interval",
+                "checkpoint_interval", "resume",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -1073,12 +1075,14 @@ class _ToolsNamespace:
         """
         return nb_offset_test(data, **kwargs)
 
-    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None):
+    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None,
+                          centre="zero", n_cells=None):
         """apeGLM shrinkage of fold changes given as arrays, exactly.
 
         See :func:`crispyx.de.shrink_lfc_arrays`.
         """
-        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor)
+        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor,
+                                 centre=centre, n_cells=n_cells)
 
     def shrink_lfc(
         self,
@@ -1093,6 +1097,10 @@ class _ToolsNamespace:
         batch_size: int = 128,
         profiling: bool = False,
         memory_limit_gb: float | None = None,
+        exclude=None,
+        floor=None,
+        centre: str = "zero",
+        n_cells=None,
         verbose: int | bool = True,
     ):
         """Apply apeGLM LFC shrinkage to NB-GLM results.
@@ -1119,6 +1127,8 @@ class _ToolsNamespace:
             Enable timing/memory profiling.
         memory_limit_gb
             Optional memory budget in GB. None auto-detects via psutil.
+        exclude, floor, centre, n_cells
+            As in :func:`crispyx.de.shrink_lfc` (``method="stats"`` only).
 
         Returns
         -------
@@ -1137,6 +1147,10 @@ class _ToolsNamespace:
             batch_size=batch_size,
             profiling=profiling,
             memory_limit_gb=memory_limit_gb,
+            exclude=exclude,
+            floor=floor,
+            centre=centre,
+            n_cells=n_cells,
             verbose=verbose,
         )
 

@@ -101,7 +101,10 @@ when ``verbose`` is on; the copy is reused by later runs on the same input,
 and passing it as the input skips the check. Sort once up front with
 ``cx.data.sort_by_perturbation`` for a file under those thresholds that is
 still slow (a smaller screen on a network filesystem), or for a script of
-your own that reads the cells of each perturbation.
+your own that reads the cells of each perturbation. When the file goes
+through QC first, ``cx.pp.qc_summary(..., sort_by_perturbation=True)`` writes
+the filtered file in that order directly, from the same passes over the
+source, so no separate sort is needed.
 
 NB-GLM then streams the CSR file:
 
@@ -142,8 +145,8 @@ above, the result file of ``cx.tl.t_test`` / ``cx.tl.wilcoxon_test`` /
 ``cx.tl.nb_glm_test`` as it is filled, QC's chunk cache, and whole-file
 CSR↔CSC conversions. The DE functions fill their result file beside the output
 (in a hidden ``.<output name>.resume`` directory, moved to the output on
-success) rather than in ``$TMPDIR``, so an interrupted run can continue with
-``resume=True``; their ``"output"`` estimate covers that file.
+success) rather than in ``$TMPDIR``, so an interrupted run continues where it
+stopped; their ``"output"`` estimate covers that file.
 ``cx.tl.batch_process`` writes results directly into its output file as each
 gene chunk finishes, so its ``"output"`` estimate likewise accounts for the
 full footprint (see ``resume`` below for what that also enables). Every other
@@ -355,25 +358,28 @@ invalidate it. Pass ``force=True`` to recompute regardless.
 Resume and checkpointing
 ------------------------
 
-Long-running differential expression analyses can be resumed after interruption
-using the ``resume`` and ``checkpoint_interval`` parameters:
+``cx.tl.t_test``, ``cx.tl.wilcoxon_test``, ``cx.tl.nb_glm_test`` and
+``cx.tl.nb_offset_test`` resume an interrupted run by default: rerun the same call and the perturbations (or gene
+chunks) it had finished are skipped. A checkpoint is used only when it comes
+from the same crispyx version, input file and result-affecting arguments;
+``n_jobs``, ``memory_limit_gb`` and other operational arguments may change, so a
+run killed for memory can restart with a lower limit or more workers. Any other
+checkpoint is discarded with a warning. ``resume=False`` or ``force=True``
+starts over.
 
 .. code-block:: python
 
-   # Enable checkpointing during long runs
-   result = cx.nb_glm_test(
-       adata_ro,
+   result = cx.tl.nb_glm_test(
+       "screen.h5ad",
        perturbation_column="perturbation",
-       resume=True,
-       checkpoint_interval=10,  # Save progress every 10 perturbations
+       checkpoint_interval=10,  # save progress every 10 perturbations
    )
 
-If interrupted, simply re-run the same command - completed perturbations will
-be skipped automatically. The checkpoint file ``<output>.progress.json`` is
-written atomically to prevent corruption.
+The checkpoint file ``<output>.progress.json`` is written atomically to prevent
+corruption.
 
-``cx.tl.batch_process`` supports the same ``resume``/``checkpoint_interval``
-parameters. Its unit of resumable progress is a *gene chunk* rather than a
+``cx.tl.batch_process`` takes the same ``resume``/``checkpoint_interval``
+parameters, with ``resume=False`` by default. Its unit of resumable progress is a *gene chunk* rather than a
 perturbation, since a chunk's result depends on every group and batch having
 been swept once, not on one group alone; if the checkpoint file is itself
 missing or corrupted, it falls back to scanning the (already partially

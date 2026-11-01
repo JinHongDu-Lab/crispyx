@@ -94,8 +94,8 @@ def _nb_loglik_grid_numba(
 def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
     """``-0.5 * log det(xtwx)`` from a Cholesky factorisation in place.
 
-    Zero for an empty matrix (no Cox-Reid adjustment), or one that is not
-    positive definite (as the gene-wise Cox-Reid step treats it).
+    Zero for an empty matrix (no Cox-Reid adjustment); NaN for one that is
+    not positive definite.
     """
     log_det = 0.0
     for j in range(xtwx.shape[0]):
@@ -103,7 +103,7 @@ def _neg_half_log_det_numba(xtwx: np.ndarray) -> float:
         for k in range(j):
             d -= xtwx[j, k] * xtwx[j, k]
         if d <= 0.0:
-            return 0.0
+            return np.nan
         ljj = math.sqrt(d)
         xtwx[j, j] = ljj
         log_det += math.log(ljj)
@@ -132,6 +132,9 @@ def _brent_minimize_numba(
     x_indices: np.ndarray,
     x_data: np.ndarray,
     xtwx: np.ndarray,
+    x_group: np.ndarray,
+    gdiag: np.ndarray,
+    gcross: np.ndarray,
     a: float,
     b: float,
     tol: float = 1e-5,
@@ -149,7 +152,7 @@ def _brent_minimize_numba(
     x = w = v = a + golden * (b - a)
     fx = fw = fv = -_nb_posterior_with_cache_numba(
         Y_g, mu_g, x, log_trend_g, prior_var, gammaln_y_plus_1_sum, small_counts, x_indptr, x_indices, x_data,
-        xtwx,
+        xtwx, x_group, gdiag, gcross,
     )
     
     d = 0.0  # Distance to next point
@@ -206,7 +209,7 @@ def _brent_minimize_numba(
         
         fu = -_nb_posterior_with_cache_numba(
             Y_g, mu_g, u, log_trend_g, prior_var, gammaln_y_plus_1_sum, small_counts, x_indptr, x_indices, x_data,
-            xtwx,
+            xtwx, x_group, gdiag, gcross,
         )
         
         # Update a, b, v, w, x
@@ -253,14 +256,23 @@ def _nb_posterior_with_cache_numba(
     x_indices: np.ndarray,
     x_data: np.ndarray,
     xtwx: np.ndarray,
+    x_group: np.ndarray,
+    gdiag: np.ndarray,
+    gcross: np.ndarray,
 ) -> float:
     """Cox-Reid adjusted NB log-likelihood plus log-prior for one gene.
 
-    Uses the precomputed ``gammaln(Y+1)`` sum. ``XᵀWX``, ``W = mu / (1 +
-    alpha mu)``, is accumulated into the work buffer ``xtwx`` (``(0, 0)``
-    for no adjustment) in the same pass over the cells as the likelihood;
-    the design ``X`` is given in CSR form, so a one-hot batch design costs a
-    few products per cell rather than ``n_features**2``. ``small_counts[k]``
+    Uses the precomputed ``gammaln(Y+1)`` sum. The design is ``[F | G]``:
+    ``F`` in CSR form (``x_indptr``, ``x_indices``, ``x_data``), and ``G``
+    one-hot, cell ``i`` in column ``x_group[i]`` (-1 for none). With ``W =
+    mu / (1 + alpha mu)``, ``FᵀWF`` is accumulated into the work buffer
+    ``xtwx`` (``(0, 0)`` for no adjustment), the diagonal ``GᵀWG`` into
+    ``gdiag`` and ``GᵀWF`` into ``gcross``, in the same pass over the cells
+    as the likelihood; then ``log det(XᵀWX) = sum log gdiag + log det(FᵀWF -
+    GᵀWFᵀ diag(gdiag)⁻¹ GᵀWF)``, the Schur complement of the one-hot block,
+    so hundreds of stratum columns cost ``n_groups x n_F**2`` rather than a
+    factorisation of the whole ``XᵀWX``. The adjustment is zero when
+    ``XᵀWX`` is not positive definite. ``small_counts[k]``
     is the number of cells with count ``k`` (below its length): their
     ``lgamma(y + r) - lgamma(r)`` terms depend on the count only, so each
     value's is formed once, by recurrence, rather than once per cell.
@@ -271,6 +283,10 @@ def _nb_posterior_with_cache_numba(
     log_r = math.log(r)
     cox_reid = xtwx.shape[0] > 0
     xtwx[:, :] = 0.0
+    n_groups = gdiag.shape[0]
+    if n_groups:
+        gdiag[:] = 0.0
+        gcross[:, :] = 0.0
 
     # lgamma(y + r) - lgamma(r) - y log r, without libm's lgamma (see
     # _lgamma_ratio_term): sum(log1p(i / r), i < y) for the small counts.
@@ -296,10 +312,31 @@ def _nb_posterior_with_cache_numba(
                 ja = x_indices[a]
                 for b in range(x_indptr[i], x_indptr[i + 1]):
                     xtwx[ja, x_indices[b]] += wa * x_data[b]
+            if n_groups and x_group[i] >= 0:
+                j = x_group[i]
+                gdiag[j] += w
+                for a in range(x_indptr[i], x_indptr[i + 1]):
+                    gcross[j, x_indices[a]] += w * x_data[a]
     ll -= gammaln_y_plus_1_sum
 
     log_prior = -0.5 * (log_alpha - log_trend_g) ** 2 / prior_var
-    return ll + log_prior + _neg_half_log_det_numba(xtwx)
+    if not cox_reid:
+        return ll + log_prior
+    adjustment = 0.0
+    for j in range(n_groups):
+        dj = gdiag[j]
+        if dj <= 0.0:
+            return ll + log_prior  # XᵀWX is not positive definite
+        adjustment -= 0.5 * math.log(dj)
+        for a in range(xtwx.shape[0]):
+            ca = gcross[j, a] / dj
+            if ca != 0.0:
+                for b in range(xtwx.shape[0]):
+                    xtwx[a, b] -= ca * gcross[j, b]
+    schur = _neg_half_log_det_numba(xtwx)
+    if math.isnan(schur):
+        return ll + log_prior
+    return ll + log_prior + adjustment + schur
 
 
 @nb.njit(parallel=True, cache=True)
@@ -315,6 +352,8 @@ def _nb_map_grid_search_with_refinement_numba(
     x_indices: np.ndarray,
     x_data: np.ndarray,
     n_features: int,
+    x_group: np.ndarray,
+    n_groups: int,
     tol: float = 1e-5,
     max_refine_iter: int = 50,
 ) -> np.ndarray:
@@ -339,8 +378,12 @@ def _nb_map_grid_search_with_refinement_numba(
         Variance of the log-normal prior (``inf`` for none: the gene-wise
         estimate).
     x_indptr, x_indices, x_data, n_features
-        The design matrix in CSR form, for the Cox-Reid adjustment
-        (``n_features=0`` for none).
+        The design's columns outside its one-hot block in CSR form, for the
+        Cox-Reid adjustment (``n_features=0`` for none).
+    x_group, n_groups
+        Each cell's column of the one-hot block (-1 for none), and the
+        block's width (0 for no block): see
+        :func:`_nb_posterior_with_cache_numba`.
     tol : float
         Tolerance for Brent convergence.
     max_refine_iter : int
@@ -358,6 +401,8 @@ def _nb_map_grid_search_with_refinement_numba(
         Y_g = Y[:, g]
         mu_g = mu[:, g]
         xtwx = np.empty((n_features, n_features))
+        gdiag = np.empty(n_groups)
+        gcross = np.empty((n_groups, n_features))
         small_counts = np.zeros(_SMALL_COUNTS)
         for i in range(Y_g.shape[0]):
             if Y_g[i] < _SMALL_COUNTS:
@@ -369,7 +414,7 @@ def _nb_map_grid_search_with_refinement_numba(
         for k in range(n_grid):
             posterior = _nb_posterior_with_cache_numba(
                 Y_g, mu_g, lo[g] + k * step, log_trend_g, prior_var, 0.0, small_counts,
-                x_indptr, x_indices, x_data, xtwx,
+                x_indptr, x_indices, x_data, xtwx, x_group, gdiag, gcross,
             )
             if posterior > best_posterior:
                 best_posterior = posterior
@@ -378,11 +423,11 @@ def _nb_map_grid_search_with_refinement_numba(
         if 0 < best_k < n_grid - 1 and 2 * step > tol:
             refined = _brent_minimize_numba(
                 Y_g, mu_g, log_trend_g, prior_var, 0.0, small_counts, x_indptr, x_indices, x_data, xtwx,
-                best - step, best + step, tol=tol, max_iter=max_refine_iter,
+                x_group, gdiag, gcross, best - step, best + step, tol=tol, max_iter=max_refine_iter,
             )
             refined_posterior = _nb_posterior_with_cache_numba(
                 Y_g, mu_g, refined, log_trend_g, prior_var, 0.0, small_counts, x_indptr, x_indices, x_data,
-                xtwx,
+                xtwx, x_group, gdiag, gcross,
             )
             if refined_posterior >= best_posterior:
                 best = refined
@@ -498,6 +543,148 @@ def _compute_ctrl_tie_sums(
     return ctrl_tie_sums
 
 
+# The NB IRLS fits measure a deviance change relative to |deviance| plus
+# this, DESeq2's ratio: a saturated fit's deviance near zero still converges.
+_DEVIANCE_OFFSET = 0.1
+
+
+# The rank-sum p-value treats the number of expressing cells that fall in the
+# perturbation group as hypergeometric whenever its variance, summed over
+# strata, is below this; above it the normal approximation is used.
+_RANK_SUM_MIXTURE_MAX_VAR = 100.0
+# The most components the strata's combined mixture keeps; beyond it,
+# components with nearby means are merged.
+_RANK_SUM_MIXTURE_MAX_COMPONENTS = 1 << 15
+
+
+@nb.njit(cache=True)
+def _merge_mixture(w: np.ndarray, m: np.ndarray, v: np.ndarray, n_bins: int) -> tuple:
+    """Merge a normal mixture's components into at most ``n_bins`` by their
+    mean (equal-width bins over its range), each bin a normal with the
+    bin's weight, mean and variance."""
+    lo = m.min()
+    span = m.max() - lo
+    bins = np.zeros(m.shape[0], dtype=np.int64)
+    if span > 0.0:
+        for i in range(m.shape[0]):
+            bins[i] = min(int((m[i] - lo) / span * n_bins), n_bins - 1)
+    bw = np.zeros(n_bins)
+    bm = np.zeros(n_bins)
+    for i in range(m.shape[0]):
+        bw[bins[i]] += w[i]
+        bm[bins[i]] += w[i] * m[i]
+    for b in range(n_bins):
+        if bw[b] > 0.0:
+            bm[b] /= bw[b]
+    bv = np.zeros(n_bins)
+    for i in range(m.shape[0]):
+        d = m[i] - bm[bins[i]]
+        bv[bins[i]] += w[i] * (v[i] + d * d)
+    keep = np.flatnonzero(bw > 0.0)
+    return bw[keep], bm[keep], bv[keep] / bw[keep]
+
+
+@nb.njit(cache=True)
+def _rank_sum_mixture_pvalue(
+    n1s: np.ndarray, ns: np.ndarray, ks: np.ndarray, nz_tie_sums: np.ndarray, deviation: float,
+    max_components: int = _RANK_SUM_MIXTURE_MAX_COMPONENTS,
+) -> float:
+    """Two-sided p-value of a (stratified) rank sum when most values are tied
+    at zero.
+
+    Stratum ``b`` has ``ns[b]`` cells, ``n1s[b]`` of them in the group and
+    ``ks[b]`` non-zero, whose ties give ``nz_tie_sums[b] = sum(t^3 - t)``;
+    ``deviation`` is ``sum_b (R_b - E_b)``. Under the permutation null the
+    group's count of non-zero cells ``J_b`` is hypergeometric: with few
+    non-zeros it is very skewed, which the normal approximation misses by
+    orders of magnitude (one expressing cell of 232 against 3 of 30,000
+    controls: p 3e-8 against a permutation p of 0.03). Here ``J_b`` keeps
+    its exact distribution, and given ``J_b = j`` the rank sum is normal
+    with the exact mean and variance of ``j`` draws without replacement from
+    the non-zero ranks. The strata's
+    mixtures are combined exactly up to ``max_components`` components;
+    past it, :func:`_merge_mixture` merges those with nearby means, keeping
+    each merged component's weight, mean and variance.
+    """
+    w = np.ones(1)
+    m = np.zeros(1)
+    v = np.zeros(1)
+    for b in range(n1s.shape[0]):
+        n1 = n1s[b]
+        n = ns[b]
+        k = ks[b]
+        z = n - k
+        if n1 == 0 or n1 == n:
+            continue
+        r0 = (z + 1.0) / 2.0
+        mean_nz = z + (k + 1.0) / 2.0
+        var_nz = ((k * k - 1.0) / 12.0 - nz_tie_sums[b] / (12.0 * k)) if k > 1 else 0.0
+        expected = n1 * (n + 1.0) / 2.0
+        lo = max(0, n1 - z)
+        hi = min(k, n1)
+        # Start at the mode and walk out by the ratio of successive terms.
+        mode = min(max(int((n1 + 1.0) * (k + 1.0) / (n + 2.0)), lo), hi)
+        log_mode = (math.lgamma(k + 1.0) - math.lgamma(mode + 1.0) - math.lgamma(k - mode + 1.0)
+                    + math.lgamma(z + 1.0) - math.lgamma(n1 - mode + 1.0) - math.lgamma(z - n1 + mode + 1.0)
+                    - math.lgamma(n + 1.0) + math.lgamma(n1 + 1.0) + math.lgamma(n - n1 + 1.0))
+        width = hi - lo + 1
+        pmf = np.zeros(width)
+        pmf[mode - lo] = math.exp(log_mode)
+        for j in range(mode, hi):
+            pmf[j + 1 - lo] = pmf[j - lo] * (k - j) * (n1 - j) / ((j + 1.0) * (z - n1 + j + 1.0))
+            if pmf[j + 1 - lo] < 1e-300:
+                break
+        for j in range(mode, lo, -1):
+            pmf[j - 1 - lo] = pmf[j - lo] * j * (z - n1 + j) / ((k - j + 1.0) * (n1 - j + 1.0))
+            if pmf[j - 1 - lo] < 1e-300:
+                break
+        c = 0
+        for i in range(width):
+            if pmf[i] >= 1e-300:
+                c += 1
+        if c == 1:
+            j = mode
+            m += (n1 - j) * r0 + j * mean_nz - expected
+            v += j * (k - j) / (k - 1.0) * var_nz if k > 1 else 0.0
+            continue
+        if w.shape[0] * c > max_components:
+            w, m, v = _merge_mixture(w, m, v, max(max_components // c, 1))
+        nw = np.empty(w.shape[0] * c)
+        nm = np.empty(w.shape[0] * c)
+        nv = np.empty(w.shape[0] * c)
+        out = 0
+        for i in range(width):
+            if pmf[i] < 1e-300:
+                continue
+            j = lo + i
+            cm = (n1 - j) * r0 + j * mean_nz - expected
+            cv = j * (k - j) / (k - 1.0) * var_nz if k > 1 else 0.0
+            for a in range(w.shape[0]):
+                nw[out] = w[a] * pmf[i]
+                nm[out] = m[a] + cm
+                nv[out] = v[a] + cv
+                out += 1
+        w, m, v = nw, nm, nv
+    d = abs(deviation)
+    tol = 1e-9 * (1.0 + d)
+    total = 0.0
+    for i in range(w.shape[0]):
+        if v[i] > 0.0:
+            sd = math.sqrt(2.0 * v[i])
+            total += w[i] * 0.5 * (math.erfc((d - m[i]) / sd) + math.erfc((d + m[i]) / sd))
+        elif m[i] >= d - tol or m[i] <= -d + tol:
+            total += w[i]
+    return min(total, 1.0)
+
+
+@nb.njit(cache=True)
+def _hypergeometric_variance(n1: float, n: float, k: float) -> float:
+    """Variance of the group's count of non-zero cells under the permutation null."""
+    if n <= 1.0:
+        return 0.0
+    return n1 * (k / n) * ((n - k) / n) * ((n - n1) / (n - 1.0))
+
+
 @nb.njit(cache=True)
 def _all_tied(n_zeros: int, ctrl_sorted: np.ndarray, pert_sorted: np.ndarray) -> bool:
     """Whether every value of a gene -- ``n_zeros`` zeros plus the sorted
@@ -551,6 +738,8 @@ def _rank_sum_pert_bsearch_numba(
         ``n_pert_zeros * zero_avg_rank`` is added by the caller).
     tie_corr : float
         Tie correction factor: 1 - sum(t^3 - t) / (n_total^3 - n_total).
+    tie_sum : float
+        ``sum(t^3 - t)`` over every tie group, the zeros included.
     """
     n_ctrl_nz = ctrl_sorted.shape[0]
     n_pert_nz = pert_sorted.shape[0]
@@ -614,7 +803,7 @@ def _rank_sum_pert_bsearch_numba(
     else:
         tie_corr = 1.0
 
-    return rank_sum, tie_corr
+    return rank_sum, tie_corr, tie_sum
 
 
 @nb.njit(parallel=False, cache=True)
@@ -628,6 +817,7 @@ def _wilcoxon_single_pert_presorted(
     pert_dense: np.ndarray,
     valid_genes: np.ndarray,
     tie_correct: bool,
+    hypergeometric: bool,
     zero_threshold: float,
     u_stat_out: np.ndarray,
     z_score_out: np.ndarray,
@@ -673,6 +863,7 @@ def _wilcoxon_single_pert_presorted(
         tied = n_zeros == n_total
         rank_sum = 0.0
         tie_corr = 1.0
+        tie_sum = 0.0
         if not tied:
             # --- Binary-search ranking (always) ---
             # O(n_pert_nz * log(n_ctrl_nz)) — works for any zero fraction.
@@ -693,7 +884,7 @@ def _wilcoxon_single_pert_presorted(
             ctrl_sorted = ctrl_sorted_flat[start : start + n_ctrl_nz]
 
             tied = _all_tied(n_zeros, ctrl_sorted, pert_sorted)
-            rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
+            rank_sum_nz, tie_corr, tie_sum = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[g]
             )
 
@@ -722,6 +913,13 @@ def _wilcoxon_single_pert_presorted(
             z = (rank_sum - expected) / std
             abs_z = abs(z)
             pval = math.erfc(abs_z / math.sqrt(2.0))
+            n_nonzero = n_total - n_zeros
+            if hypergeometric and _hypergeometric_variance(n_pert_f, n_total_f, float(n_nonzero)) < _RANK_SUM_MIXTURE_MAX_VAR:
+                zf = float(n_zeros)
+                pval = _rank_sum_mixture_pvalue(
+                    np.array([n_pert]), np.array([n_total]), np.array([n_nonzero]),
+                    np.array([tie_sum - (zf ** 3 - zf)]), rank_sum - expected,
+                )
         else:
             # An empty group: no comparison was made.
             z = np.nan
@@ -753,6 +951,7 @@ def _wilcoxon_batch_perts_presorted_numba(
     pert_row_offsets: np.ndarray,
     valid_masks: np.ndarray,
     tie_correct: bool,
+    hypergeometric: bool,
     zero_threshold: float,
     u_stat_out: np.ndarray,
     z_score_out: np.ndarray,
@@ -788,6 +987,9 @@ def _wilcoxon_batch_perts_presorted_numba(
     valid_masks : (n_perts, n_valid_genes)
         Boolean validity mask per (pert, gene).
     tie_correct : bool
+    hypergeometric : bool
+        Whether p-values come from :func:`_rank_sum_mixture_pvalue` where the
+        group's count of non-zero cells is skewed.
     zero_threshold : float
     u_stat_out : (n_perts, n_valid_genes)
     z_score_out : (n_perts, n_valid_genes)
@@ -811,6 +1013,7 @@ def _wilcoxon_batch_perts_presorted_numba(
             pert_dense,
             valid_masks[p_idx],
             tie_correct,
+            hypergeometric,
             zero_threshold,
             u_stat_out[p_idx],
             z_score_out[p_idx],
@@ -833,6 +1036,7 @@ def _wilcoxon_stratified_single_pert(
     seg_hi: int,
     valid_genes: np.ndarray,
     tie_correct: bool,
+    hypergeometric: bool,
     u_stat_out: np.ndarray,
     z_score_out: np.ndarray,
     pvalue_out: np.ndarray,
@@ -867,6 +1071,11 @@ def _wilcoxon_stratified_single_pert(
     """
     n_genes = all_pert_stacked.shape[1]
     sqrt2 = math.sqrt(2.0)
+    n_seg = seg_hi - seg_lo
+    strata_n1 = np.empty(n_seg, dtype=np.int64)
+    strata_n = np.empty(n_seg, dtype=np.int64)
+    strata_k = np.empty(n_seg, dtype=np.int64)
+    strata_ties = np.empty(n_seg, dtype=np.float64)
 
     for g in range(n_genes):
         if not valid_genes[g]:
@@ -881,6 +1090,8 @@ def _wilcoxon_stratified_single_pert(
         u_sum = 0.0      # sum_b U_b
         n1n0_sum = 0.0   # sum_b n1_b * n0_b
         tied = True      # every contributing stratum has a single value
+        var_j = 0.0      # sum_b Var(J_b): the group's count of non-zero cells
+        n_used = 0
 
         for s in range(seg_lo, seg_hi):
             b = seg_batch[s]
@@ -919,9 +1130,16 @@ def _wilcoxon_stratified_single_pert(
 
             if not _all_tied(n_zeros, ctrl_sorted, pert_sorted):
                 tied = False
-            rank_sum_nz, tie_corr = _rank_sum_pert_bsearch_numba(
+            rank_sum_nz, tie_corr, tie_sum = _rank_sum_pert_bsearch_numba(
                 ctrl_sorted, pert_sorted, n_zeros, ctrl_tie_sums[b, g]
             )
+            zf = float(n_zeros)
+            strata_n1[n_used] = n1
+            strata_n[n_used] = N
+            strata_k[n_used] = N - n_zeros
+            strata_ties[n_used] = tie_sum - (zf ** 3 - zf)
+            n_used += 1
+            var_j += _hypergeometric_variance(float(n1), float(N), float(N - n_zeros))
             if not tie_correct:
                 tie_corr = 1.0
 
@@ -943,6 +1161,10 @@ def _wilcoxon_stratified_single_pert(
         if var > 0.0 and not tied:
             z = num / math.sqrt(var)
             pval = math.erfc(abs(z) / sqrt2)
+            if hypergeometric and var_j < _RANK_SUM_MIXTURE_MAX_VAR:
+                pval = _rank_sum_mixture_pvalue(
+                    strata_n1[:n_used], strata_n[:n_used], strata_k[:n_used], strata_ties[:n_used], num,
+                )
         else:
             # No stratum to compare in, or every value tied within each:
             # the rank test is undefined (with or without the tie
@@ -977,6 +1199,7 @@ def _wilcoxon_stratified_batch_perts_numba(
     pert_ptr: np.ndarray,
     valid_masks: np.ndarray,
     tie_correct: bool,
+    hypergeometric: bool,
     u_stat_out: np.ndarray,
     z_score_out: np.ndarray,
     pvalue_out: np.ndarray,
@@ -1006,6 +1229,8 @@ def _wilcoxon_stratified_batch_perts_numba(
         perturbation ``p``.
     valid_masks : (n_perts, n_valid_genes)
     tie_correct : bool
+    hypergeometric : bool
+        As in :func:`_wilcoxon_batch_perts_presorted_numba`.
     u_stat_out, z_score_out, pvalue_out, effect_out : (n_perts, n_valid_genes)
     """
     n_perts = pert_ptr.shape[0] - 1
@@ -1024,6 +1249,7 @@ def _wilcoxon_stratified_batch_perts_numba(
             pert_ptr[p_idx + 1],
             valid_masks[p_idx],
             tie_correct,
+            hypergeometric,
             u_stat_out[p_idx],
             z_score_out[p_idx],
             pvalue_out[p_idx],
@@ -1974,7 +2200,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
             ceiling = dev + 1e-9 * abs(dev)
             rose = new_dev > ceiling
             worse = rose and not on_floor
-            scale = max(abs(dev), 1e-8)
+            scale = abs(dev) + _DEVIANCE_OFFSET
             excess = (new_dev - dev) / scale
             step = 1.0
             for _h in range(max_halvings):
@@ -2001,7 +2227,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
                 new_mu[:] = mu
                 new_dev = dev
             relative_change = abs(new_dev - dev) / scale
-            deviance_ratio = abs(new_dev - dev) / (abs(new_dev) + 0.1)
+            deviance_ratio = abs(new_dev - dev) / (abs(new_dev) + _DEVIANCE_OFFSET)
             coef_change = 0.0
             for j in range(dx):
                 coef_change = max(coef_change, abs(new_f[j] - bf[j]))

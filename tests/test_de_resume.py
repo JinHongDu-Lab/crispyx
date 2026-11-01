@@ -47,6 +47,10 @@ def _run(method, screen, out: Path, **kw):
         return de.t_test(screen / "norm.h5ad", n_jobs=1, checkpoint_interval=1, **common, **kw)
     if method == "nb_glm":
         return de.nb_glm_test(screen / "counts.h5ad", n_jobs=1, checkpoint_interval=1, **common, **kw)
+    if method == "nb_offset":
+        return de.nb_offset_test(
+            screen / "counts.h5ad", strata="batch", n_jobs=1, checkpoint_interval=1, **common, **kw,
+        )
     extra = {"batch_column": "batch"} if method == "wilcoxon_stratified" else {}
     return de.wilcoxon_test(
         screen / "norm.h5ad", chunk_size=25, checkpoint_interval=1, **common, **extra, **kw,
@@ -116,7 +120,7 @@ def _resume_dir(out: Path) -> Path:
     return out.with_name(f".{out.name}.resume")
 
 
-CASES = ["t_test", "nb_glm", "wilcoxon", "wilcoxon_stratified"]
+CASES = ["t_test", "nb_glm", "nb_offset", "wilcoxon", "wilcoxon_stratified"]
 
 
 @pytest.mark.parametrize("method", CASES)
@@ -201,16 +205,45 @@ def test_checkpoint_listing_an_argument_left_at_none_resumes(screen, tmp_path, m
     assert not [w for w in recwarn if "Not resuming" in str(w.message)]
 
 
-def test_resume_false_discards_a_stale_checkpoint(screen, tmp_path, monkeypatch):
+@pytest.mark.parametrize("start_over", [{"resume": False}, {"force": True}])
+def test_resume_false_or_force_discards_a_checkpoint(screen, tmp_path, monkeypatch, start_over):
     out = tmp_path / "result.h5ad"
     with monkeypatch.context() as m:
         _interrupt_after(m, 2)
         with pytest.raises(Interrupted):
             _run("wilcoxon", screen, out)
     runs = _record_runs(monkeypatch)
-    _run("wilcoxon", screen, out)  # resume=False
+    _run("wilcoxon", screen, out, **start_over)
     assert not runs[-1].resumed
     assert not out.with_suffix(".progress.json").exists() and not _resume_dir(out).exists()
+
+
+@pytest.mark.parametrize("method", ["t_test", "nb_glm", "nb_offset", "wilcoxon"])
+def test_a_rerun_resumes_by_default(screen, tmp_path, monkeypatch, method):
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run(method, screen, out)
+    runs = _record_runs(monkeypatch)
+    _run(method, screen, out)
+    assert runs[-1].resumed
+
+
+def test_a_checkpoint_from_another_crispyx_version_starts_over(screen, tmp_path, monkeypatch):
+    out = tmp_path / "result.h5ad"
+    with monkeypatch.context() as m:
+        _interrupt_after(m, 2)
+        with pytest.raises(Interrupted):
+            _run("t_test", screen, out)
+    checkpoint = out.with_suffix(".progress.json")
+    saved = json.loads(checkpoint.read_text())
+    saved["fingerprint"]["crispyx"] = "0.0.1"
+    checkpoint.write_text(json.dumps(saved))
+    runs = _record_runs(monkeypatch)
+    with pytest.warns(UserWarning, match="written by crispyx 0.0.1"):
+        _run("t_test", screen, out)
+    assert not runs[-1].resumed
 
 
 def test_memory_and_chunking_changes_still_resume(screen, tmp_path, monkeypatch):
@@ -224,7 +257,7 @@ def test_memory_and_chunking_changes_still_resume(screen, tmp_path, monkeypatch)
         with pytest.raises(Interrupted):
             _run("t_test", screen, out)
     runs = _record_runs(monkeypatch)
-    _run("t_test", screen, out, resume=True, memory_limit_gb=1.0, cell_chunk_size=64)
+    _run("t_test", screen, out, memory_limit_gb=1.0, cell_chunk_size=64)
     assert runs[-1].resumed
     # A different cell chunk sums in a different order, so rows fitted after
     # the resume may differ from the reference in the last bit.

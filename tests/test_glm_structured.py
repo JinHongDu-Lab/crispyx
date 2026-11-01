@@ -725,3 +725,34 @@ def test_dense_designs_take_the_kernel_within_tolerance(min_mu):
     np.testing.assert_allclose(kernel_fit.coef[:, 1], numpy_fit.coef[:, 1], atol=1e-7)
     np.testing.assert_allclose(kernel_fit.se[:, 1], numpy_fit.se[:, 1], rtol=1e-6)
     np.testing.assert_allclose(kernel_fit.deviance, numpy_fit.deviance, rtol=1e-10)
+
+
+@pytest.mark.parametrize("empty_level", [False, True])
+def test_cox_reid_search_through_the_onehot_block_matches_the_full_design(empty_level):
+    """The MAP dispersion search takes log det(XᵀWX) through the Schur
+    complement of the design's one-hot block; it must find what the full
+    factorisation finds, including a level with no cells (XᵀWX singular)."""
+    from crispyx._kernels import _nb_map_grid_search_with_refinement_numba as grid
+    from crispyx.glm import _design_csr
+
+    rng = np.random.default_rng(0)
+    n, n_genes, n_levels = 3000, 24, 40
+    level = rng.integers(0, n_levels, n)
+    if empty_level:
+        level[level == 3] = 4
+    design = np.zeros((n, 3 + n_levels - 1))
+    design[:, 0], design[:, 1], design[:, 2] = 1.0, rng.random(n) < 0.1, rng.normal(size=n)
+    for j in range(1, n_levels):
+        design[level == j, 2 + j] = 1.0
+    mu = np.asfortranarray(rng.gamma(2, 1, (n, n_genes)) * rng.uniform(0.2, 3, n)[:, None])
+    counts = np.asfortranarray(rng.negative_binomial(2, 2 / (2 + mu)).astype(float))
+    split = _design_csr(design, protected_columns=(0, 1))
+    assert split[5] == n_levels - 1 - int(empty_level) and split[3] == 3 + int(empty_level)
+    csr = sps.csr_matrix(design)
+    full = (csr.indptr.astype(np.int64), csr.indices.astype(np.int64), csr.data, design.shape[1],
+            np.full(n, -1, dtype=np.int64), 0)
+    bounds = (np.full(n_genes, np.log(1e-8)), np.full(n_genes, np.log(10.0)))
+    for prior_var in (np.inf, 1.0):
+        a = grid(counts, mu, np.zeros(n_genes), *bounds, 31, prior_var, *split, tol=1e-8, max_refine_iter=100)
+        b = grid(counts, mu, np.zeros(n_genes), *bounds, 31, prior_var, *full, tol=1e-8, max_refine_iter=100)
+        np.testing.assert_allclose(a, b, atol=1e-6)

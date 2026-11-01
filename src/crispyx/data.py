@@ -681,6 +681,7 @@ def _copy_extra_slots(
     varp_keys: Sequence[str],
     cell_mask: np.ndarray | None,
     gene_mask: np.ndarray | None,
+    row_order: np.ndarray | None = None,
 ) -> None:
     """Copy obsm/varm/obsp/varp from ``source`` (a backed AnnData, or
     :class:`_H5Slots` of an open h5ad) into ``output_path``, subsetting by ``cell_mask``/``gene_mask`` when given
@@ -699,6 +700,8 @@ def _copy_extra_slots(
             arr = np.asarray(source.obsm[key])
             if cell_mask is not None:
                 arr = arr[cell_mask]
+            if row_order is not None:
+                arr = arr[row_order]
             write_obsm_to_h5ad(f, key, arr)
         for key in varm_keys:
             arr = np.asarray(source.varm[key])
@@ -710,6 +713,8 @@ def _copy_extra_slots(
             mat = mat.tocsr() if sp.issparse(mat) else np.asarray(mat)
             if cell_mask is not None:
                 mat = mat[cell_mask][:, cell_mask]
+            if row_order is not None:
+                mat = mat[row_order][:, row_order]
             write_obsp_to_h5ad(f, key, mat)
         for key in varp_keys:
             mat = source.varp[key]
@@ -890,7 +895,8 @@ def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = Tru
     An output is named after its input file by default, so with in-memory
     input ``output_path`` (or ``output_dir``) is required, unless
     ``output_required=False`` says ``fn`` writes nothing without one;
-    ``resume`` is refused, since it identifies a run by its input file.
+    ``resume=True`` passed explicitly is refused, since it identifies a run
+    by its input file; a ``resume`` left at its default is turned off.
     """
     if fn is None:
         return functools.partial(accepts_in_memory, output_required=output_required)
@@ -911,12 +917,14 @@ def accepts_in_memory(fn: Callable | None = None, *, output_required: bool = Tru
                 f"{name}: an in-memory AnnData has no file to name the output after; "
                 "pass output_path."
             )
-        if given.get("resume"):
+        if kwargs.get("resume"):
             raise ValueError(
                 f"{name}: resume identifies a run by its input file, which an in-memory "
                 'AnnData does not have; save it with adata.write_h5ad("data.h5ad") and '
                 "pass the path to resume."
             )
+        if "resume" in signature.parameters:
+            kwargs["resume"] = False  # the scratch copy is new on every call
         # Room for the copy and one file derived from it (nb_glm_test's sorted copy).
         required = 2 * _anndata_nbytes(data)
         fallback = Path(output_path).parent if output_path is not None else Path(output_dir or ".")
@@ -1942,9 +1950,16 @@ def _stream_write_matrix_subset(
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
     context: str,
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     """Stream the rows of ``segments``, one after another, into the CSR
     matrix ``dest_group`` (``X`` or a layer) of ``output_path``.
+
+    With ``row_order`` (the selected rows' positions, in the order they are
+    to be written), the rows are written in that order instead: placed by
+    :func:`_transpose_in_bands` from passes over the rows in source order,
+    in bands that fit half of ``memory_limit_gb``.
 
     A counting pass sizes ``data``/``indices``/``indptr`` once; the rows are
     then written in order without holding the matrix. One segment is
@@ -2002,8 +2017,9 @@ def _stream_write_matrix_subset(
             grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
             return
 
+        out_nnz = row_nnz if row_order is None else row_nnz[row_order]
         indptr = np.zeros(n_obs + 1, dtype=np.int64)
-        np.cumsum(row_nnz, out=indptr[1:])
+        np.cumsum(out_nnz, out=indptr[1:])
 
         # ~1 MB HDF5 chunks (8K to 256K elements), written from a buffer of
         # two chunks to keep the number of writes down.
@@ -2024,52 +2040,102 @@ def _stream_write_matrix_subset(
         grp.create_dataset("indptr", data=indptr)
         grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
 
-        offset = 0
-        data_buffer: list[np.ndarray] = []
-        indices_buffer: list[np.ndarray] = []
-        buffer_nnz = 0
-        evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
+        if row_order is None:
+            offset = 0
+            data_buffer: list[np.ndarray] = []
+            indices_buffer: list[np.ndarray] = []
+            buffer_nnz = 0
+            evict = _EvictEvery(output_path, *{segment.source_path for segment in segments})
 
-        def flush() -> None:
-            nonlocal offset, data_buffer, indices_buffer, buffer_nnz
-            if buffer_nnz:
-                data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
-                indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
-                offset += buffer_nnz
-                evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
-            data_buffer, indices_buffer, buffer_nnz = [], [], 0
+            def flush() -> None:
+                nonlocal offset, data_buffer, indices_buffer, buffer_nnz
+                if buffer_nnz:
+                    data_ds[offset : offset + buffer_nnz] = np.concatenate(data_buffer)
+                    indices_ds[offset : offset + buffer_nnz] = np.concatenate(indices_buffer)
+                    offset += buffer_nnz
+                    evict(buffer_nnz * (data_ds.dtype.itemsize + 4))
+                data_buffer, indices_buffer, buffer_nnz = [], [], 0
 
-        def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
-            nonlocal buffer_nnz
-            if len(chunk_data):
-                data_buffer.append(chunk_data)
-                indices_buffer.append(chunk_indices)
-                buffer_nnz += len(chunk_data)
-                if buffer_nnz >= write_buffer_size:
-                    flush()
+            def append(chunk_data: np.ndarray, chunk_indices: np.ndarray) -> None:
+                nonlocal buffer_nnz
+                if len(chunk_data):
+                    data_buffer.append(chunk_data)
+                    indices_buffer.append(chunk_indices)
+                    buffer_nnz += len(chunk_data)
+                    if buffer_nnz >= write_buffer_size:
+                        flush()
 
+            if chunk_cache is not None:
+                # Cached CSR chunks of X (avoids re-reading the source matrix).
+                for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
+                    segments[0].gene_indices, data_dtype
+                ):
+                    append(filtered_data, filtered_indices)
+            else:
+                for segment in segments:
+                    for block in _segment_blocks(segment, chunk_size):
+                        if sp.issparse(block):
+                            csr = _ensure_csr(block, dtype=data_dtype)
+                            if not csr.has_sorted_indices:
+                                csr = csr.copy()
+                                csr.sort_indices()
+                            append(csr.data, csr.indices.astype(np.int32, copy=False))
+                        else:
+                            # Dense: numba-accelerated direct extraction.
+                            chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
+                                block, data_dtype
+                            )
+                            append(chunk_data, chunk_indices)
+            flush()
+
+    if row_order is not None:
+        _place_rows_in_order(
+            segments, dest_group=dest_group, n_vars=n_vars, output_path=output_path, chunk_size=chunk_size,
+            row_nnz=row_nnz, data_dtype=data_dtype, chunk_cache=chunk_cache, context=context,
+            row_order=row_order, indptr=indptr, memory_limit_gb=memory_limit_gb,
+        )
+
+
+def _place_rows_in_order(
+    segments: Sequence[_RowSegment], *, dest_group: str, n_vars: int, output_path: Path, chunk_size: int,
+    row_nnz: np.ndarray, data_dtype: np.dtype, chunk_cache: Any, context: str, row_order: np.ndarray,
+    indptr: np.ndarray, memory_limit_gb: float | None,
+) -> None:
+    """Fill :func:`_stream_write_matrix_subset`'s pre-sized ``dest_group``
+    with the selected rows in ``row_order``, as :func:`sort_by_perturbation`
+    places a source's rows."""
+    n_obs = row_order.shape[0]
+    dest = np.empty(n_obs, dtype=np.int64)
+    dest[row_order] = np.arange(n_obs)
+
+    def rows_in_source_order():
+        major0 = 0
         if chunk_cache is not None:
-            # Cached CSR chunks of X (avoids re-reading the source matrix).
-            for filtered_data, filtered_indices, _n_cells in chunk_cache.iter_filtered_chunks(
-                segments[0].gene_indices, data_dtype
-            ):
-                append(filtered_data, filtered_indices)
-        else:
-            for segment in segments:
-                for block in _segment_blocks(segment, chunk_size):
-                    if sp.issparse(block):
-                        csr = _ensure_csr(block, dtype=data_dtype)
-                        if not csr.has_sorted_indices:
-                            csr = csr.copy()
-                            csr.sort_indices()
-                        append(csr.data, csr.indices.astype(np.int32, copy=False))
-                    else:
-                        # Dense: numba-accelerated direct extraction.
-                        chunk_data, chunk_indices, _row_nnz, _nnz = _extract_csr_components_dense(
-                            block, data_dtype
-                        )
-                        append(chunk_data, chunk_indices)
-        flush()
+            for data, indices, n_cells in chunk_cache.iter_filtered_chunks(segments[0].gene_indices, data_dtype):
+                chunk_indptr = np.zeros(n_cells + 1, dtype=np.int64)
+                np.cumsum(row_nnz[major0:major0 + n_cells], out=chunk_indptr[1:])
+                yield major0, sp.csr_matrix((data, indices, chunk_indptr), shape=(n_cells, n_vars))
+                major0 += n_cells
+            return
+        for segment in segments:
+            for block in _segment_blocks(segment, chunk_size):
+                csr = _ensure_csr(block, dtype=data_dtype) if sp.issparse(block) else sp.csr_matrix(
+                    np.asarray(block), dtype=data_dtype)
+                yield major0, csr
+                major0 += csr.shape[0]
+
+    minor_dtype = np.dtype(np.int32)
+    bands = _contiguous_bands(
+        row_nnz[row_order], per_item_bytes=np.dtype(data_dtype).itemsize + minor_dtype.itemsize,
+        budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
+    )
+    _transpose_in_bands(
+        output_path, output_path, source_path=segments[0].source_path,
+        chunks=lambda: _keyed_by_destination(rows_in_source_order(), dest, 0, n_obs),
+        n_chunks=-(-n_obs // chunk_size), bands=bands, indptr=indptr, value_dtype=np.dtype(data_dtype),
+        minor_dtype=minor_dtype, fn_name=context, band_kind="row", verbose=False, group=dest_group, label=context,
+    )
+
 
 
 def write_filtered_subset(
@@ -2085,6 +2151,8 @@ def write_filtered_subset(
     data_dtype: np.dtype | None = None,
     chunk_cache: Any = None,
     format_mismatch_policy: Literal["auto", "warn", "convert", "off"] = "auto",
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     """Stream a filtered AnnData view to disk without materialising ``X``.
 
@@ -2127,6 +2195,15 @@ def write_filtered_subset(
         What to do when ``X`` is CSC, which streaming by rows re-reads in
         full for every chunk; see :func:`stream_on_fast_axis`. A temporary
         CSR copy goes beside ``output_path``. Layers are streamed as stored.
+    row_order
+        The kept cells' order in the output, as positions among them (e.g.
+        :func:`perturbation_sort_order` of their labels); None keeps the
+        source's order. ``X``, the layers, ``obs``, ``obsm`` and ``obsp``
+        follow it, placed from passes over the source in its own order.
+    memory_limit_gb
+        With ``row_order``, bounds the reordered rows held before they are
+        written (half of it; ``None``: of the memory available), as in
+        :func:`sort_by_perturbation`.
     """
 
     source_path = Path(source_path)
@@ -2146,6 +2223,8 @@ def write_filtered_subset(
             data_dtype=data_dtype,
             chunk_cache=chunk_cache,
             format_mismatch_policy=format_mismatch_policy,
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
 
@@ -2162,9 +2241,13 @@ def _write_filtered_subset(
     data_dtype: np.dtype | None,
     chunk_cache: Any,
     format_mismatch_policy: str,
+    row_order: np.ndarray | None = None,
+    memory_limit_gb: float | None = None,
 ) -> None:
     meta = _read_h5ad_metadata(source_path)
     obs = meta["obs"].iloc[cell_mask].copy()
+    if row_order is not None:
+        obs = obs.iloc[row_order]
     var = meta["var"].iloc[gene_mask].copy()
     obs.index = obs.index.astype(str)
     var.index = var.index.astype(str)
@@ -2180,7 +2263,10 @@ def _write_filtered_subset(
                     f"Length mismatch for column '{key}': expected {var.shape[0]}, received {len(values)}"
                 )
             var[key] = np.asarray(values)
-    uns = dict(meta["uns"])
+    if row_order is None:
+        uns = filtered_sorting_metadata(meta["uns"], obs, cell_mask)
+    else:  # the caller records the new order
+        uns = {k: v for k, v in meta["uns"].items() if k != "sorting_metadata"}
     layer_keys, obsm_keys, varm_keys, obsp_keys, varp_keys = (
         meta[slot] for slot in ("layers", "obsm", "varm", "obsp", "varp")
     )
@@ -2229,6 +2315,8 @@ def _write_filtered_subset(
             data_dtype=data_dtype,
             chunk_cache=chunk_cache,
             context="write_filtered_subset (X)",
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
     for key in layer_keys:
@@ -2239,6 +2327,8 @@ def _write_filtered_subset(
             output_path=output_path,
             chunk_size=chunk_size,
             context=f"write_filtered_subset (layers/{key})",
+            row_order=row_order,
+            memory_limit_gb=memory_limit_gb,
         )
 
     if obsm_keys or varm_keys or obsp_keys or varp_keys:
@@ -2252,6 +2342,7 @@ def _write_filtered_subset(
                 varp_keys=varp_keys,
                 cell_mask=cell_mask,
                 gene_mask=gene_mask,
+                row_order=row_order,
             )
 
 
@@ -3850,6 +3941,44 @@ def _scatter_band(
                 offset[k - lo] = pos + 1
 
 
+class _KeyedRows(NamedTuple):
+    """A CSR row chunk whose row ``i`` is output row ``keys[i]``: a row
+    permutation, placed by copying each row whole (:func:`_copy_rows_band`)
+    rather than by transposing."""
+
+    keys: np.ndarray
+    csr: sp.csr_matrix
+
+    @property
+    def nnz(self) -> int:
+        return self.csr.nnz
+
+    def keyed_columns(self, n_out: int) -> sp.csc_matrix:
+        """The chunk as columns whose indices are output rows, for the spill
+        path, which splits non-zeros by band."""
+        csc = self.csr.tocsc()
+        return sp.csc_matrix((csc.data, self.keys[csc.indices], csc.indptr), shape=(n_out, csc.shape[1]))
+
+
+@njit(cache=True)
+def _copy_rows_band(
+    indptr: np.ndarray, indices: np.ndarray, data: np.ndarray, keys: np.ndarray, lo: int, hi: int,
+    offset: np.ndarray, out_vals: np.ndarray, out_minor: np.ndarray,
+) -> None:
+    """Copy each CSR row ``i`` whose output row ``keys[i]`` falls in band
+    ``[lo, hi)`` to that row's place in the band's buffers (``offset[k - lo]``,
+    advanced in place)."""
+    for i in range(indptr.shape[0] - 1):
+        k = keys[i]
+        if lo <= k < hi:
+            pos = offset[k - lo]
+            for j in range(indptr[i], indptr[i + 1]):
+                out_vals[pos] = data[j]
+                out_minor[pos] = indices[j]
+                pos += 1
+            offset[k - lo] = pos
+
+
 @contextmanager
 def _replace_on_success(output_path: Path) -> Iterator[Path]:
     """Yield a partial path beside ``output_path``; rename it over
@@ -4133,8 +4262,7 @@ def _transpose_in_bands(
     output_path: Path,
     *,
     source_path: Path,
-    axis: int,
-    chunk_size: int,
+    chunks: "Callable[[], Iterator[tuple[int, sp.spmatrix]]]",
     n_chunks: int,
     bands: list[tuple[int, int]],
     indptr: np.ndarray,
@@ -4143,10 +4271,15 @@ def _transpose_in_bands(
     fn_name: str,
     band_kind: str,
     verbose: int | bool,
+    group: str = "X",
+    label: str | None = None,
 ) -> None:
-    """Fill the pre-sized ``X/data`` and ``X/indices`` of ``partial`` with the
-    transpose of ``source_path``'s compressed chunks along ``axis``, one band
-    of output keys (columns for CSC, rows for CSR) at a time.
+    """Fill the pre-sized ``{group}/data`` and ``{group}/indices`` of
+    ``partial`` with the transpose of the compressed chunks ``chunks()``
+    yields, ``(first major index, chunk)`` in source order, whose indices are
+    the output's keys (columns for CSC, rows for CSR), or :class:`_KeyedRows`
+    whose rows are copied whole: one band of keys at a time. ``chunks()``
+    gives a fresh pass over ``source_path`` each call.
 
     With one band the source is read once. With several, each band reads
     the source again -- except where page cache counts against a memory
@@ -4195,15 +4328,20 @@ def _transpose_in_bands(
         # int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
         return base, np.empty(n, dtype=value_dtype), np.empty(n, dtype=minor_dtype), indptr[lo:hi].astype(np.int64) - base
 
+    label = label or f"{fn_name} (pass 2)"
     with h5py.File(partial, "r+") as dest:
-        ds_data, ds_minor = dest["X/data"], dest["X/indices"]
+        ds_data, ds_minor = dest[f"{group}/data"], dest[f"{group}/indices"]
         evict = _EvictEvery(partial)
         if spill_dir is None:
-            with _create_progress_context(n_chunks * n_bands, f"{fn_name} (pass 2)", verbose, unit="chunk") as pbar:
+            with _create_progress_context(n_chunks * n_bands, label, verbose, unit="chunk") as pbar:
                 for lo, hi in bands:
                     base, band_vals, band_minor, offset = band_buffers(lo, hi)
-                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
-                        if chunk.nnz:
+                    for major0, chunk in chunks():
+                        if isinstance(chunk, _KeyedRows) and chunk.nnz:
+                            csr = chunk.csr
+                            _copy_rows_band(csr.indptr, csr.indices, csr.data, chunk.keys, lo, hi,
+                                            offset, band_vals, band_minor)
+                        elif chunk.nnz:
                             _scatter_band(chunk.indptr, chunk.indices, chunk.data, major0, lo, hi,
                                           offset, band_vals, band_minor)
                         pbar.update(1)
@@ -4218,14 +4356,16 @@ def _transpose_in_bands(
         paths = [scratch / f"band{b}" for b in range(n_bands)]
         spill_evict = _EvictEvery(*paths[1:])
         try:
-            with _create_progress_context(n_chunks + n_bands - 1, f"{fn_name} (pass 2)", verbose, unit="step") as pbar:
+            with _create_progress_context(n_chunks + n_bands - 1, label, verbose, unit="step") as pbar:
                 lo0, hi0 = bands[0]
                 base0, band_vals, band_minor, offset0 = band_buffers(lo0, hi0)
                 handles = []
                 try:
                     for path in paths[1:]:
                         handles.append(open(path, "wb"))
-                    for major0, chunk in _source_chunks(source_path, axis, chunk_size):
+                    for major0, chunk in chunks():
+                        if isinstance(chunk, _KeyedRows):
+                            chunk, major0 = chunk.keyed_columns(n_keys), 0
                         if chunk.nnz:
                             counts = np.bincount(band_of[chunk.indices], minlength=n_bands)
                             starts = np.zeros(n_bands + 1, dtype=np.int64)
@@ -4418,7 +4558,7 @@ def convert_to_csc(
         )
         _transpose_in_bands(
             partial, output_path,
-            source_path=source_path, axis=0, chunk_size=chunk_size, n_chunks=n_chunks,
+            source_path=source_path, chunks=lambda: _source_chunks(source_path, 0, chunk_size), n_chunks=n_chunks,
             bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=row_dtype,
             fn_name="pp.convert_to_csc", band_kind="column", verbose=verbose,
         )
@@ -4604,7 +4744,8 @@ def convert_to_csr(
             )
             _transpose_in_bands(
                 partial, output_path,
-                source_path=source_path, axis=1, chunk_size=chunk_size, n_chunks=n_col_chunks,
+                source_path=source_path, chunks=lambda: _source_chunks(source_path, 1, chunk_size),
+                n_chunks=n_col_chunks,
                 bands=bands, indptr=indptr, value_dtype=value_dtype, minor_dtype=col_dtype,
                 fn_name="pp.convert_to_csr", band_kind="row", verbose=verbose,
             )
@@ -5700,6 +5841,63 @@ def perturbation_sort_order(labels: np.ndarray, control_label: str) -> np.ndarra
     return np.argsort(keys, kind="stable")
 
 
+def sorting_metadata(
+    sorted_labels: np.ndarray, sort_indices: np.ndarray, *, perturbation_column: str, control_label: str,
+    original_path: Path,
+) -> dict:
+    """``uns["sorting_metadata"]`` of a file whose cells are in perturbation
+    order: each label's ``[start, end)`` rows, the column and control, and
+    the order itself for files under 100,000 cells (``sort_indices``, rows
+    of the unsorted cells)."""
+    import datetime
+
+    boundaries = _label_boundaries(sorted_labels)
+    metadata = {
+        "original_path": str(original_path),
+        "sorted_by": perturbation_column,
+        "control_label": control_label,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "n_perturbations": len(boundaries),
+        "perturbation_boundaries": boundaries,
+    }
+    if len(sort_indices) < 100000:
+        metadata["sort_order"] = np.asarray(sort_indices).tolist()
+    return metadata
+
+
+def _label_boundaries(sorted_labels: np.ndarray) -> dict[str, list[int]] | None:
+    """Each label's ``[start, end)`` rows in ``sorted_labels``, or None when
+    a label's rows are not contiguous."""
+    sorted_labels = np.asarray(sorted_labels).astype(str)
+    if not sorted_labels.size:
+        return {}
+    starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
+    stops = np.r_[starts[1:], sorted_labels.size]
+    boundaries = {str(sorted_labels[a]): [int(a), int(b)] for a, b in zip(starts, stops)}
+    return boundaries if len(boundaries) == len(starts) else None
+
+
+def filtered_sorting_metadata(uns: Mapping, obs: pd.DataFrame, cell_mask: np.ndarray) -> dict:
+    """``uns`` of a file whose rows are ``cell_mask``'s rows of a source with
+    ``uns``, in the source's order: a filter keeps a sorted file sorted, so its
+    ``sorting_metadata`` is rebuilt from the kept cells' labels in ``obs``
+    (dropped if they are no longer contiguous)."""
+    uns = dict(uns)
+    metadata = uns.pop("sorting_metadata", None)
+    if metadata is None:
+        return uns
+    column = metadata.get("sorted_by")
+    boundaries = _label_boundaries(obs[column].to_numpy()) if column in obs.columns else None
+    if boundaries is not None:
+        metadata = dict(metadata)
+        metadata["perturbation_boundaries"] = boundaries
+        metadata["n_perturbations"] = len(boundaries)
+        if "sort_order" in metadata:
+            metadata["sort_order"] = np.asarray(metadata["sort_order"])[np.asarray(cell_mask, dtype=bool)].tolist()
+        uns["sorting_metadata"] = metadata
+    return uns
+
+
 def sort_by_perturbation(
     path: str | Path,
     perturbation_column: str = "perturbation",
@@ -5707,6 +5905,7 @@ def sort_by_perturbation(
     *,
     output_path: str | Path | None = None,
     chunk_size: int = 4096,
+    memory_limit_gb: float | None = None,
     force: bool = False,
     verbose: int | bool = True,
 ) -> Path:
@@ -5731,7 +5930,13 @@ def sort_by_perturbation(
     output_path
         Path for output sorted file. If None, appends '_sorted' to input name.
     chunk_size
-        Number of cells to process per chunk during streaming write.
+        Rows (or, from a CSC source, columns) read per chunk.
+    memory_limit_gb
+        Bounds the sorted rows held before they are written: half of it
+        (``None``: of the memory available). A larger output is written in
+        row bands, each reading the source once more; for a sparse source
+        where page cache counts against the memory limit (a Slurm job), the
+        source is instead read once and the later bands spilled to disk.
     force
         If True, recreate sorted file even if it already exists.
     verbose
@@ -5764,8 +5969,6 @@ def sort_by_perturbation(
     benefits row-wise (per-perturbation) access patterns used by NB-GLM. CSC
     files used by Wilcoxon do not need perturbation sorting.
     """
-    import datetime
-
     name = "sort_by_perturbation"
     path = Path(path)
     
@@ -5812,22 +6015,7 @@ def sort_by_perturbation(
         
         sort_indices = perturbation_sort_order(labels, control_label)
         label_order = [control_label] + sorted(set(labels) - {control_label})
-        
-        # Compute perturbation boundaries
-        sorted_labels = labels[sort_indices]
-        boundaries = {}
-        current_label = None
-        start_idx = 0
-        
-        for i, label in enumerate(sorted_labels):
-            if label != current_label:
-                if current_label is not None:
-                    boundaries[current_label] = [start_idx, i]  # Use list, not tuple
-                current_label = label
-                start_idx = i
-        if current_label is not None:
-            boundaries[current_label] = [start_idx, len(sorted_labels)]  # Use list, not tuple
-        
+
         # Read obs and var
         obs_sorted = backed.obs.iloc[sort_indices].copy()
         var = backed.var.copy()
@@ -5838,20 +6026,10 @@ def sort_by_perturbation(
     finally:
         backed.file.close()
     
-    # Add sorting metadata - convert all to h5ad-compatible types
-    # Note: boundaries values are [start, end] lists (tuples not serializable)
-    sorting_metadata = {
-        "original_path": str(path),
-        "sorted_by": perturbation_column,
-        "control_label": control_label,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "n_perturbations": len(label_order),
-        "perturbation_boundaries": boundaries,  # Dict[str, List[int]]
-    }
-    # Don't store full sort_order for large datasets (memory waste)
-    if len(sort_indices) < 100000:
-        sorting_metadata["sort_order"] = sort_indices.tolist()
-    uns["sorting_metadata"] = sorting_metadata
+    uns["sorting_metadata"] = sorting_metadata(
+        labels[sort_indices], sort_indices, perturbation_column=perturbation_column,
+        control_label=control_label, original_path=path,
+    )
     uns[_PROVENANCE_KEY] = stamp("sorted", fingerprint)
     
     # Create output file
@@ -5871,16 +6049,10 @@ def sort_by_perturbation(
     # so a run killed midway must not leave a file that passes for a
     # finished copy.
     with _replace_on_success(output_path) as partial:
+        common = dict(source_path=path, output_path=partial, sort_indices=sort_indices,
+                      obs_sorted=obs_sorted, var=var, uns=uns, chunk_size=chunk_size)
         writer = _write_sorted_dense if is_dense else _write_sorted_sparse
-        writer(
-            source_path=path,
-            output_path=partial,
-            sort_indices=sort_indices,
-            obs_sorted=obs_sorted,
-            var=var,
-            uns=uns,
-            chunk_size=chunk_size,
-        )
+        writer(**common, memory_limit_gb=memory_limit_gb, fn_name=name, verbose=verbose)
     
     _messages.print_done(
         verbose, name,
@@ -5897,78 +6069,70 @@ def _write_sorted_dense(
     var: pd.DataFrame,
     uns: dict,
     chunk_size: int,
+    *,
+    memory_limit_gb: float | None,
+    fn_name: str,
+    verbose: int | bool,
 ) -> None:
-    """Write sorted file for dense input matrix.
-    
-    Uses chunked reading to avoid loading full matrix into memory.
-    Writes h5ad in two passes: first X matrix via h5py, then metadata via anndata.
-    """
-    backed = read_backed(source_path)
-    try:
-        n_cells = backed.n_obs
-        n_genes = backed.n_vars
-        
-        # Get dtype from first chunk
-        sample = backed.X[:min(100, n_cells), :]
-        dtype = sample.dtype
-        
-        # Create output with chunked writing for memory efficiency
-        with h5py.File(output_path, 'w') as f:
-            # Create dataset with chunking for efficient access
-            X_out = f.create_dataset(
-                'X',
-                shape=(n_cells, n_genes),
-                dtype=dtype,
-                chunks=(min(chunk_size, n_cells), n_genes),
-            )
-            
-            # Write in chunks based on output order
-            for start in range(0, n_cells, chunk_size):
-                end = min(start + chunk_size, n_cells)
-                # Get the original indices for this output chunk
-                chunk_indices = sort_indices[start:end]
-                
-                # Read from source (optimize by sorting indices for sequential read)
-                read_order = np.argsort(chunk_indices)
-                sorted_chunk_indices = chunk_indices[read_order]
-                
-                # Read data in optimized order
-                chunk_data = backed.X[sorted_chunk_indices, :]
-                
-                # Reorder to match output order
-                inverse_order = np.argsort(read_order)
-                chunk_data = chunk_data[inverse_order]
-                
-                X_out[start:end, :] = chunk_data
-                
-                if (start // chunk_size) % 100 == 0:
-                    logger.debug(f"  Written {end:,}/{n_cells:,} cells...")
-        
-    finally:
-        backed.file.close()
-    
-    # Write metadata using anndata (proper h5ad structure)
-    # First create a temp file with correct metadata structure
-    temp_path = output_path.with_suffix('.meta.h5ad')
-    adata_meta = ad.AnnData(
-        X=sp.csr_matrix((len(obs_sorted), len(var)), dtype=np.float32),  # Placeholder
-        obs=obs_sorted,
-        var=var,
-        uns=uns,
-    )
-    try:
-        adata_meta.write(temp_path)
-        # Copy metadata from temp to main file
-        with h5py.File(temp_path, 'r') as src:
-            with h5py.File(output_path, 'a') as dst:
-                for key in ['obs', 'var', 'uns']:
-                    if key in src:
-                        if key in dst:
-                            del dst[key]
-                        src.copy(key, dst)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    """Write the rows of a dense source in the order ``sort_indices``.
 
+    As for a sparse source, the output rows are split into bands that fit
+    half of ``memory_limit_gb``, and each band is filled from one sequential
+    pass over the source, every row bound for it copied to its place, then
+    written at once.
+    """
+    n_cells, n_genes = len(obs_sorted), len(var)
+    with h5py.File(source_path, "r") as handle:
+        dtype = handle["X"].dtype
+    dest = np.empty(n_cells, dtype=np.int64)
+    dest[sort_indices] = np.arange(n_cells)
+    bands = _contiguous_bands(
+        np.full(n_cells, n_genes, dtype=np.int64), per_item_bytes=dtype.itemsize,
+        budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
+    )
+    if len(bands) > 1:
+        _messages.vprint(
+            verbose, fn_name,
+            f"the sorted matrix needs {format_bytes(n_cells * n_genes * dtype.itemsize)}; "
+            f"writing it in {len(bands)} row bands, one sequential pass over the source each",
+        )
+    ad.AnnData(obs=obs_sorted, var=var, uns=uns).write(output_path)
+    with h5py.File(source_path, "r") as src, h5py.File(output_path, "r+") as out:
+        x_in = src["X"]
+        x_out = out.create_dataset("X", shape=(n_cells, n_genes), dtype=dtype,
+                                   chunks=(max(1, min(chunk_size, n_cells)), n_genes) if n_cells else None)
+        x_out.attrs["encoding-type"] = "array"
+        x_out.attrs["encoding-version"] = "0.2.0"
+        evict = _EvictEvery(output_path, source_path)
+        n_chunks = -(-n_cells // chunk_size)
+        with _create_progress_context(n_chunks * len(bands), fn_name, verbose, unit="chunk") as pbar:
+            for lo, hi in bands:
+                band = np.empty((hi - lo, n_genes), dtype=dtype)
+                for start in range(0, n_cells, chunk_size):
+                    rows = dest[start:start + chunk_size]
+                    inside = (rows >= lo) & (rows < hi)
+                    if inside.any():
+                        chunk = x_in[start:start + chunk_size]
+                        band[rows[inside] - lo] = chunk[inside]
+                        evict(chunk.nbytes)
+                    pbar.update(1)
+                x_out[lo:hi] = band
+                evict(band.nbytes)
+                del band
+
+
+def _keyed_by_destination(chunks, dest: np.ndarray, axis: int, n_out: int):
+    """The source's compressed chunks keyed by output row ``dest[row]``, for
+    :func:`_transpose_in_bands` to place the rows in their new order: a CSR
+    row chunk as :class:`_KeyedRows` (its rows copied whole, columns sorted),
+    a CSC column chunk with its row indices replaced by output rows."""
+    for major0, chunk in chunks:
+        if axis == 0:
+            if not chunk.has_sorted_indices:
+                chunk = chunk.sorted_indices()
+            yield major0, _KeyedRows(dest[major0:major0 + chunk.shape[0]], chunk)
+        else:
+            yield major0, sp.csc_matrix((chunk.data, dest[chunk.indices], chunk.indptr), shape=(n_out, chunk.shape[1]))
 
 
 def _write_sorted_sparse(
@@ -5979,125 +6143,59 @@ def _write_sorted_sparse(
     var: pd.DataFrame,
     uns: dict,
     chunk_size: int,
+    *,
+    memory_limit_gb: float | None,
+    fn_name: str,
+    verbose: int | bool,
 ) -> None:
-    """Write sorted file for sparse input matrix.
+    """Write the rows of a sparse source in the order ``sort_indices``, as CSR.
 
-    Uses chunked I/O to avoid loading the full matrix into memory.
-    Rows are read in output order (chunk_size at a time), converted
-    to CSR components, and appended to resizable HDF5 datasets.
-    Peak memory is proportional to chunk_size × n_genes, not n_cells × n_genes.
+    The output's row pointers follow from the source's row lengths, so every
+    row's place is known before any value is read. The rows are then placed
+    by :func:`_transpose_in_bands`, reading the source in its own order: in
+    one pass when the sorted matrix fits half of ``memory_limit_gb``, else
+    in row bands, one pass each or, where page cache counts against the
+    memory limit, one pass spilling the later bands to disk, as the format
+    converters do. Gathering each output chunk's scattered rows instead read
+    a compressed source many times over.
     """
-    backed = read_backed(source_path)
-    try:
-        n_cells = backed.n_obs
-        n_genes = backed.n_vars
-
-        # Determine dtype from a small sample
-        sample = backed.X[:1]
-        if sp.issparse(sample):
-            data_dtype = sample.dtype
-        else:
-            data_dtype = np.float32
-
-        logger.info(
-            f"  Streaming sorted sparse write: {n_cells:,} cells, "
-            f"chunk_size={chunk_size}"
-        )
-
-        # Build CSR structure incrementally via h5py
-        with h5py.File(output_path, "w") as f:
-            x_grp = f.create_group("X")
-            x_grp.attrs["encoding-type"] = "csr_matrix"
-            x_grp.attrs["encoding-version"] = "0.1.0"
-            x_grp.attrs["shape"] = np.array([n_cells, n_genes], dtype=np.int64)
-
-            # Resizable datasets for data and indices; indptr is pre-allocated
-            ds_data = x_grp.create_dataset(
-                "data",
-                shape=(0,),
-                maxshape=(None,),
-                dtype=data_dtype,
-                chunks=(min(262144, max(1, n_cells)),),
-            )
-            ds_indices = x_grp.create_dataset(
-                "indices",
-                shape=(0,),
-                maxshape=(None,),
-                dtype=np.int32,
-                chunks=(min(262144, max(1, n_cells)),),
-            )
-            ds_indptr = x_grp.create_dataset(
-                "indptr",
-                shape=(n_cells + 1,),
-                dtype=np.int64,
-            )
-
-            nnz_written = 0
-            ds_indptr[0] = 0
-            evict = _EvictEvery(output_path, source_path)
-
-            for start in range(0, n_cells, chunk_size):
-                end = min(start + chunk_size, n_cells)
-                # Original row indices for this output chunk
-                orig_idx = sort_indices[start:end]
-
-                # Read rows from source (sorted for sequential access)
-                read_order = np.argsort(orig_idx)
-                sorted_orig_idx = orig_idx[read_order]
-                block = backed.X[sorted_orig_idx, :]
-
-                # Undo read_order to restore output order
-                inverse_order = np.argsort(read_order)
-                if sp.issparse(block):
-                    block = sp.csr_matrix(block)[inverse_order, :]
-                else:
-                    block = sp.csr_matrix(block[inverse_order, :])
-
-                csr = sp.csr_matrix(block, dtype=data_dtype)
-
-                chunk_nnz = csr.nnz
-                if chunk_nnz > 0:
-                    new_total = nnz_written + chunk_nnz
-                    ds_data.resize((new_total,))
-                    ds_indices.resize((new_total,))
-                    ds_data[nnz_written:new_total] = csr.data
-                    ds_indices[nnz_written:new_total] = csr.indices
-                    evict(chunk_nnz * (csr.data.itemsize + 4))
-
-                # Write indptr for this chunk (int64 to avoid overflow
-                # when cumulative nnz exceeds INT32_MAX ≈ 2.1 billion)
-                chunk_indptr = csr.indptr[1:].astype(np.int64) + nnz_written
-                ds_indptr[start + 1 : end + 1] = chunk_indptr
-
-                nnz_written += chunk_nnz
-
-                if (start // chunk_size) % 50 == 0:
-                    logger.debug(
-                        f"  Written {end:,}/{n_cells:,} cells "
-                        f"({nnz_written:,} nnz)..."
-                    )
-    finally:
-        backed.file.close()
-
-    # Write obs, var, uns metadata using anndata
-    temp_path = output_path.with_suffix(".meta.h5ad")
-    adata_meta = ad.AnnData(
-        X=sp.csr_matrix((len(obs_sorted), len(var)), dtype=np.float32),
-        obs=obs_sorted,
-        var=var,
-        uns=uns,
+    with h5py.File(source_path, "r") as handle:
+        group = handle["X"]
+        encoding = group.attrs.get("encoding-type")
+        encoding = encoding.decode() if isinstance(encoding, bytes) else str(encoding)
+        value_dtype = group["data"].dtype
+        source_indptr = group["indptr"][...] if encoding == "csr_matrix" else None
+    n_cells, n_genes = len(obs_sorted), len(var)
+    axis = 0 if encoding == "csr_matrix" else 1
+    if axis == 0:
+        row_nnz = np.diff(source_indptr)
+    else:
+        row_nnz = np.zeros(n_cells, dtype=np.int64)
+        for _major0, chunk in _source_chunks(source_path, 1, chunk_size):
+            row_nnz += np.bincount(chunk.indices, minlength=n_cells)
+    out_nnz = row_nnz[sort_indices]
+    indptr = np.zeros(n_cells + 1, dtype=np.int64)
+    np.cumsum(out_nnz, out=indptr[1:])
+    dest = np.empty(n_cells, dtype=np.int64)
+    dest[sort_indices] = np.arange(n_cells)
+    minor_dtype = np.dtype(np.int32)
+    bands = _contiguous_bands(
+        out_nnz, per_item_bytes=value_dtype.itemsize + minor_dtype.itemsize,
+        budget_bytes=_conversion_buffer_budget_bytes(memory_limit_gb),
     )
-    try:
-        adata_meta.write(temp_path)
-        with h5py.File(temp_path, "r") as src:
-            with h5py.File(output_path, "a") as dst:
-                for key in ["obs", "var", "uns"]:
-                    if key in src:
-                        if key in dst:
-                            del dst[key]
-                        src.copy(key, dst)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    _write_sparse_skeleton(
+        output_path, obs_sorted, var, encoding="csr_matrix", shape=(n_cells, n_genes), indptr=indptr,
+        total_nnz=int(indptr[-1]), value_dtype=value_dtype, index_dtype=minor_dtype,
+    )
+    with h5py.File(output_path, "r+") as dest_file:
+        write_elem(dest_file, "uns", uns)
+    _transpose_in_bands(
+        output_path, output_path, source_path=source_path,
+        chunks=lambda: _keyed_by_destination(_source_chunks(source_path, axis, chunk_size), dest, axis, n_cells),
+        n_chunks=-(-(n_cells if axis == 0 else n_genes) // chunk_size), bands=bands, indptr=indptr,
+        value_dtype=value_dtype, minor_dtype=minor_dtype, fn_name=fn_name, band_kind="row", verbose=verbose,
+        label=fn_name,
+    )
 
 
 def get_perturbation_slice(

@@ -12,6 +12,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
+from crispyx.de import _offset_baseline
 
 NO_FILTERS = dict(min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_total_count=0)
 
@@ -91,7 +92,7 @@ def test_a_stratum_without_control_counts_of_a_gene_does_not_send_beta_to_the_bo
     _screen(tmp_path / "s.h5ad", zero_stratum_gene=(2, 30))
     offset = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", strata="stratum", lfc_base="ln", **NO_FILTERS)
     value = offset.X[0, 30]
-    assert np.isfinite(value) and value < 10  # the pseudo-cell keeps the baseline above zero
+    assert np.isfinite(value) and value < 10  # the prior keeps the baseline above zero
 
 
 def test_cells_of_strata_without_controls_are_left_out(tmp_path):
@@ -293,7 +294,6 @@ def test_the_dispersion_is_unbiased_over_many_small_strata():
     """The residuals are about each stratum's own baseline, which costs a
     degree of freedom per stratum: subtracting the full Poisson term biased
     alpha down by 1/n_b, to the floor over hundreds of two-cell strata."""
-    from crispyx.de import _offset_baseline
 
     rng = np.random.default_rng(3)
     alpha, n_genes = 0.3, 400
@@ -384,3 +384,75 @@ def test_the_cell_block_is_shared_between_the_threads(tmp_path, monkeypatch):
     _run(tmp_path / "s.h5ad", tmp_path / "one.h5ad", memory_limit_gb=budget_gb, n_jobs=1, **NO_FILTERS)
     _run(tmp_path / "s.h5ad", tmp_path / "four.h5ad", memory_limit_gb=budget_gb, n_jobs=4, **NO_FILTERS)
     assert seen[0] == 4096 and seen[-1] == 1024, seen
+
+
+def test_a_stratum_baseline_moves_from_the_pooled_mean_only_as_far_as_its_expected_count_allows():
+    # 2 strata of 500 controls. Gene 0 is rare (one read, in stratum 0): stratum 1 expected ~0.5 reads and saw
+    # none, which says little. Gene 1 has 1000 reads, all in stratum 0: stratum 1 expected ~500, so it is absent.
+    counts = sp.lil_matrix((1000, 2))
+    counts[0, 0] = 1
+    counts[:500, 1] = 2
+    strata = np.repeat([0, 1], 500)
+    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1)
+    pooled = base.pooled_mean
+    assert 0.5 < base.mean[1, 0] / pooled[0] < 1.0       # one cell of prior put it at pooled / 501
+    assert base.mean[1, 1] / pooled[1] < 0.01
+    one = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), np.zeros(1000, int), 1, 2,
+                           dispersion=0.1)
+    np.testing.assert_allclose(one.mean[0], one.pooled_mean)
+
+
+def test_shrink_lfc_on_a_file_matches_the_arrays_with_its_options(tmp_path):
+    _screen(tmp_path / "s.h5ad")
+    fit = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", strata="stratum", **NO_FILTERS)
+    source = tmp_path / "off.h5ad"
+    ln, se = fit.layers["logfoldchange_raw_ln"], fit.layers["standard_error_ln"]
+    own = sp.lil_matrix(ln.shape, dtype=bool)
+    own[0, 0] = own[1, 1] = True
+    floor = np.full((ln.shape[0], 1), np.nan)
+    floor[0] = -2.0
+    cells = np.arange(1, ln.shape[0] + 1)
+    shrunk = ad.read_h5ad(cx.shrink_lfc(
+        source, exclude=own.tocoo(), floor=floor, centre="pooled", n_cells=cells, data_name="pooled", verbose=False,
+    ).result_path)
+    expected = cx.tl.shrink_lfc_arrays(ln, se, exclude=own.toarray(), floor=floor, centre="pooled", n_cells=cells)
+    np.testing.assert_allclose(shrunk.X * np.log(2), expected.lfc, rtol=1e-10, equal_nan=True)
+    np.testing.assert_allclose(shrunk.layers["standard_error"] * np.log(2), expected.se, rtol=1e-10, equal_nan=True)
+    np.testing.assert_allclose(shrunk.var["shrinkage_centre"] * np.log(2), expected.centre, rtol=1e-10)
+    assert shrunk.uns["shrinkage_centre"] == "pooled"
+    assert shrunk.uns["apeglm_prior_scale"] == pytest.approx(expected.prior_scale)
+    plain = ad.read_h5ad(cx.shrink_lfc(source, data_name="plain", verbose=False).result_path)
+    np.testing.assert_allclose(plain.X * np.log(2), cx.tl.shrink_lfc_arrays(ln, se).lfc, rtol=1e-10, equal_nan=True)
+    # Re-shrinking the pooled result toward zero drops its stale centre.
+    again = ad.read_h5ad(cx.shrink_lfc(tmp_path / "pooled.h5ad", data_name="again", verbose=False).result_path)
+    assert "shrinkage_centre" not in again.var and again.uns["shrinkage_centre"] == "zero"
+    # Per comparison: each row with its own prior scale.
+    each = ad.read_h5ad(cx.shrink_lfc(
+        source, exclude=own, floor=floor, prior_scale_mode="per_comparison", data_name="each", verbose=False,
+    ).result_path)
+    for i in range(ln.shape[0]):
+        row = cx.tl.shrink_lfc_arrays(ln[i], se[i], exclude=own.toarray()[i], floor=floor[i])
+        np.testing.assert_allclose(each.X[i] * np.log(2), row.lfc, rtol=1e-10, equal_nan=True)
+    with pytest.raises(ValueError, match="method='stats'"):
+        cx.shrink_lfc(source, centre="pooled", method="full", verbose=False)
+
+
+def test_controls_without_residual_degrees_of_freedom(tmp_path):
+    """One control unit per batch: the dispersion cannot be estimated, and at a
+    given one the saturated control fit converges (its deviance is ~0, which
+    a convergence test relative to the deviance alone never settles on)."""
+    rng = np.random.default_rng(0)
+    labels = ["control", "control"] + [f"p{k}" for k in range(6) for _ in range(2)]
+    n, n_genes = len(labels), 80
+    mu = np.exp(rng.uniform(np.log(5), np.log(5000), n_genes)) * rng.lognormal(0, 0.2, n)[:, None]
+    counts = rng.negative_binomial(20, 20 / (20 + mu)).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "batch": ["b1", "b2"] * (n // 2), "stratum": [f"s{i}" for i in range(n)]},
+                       index=[f"u{i}" for i in range(n)])
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])).write(
+        tmp_path / "u.h5ad")
+    for design in ({"covariates": ["batch"]}, {"strata": "stratum"}):
+        with pytest.raises(ValueError, match="no residual degrees of freedom"):
+            _run(tmp_path / "u.h5ad", tmp_path / "x.h5ad", **design)
+    got = _run(tmp_path / "u.h5ad", tmp_path / "o.h5ad", covariates=["batch"], dispersion=0.05,
+               size_factor_method="deseq2", **NO_FILTERS)
+    assert np.isfinite(got.X).all()
