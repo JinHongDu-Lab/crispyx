@@ -1375,7 +1375,7 @@ class NBGLMBatchFitter:
             ceiling = dev_a + 1e-9 * np.abs(dev_a)
             rose = dev_new > ceiling
             worse = rose & ~on_floor
-            scale = np.maximum(np.abs(dev_a), 1e-8)
+            scale = np.abs(dev_a) + 0.1
             # Smallest relative deviance increase over the steps tried, which
             # is what decides the fate of a gene that never finds an improving
             # one.
@@ -2186,7 +2186,7 @@ class StructuredGLMBatchFitter:
             ceiling = deviance_a + 1e-9 * np.abs(deviance_a)
             rose = new_deviance > ceiling
             worse = rose & ~on_floor
-            scale = np.maximum(np.abs(deviance_a), 1e-8)
+            scale = np.abs(deviance_a) + 0.1
             excess = (new_deviance - deviance_a) / scale
             step = 1.0
             for _ in range(_MAX_STEP_HALVINGS):

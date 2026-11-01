@@ -2961,7 +2961,15 @@ def nb_offset_test(
     hundreds of lane x donor strata. The dispersion is then ``dispersion``
     as given (one value, or one per gene), or the method-of-moments estimate
     from the controls pooled over strata, with the parametric
-    mean-dispersion trend for genes below 0.5 counts per unit size factor.
+    mean-dispersion trend for genes below 0.5 counts per unit size factor:
+    ``a0 + a1 / mean`` fitted on the genes above, evaluated at each gene's
+    own mean, and flat (PyDESeq2's trimmed-mean fallback) when those genes
+    show no rise toward low means. Below that mean the gene-wise moment
+    estimates are too noisy to use: with a few thousand controls about half
+    of those under 0.1 counts clip at zero, so their median sits far below
+    the dispersion they estimate. The controls must leave residual degrees
+    of freedom for this estimate (a stratum with two controls; more control
+    units than design columns); otherwise pass ``dispersion``.
     With ``covariates``, any design (one-hot levels and continuous terms
     such as the log cells per pseudo-bulk unit), the controls' GLM on
     ``~ covariates`` is fitted once with DESeq2's dispersion steps on the
@@ -3170,6 +3178,22 @@ def nb_offset_test(
             design_all = np.ascontiguousarray(design_all[:, keep_column])
             columns = [c for c, k in zip(columns, keep_column) if k]
             check_full_rank(design_all[control_rows], columns, f"{name}, the controls' design")
+        # The dispersion comes from the controls' residuals, which a saturated
+        # design (a column per control) or strata of single controls leave none of.
+        if dispersion is None:
+            if design_all is not None and control_rows.size <= design_all.shape[1]:
+                saturated = (f"{control_rows.size} control units against {design_all.shape[1]} columns of "
+                             f"~ {' + '.join(covariates)}")
+            elif design_all is None and np.bincount(stratum_codes[control_rows]).max() < 2:
+                saturated = "no stratum with two or more control cells"
+            else:
+                saturated = None
+            if saturated:
+                raise ValueError(
+                    f"{name}: the controls leave no residual degrees of freedom ({saturated}), so their "
+                    "dispersion cannot be estimated; pass dispersion=, or use nb_glm_test, which estimates it "
+                    "from every unit."
+                )
         boundaries = {}
         if "sorting_metadata" in backed.uns:
             metadata = backed.uns["sorting_metadata"]

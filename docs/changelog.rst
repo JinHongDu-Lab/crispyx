@@ -24,6 +24,8 @@ Version 0.2.6
 
 **Fixed**
 
+* The NB IRLS fits judged convergence on the deviance change relative to the deviance floored at 1e-8, so a saturated fit (deviance near zero, e.g. ``nb_offset_test``'s controls with one unit per covariate level) never converged on rounding noise and its genes came back NaN; the change is now relative to ``|deviance| + 0.1``, DESeq2's ratio.
+* ``cx.tl.nb_offset_test`` raises when the controls leave no residual degrees of freedom for their dispersion (as many control units as design columns, or no stratum with two controls) and ``dispersion`` is not given, instead of returning dispersions at the search's bound.
 * ``cx.pp.qc_summary`` passed ``cache_mode="memmap"`` by default, which no QC path recognises, so the row-oriented path ran without its chunk cache and read the source again to write the filtered file. It now defaults to ``"disk"`` as ``quality_control_summary`` does, and an unknown ``cache_mode`` raises.
 
 Version 0.2.5

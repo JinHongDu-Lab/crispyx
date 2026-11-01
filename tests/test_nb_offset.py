@@ -425,3 +425,24 @@ def test_shrink_lfc_on_a_file_matches_the_arrays_with_its_options(tmp_path):
     np.testing.assert_allclose(plain.X * np.log(2), cx.tl.shrink_lfc_arrays(ln, se).lfc, rtol=1e-10, equal_nan=True)
     with pytest.raises(ValueError, match="prior_scale_mode='global'"):
         cx.shrink_lfc(source, centre="pooled", prior_scale_mode="per_comparison", verbose=False)
+
+
+def test_controls_without_residual_degrees_of_freedom(tmp_path):
+    """One control unit per batch: the dispersion cannot be estimated, and at a
+    given one the saturated control fit converges (its deviance is ~0, which
+    a convergence test relative to the deviance alone never settles on)."""
+    rng = np.random.default_rng(0)
+    labels = ["control", "control"] + [f"p{k}" for k in range(6) for _ in range(2)]
+    n, n_genes = len(labels), 80
+    mu = np.exp(rng.uniform(np.log(5), np.log(5000), n_genes)) * rng.lognormal(0, 0.2, n)[:, None]
+    counts = rng.negative_binomial(20, 20 / (20 + mu)).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "batch": ["b1", "b2"] * (n // 2), "stratum": [f"s{i}" for i in range(n)]},
+                       index=[f"u{i}" for i in range(n)])
+    ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])).write(
+        tmp_path / "u.h5ad")
+    for design in ({"covariates": ["batch"]}, {"strata": "stratum"}):
+        with pytest.raises(ValueError, match="no residual degrees of freedom"):
+            _run(tmp_path / "u.h5ad", tmp_path / "x.h5ad", **design)
+    got = _run(tmp_path / "u.h5ad", tmp_path / "o.h5ad", covariates=["batch"], dispersion=0.05,
+               size_factor_method="deseq2", **NO_FILTERS)
+    assert np.isfinite(got.X).all()

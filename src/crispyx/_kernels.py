@@ -2170,7 +2170,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
             ceiling = dev + 1e-9 * abs(dev)
             rose = new_dev > ceiling
             worse = rose and not on_floor
-            scale = max(abs(dev), 1e-8)
+            scale = abs(dev) + 0.1
             excess = (new_dev - dev) / scale
             step = 1.0
             for _h in range(max_halvings):
