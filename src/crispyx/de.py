@@ -5094,12 +5094,14 @@ def shrink_lfc(
 @dataclass(frozen=True)
 class ShrunkLFC:
     """:func:`shrink_lfc_arrays`'s result: the shrunk fold changes, their
-    posterior standard errors (the MLE's where an entry was excluded) and the
-    Cauchy prior scale used."""
+    posterior standard errors (the MLE's where an entry was excluded), the
+    Cauchy prior scale used and, with ``centre="pooled"``, each gene's centre
+    (None when shrinking toward zero)."""
 
     lfc: np.ndarray
     se: np.ndarray
     prior_scale: float
+    centre: np.ndarray | None = None
 
 
 def shrink_lfc_arrays(
@@ -5109,6 +5111,8 @@ def shrink_lfc_arrays(
     prior_scale: float | None = None,
     exclude: ArrayLike | None = None,
     floor: ArrayLike | None = None,
+    centre: Literal["zero", "pooled"] = "zero",
+    n_cells: ArrayLike | None = None,
 ) -> ShrunkLFC:
     """apeGLM shrinkage of fold changes given as arrays, exactly.
 
@@ -5143,11 +5147,29 @@ def shrink_lfc_arrays(
         ``min_mu=0.01``, -12 to -16 on cells with 1e-6) is a bound, not a
         measurement; ``ln(0.5 / expected count)``, the strongest knockdown
         zero counts can show, is a sensible floor for an excluded target.
+    centre
+        What each fold change is shrunk toward. ``"zero"`` is apeGLM's
+        prior, as in :func:`shrink_lfc`. ``"pooled"`` takes ``lfc`` as
+        perturbations x genes and shrinks each entry toward its gene's pooled
+        fold change across the perturbations,
+        ``ln(sum_p n_p exp(lfc_p) / sum_p n_p)``: noise goes to the response
+        the perturbations share instead of removing it. The prior scale is
+        then estimated from the deviations from the centre. The weights
+        ``n_p`` do not depend on the estimates, so the centre is unbiased
+        where counts are low; a precision-weighted (1 / SE^2) mean is not,
+        since a perturbation that by chance has more reads of a lowly
+        expressed gene has both a higher fold change and a smaller SE, and a
+        median of the fold changes is biased downward. A fold change at the
+        fitted-mean floor counts as about zero in the sum. Entries that are
+        excluded, invalid or have ``se == 0`` are left out of the centre.
+    n_cells
+        With ``centre="pooled"``, the cells behind each row (the weights
+        ``n_p``); None weighs the rows equally.
 
     Returns
     -------
     ShrunkLFC
-        ``lfc``, ``se`` and ``prior_scale``.
+        ``lfc``, ``se``, ``prior_scale`` and ``centre``.
     """
     lfc = np.array(lfc, dtype=np.float64)
     se = np.asarray(se, dtype=np.float64)
@@ -5159,18 +5181,38 @@ def shrink_lfc_arrays(
     excluded = (np.zeros(lfc.shape, dtype=bool) if exclude is None
                 else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape))
     valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
+    pick = valid & ~excluded & (se > 0)
+    if centre == "zero":
+        mu = None
+        deviation = lfc
+    elif centre == "pooled":
+        if lfc.ndim != 2:
+            raise ValueError(f"shrink_lfc_arrays: centre='pooled' needs perturbations x genes, got shape {lfc.shape}")
+        weights = (np.ones(lfc.shape[0]) if n_cells is None
+                   else np.asarray(n_cells, dtype=np.float64).reshape(-1))
+        if weights.shape != (lfc.shape[0],):
+            raise ValueError(f"shrink_lfc_arrays: n_cells has {weights.size} entries, lfc {lfc.shape[0]} rows")
+        w = np.where(pick, weights[:, None], 0.0)
+        total = w.sum(axis=0)
+        pooled = (w * np.exp(np.minimum(np.where(pick, lfc, 0.0), 20.0))).sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mu = np.where(total > 0, np.log(np.maximum(pooled, 1e-300) / total), 0.0)
+        deviation = lfc - mu
+    else:
+        raise ValueError(f"shrink_lfc_arrays: centre must be 'zero' or 'pooled', got {centre!r}")
     if prior_scale is None:
-        pick = valid & ~excluded & (se > 0)
-        prior_scale = _estimate_apeglm_prior_scale(lfc[pick], se[pick]) if pick.any() else 1.0
+        prior_scale = _estimate_apeglm_prior_scale(deviation[pick], se[pick]) if pick.any() else 1.0
     prior_scale = float(prior_scale)
-    mode = cauchy_map(lfc, se, prior_scale)
-    out_lfc = np.where(valid, np.where(excluded, lfc, mode), np.nan)
+    mode = cauchy_map(deviation, se, prior_scale)
+    out_dev = np.where(valid, np.where(excluded, deviation, mode), np.nan)
     with np.errstate(divide="ignore", invalid="ignore"):
-        denominator = prior_scale ** 2 + out_lfc ** 2
-        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_lfc ** 2) / denominator ** 2
+        denominator = prior_scale ** 2 + out_dev ** 2
+        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_dev ** 2) / denominator ** 2
         post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
+    out_lfc = out_dev if mu is None else out_dev + mu
+    out_lfc = np.where(excluded & valid, lfc, out_lfc)
     out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
-    return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale)
+    return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale, centre=mu)
 
 
 # ---------------------------------------------------------------------------

@@ -1071,12 +1071,14 @@ class _ToolsNamespace:
         """
         return nb_offset_test(data, **kwargs)
 
-    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None):
+    def shrink_lfc_arrays(self, lfc, se, *, prior_scale=None, exclude=None, floor=None,
+                          centre="zero", n_cells=None):
         """apeGLM shrinkage of fold changes given as arrays, exactly.
 
         See :func:`crispyx.de.shrink_lfc_arrays`.
         """
-        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor)
+        return shrink_lfc_arrays(lfc, se, prior_scale=prior_scale, exclude=exclude, floor=floor,
+                                 centre=centre, n_cells=n_cells)
 
     def shrink_lfc(
         self,

@@ -398,3 +398,22 @@ the prior estimate; ``floor`` raises a fold change at the fitted-mean floor
    own_target = np.zeros(ln_lfc.shape, dtype=bool)         # each row's target gene column
    shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target)
    shrunk.lfc, shrunk.se, shrunk.prior_scale
+
+On a screen where most perturbations move a gene the same way, a prior
+centred on zero removes that shared response along with the noise.
+``centre="pooled"`` treats the arrays as perturbations x genes and shrinks
+each entry toward its gene's pooled fold change,
+``ln(sum_p n_p exp(lfc_p) / sum_p n_p)`` with ``n_cells`` as the weights
+``n_p``, and estimates the prior scale from the deviations. The weights must
+not depend on the estimates: for a lowly expressed gene, a perturbation that
+by chance has more reads has both a higher fold change and a smaller standard
+error, so an inverse-variance mean of the fold changes is biased upward, and
+on a real screen this made three quarters of the genes look up-regulated.
+
+.. code-block:: python
+
+   labels = input_obs["perturbation"]                       # the counts file's obs
+   cells = labels.value_counts().reindex(result.result.obs_names).to_numpy()
+   shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target,
+                                    centre="pooled", n_cells=cells)
+   shrunk.centre                                            # per gene

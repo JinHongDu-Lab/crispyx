@@ -4,7 +4,11 @@ Changelog
 Version 0.2.6
 -------------
 
-*Unreleased.* Faster sorting and offset fits on genome-wide screens, and long DE runs that resume by default.
+*Unreleased.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, and shrinkage toward each gene's shared response.
+
+**Added**
+
+* ``cx.tl.shrink_lfc_arrays(centre="pooled", n_cells=)``: shrinks each perturbation's fold change toward its gene's pooled fold change across the perturbations, ``ln(sum_p n_p exp(lfc_p) / sum_p n_p)``, rather than toward zero, so noise goes to the response the perturbations share instead of removing it. The cell-count weights keep the centre unbiased for lowly expressed genes, where a precision-weighted mean drifts upward; the result's ``centre`` holds it.
 
 **Changed**
 
