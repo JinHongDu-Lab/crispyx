@@ -23,22 +23,36 @@ def _screen(tmp_path, fmt: str):
     obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(n_cells)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     path = tmp_path / f"{fmt}.h5ad"
-    ad.AnnData(counts.asformat(fmt), obs=obs, var=var).write_h5ad(path)
+    matrix = counts.toarray() if fmt == "dense" else counts.asformat(fmt)
+    ad.AnnData(matrix, obs=obs, var=var).write_h5ad(path)
     return path, counts, labels
 
 
-@pytest.mark.parametrize("fmt", ["csr", "csc"])
-@pytest.mark.parametrize("budget_bytes", [None, 2_000])
-def test_sorted_rows_match_the_reference(tmp_path, monkeypatch, fmt, budget_bytes):
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+@pytest.mark.parametrize("bands", ["one", "several", "spilled"])
+def test_sorted_rows_match_the_reference(tmp_path, monkeypatch, fmt, bands):
     path, counts, labels = _screen(tmp_path, fmt)
-    if budget_bytes is not None:  # several row bands, one pass over the source each
-        monkeypatch.setattr(crispyx.data, "_conversion_buffer_budget_bytes", lambda _limit: budget_bytes)
+    if bands != "one":  # several row bands: one pass over the source each, or one pass spilling the rest
+        monkeypatch.setattr(crispyx.data, "_conversion_buffer_budget_bytes", lambda _limit: 2_000)
+    if bands == "spilled":
+        monkeypatch.setattr(crispyx.data, "_page_cache_is_charged", lambda: True)  # as in a Slurm job
+        monkeypatch.setattr(crispyx.data, "_spill_dir", lambda *args: tmp_path)
+        passes = []
+        real = crispyx.data._source_chunks
+        monkeypatch.setattr(crispyx.data, "_source_chunks",
+                            lambda *args: (passes.append(args), real(*args))[1])
     out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad",
                                chunk_size=64, verbose=False)
     order = perturbation_sort_order(labels, "ctrl")
     result = ad.read_h5ad(out)
-    assert sp.isspmatrix_csr(result.X) or isinstance(result.X, sp.csr_array)
-    assert result.X.has_sorted_indices
-    np.testing.assert_array_equal(result.X.toarray(), counts[order].toarray())
+    if fmt == "dense":
+        assert isinstance(result.X, np.ndarray)
+    else:
+        assert sp.isspmatrix_csr(result.X) or isinstance(result.X, sp.csr_array)
+        assert result.X.has_sorted_indices
+    if bands == "spilled" and fmt == "csr":
+        assert len(passes) == 1                       # the source read once
+    got = result.X if isinstance(result.X, np.ndarray) else result.X.toarray()
+    np.testing.assert_array_equal(got, counts[order].toarray())
     assert list(result.obs_names) == [f"c{i}" for i in order]
     assert result.uns["sorting_metadata"]["sorted_by"] == "perturbation"
