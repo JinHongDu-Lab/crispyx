@@ -844,9 +844,14 @@ def compute_de_comparison_metrics(
     if method_a is None or method_b is None or method_a.empty or method_b.empty:
         return metrics
 
+    # A gene name that occurs twice in a dataset (e.g. TBCE in Feng-ts) cannot be
+    # matched between methods by name, so those genes are left out on both sides.
+    key = ["perturbation", "gene"]
+    method_a = method_a[~method_a.duplicated(key, keep=False)]
+    method_b = method_b[~method_b.duplicated(key, keep=False)]
     merged = method_a.merge(
         method_b,
-        on=["perturbation", "gene"],
+        on=key,
         suffixes=("_method_a", "_method_b"),
         how="inner",
     )
