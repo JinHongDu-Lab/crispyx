@@ -435,3 +435,15 @@ without a threshold on the standard error.
                                     centre="pooled", n_cells=cells)
    shrunk.centre                                            # per gene
    estimable = np.isfinite(ln_lfc) & (result.result.layers["pts"] > 0)
+
+:func:`crispyx.tl.shrink_lfc` takes the same ``exclude``, ``floor``,
+``centre`` and ``n_cells`` on a result file (with the default
+``method="stats"`` and ``prior_scale_mode="global"``), reading it a block of
+rows at a time; ``exclude`` may be a scipy sparse matrix, and the pooled
+centre is written to ``var["shrinkage_centre"]``:
+
+.. code-block:: python
+
+   own_target = scipy.sparse.csr_matrix(own_target)        # one True per row
+   shrunk = cx.tl.shrink_lfc(result.result_path, exclude=own_target,
+                             centre="pooled", n_cells=cells)

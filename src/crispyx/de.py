@@ -4685,6 +4685,18 @@ def _apeglm_worker_count(
     )
 
 
+def _write_var_column(handle: h5py.File, name: str, values: np.ndarray) -> None:
+    """Write (or replace) column ``name`` of an open h5ad file's ``var``."""
+    var = handle["var"]
+    if name in var:
+        del var[name]
+    write_elem(var, name, np.asarray(values))
+    order = [c.decode() if isinstance(c, bytes) else str(c) for c in var.attrs.get("column-order", [])]
+    if name not in order:
+        order.append(name)
+    var.attrs["column-order"] = order
+
+
 def shrink_lfc(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -4697,6 +4709,10 @@ def shrink_lfc(
     batch_size: int = 128,
     profiling: bool = False,
     memory_limit_gb: float | None = None,
+    exclude: "ArrayLike | sp.spmatrix | None" = None,
+    floor: ArrayLike | None = None,
+    centre: Literal["zero", "pooled"] = "zero",
+    n_cells: ArrayLike | None = None,
     verbose: int | bool = True,
 ) -> RankGenesGroupsResult:
     """Apply apeGLM log-fold change shrinkage to existing NB-GLM results.
@@ -4777,7 +4793,18 @@ def shrink_lfc(
         Optional memory budget in gigabytes. With ``method="full"``, the
         number of parallel workers is capped so that they fit in the budget
         (``None``, the default, uses the memory currently available).
-        ``method="stats"`` holds no per-worker data and ignores it.
+        ``method="stats"`` holds no per-worker data and ignores it, except
+        that the file's fold changes are read once, rather than a block at a
+        time per pass, when they fit a quarter of it.
+    exclude, floor, centre, n_cells
+        As in :func:`shrink_lfc_arrays`, over the file's perturbations x
+        genes (``method="stats"`` with ``prior_scale_mode="global"`` only).
+        ``exclude`` is a boolean array or scipy sparse matrix of that shape,
+        such as each perturbation's own target gene; ``floor`` broadcasts to
+        it on the natural-log scale (a column of one bound per perturbation);
+        ``n_cells`` gives one weight per perturbation for
+        ``centre="pooled"``, whose per-gene centre is written to
+        ``var["shrinkage_centre"]`` in the file's ``lfc_base``.
     verbose
         Print basic progress/completion messages. Defaults to ``True``.
 
@@ -4817,6 +4844,15 @@ def shrink_lfc(
     # Validate min_mu parameter
     if min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
+    if centre not in ("zero", "pooled"):
+        raise ValueError(f"shrink_lfc: centre must be 'zero' or 'pooled', got {centre!r}")
+    # The stats method with one global prior shrinks with shrink_lfc_arrays'
+    # closed form, a block of rows at a time, and takes its options.
+    by_blocks = method == "stats" and prior_scale_mode == "global"
+    if not by_blocks and (exclude is not None or floor is not None or centre != "zero" or n_cells is not None):
+        raise ValueError(
+            "shrink_lfc: exclude, floor, centre and n_cells need method='stats' and prior_scale_mode='global'"
+        )
     
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -4889,18 +4925,48 @@ def shrink_lfc(
         rows["dispersion"] = handle["layers/dispersion"][sl]
         return rows
 
-    # Global prior scale from ALL perturbations' MLE LFCs: read once when the
-    # pairs fit a quarter of the budget, else re-read in blocks for each
-    # evaluation of the objective.
-    if n_groups * n_genes * 16 <= 0.25 * budget:
+    shape = (n_groups, n_genes)
+    if exclude is not None and not sp.issparse(exclude):
+        exclude = np.broadcast_to(np.asarray(exclude, dtype=bool), shape)
+    if exclude is not None and exclude.shape != shape:
+        raise ValueError(f"shrink_lfc: exclude has shape {exclude.shape}, the result {shape}")
+    if floor is not None:
+        floor = np.broadcast_to(np.asarray(floor, dtype=np.float64), shape)
+    weights = np.ones(n_groups) if n_cells is None else np.asarray(n_cells, dtype=np.float64).reshape(-1)
+    if weights.shape != (n_groups,):
+        raise ValueError(f"shrink_lfc: n_cells has {weights.size} entries, the result {n_groups} perturbations")
+
+    def prepared(raw: np.ndarray, se: np.ndarray, sl: slice):
+        """A block's ln fold changes and SEs with ``floor`` and ``exclude``
+        applied: (lfc, se, valid, excluded, pick)."""
+        excluded = None
+        if exclude is not None:
+            excluded = exclude[sl].toarray().astype(bool) if sp.issparse(exclude) else np.asarray(exclude[sl])
+        lfc, valid, excluded, pick = _shrink_prepare(raw, se, excluded, None if floor is None else floor[sl])
+        return lfc, se, valid, excluded, pick
+
+    # The ln fold changes and SEs, prepared: read once when they fit a
+    # quarter of the budget, else re-read in blocks for each pass (the
+    # centre's mean shift, each evaluation of the prior's objective).
+    def read_blocks():
         with h5py.File(path, "r") as handle:
-            all_pairs = [(handle[raw_key][()], handle[se_key][()])]
-        prior_blocks = lambda: all_pairs  # noqa: E731
+            for sl in _row_blocks(n_groups, n_genes):
+                yield (sl, *prepared(handle[raw_key][sl], handle[se_key][sl], sl))
+    if n_groups * n_genes * 16 <= 0.25 * budget:
+        cached = list(read_blocks())
+        blocks = lambda: cached  # noqa: E731
     else:
-        def prior_blocks():
-            with h5py.File(path, "r") as handle:
-                for sl in _row_blocks(n_groups, n_genes):
-                    yield handle[raw_key][sl], handle[se_key][sl]
+        blocks = read_blocks
+    mu = None
+    if by_blocks and centre == "pooled":
+        mu = _pooled_centre(
+            lambda: ((lfc, se, pick, weights[sl]) for sl, lfc, se, _, _, pick in blocks()), n_genes,
+        )
+
+    def prior_blocks():
+        for _, lfc, se, _, _, pick in blocks():
+            deviation = lfc if mu is None else lfc - mu
+            yield deviation[pick], se[pick]
     global_prior_scale = _apeglm_prior_scale_from_blocks(prior_blocks)
     del prior_blocks
     logger.info(f"Global prior scale for apeGLM: {global_prior_scale:.4f}")
@@ -4934,7 +5000,12 @@ def shrink_lfc(
             total_needs_refit += int(needs_refit.sum())
         return shrunk_lfc, shrunk_se
 
-    if method == "stats":
+    if by_blocks:
+        def shrink_rows(rows: dict[str, np.ndarray], sl: slice) -> tuple[np.ndarray, np.ndarray]:
+            lfc, se, valid, excluded, _ = prepared(rows["raw"], rows["se"], sl)
+            return _shrink_entries(lfc, se, valid, excluded, global_prior_scale, mu)
+        backed = None
+    elif method == "stats":
         # Fast stats-based shrinkage using vectorized Newton-Raphson
         # No need to load original dataset - uses pre-computed MLE stats
         logger.info("Using fast stats-based shrinkage (method='stats')")
@@ -4955,7 +5026,7 @@ def shrink_lfc(
             base_mean_proxy = np.exp(np.clip(mean_intercept, -20, 20))  # Clamp to avoid overflow
         else:
             base_mean_proxy = None
-        shrink_rows = lambda rows: shrink_stats(rows, base_mean_proxy)  # noqa: E731
+        shrink_rows = lambda rows, sl: shrink_stats(rows, base_mean_proxy)  # noqa: E731
         backed = None
     else:  # method == "full"
         # Full model re-fitting with L-BFGS-B per gene
@@ -5068,10 +5139,7 @@ def shrink_lfc(
                         _create_unfilled_array(layers, name, (n_groups, n_genes), np.float64)
                 for sl in _row_blocks(n_groups, n_genes):
                     rows = read_rows(out, sl)
-                    if method == "stats":
-                        shrunk_lfc, shrunk_se = shrink_rows(rows)
-                    else:
-                        shrunk_lfc, shrunk_se = shrink_rows(rows, sl.start)
+                    shrunk_lfc, shrunk_se = shrink_rows(rows, sl if method == "stats" else sl.start)
                     layers["logfoldchange_raw"][sl] = rows["mle"]
                     if lfc_base == "ln":
                         layers["standard_error_ln"][sl] = rows["se"]
@@ -5099,11 +5167,14 @@ def shrink_lfc(
                     }
                 else:
                     profiling_uns = "NA"
+                if mu is not None:
+                    _write_var_column(out, "shrinkage_centre", mu / lfc_scale)
                 for key, value in {
                     "lfc_shrinkage_type": "apeglm",
                     "apeglm_prior_scale": global_prior_scale,
                     "shrinkage_method": method,
                     "prior_scale_mode": prior_scale_mode,
+                    "shrinkage_centre": centre,
                     "profiling": profiling_uns,
                 }.items():
                     if key in uns_out:
@@ -5143,33 +5214,67 @@ _CENTRE_MAX_Z = 3.0
 _CENTRE_MAX_UPWARD_SE = 5.0
 
 
-def _pooled_centre(lfc: np.ndarray, se: np.ndarray, use: np.ndarray, weights: np.ndarray,
-                   *, max_iter: int = 50, tol: float = 1e-8) -> np.ndarray:
-    """Per gene (column), ``ln(sum w exp(lfc) / sum w)`` over the entries
-    ``use`` within ``_CENTRE_MAX_Z`` standard errors of the result: a mean
-    shift from the pool of every ``use`` entry. A gene with no entry left in
-    its window keeps the previous value; one with no entry at all is 0."""
-    linear = np.exp(np.minimum(np.where(use, lfc, 0.0), 20.0))
-    w_all = np.where(use, weights[:, None], 0.0)
+def _shrink_prepare(lfc: np.ndarray, se: np.ndarray, exclude: np.ndarray | None, floor: np.ndarray | None):
+    """One block of entries made ready to shrink: ``lfc`` raised to
+    ``floor`` (NaN: no bound), and the masks of valid, excluded and
+    prior-forming (valid, not excluded, ``se > 0``) entries."""
+    if floor is not None:
+        lfc = np.where(np.isfinite(floor), np.maximum(lfc, floor), lfc)
+    excluded = np.zeros(lfc.shape, dtype=bool) if exclude is None else exclude
+    valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
+    return lfc, valid, excluded, valid & ~excluded & (se > 0)
 
-    def pool(mask):
-        w = np.where(mask, w_all, 0.0)
-        total = w.sum(axis=0)
+
+def _pooled_centre(blocks, n_genes: int, *, max_iter: int = 50, tol: float = 1e-8) -> np.ndarray:
+    """Per gene, ``ln(sum w exp(lfc) / sum w)`` over the entries within
+    ``_CENTRE_MAX_Z`` standard errors of the result, leaving out upward fold
+    changes with a standard error above ``_CENTRE_MAX_UPWARD_SE``: a mean
+    shift from the pool of every such entry. ``blocks()`` yields ``(lfc,
+    se, pick, weights)`` row blocks afresh for each pass (``weights`` per
+    row). A gene with no entry left in its window keeps the previous value;
+    one with no entry at all is 0."""
+
+    def pool(centre):
+        num, den = np.zeros(n_genes), np.zeros(n_genes)
+        for lfc, se, pick, weights in blocks():
+            with np.errstate(invalid="ignore"):
+                use = pick & ~((se > _CENTRE_MAX_UPWARD_SE) & (lfc > 0))
+                if centre is not None:
+                    use &= np.abs(lfc - centre) < _CENTRE_MAX_Z * se
+            w = np.where(use, weights[:, None], 0.0)
+            num += (w * np.exp(np.minimum(np.where(use, lfc, 0.0), 20.0))).sum(axis=0)
+            den += w.sum(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            return np.log(np.maximum((w * linear).sum(axis=0), 1e-300) / total), total > 0
+            return np.log(np.maximum(num, 1e-300) / den), den > 0
 
-    centre, has = pool(use)
+    centre, has = pool(None)
     centre = np.where(has, centre, 0.0)
     for _ in range(max_iter):
-        with np.errstate(invalid="ignore"):
-            window = use & (np.abs(lfc - centre) < _CENTRE_MAX_Z * se)
-        new, has = pool(window)
+        new, has = pool(centre)
         new = np.where(has, new, centre)
         done = np.abs(new - centre).max(initial=0.0) < tol
         centre = new
         if done:
             break
     return centre
+
+
+def _shrink_entries(lfc, se, valid, excluded, prior_scale: float, mu: np.ndarray | None):
+    """The posterior mode and standard error of each entry under a Cauchy
+    prior of scale ``prior_scale`` centred on ``mu`` (zero when None);
+    excluded entries keep their fold change and standard error, invalid ones
+    are NaN, and ``se == 0`` keeps its standard error."""
+    deviation = lfc if mu is None else lfc - mu
+    mode = cauchy_map(deviation, se, prior_scale)
+    out_dev = np.where(valid, np.where(excluded, deviation, mode), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = prior_scale ** 2 + out_dev ** 2
+        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_dev ** 2) / denominator ** 2
+        post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
+    out_lfc = out_dev if mu is None else out_dev + mu
+    out_lfc = np.where(excluded & valid, lfc, out_lfc)
+    out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
+    return out_lfc, out_se
 
 
 @dataclass(frozen=True)
@@ -5272,39 +5377,25 @@ def shrink_lfc_arrays(
     se = np.asarray(se, dtype=np.float64)
     if se.shape != lfc.shape:
         raise ValueError(f"shrink_lfc_arrays: se has shape {se.shape}, lfc {lfc.shape}")
-    if floor is not None:
-        bound = np.broadcast_to(np.asarray(floor, dtype=np.float64), lfc.shape)
-        lfc = np.where(np.isfinite(bound), np.maximum(lfc, bound), lfc)
-    excluded = (np.zeros(lfc.shape, dtype=bool) if exclude is None
-                else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape))
-    valid = np.isfinite(lfc) & np.isfinite(se) & (se >= 0)
-    pick = valid & ~excluded & (se > 0)
-    if centre == "zero":
-        mu = None
-        deviation = lfc
-    elif centre == "pooled":
+    if centre not in ("zero", "pooled"):
+        raise ValueError(f"shrink_lfc_arrays: centre must be 'zero' or 'pooled', got {centre!r}")
+    bound = None if floor is None else np.broadcast_to(np.asarray(floor, dtype=np.float64), lfc.shape)
+    excluded = None if exclude is None else np.broadcast_to(np.asarray(exclude, dtype=bool), lfc.shape)
+    lfc, valid, excluded, pick = _shrink_prepare(lfc, se, excluded, bound)
+    mu = None
+    if centre == "pooled":
         if lfc.ndim != 2:
             raise ValueError(f"shrink_lfc_arrays: centre='pooled' needs perturbations x genes, got shape {lfc.shape}")
         weights = (np.ones(lfc.shape[0]) if n_cells is None
                    else np.asarray(n_cells, dtype=np.float64).reshape(-1))
         if weights.shape != (lfc.shape[0],):
             raise ValueError(f"shrink_lfc_arrays: n_cells has {weights.size} entries, lfc {lfc.shape[0]} rows")
-        mu = _pooled_centre(lfc, se, pick & ~((se > _CENTRE_MAX_UPWARD_SE) & (lfc > 0)), weights)
-        deviation = lfc - mu
-    else:
-        raise ValueError(f"shrink_lfc_arrays: centre must be 'zero' or 'pooled', got {centre!r}")
+        mu = _pooled_centre(lambda: [(lfc, se, pick, weights)], lfc.shape[1])
     if prior_scale is None:
+        deviation = lfc if mu is None else lfc - mu
         prior_scale = _estimate_apeglm_prior_scale(deviation[pick], se[pick]) if pick.any() else 1.0
     prior_scale = float(prior_scale)
-    mode = cauchy_map(deviation, se, prior_scale)
-    out_dev = np.where(valid, np.where(excluded, deviation, mode), np.nan)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        denominator = prior_scale ** 2 + out_dev ** 2
-        curvature = 1.0 / se ** 2 + 2 * (prior_scale ** 2 - out_dev ** 2) / denominator ** 2
-        post_se = 1.0 / np.sqrt(np.maximum(np.abs(curvature), 1e-12))
-    out_lfc = out_dev if mu is None else out_dev + mu
-    out_lfc = np.where(excluded & valid, lfc, out_lfc)
-    out_se = np.where(valid, np.where(excluded | (se == 0), se, post_se), np.nan)
+    out_lfc, out_se = _shrink_entries(lfc, se, valid, excluded, prior_scale, mu)
     return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale, centre=mu)
 
 

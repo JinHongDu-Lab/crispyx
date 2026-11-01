@@ -1093,6 +1093,10 @@ class _ToolsNamespace:
         batch_size: int = 128,
         profiling: bool = False,
         memory_limit_gb: float | None = None,
+        exclude=None,
+        floor=None,
+        centre: str = "zero",
+        n_cells=None,
         verbose: int | bool = True,
     ):
         """Apply apeGLM LFC shrinkage to NB-GLM results.
@@ -1119,6 +1123,8 @@ class _ToolsNamespace:
             Enable timing/memory profiling.
         memory_limit_gb
             Optional memory budget in GB. None auto-detects via psutil.
+        exclude, floor, centre, n_cells
+            As in :func:`crispyx.de.shrink_lfc` (``method="stats"``, global prior).
 
         Returns
         -------
@@ -1137,6 +1143,10 @@ class _ToolsNamespace:
             batch_size=batch_size,
             profiling=profiling,
             memory_limit_gb=memory_limit_gb,
+            exclude=exclude,
+            floor=floor,
+            centre=centre,
+            n_cells=n_cells,
             verbose=verbose,
         )
 

@@ -400,3 +400,28 @@ def test_a_stratum_baseline_moves_from_the_pooled_mean_only_as_far_as_its_expect
     one = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), np.zeros(1000, int), 1, 2,
                            dispersion=0.1)
     np.testing.assert_allclose(one.mean[0], one.pooled_mean)
+
+
+def test_shrink_lfc_on_a_file_matches_the_arrays_with_its_options(tmp_path):
+    _screen(tmp_path / "s.h5ad")
+    fit = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", strata="stratum", **NO_FILTERS)
+    source = tmp_path / "off.h5ad"
+    ln, se = fit.layers["logfoldchange_raw_ln"], fit.layers["standard_error_ln"]
+    own = sp.lil_matrix(ln.shape, dtype=bool)
+    own[0, 0] = own[1, 1] = True
+    floor = np.full((ln.shape[0], 1), np.nan)
+    floor[0] = -2.0
+    cells = np.arange(1, ln.shape[0] + 1)
+    shrunk = ad.read_h5ad(cx.shrink_lfc(
+        source, exclude=own.tocsr(), floor=floor, centre="pooled", n_cells=cells, verbose=False,
+    ).result_path)
+    expected = cx.tl.shrink_lfc_arrays(ln, se, exclude=own.toarray(), floor=floor, centre="pooled", n_cells=cells)
+    np.testing.assert_allclose(shrunk.X * np.log(2), expected.lfc, rtol=1e-10, equal_nan=True)
+    np.testing.assert_allclose(shrunk.layers["standard_error"] * np.log(2), expected.se, rtol=1e-10, equal_nan=True)
+    np.testing.assert_allclose(shrunk.var["shrinkage_centre"] * np.log(2), expected.centre, rtol=1e-10)
+    assert shrunk.uns["shrinkage_centre"] == "pooled"
+    assert shrunk.uns["apeglm_prior_scale"] == pytest.approx(expected.prior_scale)
+    plain = ad.read_h5ad(cx.shrink_lfc(source, data_name="plain", verbose=False).result_path)
+    np.testing.assert_allclose(plain.X * np.log(2), cx.tl.shrink_lfc_arrays(ln, se).lfc, rtol=1e-10, equal_nan=True)
+    with pytest.raises(ValueError, match="prior_scale_mode='global'"):
+        cx.shrink_lfc(source, centre="pooled", prior_scale_mode="per_comparison", verbose=False)
