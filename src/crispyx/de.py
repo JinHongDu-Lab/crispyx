@@ -1720,7 +1720,13 @@ def nb_glm_test(
         populated for every gene, so a pair expressed in 0% of perturbed and
         95% of control cells is plainly visible there. ``lfc_shrinkage_type``
         does not change this: an excluded pair is dropped before any fit, so
-        it stays ``NaN`` under ``"apeglm"`` as well.
+        it stays ``NaN`` under ``"apeglm"`` as well. With either set to
+        ``0`` such a pair is fitted, and its fold change is the fitted-mean
+        bound (about -7 to -16 on cells, with a standard error of 100 or more, or
+        the upper bound when the controls have no count), not an estimate.
+        ``pts`` and ``pts_rest`` mark it, with no extra layer:
+        ``np.isfinite(X) & (pts > 0) & (pts_rest > 0)`` is the estimable
+        pairs.
     lfc_shrinkage_type
         Type of log-fold change shrinkage to apply.
 
@@ -2970,7 +2976,10 @@ def nb_offset_test(
     ``pvalue_adj``, ``intercept``, ``dispersion``, ``pts``, ``converged``),
     so :func:`shrink_lfc` and every reader of an NB-GLM result accept it;
     ``uns["method"]`` is ``"nb_offset"``. The expression filters are
-    :func:`nb_glm_test`'s, with the same defaults. An existing output is
+    :func:`nb_glm_test`'s, with the same defaults; with
+    ``min_cells_pert=0`` a pair with no count among the perturbed cells is
+    fitted to the fitted-mean floor, and ``pts == 0`` marks it (a gene with
+    no control count has no baseline and stays NaN). An existing output is
     reused when it was computed from the same input and arguments
     (:ref:`auto-reload`).
 

@@ -421,7 +421,11 @@ effects do not lift it while a response every perturbation shares stays in.
 The pool also needs the perturbations with no count of a gene, at the
 fitted-mean floor; the tests' default ``min_cells_pert=1`` leaves them NaN,
 which keeps only the perturbations that happened to have a count of a rare
-gene, so fit with ``min_cells_pert=0`` for a pooled centre.
+gene, so fit with ``min_cells_pert=0`` for a pooled centre. Those entries
+are bounds, not estimates (about -7 to -16 on cells, standard error of 100
+or more); the result's ``pts`` layer, the fraction of the perturbation's cells
+expressing the gene, is 0 exactly there, so ``pts > 0`` tells them apart
+without a threshold on the standard error.
 
 .. code-block:: python
 
@@ -430,3 +434,4 @@ gene, so fit with ``min_cells_pert=0`` for a pooled centre.
    shrunk = cx.tl.shrink_lfc_arrays(ln_lfc, ln_se, exclude=own_target,
                                     centre="pooled", n_cells=cells)
    shrunk.centre                                            # per gene
+   estimable = np.isfinite(ln_lfc) & (result.result.layers["pts"] > 0)
