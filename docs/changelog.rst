@@ -4,7 +4,7 @@ Changelog
 Version 0.2.6
 -------------
 
-*Unreleased.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, shrinkage toward each gene's shared response, and a Wilcoxon null that holds for genes few cells express.
+*Released 2026-11-01.* Faster sorting and offset fits on genome-wide screens, long DE runs that resume by default, shrinkage toward each gene's shared response, and a Wilcoxon null that holds for genes few cells express.
 
 **Added**
 
