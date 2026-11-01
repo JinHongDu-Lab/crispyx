@@ -2924,6 +2924,8 @@ def nb_offset_test(
     verbose: int | bool = True,
     memory_limit_gb: float | None = None,
     n_jobs: int | None = None,
+    resume: bool = True,
+    checkpoint_interval: int | None = None,
     force: bool = False,
 ) -> RankGenesGroupsResult:
     """Negative binomial test of each perturbation on its own cells, with the
@@ -3047,6 +3049,18 @@ def nb_offset_test(
     n_jobs
         Perturbations fitted concurrently, in threads (None or -1: all
         cores). The controls are read once, each perturbation's cells once.
+    resume
+        If True (default), continue an interrupted run from its last
+        checkpoint, skipping the perturbations it had finished (the pass over
+        the controls is repeated). Only a checkpoint from this crispyx
+        version and a call with the same input and result-affecting
+        parameters is used (``n_jobs`` and ``memory_limit_gb`` may differ);
+        any other is discarded with a warning. Partial results live in a
+        hidden ``.<output name>.resume`` directory until the output is
+        written. False, or ``force=True``, starts over.
+    checkpoint_interval
+        Perturbations between checkpoint saves; None chooses one from the
+        number of perturbations.
     force
         Recompute even when a reusable output exists.
 
@@ -3083,6 +3097,7 @@ def nb_offset_test(
     )
     if (existing := _try_load_existing_de_result(output_path, force=force, verbose=verbose, fingerprint=fingerprint)):
         return existing
+    resume = resume and not force
 
     storage_format = _storage_format_warning_csc(path, name)
     backed = read_backed(path)
@@ -3240,7 +3255,7 @@ def nb_offset_test(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run = _resumable_result(
         output_path, output_path.with_suffix(".progress.json"),
-        fingerprint=_checkpoint_fingerprint(fingerprint), resume=False, obs=obs, var=var,
+        fingerprint=_checkpoint_fingerprint(fingerprint), resume=resume, obs=obs, var=var,
         uns={
             "lfc_base": lfc_base,
             "method": "nb_offset",
@@ -3268,6 +3283,12 @@ def nb_offset_test(
     out = {key: run.file[key] for key in ["X", *(f"layers/{layer}" for layer in layers)]}
     lfc_scale = np.log(2) if lfc_base == "log2" else 1.0
     candidate_to_idx = {label: idx for idx, label in enumerate(candidates)}
+    completed: list[str] = list(run.progress.get("completed", []))
+    done = set(completed)
+    to_run = [label for label in candidates if label not in done]
+    if run.resumed:
+        _messages.vprint(verbose, name, f"Resuming: {len(completed)}/{n_groups} perturbations already done")
+    interval = _get_checkpoint_interval(n_groups, checkpoint_interval)
 
     def fit(label: str, y: sp.csr_matrix, rows: np.ndarray) -> dict:
         # The cells without a baseline leave before the filters and ``pts``
@@ -3353,7 +3374,7 @@ def nb_offset_test(
             # The rows are read here, in the caller's thread, as each task is
             # dispatched (joblib pre-dispatches two per thread), and fitted in
             # the pool: numpy releases the GIL in the fits' array work.
-            for label in candidates:
+            for label in to_run:
                 rows = group_rows[label]
                 y = sp.csr_matrix(backed.X[rows, :], dtype=np.float64)
                 y.sum_duplicates()
@@ -3362,7 +3383,7 @@ def nb_offset_test(
                     rows = np.arange(rows.start, rows.stop)
                 yield delayed(fit_or_fail)(label, y, rows)
 
-        with _create_progress_context(n_groups, name, verbose) as pbar:
+        with _create_progress_context(len(to_run), name, verbose) as pbar:
             results = Parallel(n_jobs=n_threads, backend="threading", return_as="generator_unordered")(tasks())
             for label, res in results:
                 if isinstance(res, Exception):
@@ -3371,12 +3392,15 @@ def nb_offset_test(
                     write_failed(label)
                 else:
                     write(res)
+                    completed.append(label)
                     n_tested_list.append(res["n_tested"])
                     _print_de_perturbation_verbose(verbose, label, res["n_tested"], n_genes)
                 pbar.update(1)
+                if (len(completed) + len(failed)) % interval == 0:
+                    run.save(total=n_groups, completed=completed, failed=failed)
     finally:
         backed.file.close()
-    _print_de_summary(verbose, name, n_groups - len(failed), n_groups, n_tested_list, n_genes)
+    _print_de_summary(verbose, name, len(completed), n_groups, n_tested_list, n_genes)
     if failed:
         _messages.warn(
             name,

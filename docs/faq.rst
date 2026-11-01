@@ -316,7 +316,8 @@ interrupted removes its partial file; a run killed outright (``SIGKILL``, an
 out-of-memory kill, a scheduler timeout) cannot, and leaves it for you to
 delete. Either way, whatever was at the output path before is still there. The
 resumable functions (``t_test``, ``wilcoxon_test``, ``nb_glm_test``,
-``batch_process``) keep their work file instead, so a rerun can continue it
+``nb_offset_test``, ``batch_process``) keep their work file instead, so a rerun
+can continue it
 (by default for the DE tests, with ``resume=True`` for ``batch_process``).
 
 My DE result is loaded instantly on the second call — is that expected?

@@ -355,8 +355,8 @@ invalidate it. Pass ``force=True`` to recompute regardless.
 Resume and checkpointing
 ------------------------
 
-``cx.tl.t_test``, ``cx.tl.wilcoxon_test`` and ``cx.tl.nb_glm_test`` resume an
-interrupted run by default: rerun the same call and the perturbations (or gene
+``cx.tl.t_test``, ``cx.tl.wilcoxon_test``, ``cx.tl.nb_glm_test`` and
+``cx.tl.nb_offset_test`` resume an interrupted run by default: rerun the same call and the perturbations (or gene
 chunks) it had finished are skipped. A checkpoint is used only when it comes
 from the same crispyx version, input file and result-affecting arguments;
 ``n_jobs``, ``memory_limit_gb`` and other operational arguments may change, so a

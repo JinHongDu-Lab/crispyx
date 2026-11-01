@@ -47,6 +47,10 @@ def _run(method, screen, out: Path, **kw):
         return de.t_test(screen / "norm.h5ad", n_jobs=1, checkpoint_interval=1, **common, **kw)
     if method == "nb_glm":
         return de.nb_glm_test(screen / "counts.h5ad", n_jobs=1, checkpoint_interval=1, **common, **kw)
+    if method == "nb_offset":
+        return de.nb_offset_test(
+            screen / "counts.h5ad", strata="batch", n_jobs=1, checkpoint_interval=1, **common, **kw,
+        )
     extra = {"batch_column": "batch"} if method == "wilcoxon_stratified" else {}
     return de.wilcoxon_test(
         screen / "norm.h5ad", chunk_size=25, checkpoint_interval=1, **common, **extra, **kw,
@@ -116,7 +120,7 @@ def _resume_dir(out: Path) -> Path:
     return out.with_name(f".{out.name}.resume")
 
 
-CASES = ["t_test", "nb_glm", "wilcoxon", "wilcoxon_stratified"]
+CASES = ["t_test", "nb_glm", "nb_offset", "wilcoxon", "wilcoxon_stratified"]
 
 
 @pytest.mark.parametrize("method", CASES)
@@ -214,7 +218,7 @@ def test_resume_false_or_force_discards_a_checkpoint(screen, tmp_path, monkeypat
     assert not out.with_suffix(".progress.json").exists() and not _resume_dir(out).exists()
 
 
-@pytest.mark.parametrize("method", ["t_test", "nb_glm", "wilcoxon"])
+@pytest.mark.parametrize("method", ["t_test", "nb_glm", "nb_offset", "wilcoxon"])
 def test_a_rerun_resumes_by_default(screen, tmp_path, monkeypatch, method):
     out = tmp_path / "result.h5ad"
     with monkeypatch.context() as m:
