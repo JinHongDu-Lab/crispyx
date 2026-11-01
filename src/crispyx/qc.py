@@ -43,6 +43,7 @@ from .data import (
     load_obs,
     load_var,
     write_obs,
+    filtered_sorting_metadata,
     perturbation_sort_order,
     sorting_metadata,
 )
@@ -1024,8 +1025,19 @@ def _qc_in_memory(
     # Build gene mask
     gene_mask = gene_cell_counts >= min_cells_per_gene
     
-    # ===== Single copy at the end (like Scanpy) =====
-    adata_filtered = adata[combined_cell_mask, :][:, gene_mask].copy()
+    # ===== Single copy at the end (like Scanpy), rows in output order =====
+    rows = np.flatnonzero(combined_cell_mask)
+    order = _kept_order(labels_full, combined_cell_mask, control_label, sort_by_perturbation)
+    if order is not None:
+        rows = rows[order]
+    adata_filtered = adata[rows, gene_mask].copy()
+    if order is None:
+        adata_filtered.uns = filtered_sorting_metadata(adata_filtered.uns, adata_filtered.obs, combined_cell_mask)
+    else:
+        adata_filtered.uns["sorting_metadata"] = sorting_metadata(
+            labels_full[rows], order, perturbation_column=perturbation_column, control_label=control_label,
+            original_path=Path(path),
+        )
     
     # Free original data immediately
     del adata
@@ -1039,15 +1051,6 @@ def _qc_in_memory(
     for _col in adata_filtered.obs.columns:
         if isinstance(adata_filtered.obs[_col].dtype, pd.CategoricalDtype):
             adata_filtered.obs[_col] = adata_filtered.obs[_col].cat.remove_unused_categories()
-
-    if sort_by_perturbation:
-        kept_labels = adata_filtered.obs[perturbation_column].astype(str).to_numpy()
-        order = perturbation_sort_order(kept_labels, control_label)
-        adata_filtered = adata_filtered[order].copy()
-        adata_filtered.uns["sorting_metadata"] = sorting_metadata(
-            kept_labels[order], order, perturbation_column=perturbation_column, control_label=control_label,
-            original_path=Path(path),
-        )
 
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)

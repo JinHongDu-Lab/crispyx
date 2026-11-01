@@ -29,7 +29,9 @@ KEY = "crispyx"
 #: it -- so existing files of the old layout are recomputed instead of being
 #: read under the new one.
 SCHEMAS = {
-    "de_result": 3,  # 2: all-tied Wilcoxon genes NaN; 3: Wilcoxon X is the AUC (was AUC - 0.5)
+    # 2: all-tied Wilcoxon genes NaN; 3: Wilcoxon X is the AUC (was AUC - 0.5);
+    # 4: nb_offset_test's stratum baselines, saturated NB fits converge
+    "de_result": 4,
     "pseudobulk": 2,  # 2: profiles named by group key, constant obs columns carried over
     "pseudobulk_effects": 1,
     "batch": 1,

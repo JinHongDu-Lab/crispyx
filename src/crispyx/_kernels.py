@@ -543,18 +543,51 @@ def _compute_ctrl_tie_sums(
     return ctrl_tie_sums
 
 
+# The NB IRLS fits measure a deviance change relative to |deviance| plus
+# this, DESeq2's ratio: a saturated fit's deviance near zero still converges.
+_DEVIANCE_OFFSET = 0.1
+
+
 # The rank-sum p-value treats the number of expressing cells that fall in the
 # perturbation group as hypergeometric whenever its variance, summed over
 # strata, is below this; above it the normal approximation is used.
 _RANK_SUM_MIXTURE_MAX_VAR = 100.0
-# The largest product of per-stratum mixtures enumerated; beyond it the normal
-# approximation is used.
+# The most components the strata's combined mixture keeps; beyond it,
+# components with nearby means are merged.
 _RANK_SUM_MIXTURE_MAX_COMPONENTS = 1 << 15
+
+
+@nb.njit(cache=True)
+def _merge_mixture(w: np.ndarray, m: np.ndarray, v: np.ndarray, n_bins: int) -> tuple:
+    """Merge a normal mixture's components into at most ``n_bins`` by their
+    mean (equal-width bins over its range), each bin a normal with the
+    bin's weight, mean and variance."""
+    lo = m.min()
+    span = m.max() - lo
+    bins = np.zeros(m.shape[0], dtype=np.int64)
+    if span > 0.0:
+        for i in range(m.shape[0]):
+            bins[i] = min(int((m[i] - lo) / span * n_bins), n_bins - 1)
+    bw = np.zeros(n_bins)
+    bm = np.zeros(n_bins)
+    for i in range(m.shape[0]):
+        bw[bins[i]] += w[i]
+        bm[bins[i]] += w[i] * m[i]
+    for b in range(n_bins):
+        if bw[b] > 0.0:
+            bm[b] /= bw[b]
+    bv = np.zeros(n_bins)
+    for i in range(m.shape[0]):
+        d = m[i] - bm[bins[i]]
+        bv[bins[i]] += w[i] * (v[i] + d * d)
+    keep = np.flatnonzero(bw > 0.0)
+    return bw[keep], bm[keep], bv[keep] / bw[keep]
 
 
 @nb.njit(cache=True)
 def _rank_sum_mixture_pvalue(
     n1s: np.ndarray, ns: np.ndarray, ks: np.ndarray, nz_tie_sums: np.ndarray, deviation: float,
+    max_components: int = _RANK_SUM_MIXTURE_MAX_COMPONENTS,
 ) -> float:
     """Two-sided p-value of a (stratified) rank sum when most values are tied
     at zero.
@@ -569,8 +602,9 @@ def _rank_sum_mixture_pvalue(
     its exact distribution, and given ``J_b = j`` the rank sum is normal
     with the exact mean and variance of ``j`` draws without replacement from
     the non-zero ranks. The strata's
-    mixtures are combined exactly. Returns NaN when that takes more than
-    ``_RANK_SUM_MIXTURE_MAX_COMPONENTS`` components.
+    mixtures are combined exactly up to ``max_components`` components;
+    past it, :func:`_merge_mixture` merges those with nearby means, keeping
+    each merged component's weight, mean and variance.
     """
     w = np.ones(1)
     m = np.zeros(1)
@@ -613,8 +647,8 @@ def _rank_sum_mixture_pvalue(
             m += (n1 - j) * r0 + j * mean_nz - expected
             v += j * (k - j) / (k - 1.0) * var_nz if k > 1 else 0.0
             continue
-        if w.shape[0] * c > _RANK_SUM_MIXTURE_MAX_COMPONENTS:
-            return np.nan
+        if w.shape[0] * c > max_components:
+            w, m, v = _merge_mixture(w, m, v, max(max_components // c, 1))
         nw = np.empty(w.shape[0] * c)
         nm = np.empty(w.shape[0] * c)
         nv = np.empty(w.shape[0] * c)
@@ -882,12 +916,10 @@ def _wilcoxon_single_pert_presorted(
             n_nonzero = n_total - n_zeros
             if hypergeometric and _hypergeometric_variance(n_pert_f, n_total_f, float(n_nonzero)) < _RANK_SUM_MIXTURE_MAX_VAR:
                 zf = float(n_zeros)
-                exact = _rank_sum_mixture_pvalue(
+                pval = _rank_sum_mixture_pvalue(
                     np.array([n_pert]), np.array([n_total]), np.array([n_nonzero]),
                     np.array([tie_sum - (zf ** 3 - zf)]), rank_sum - expected,
                 )
-                if not math.isnan(exact):
-                    pval = exact
         else:
             # An empty group: no comparison was made.
             z = np.nan
@@ -1130,11 +1162,9 @@ def _wilcoxon_stratified_single_pert(
             z = num / math.sqrt(var)
             pval = math.erfc(abs(z) / sqrt2)
             if hypergeometric and var_j < _RANK_SUM_MIXTURE_MAX_VAR:
-                exact = _rank_sum_mixture_pvalue(
+                pval = _rank_sum_mixture_pvalue(
                     strata_n1[:n_used], strata_n[:n_used], strata_k[:n_used], strata_ties[:n_used], num,
                 )
-                if not math.isnan(exact):
-                    pval = exact
         else:
             # No stratum to compare in, or every value tied within each:
             # the rank test is undefined (with or without the tie
@@ -2170,7 +2200,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
             ceiling = dev + 1e-9 * abs(dev)
             rose = new_dev > ceiling
             worse = rose and not on_floor
-            scale = abs(dev) + 0.1
+            scale = abs(dev) + _DEVIANCE_OFFSET
             excess = (new_dev - dev) / scale
             step = 1.0
             for _h in range(max_halvings):
@@ -2197,7 +2227,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
                 new_mu[:] = mu
                 new_dev = dev
             relative_change = abs(new_dev - dev) / scale
-            deviance_ratio = abs(new_dev - dev) / (abs(new_dev) + 0.1)
+            deviance_ratio = abs(new_dev - dev) / (abs(new_dev) + _DEVIANCE_OFFSET)
             coef_change = 0.0
             for j in range(dx):
                 coef_change = max(coef_change, abs(new_f[j] - bf[j]))

@@ -1128,7 +1128,7 @@ class _ToolsNamespace:
         memory_limit_gb
             Optional memory budget in GB. None auto-detects via psutil.
         exclude, floor, centre, n_cells
-            As in :func:`crispyx.de.shrink_lfc` (``method="stats"``, global prior).
+            As in :func:`crispyx.de.shrink_lfc` (``method="stats"`` only).
 
         Returns
         -------

@@ -441,9 +441,9 @@ without a threshold on the standard error.
 
 :func:`crispyx.tl.shrink_lfc` takes the same ``exclude``, ``floor``,
 ``centre`` and ``n_cells`` on a result file (with the default
-``method="stats"`` and ``prior_scale_mode="global"``), reading it a block of
-rows at a time; ``exclude`` may be a scipy sparse matrix, and the pooled
-centre is written to ``var["shrinkage_centre"]``:
+``method="stats"``), reading it a block of rows at a time; ``exclude`` may be
+a scipy sparse matrix, and the pooled centre is written to
+``var["shrinkage_centre"]``:
 
 .. code-block:: python
 

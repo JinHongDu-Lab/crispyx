@@ -16,6 +16,7 @@ from scipy.special import polygamma
 
 # Import Numba kernels from separate module
 from ._kernels import (
+    _DEVIANCE_OFFSET,
     gammaln_nb,
     _nb_loglik_grid_numba,
     _nb_map_grid_search_with_refinement_numba,
@@ -344,20 +345,24 @@ def fit_dispersion_trend(
     return np.maximum(trend, 1e-8)
 
 
+def _onehot_columns(design: np.ndarray, protected_columns: Sequence[int] = ()) -> np.ndarray:
+    """The columns of ``design``'s block of disjoint one-hot columns outside
+    ``protected_columns`` (:func:`detect_onehot_block`), empty if none: the
+    block :func:`fit_nb_glm_batch_auto` fits through its Schur complement."""
+    candidates = np.setdiff1d(np.arange(design.shape[1]), np.asarray(protected_columns, dtype=int))
+    if candidates.size < 2:
+        return np.array([], dtype=int)
+    return candidates[detect_onehot_block(design[:, candidates], min_block=2)]
+
+
 def _design_csr(design: np.ndarray, protected_columns: Sequence[int] = ()) -> tuple:
     """``design`` as the MAP kernels take it for their Cox-Reid adjustment:
-    ``(indptr, indices, data, n_features, group, n_groups)``. A block of
-    disjoint one-hot columns outside ``protected_columns``
-    (:func:`detect_onehot_block`, as :func:`fit_nb_glm_batch_auto` finds
-    it) becomes each cell's column in it, ``group`` (-1 for none), and the
-    other columns the CSR arrays, so the kernels take ``log det XᵀWX``
-    through the block's Schur complement."""
+    ``(indptr, indices, data, n_features, group, n_groups)``. The one-hot
+    block (:func:`_onehot_columns`) becomes each cell's column in it,
+    ``group`` (-1 for none), and the other columns the CSR arrays, so the
+    kernels take ``log det XᵀWX`` through the block's Schur complement."""
     design = np.asarray(design, dtype=np.float64)
-    candidates = np.setdiff1d(np.arange(design.shape[1]), np.asarray(protected_columns, dtype=int))
-    block = np.array([], dtype=int)
-    if candidates.size >= 2:
-        found = detect_onehot_block(design[:, candidates], min_block=2)
-        block = candidates[found] if found.size else block
+    block = _onehot_columns(design, protected_columns)
     group = np.full(design.shape[0], -1, dtype=np.int64)
     if block.size:
         rows, cols = np.nonzero(design[:, block])
@@ -1375,7 +1380,7 @@ class NBGLMBatchFitter:
             ceiling = dev_a + 1e-9 * np.abs(dev_a)
             rose = dev_new > ceiling
             worse = rose & ~on_floor
-            scale = np.abs(dev_a) + 0.1
+            scale = np.abs(dev_a) + _DEVIANCE_OFFSET
             # Smallest relative deviance increase over the steps tried, which
             # is what decides the fate of a gene that never finds an improving
             # one.
@@ -1421,7 +1426,7 @@ class NBGLMBatchFitter:
             # aliases ``dev`` while the whole batch is active: computing it
             # after ``dev[active] = dev_new`` would compare ``dev_new`` with
             # itself and make the ratio identically zero.
-            deviance_ratio = np.abs(dev_new - dev_a) / (np.abs(dev_new) + 0.1)
+            deviance_ratio = np.abs(dev_new - dev_a) / (np.abs(dev_new) + _DEVIANCE_OFFSET)
             coef_change = np.max(np.abs(beta_new - beta_a), axis=0)
 
             beta[:, active] = beta_new
@@ -2186,7 +2191,7 @@ class StructuredGLMBatchFitter:
             ceiling = deviance_a + 1e-9 * np.abs(deviance_a)
             rose = new_deviance > ceiling
             worse = rose & ~on_floor
-            scale = np.abs(deviance_a) + 0.1
+            scale = np.abs(deviance_a) + _DEVIANCE_OFFSET
             excess = (new_deviance - deviance_a) / scale
             step = 1.0
             for _ in range(_MAX_STEP_HALVINGS):
@@ -2226,9 +2231,7 @@ class StructuredGLMBatchFitter:
             # reason given in NBGLMBatchFitter._irls_at_fixed_dispersion:
             # ``deviance_a`` aliases ``deviance`` while the whole batch is
             # active, so a ratio read after that write is always zero.
-            deviance_ratio = np.abs(new_deviance - deviance_a) / (
-                np.abs(new_deviance) + 0.1
-            )
+            deviance_ratio = np.abs(new_deviance - deviance_a) / (np.abs(new_deviance) + _DEVIANCE_OFFSET)
             coef_change = np.maximum(
                 np.max(np.abs(new_features - features_a), axis=1),
                 np.max(np.abs(new_groups - groups_a), axis=1) if self.n_groups else 0.0,
@@ -2557,13 +2560,7 @@ def fit_nb_glm_batch_auto(
     design = np.asarray(design, dtype=np.float64)
     n_features = design.shape[1]
 
-    candidates = np.setdiff1d(np.arange(n_features), np.asarray(protected_columns, dtype=int))
-    group_columns = np.array([], dtype=int)
-    if candidates.size >= 2:
-        found = detect_onehot_block(design[:, candidates], min_block=2)
-        if found.size:
-            group_columns = candidates[found]
-
+    group_columns = _onehot_columns(design, protected_columns)
     covariate_columns = np.setdiff1d(np.arange(n_features), group_columns)
     if group_columns.size <= covariate_columns.size and threaded and fixed_dispersion is not None:
         # The kernel with no group block, in NBGLMBatchFitter's unit

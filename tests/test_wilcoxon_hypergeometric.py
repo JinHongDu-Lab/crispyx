@@ -94,3 +94,22 @@ def test_the_distribution_is_checked_and_reaches_rank_genes_groups(tmp_path):
                                   output_dir=tmp_path / "b", verbose=False, **NO_FILTER)
     (written,) = (tmp_path / "b").glob("*.h5ad")
     np.testing.assert_allclose(ad.read_h5ad(written).layers["pvalue"], direct.pvalues)
+
+
+def test_many_strata_merge_the_mixture_instead_of_falling_back():
+    """Past its component cap the strata's mixture merges components with
+    nearby means, close to the exact mixture far into the tail."""
+    from crispyx._kernels import _rank_sum_mixture_pvalue
+
+    rng = np.random.default_rng(0)
+    n_strata = 9
+    ns = rng.integers(150, 400, n_strata)
+    n1s, ks, ties = rng.integers(3, 9, n_strata), rng.integers(2, 5, n_strata), np.zeros(n_strata)
+    for deviation in (200.0, 600.0, 1200.0, 2000.0):
+        exact = _rank_sum_mixture_pvalue(n1s, ns, ks, ties, deviation, 1 << 26)
+        merged = _rank_sum_mixture_pvalue(n1s, ns, ks, ties, deviation, 1 << 10)
+        np.testing.assert_allclose(merged, exact, rtol=0.02)
+    many = 100
+    p = _rank_sum_mixture_pvalue(rng.integers(1, 4, many), rng.integers(150, 400, many), rng.integers(1, 4, many),
+                                 np.zeros(many), 1000.0)
+    assert 0.0 < p < 1e-3

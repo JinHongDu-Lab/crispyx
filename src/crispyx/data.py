@@ -2263,7 +2263,10 @@ def _write_filtered_subset(
                     f"Length mismatch for column '{key}': expected {var.shape[0]}, received {len(values)}"
                 )
             var[key] = np.asarray(values)
-    uns = dict(meta["uns"])
+    if row_order is None:
+        uns = filtered_sorting_metadata(meta["uns"], obs, cell_mask)
+    else:  # the caller records the new order
+        uns = {k: v for k, v in meta["uns"].items() if k != "sorting_metadata"}
     layer_keys, obsm_keys, varm_keys, obsp_keys, varp_keys = (
         meta[slot] for slot in ("layers", "obsm", "varm", "obsp", "varp")
     )
@@ -3938,6 +3941,44 @@ def _scatter_band(
                 offset[k - lo] = pos + 1
 
 
+class _KeyedRows(NamedTuple):
+    """A CSR row chunk whose row ``i`` is output row ``keys[i]``: a row
+    permutation, placed by copying each row whole (:func:`_copy_rows_band`)
+    rather than by transposing."""
+
+    keys: np.ndarray
+    csr: sp.csr_matrix
+
+    @property
+    def nnz(self) -> int:
+        return self.csr.nnz
+
+    def keyed_columns(self, n_out: int) -> sp.csc_matrix:
+        """The chunk as columns whose indices are output rows, for the spill
+        path, which splits non-zeros by band."""
+        csc = self.csr.tocsc()
+        return sp.csc_matrix((csc.data, self.keys[csc.indices], csc.indptr), shape=(n_out, csc.shape[1]))
+
+
+@njit(cache=True)
+def _copy_rows_band(
+    indptr: np.ndarray, indices: np.ndarray, data: np.ndarray, keys: np.ndarray, lo: int, hi: int,
+    offset: np.ndarray, out_vals: np.ndarray, out_minor: np.ndarray,
+) -> None:
+    """Copy each CSR row ``i`` whose output row ``keys[i]`` falls in band
+    ``[lo, hi)`` to that row's place in the band's buffers (``offset[k - lo]``,
+    advanced in place)."""
+    for i in range(indptr.shape[0] - 1):
+        k = keys[i]
+        if lo <= k < hi:
+            pos = offset[k - lo]
+            for j in range(indptr[i], indptr[i + 1]):
+                out_vals[pos] = data[j]
+                out_minor[pos] = indices[j]
+                pos += 1
+            offset[k - lo] = pos
+
+
 @contextmanager
 def _replace_on_success(output_path: Path) -> Iterator[Path]:
     """Yield a partial path beside ``output_path``; rename it over
@@ -4236,8 +4277,9 @@ def _transpose_in_bands(
     """Fill the pre-sized ``{group}/data`` and ``{group}/indices`` of
     ``partial`` with the transpose of the compressed chunks ``chunks()``
     yields, ``(first major index, chunk)`` in source order, whose indices are
-    the output's keys (columns for CSC, rows for CSR): one band of keys at a
-    time. ``chunks()`` gives a fresh pass over ``source_path`` each call.
+    the output's keys (columns for CSC, rows for CSR), or :class:`_KeyedRows`
+    whose rows are copied whole: one band of keys at a time. ``chunks()``
+    gives a fresh pass over ``source_path`` each call.
 
     With one band the source is read once. With several, each band reads
     the source again -- except where page cache counts against a memory
@@ -4295,7 +4337,11 @@ def _transpose_in_bands(
                 for lo, hi in bands:
                     base, band_vals, band_minor, offset = band_buffers(lo, hi)
                     for major0, chunk in chunks():
-                        if chunk.nnz:
+                        if isinstance(chunk, _KeyedRows) and chunk.nnz:
+                            csr = chunk.csr
+                            _copy_rows_band(csr.indptr, csr.indices, csr.data, chunk.keys, lo, hi,
+                                            offset, band_vals, band_minor)
+                        elif chunk.nnz:
                             _scatter_band(chunk.indptr, chunk.indices, chunk.data, major0, lo, hi,
                                           offset, band_vals, band_minor)
                         pbar.update(1)
@@ -4318,6 +4364,8 @@ def _transpose_in_bands(
                     for path in paths[1:]:
                         handles.append(open(path, "wb"))
                     for major0, chunk in chunks():
+                        if isinstance(chunk, _KeyedRows):
+                            chunk, major0 = chunk.keyed_columns(n_keys), 0
                         if chunk.nnz:
                             counts = np.bincount(band_of[chunk.indices], minlength=n_bands)
                             starts = np.zeros(n_bands + 1, dtype=np.int64)
@@ -5803,11 +5851,7 @@ def sorting_metadata(
     of the unsorted cells)."""
     import datetime
 
-    boundaries: dict[str, list[int]] = {}
-    if sorted_labels.size:
-        starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
-        stops = np.r_[starts[1:], sorted_labels.size]
-        boundaries = {str(sorted_labels[a]): [int(a), int(b)] for a, b in zip(starts, stops)}
+    boundaries = _label_boundaries(sorted_labels)
     metadata = {
         "original_path": str(original_path),
         "sorted_by": perturbation_column,
@@ -5819,6 +5863,39 @@ def sorting_metadata(
     if len(sort_indices) < 100000:
         metadata["sort_order"] = np.asarray(sort_indices).tolist()
     return metadata
+
+
+def _label_boundaries(sorted_labels: np.ndarray) -> dict[str, list[int]] | None:
+    """Each label's ``[start, end)`` rows in ``sorted_labels``, or None when
+    a label's rows are not contiguous."""
+    sorted_labels = np.asarray(sorted_labels).astype(str)
+    if not sorted_labels.size:
+        return {}
+    starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
+    stops = np.r_[starts[1:], sorted_labels.size]
+    boundaries = {str(sorted_labels[a]): [int(a), int(b)] for a, b in zip(starts, stops)}
+    return boundaries if len(boundaries) == len(starts) else None
+
+
+def filtered_sorting_metadata(uns: Mapping, obs: pd.DataFrame, cell_mask: np.ndarray) -> dict:
+    """``uns`` of a file whose rows are ``cell_mask``'s rows of a source with
+    ``uns``, in the source's order: a filter keeps a sorted file sorted, so its
+    ``sorting_metadata`` is rebuilt from the kept cells' labels in ``obs``
+    (dropped if they are no longer contiguous)."""
+    uns = dict(uns)
+    metadata = uns.pop("sorting_metadata", None)
+    if metadata is None:
+        return uns
+    column = metadata.get("sorted_by")
+    boundaries = _label_boundaries(obs[column].to_numpy()) if column in obs.columns else None
+    if boundaries is not None:
+        metadata = dict(metadata)
+        metadata["perturbation_boundaries"] = boundaries
+        metadata["n_perturbations"] = len(boundaries)
+        if "sort_order" in metadata:
+            metadata["sort_order"] = np.asarray(metadata["sort_order"])[np.asarray(cell_mask, dtype=bool)].tolist()
+        uns["sorting_metadata"] = metadata
+    return uns
 
 
 def sort_by_perturbation(
@@ -6045,17 +6122,17 @@ def _write_sorted_dense(
 
 
 def _keyed_by_destination(chunks, dest: np.ndarray, axis: int, n_out: int):
-    """The source's compressed chunks as column chunks whose indices are
-    output rows ``dest[row]``: what :func:`_transpose_in_bands` turns into
-    the rows in their new order. A CSR row chunk is turned into columns,
-    each output row's entries still in column order."""
+    """The source's compressed chunks keyed by output row ``dest[row]``, for
+    :func:`_transpose_in_bands` to place the rows in their new order: a CSR
+    row chunk as :class:`_KeyedRows` (its rows copied whole, columns sorted),
+    a CSC column chunk with its row indices replaced by output rows."""
     for major0, chunk in chunks:
         if axis == 0:
-            chunk = chunk.tocsc()
-            keys, major0 = dest[major0 + chunk.indices], 0
+            if not chunk.has_sorted_indices:
+                chunk = chunk.sorted_indices()
+            yield major0, _KeyedRows(dest[major0:major0 + chunk.shape[0]], chunk)
         else:
-            keys = dest[chunk.indices]
-        yield major0, sp.csc_matrix((chunk.data, keys, chunk.indptr), shape=(n_out, chunk.shape[1]))
+            yield major0, sp.csc_matrix((chunk.data, dest[chunk.indices], chunk.indptr), shape=(n_out, chunk.shape[1]))
 
 
 def _write_sorted_sparse(

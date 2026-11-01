@@ -390,3 +390,28 @@ def test_qc_summary_checks_cache_mode_and_needs_an_output_to_sort(tmp_path):
                                 output_path=tmp_path / "o.h5ad", verbose=False)
     with pytest.raises(ValueError, match="output_path"):
         quality_control_summary(path, perturbation_column="perturbation", sort_by_perturbation=True, verbose=False)
+
+
+@pytest.mark.parametrize("strategy", ["memory", *_STRATEGIES])
+def test_filtering_a_sorted_file_rebuilds_its_row_ranges(tmp_path, strategy):
+    """A filter keeps a sorted file's order, so its row ranges are rebuilt
+    from the kept cells rather than copied from the source."""
+    from crispyx.data import sort_by_perturbation
+
+    path = sort_by_perturbation(_make_uneven_screen(tmp_path / "raw.h5ad", "csr"), "perturbation", "NTC",
+                                output_path=tmp_path / "sorted.h5ad", verbose=False)
+    kw = dict(perturbation_column="perturbation", control_label="NTC", gene_name_column=None,
+              min_genes=4, min_cells_per_perturbation=15, min_cells_per_gene=20)
+    out = tmp_path / "filtered.h5ad"
+    if strategy == "memory":
+        result = _qc_in_memory(path, output_path=out, **kw)
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = _STRATEGIES[strategy](path, out, **kw)
+    assert not result.cell_mask.all()
+    labels = ad.read_h5ad(out).obs["perturbation"].astype(str).to_numpy()
+    boundaries = ad.read_h5ad(out).uns["sorting_metadata"]["perturbation_boundaries"]
+    assert set(boundaries) == set(labels)
+    for label, (start, stop) in boundaries.items():
+        assert (labels[start:stop] == label).all() and stop - start == (labels == label).sum()

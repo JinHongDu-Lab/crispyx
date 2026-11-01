@@ -66,7 +66,6 @@ from .glm import (
     fit_two_group_deseq2,
     summarize_controls,
     shrink_lfc_apeglm,
-    shrink_lfc_apeglm_from_stats,
     cauchy_map,
     fit_dispersion_trend,
     _estimate_apeglm_prior_scale,
@@ -4733,16 +4732,18 @@ def _apeglm_worker_count(
     )
 
 
-def _write_var_column(handle: h5py.File, name: str, values: np.ndarray) -> None:
-    """Write (or replace) column ``name`` of an open h5ad file's ``var``."""
+def _write_var_column(handle: h5py.File, name: str, values: np.ndarray | None) -> None:
+    """Write, replace or (``values`` None) remove column ``name`` of an open
+    h5ad file's ``var``."""
     var = handle["var"]
     if name in var:
         del var[name]
-    write_elem(var, name, np.asarray(values))
     order = [c.decode() if isinstance(c, bytes) else str(c) for c in var.attrs.get("column-order", [])]
-    if name not in order:
+    order = [c for c in order if c != name]
+    if values is not None:
+        write_elem(var, name, np.asarray(values))
         order.append(name)
-    var.attrs["column-order"] = order
+    var.attrs["column-order"] = np.array(order, dtype=h5py.string_dtype())
 
 
 def shrink_lfc(
@@ -4769,7 +4770,7 @@ def shrink_lfc(
     coefficient. Two methods are available:
     
     - **stats** (default, recommended): Uses pre-computed MLE LFC and SE from
-      the h5ad file with vectorized Newton-Raphson optimization. ~35× faster
+      the h5ad file, with each posterior mode in closed form. ~35× faster
       than full and maintains consistency with stored MLE coefficients.
     - **full**: Re-loads original count data and runs per-gene L-BFGS-B
       optimization. May produce different results from stored MLE for lowly
@@ -4803,9 +4804,9 @@ def shrink_lfc(
         Shrinkage method to use:
         
         - ``"stats"`` (default): Fast vectorized shrinkage using pre-computed
-          MLE statistics. Uses Newton-Raphson optimization across all genes
-          simultaneously. ~35× faster than "full" and maintains consistency
-          with stored MLE coefficients.
+          MLE statistics: each entry's posterior mode in closed form, as
+          :func:`shrink_lfc_arrays`. ~35× faster than "full" and maintains
+          consistency with stored MLE coefficients.
         - ``"full"``: Full model re-fitting with L-BFGS-B per gene. Re-loads
           original count data. Note: May produce different results for lowly
           expressed genes due to min_mu clamping differences. Use "stats" for
@@ -4846,7 +4847,8 @@ def shrink_lfc(
         time per pass, when they fit a quarter of it.
     exclude, floor, centre, n_cells
         As in :func:`shrink_lfc_arrays`, over the file's perturbations x
-        genes (``method="stats"`` with ``prior_scale_mode="global"`` only).
+        genes (``method="stats"`` only; with ``"per_comparison"`` each
+        perturbation's prior scale comes from its own deviations).
         ``exclude`` is a boolean array or scipy sparse matrix of that shape,
         such as each perturbation's own target gene; ``floor`` broadcasts to
         it on the natural-log scale (a column of one bound per perturbation);
@@ -4894,13 +4896,10 @@ def shrink_lfc(
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
     if centre not in ("zero", "pooled"):
         raise ValueError(f"shrink_lfc: centre must be 'zero' or 'pooled', got {centre!r}")
-    # The stats method with one global prior shrinks with shrink_lfc_arrays'
-    # closed form, a block of rows at a time, and takes its options.
-    by_blocks = method == "stats" and prior_scale_mode == "global"
-    if not by_blocks and (exclude is not None or floor is not None or centre != "zero" or n_cells is not None):
-        raise ValueError(
-            "shrink_lfc: exclude, floor, centre and n_cells need method='stats' and prior_scale_mode='global'"
-        )
+    # The stats method shrinks with shrink_lfc_arrays' closed form, a block
+    # of rows at a time, and takes its options.
+    if method != "stats" and (exclude is not None or floor is not None or centre != "zero" or n_cells is not None):
+        raise ValueError("shrink_lfc: exclude, floor, centre and n_cells need method='stats'")
     
     # Initialize profiler if enabled (timing + memory sampling)
     profiler = None
@@ -4938,7 +4937,7 @@ def shrink_lfc(
             f"Input file '{path}' lacks the 'dispersion' layer (results from crispyx before 0.2.3); "
             "re-run nb_glm_test."
         )
-    if "intercept" not in layer_names:
+    if method == "full" and "intercept" not in layer_names:
         raise ValueError(
             f"Input file '{path}' lacks 'intercept' layer. "
             "method='full' requires NB-GLM results from nb_glm_test v0.5.1+. "
@@ -4956,7 +4955,6 @@ def shrink_lfc(
         se_key = "layers/standard_error_ln" if "standard_error_ln" in layer_names else "layers/standard_error"
     else:
         raw_key, se_key = "layers/logfoldchange_raw_ln", "layers/standard_error_ln"
-    logger.info("Using fitted intercept from NB-GLM for shrinkage")
 
     if profiling and profiler is not None:
         profiler.snapshot("after_load")
@@ -4966,16 +4964,15 @@ def shrink_lfc(
     budget = _resolve_memory_limit_bytes(memory_limit_gb)
 
     def read_rows(handle: h5py.File, sl: slice) -> dict[str, np.ndarray]:
-        rows = {
-            "mle": handle[mle_key][sl], "raw": handle[raw_key][sl], "se": handle[se_key][sl],
-            "intercept": handle["layers/intercept"][sl],
-        }
-        rows["dispersion"] = handle["layers/dispersion"][sl]
+        rows = {"mle": handle[mle_key][sl], "raw": handle[raw_key][sl], "se": handle[se_key][sl]}
+        if method == "full":
+            rows["intercept"] = handle["layers/intercept"][sl]
+            rows["dispersion"] = handle["layers/dispersion"][sl]
         return rows
 
     shape = (n_groups, n_genes)
-    if exclude is not None and not sp.issparse(exclude):
-        exclude = np.broadcast_to(np.asarray(exclude, dtype=bool), shape)
+    if exclude is not None:  # a CSR matrix, row-sliceable, or a dense mask
+        exclude = exclude.tocsr() if sp.issparse(exclude) else np.broadcast_to(np.asarray(exclude, dtype=bool), shape)
     if exclude is not None and exclude.shape != shape:
         raise ValueError(f"shrink_lfc: exclude has shape {exclude.shape}, the result {shape}")
     if floor is not None:
@@ -5006,7 +5003,7 @@ def shrink_lfc(
     else:
         blocks = read_blocks
     mu = None
-    if by_blocks and centre == "pooled":
+    if method == "stats" and centre == "pooled":
         mu = _pooled_centre(
             lambda: ((lfc, se, pick, weights[sl]) for sl, lfc, se, _, _, pick in blocks()), n_genes,
         )
@@ -5019,62 +5016,17 @@ def shrink_lfc(
     del prior_blocks
     logger.info(f"Global prior scale for apeGLM: {global_prior_scale:.4f}")
 
-    total_converged = 0
-    total_genes_processed = 0
-    total_needs_refit = 0
-
-    def shrink_stats(rows: dict[str, np.ndarray], base_mean_proxy) -> tuple[np.ndarray, np.ndarray]:
-        nonlocal total_converged, total_genes_processed, total_needs_refit
-        shrunk_lfc = np.zeros_like(rows["raw"])
-        shrunk_se = np.zeros_like(rows["se"])
-        for i in range(rows["raw"].shape[0]):
-            mle_lfc_group, se_group = rows["raw"][i], rows["se"][i]
-            if prior_scale_mode == "per_comparison":
-                pert_prior_scale = _estimate_apeglm_prior_scale(mle_lfc_group, se_group)
-            else:
-                pert_prior_scale = global_prior_scale
-            # NOTE: use_gene_specific_prior=False for PyDESeq2 parity (gene-specific
-            # prior scaling is non-standard and causes accuracy regression)
-            shrunk_lfc[i], shrunk_se[i], converged, needs_refit = shrink_lfc_apeglm_from_stats(
-                mle_lfc=mle_lfc_group,
-                mle_se=se_group,
-                prior_scale=pert_prior_scale,
-                base_mean=base_mean_proxy,
-                use_gene_specific_prior=False,
-                hybrid_fallback=True,
-            )
-            total_converged += int(converged.sum())
-            total_genes_processed += n_genes
-            total_needs_refit += int(needs_refit.sum())
-        return shrunk_lfc, shrunk_se
-
-    if by_blocks:
+    if method == "stats":
         def shrink_rows(rows: dict[str, np.ndarray], sl: slice) -> tuple[np.ndarray, np.ndarray]:
-            lfc, se, valid, excluded, _ = prepared(rows["raw"], rows["se"], sl)
-            return _shrink_entries(lfc, se, valid, excluded, global_prior_scale, mu)
-        backed = None
-    elif method == "stats":
-        # Fast stats-based shrinkage using vectorized Newton-Raphson
-        # No need to load original dataset - uses pre-computed MLE stats
-        logger.info("Using fast stats-based shrinkage (method='stats')")
-        # base_mean proxy for the hybrid-fallback flag: intercept is
-        # ln(mu_control), so exp(mean intercept across perturbations)
-        # tracks each gene's expression level.
-        intercept_sum = np.zeros(n_genes)
-        intercept_count = np.zeros(n_genes)
-        with h5py.File(path, "r") as handle:
-            for sl in _row_blocks(n_groups, n_genes):
-                block = handle["layers/intercept"][sl]
-                finite = np.isfinite(block)
-                intercept_sum += np.where(finite, block, 0.0).sum(axis=0)
-                intercept_count += finite.sum(axis=0)
-        if intercept_count.any():
-            with np.errstate(invalid="ignore", divide="ignore"):
-                mean_intercept = intercept_sum / intercept_count
-            base_mean_proxy = np.exp(np.clip(mean_intercept, -20, 20))  # Clamp to avoid overflow
-        else:
-            base_mean_proxy = None
-        shrink_rows = lambda rows, sl: shrink_stats(rows, base_mean_proxy)  # noqa: E731
+            lfc, se, valid, excluded, pick = prepared(rows["raw"], rows["se"], sl)
+            if prior_scale_mode == "global":
+                return _shrink_entries(lfc, se, valid, excluded, global_prior_scale, mu)
+            deviation = lfc if mu is None else lfc - mu
+            shrunk_lfc, shrunk_se = zip(*(
+                _shrink_entries(lfc[i], se[i], valid[i], excluded[i], _prior_scale(deviation[i], se[i], pick[i]), mu)
+                for i in range(lfc.shape[0])
+            ))
+            return np.vstack(shrunk_lfc), np.vstack(shrunk_se)
         backed = None
     else:  # method == "full"
         # Full model re-fitting with L-BFGS-B per gene
@@ -5215,8 +5167,7 @@ def shrink_lfc(
                     }
                 else:
                     profiling_uns = "NA"
-                if mu is not None:
-                    _write_var_column(out, "shrinkage_centre", mu / lfc_scale)
+                _write_var_column(out, "shrinkage_centre", None if mu is None else mu / lfc_scale)
                 for key, value in {
                     "lfc_shrinkage_type": "apeglm",
                     "apeglm_prior_scale": global_prior_scale,
@@ -5233,19 +5184,6 @@ def shrink_lfc(
         if backed is not None:
             backed.file.close()
 
-    # Log warning if many genes didn't converge
-    convergence_rate = total_converged / total_genes_processed if total_genes_processed > 0 else 1.0
-    if method == "stats" and convergence_rate < 0.95:
-        logger.warning(
-            f"Low convergence rate: {total_converged}/{total_genes_processed} "
-            f"({convergence_rate:.1%}) genes converged within max_iter. "
-            "Consider using method='full' for better accuracy."
-        )
-    if total_needs_refit > 0:
-        logger.info(
-            f"Hybrid fallback: {total_needs_refit} gene-perturbation pairs "
-            f"({total_needs_refit / (n_groups * n_genes):.1%}) flagged for potential accuracy improvement with method='full'"
-        )
     _messages.print_done(verbose, "shrink_lfc", f"{n_groups} perturbations × {n_genes} genes (method={method!r})")
     logger.info(
         f"Applied apeGLM LFC shrinkage (method={method}, prior_scale_mode={prior_scale_mode}) "
@@ -5305,6 +5243,12 @@ def _pooled_centre(blocks, n_genes: int, *, max_iter: int = 50, tol: float = 1e-
         if done:
             break
     return centre
+
+
+def _prior_scale(deviation: np.ndarray, se: np.ndarray, pick: np.ndarray) -> float:
+    """PyDESeq2's Cauchy prior scale from the ``pick`` entries' deviations
+    from the centre (1 when there are none)."""
+    return _estimate_apeglm_prior_scale(deviation[pick], se[pick]) if pick.any() else 1.0
 
 
 def _shrink_entries(lfc, se, valid, excluded, prior_scale: float, mu: np.ndarray | None):
@@ -5440,8 +5384,7 @@ def shrink_lfc_arrays(
             raise ValueError(f"shrink_lfc_arrays: n_cells has {weights.size} entries, lfc {lfc.shape[0]} rows")
         mu = _pooled_centre(lambda: [(lfc, se, pick, weights)], lfc.shape[1])
     if prior_scale is None:
-        deviation = lfc if mu is None else lfc - mu
-        prior_scale = _estimate_apeglm_prior_scale(deviation[pick], se[pick]) if pick.any() else 1.0
+        prior_scale = _prior_scale(lfc if mu is None else lfc - mu, se, pick)
     prior_scale = float(prior_scale)
     out_lfc, out_se = _shrink_entries(lfc, se, valid, excluded, prior_scale, mu)
     return ShrunkLFC(lfc=out_lfc, se=out_se, prior_scale=prior_scale, centre=mu)

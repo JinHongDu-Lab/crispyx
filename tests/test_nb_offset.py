@@ -413,7 +413,7 @@ def test_shrink_lfc_on_a_file_matches_the_arrays_with_its_options(tmp_path):
     floor[0] = -2.0
     cells = np.arange(1, ln.shape[0] + 1)
     shrunk = ad.read_h5ad(cx.shrink_lfc(
-        source, exclude=own.tocsr(), floor=floor, centre="pooled", n_cells=cells, verbose=False,
+        source, exclude=own.tocoo(), floor=floor, centre="pooled", n_cells=cells, data_name="pooled", verbose=False,
     ).result_path)
     expected = cx.tl.shrink_lfc_arrays(ln, se, exclude=own.toarray(), floor=floor, centre="pooled", n_cells=cells)
     np.testing.assert_allclose(shrunk.X * np.log(2), expected.lfc, rtol=1e-10, equal_nan=True)
@@ -423,8 +423,18 @@ def test_shrink_lfc_on_a_file_matches_the_arrays_with_its_options(tmp_path):
     assert shrunk.uns["apeglm_prior_scale"] == pytest.approx(expected.prior_scale)
     plain = ad.read_h5ad(cx.shrink_lfc(source, data_name="plain", verbose=False).result_path)
     np.testing.assert_allclose(plain.X * np.log(2), cx.tl.shrink_lfc_arrays(ln, se).lfc, rtol=1e-10, equal_nan=True)
-    with pytest.raises(ValueError, match="prior_scale_mode='global'"):
-        cx.shrink_lfc(source, centre="pooled", prior_scale_mode="per_comparison", verbose=False)
+    # Re-shrinking the pooled result toward zero drops its stale centre.
+    again = ad.read_h5ad(cx.shrink_lfc(tmp_path / "pooled.h5ad", data_name="again", verbose=False).result_path)
+    assert "shrinkage_centre" not in again.var and again.uns["shrinkage_centre"] == "zero"
+    # Per comparison: each row with its own prior scale.
+    each = ad.read_h5ad(cx.shrink_lfc(
+        source, exclude=own, floor=floor, prior_scale_mode="per_comparison", data_name="each", verbose=False,
+    ).result_path)
+    for i in range(ln.shape[0]):
+        row = cx.tl.shrink_lfc_arrays(ln[i], se[i], exclude=own.toarray()[i], floor=floor[i])
+        np.testing.assert_allclose(each.X[i] * np.log(2), row.lfc, rtol=1e-10, equal_nan=True)
+    with pytest.raises(ValueError, match="method='stats'"):
+        cx.shrink_lfc(source, centre="pooled", method="full", verbose=False)
 
 
 def test_controls_without_residual_degrees_of_freedom(tmp_path):
