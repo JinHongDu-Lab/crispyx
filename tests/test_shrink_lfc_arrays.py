@@ -88,16 +88,20 @@ def test_the_pooled_centre_is_unbiased_for_low_counts():
     with np.errstate(divide="ignore"):
         lfc = np.where(k > 0, np.log(k / expected), -10.0)
         se = np.where(k > 0, 1 / np.sqrt(k), 100.0)
+    lfc[:3], se[:3] = 9.0, 8.0                           # upward fits where the dispersion is large
+    lfc[3:13], se[3:13] = 3.0, 0.2                       # a few perturbations that strongly induce every gene
     precision_weighted = (lfc / se ** 2).sum(0) / (1 / se ** 2).sum(0)
     assert np.median(precision_weighted) > 0.05          # the bias this guards against
     out = cx.tl.shrink_lfc_arrays(lfc, se, centre="pooled", n_cells=np.full(n, 50))
-    assert np.abs(out.centre).max() < 0.05
-    assert abs(np.median(np.nanmean(out.lfc, axis=0))) < 0.03
+    assert np.abs(out.centre).max() < 0.05               # pulled by neither kind
+    assert abs(np.median(np.nanmedian(out.lfc[13:], axis=0))) < 0.03
+    assert out.lfc[3, 0] > 2.5                           # a strong effect keeps its size
 
 
 def test_a_pooled_centre_keeps_the_shared_response():
     rng = np.random.default_rng(3)
-    shared = rng.normal(0, 0.5, 40)                       # every perturbation moves these genes alike
+    shared = rng.normal(0, 0.5, 40)                       # every perturbation moves these genes alike,
+    shared[:3] = [2.0, -2.0, 1.5]                         # some far beyond 3 SE of zero
     lfc = shared + rng.normal(0, 0.05, (300, 40))
     se = np.full(lfc.shape, 0.2)
     lfc[0, 0], se[0, 0] = -12.0, 150.0                    # a floor: every count zero
@@ -109,7 +113,7 @@ def test_a_pooled_centre_keeps_the_shared_response():
     assert np.abs(pooled.lfc[0, 0] - pooled.centre[0]) < 0.01      # a floor goes to the centre, not 0
     assert pooled.prior_scale < zero.prior_scale                    # the prior fits the deviations
 
-    sizes = rng.integers(10, 500, 300)
+    sizes = rng.integers(10, 500, 300)                    # every entry is within 3 SE of its gene's median
     weighted = cx.tl.shrink_lfc_arrays(lfc, se, centre="pooled", n_cells=sizes)
     expected = np.log((sizes[:, None] * np.exp(lfc)).sum(0) / sizes.sum())   # the floor counts as ~0
     np.testing.assert_allclose(weighted.centre, expected)

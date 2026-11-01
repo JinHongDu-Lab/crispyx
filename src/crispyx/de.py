@@ -2673,11 +2673,17 @@ def _offset_baseline(
 
     ``blocks`` yields ``(rows, csr)``: positions into ``size_factors`` /
     ``strata`` and those cells' counts. The baseline of stratum ``b`` is
-    ``(sum y + m_g) / (sum s + 1)`` over its controls, one pseudo-cell at the
-    pooled control mean ``m_g``: a stratum whose controls happen to have no
-    count of a gene then gives a small baseline instead of zero, which would
-    send any count among the perturbed cells to the upper bound of the
-    effect (with one stratum the pseudo-cell changes nothing). With
+    ``m_g (sum y + 1) / (m_g sum s + 1)`` over its controls: the stratum's
+    mean with a prior worth one count at the pooled control mean ``m_g``
+    (one stratum: exactly ``m_g``). A stratum whose controls have no count
+    of a gene departs from ``m_g`` only as far as its expected count
+    ``m_g sum s`` says that is informative: a gene expressed in other donors
+    only stays small, while a rare gene that happens to miss a stratum's
+    controls stays near ``m_g``. A prior worth one cell instead put such a
+    stratum at ``m_g / (sum s + 1)``, hundreds of times too low, and with the
+    large dispersion of a rare gene, where zero counts carry little
+    information, one count among the perturbed cells then raised ``beta`` by
+    6-10 with a standard error above 5. With
     ``dispersion=None`` the dispersion is the method-of-moments estimate
     pooled over strata, from ``E sum (y - s mu_b)^2`` over a stratum's
     controls, for genes with a pooled mean of at least
@@ -2725,7 +2731,7 @@ def _offset_baseline(
     has_controls = s1 > 0
     pooled = sy.sum(axis=0) / s1.sum()
     mean = np.full((n_strata, n_genes), np.nan)
-    mean[has_controls] = (sy[has_controls] + pooled) / (s1[has_controls] + 1.0)[:, None]
+    mean[has_controls] = pooled * (sy[has_controls] + 1.0) / (pooled * s1[has_controls][:, None] + 1.0)
     if dispersion is not None:
         final = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,)).astype(np.float64)
         raw = trend = np.full(n_genes, np.nan)
@@ -2935,10 +2941,12 @@ def nb_offset_test(
 
     The baseline comes in two forms. With ``strata``, one categorical
     column, it is the closed form: the stratum's control mean
-    ``(sum y + m_g) / (sum s + 1)``, one pseudo-cell at the pooled control
-    mean ``m_g``, so that a stratum whose controls happen to have no count
-    of a gene gives a small baseline rather than zero (which would send any
-    count among the perturbed cells to the upper bound of ``beta``); no
+    ``m_g (sum y + 1) / (m_g sum s + 1)``, with a prior worth one count at
+    the pooled control mean ``m_g``, so that a stratum whose controls happen
+    to have no count of a gene, where few were expected, stays near ``m_g``
+    rather than near zero (which would send a single count among the
+    perturbed cells to a large ``beta``), while a gene that many expected
+    counts show is absent from a stratum keeps a small baseline there; no
     design matrix is built, so it suits hundreds of thousands of cells over
     hundreds of lane x donor strata. The dispersion is then ``dispersion``
     as given (one value, or one per gene), or the method-of-moments estimate
@@ -5091,6 +5099,42 @@ def shrink_lfc(
     return RankGenesGroupsResult(output_path)
 
 
+# shrink_lfc_arrays(centre="pooled") pools entries within this many standard
+# errors of the centre, and leaves out upward fold changes with a standard
+# error above the second.
+_CENTRE_MAX_Z = 3.0
+_CENTRE_MAX_UPWARD_SE = 5.0
+
+
+def _pooled_centre(lfc: np.ndarray, se: np.ndarray, use: np.ndarray, weights: np.ndarray,
+                   *, max_iter: int = 50, tol: float = 1e-8) -> np.ndarray:
+    """Per gene (column), ``ln(sum w exp(lfc) / sum w)`` over the entries
+    ``use`` within ``_CENTRE_MAX_Z`` standard errors of the result: a mean
+    shift from the pool of every ``use`` entry. A gene with no entry left in
+    its window keeps the previous value; one with no entry at all is 0."""
+    linear = np.exp(np.minimum(np.where(use, lfc, 0.0), 20.0))
+    w_all = np.where(use, weights[:, None], 0.0)
+
+    def pool(mask):
+        w = np.where(mask, w_all, 0.0)
+        total = w.sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(np.maximum((w * linear).sum(axis=0), 1e-300) / total), total > 0
+
+    centre, has = pool(use)
+    centre = np.where(has, centre, 0.0)
+    for _ in range(max_iter):
+        with np.errstate(invalid="ignore"):
+            window = use & (np.abs(lfc - centre) < _CENTRE_MAX_Z * se)
+        new, has = pool(window)
+        new = np.where(has, new, centre)
+        done = np.abs(new - centre).max(initial=0.0) < tol
+        centre = new
+        if done:
+            break
+    return centre
+
+
 @dataclass(frozen=True)
 class ShrunkLFC:
     """:func:`shrink_lfc_arrays`'s result: the shrunk fold changes, their
@@ -5160,8 +5204,20 @@ def shrink_lfc_arrays(
         since a perturbation that by chance has more reads of a lowly
         expressed gene has both a higher fold change and a smaller SE, and a
         median of the fold changes is biased downward. A fold change at the
-        fitted-mean floor counts as about zero in the sum. Entries that are
-        excluded, invalid or have ``se == 0`` are left out of the centre.
+        fitted-mean floor counts as about zero in the sum. The centre leaves
+        out upward fold changes with ``se > 5``: where the dispersion is
+        large, zero counts hardly constrain a fit, so a single count lifts it
+        far above the mean count it reflects (a few such entries moved one
+        genome-wide screen's centre to +0.45). It then pools only the entries
+        within three standard errors of itself, found by iterating from the
+        pool of every entry (a mean shift), so the few perturbations that
+        move a gene on their own do not make the centre the log of an average
+        fold change, well above the typical one, while a response every
+        perturbation shares stays in. A screen against zero would drop such a
+        shared response wherever it is significant, and one against the
+        median would drop every count of a gene whose median sits at the
+        floor. Entries that are excluded, invalid or have ``se == 0`` are
+        left out of the centre too.
     n_cells
         With ``centre="pooled"``, the cells behind each row (the weights
         ``n_p``); None weighs the rows equally.
@@ -5192,11 +5248,7 @@ def shrink_lfc_arrays(
                    else np.asarray(n_cells, dtype=np.float64).reshape(-1))
         if weights.shape != (lfc.shape[0],):
             raise ValueError(f"shrink_lfc_arrays: n_cells has {weights.size} entries, lfc {lfc.shape[0]} rows")
-        w = np.where(pick, weights[:, None], 0.0)
-        total = w.sum(axis=0)
-        pooled = (w * np.exp(np.minimum(np.where(pick, lfc, 0.0), 20.0))).sum(axis=0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mu = np.where(total > 0, np.log(np.maximum(pooled, 1e-300) / total), 0.0)
+        mu = _pooled_centre(lfc, se, pick & ~((se > _CENTRE_MAX_UPWARD_SE) & (lfc > 0)), weights)
         deviation = lfc - mu
     else:
         raise ValueError(f"shrink_lfc_arrays: centre must be 'zero' or 'pooled', got {centre!r}")

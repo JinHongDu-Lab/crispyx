@@ -121,10 +121,13 @@ fallback, genes with a control mean of at least 0.5 counts per cell gave
 error ratio of 0.99; over all tested genes the offset standard error is
 larger at low counts (median ratio 1.15), where ``nb_glm_test`` shrinks
 each comparison's dispersion toward its trend and the offset test uses the
-control estimate. A stratum whose controls happen to have no count of a gene
-gets one pseudo-cell at the pooled control mean, so a single count among the
-perturbed cells does not send ``beta`` to its upper bound (the joint fit's
-stratum coefficient diverges there). Cells of a stratum without any control
+control estimate. A stratum's control mean has a prior worth one count at
+the pooled control mean, ``m (sum y + 1) / (m sum s + 1)``: a rare gene that
+happens to have no count among a stratum's controls stays near the pooled
+mean, so a single count among the perturbed cells does not send ``beta``
+toward its upper bound (the joint fit's stratum coefficient diverges there),
+while a gene that the controls' depth shows is absent from a stratum keeps a
+small baseline there. Cells of a stratum without any control
 carry no baseline and are left out, with a warning.
 
 Other options
@@ -409,6 +412,12 @@ not depend on the estimates: for a lowly expressed gene, a perturbation that
 by chance has more reads has both a higher fold change and a smaller standard
 error, so an inverse-variance mean of the fold changes is biased upward, and
 on a real screen this made three quarters of the genes look up-regulated.
+Two kinds of entry are left out of the centre: upward fold changes with a
+standard error above 5 (where the dispersion is large, zero counts hardly
+constrain a fit, and a single count lifts it far above the mean count it
+reflects), and entries more than three standard errors from the centre,
+found by iterating from the pool of every entry, so that a few strong
+effects do not lift it while a response every perturbation shares stays in.
 
 .. code-block:: python
 

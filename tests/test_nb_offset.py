@@ -12,6 +12,7 @@ import pytest
 import scipy.sparse as sp
 
 import crispyx as cx
+from crispyx.de import _offset_baseline
 
 NO_FILTERS = dict(min_pct_ctrl=0, min_pct_pert=0, min_mean_ctrl=0, min_mean_pert=0, min_total_count=0)
 
@@ -91,7 +92,7 @@ def test_a_stratum_without_control_counts_of_a_gene_does_not_send_beta_to_the_bo
     _screen(tmp_path / "s.h5ad", zero_stratum_gene=(2, 30))
     offset = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", strata="stratum", lfc_base="ln", **NO_FILTERS)
     value = offset.X[0, 30]
-    assert np.isfinite(value) and value < 10  # the pseudo-cell keeps the baseline above zero
+    assert np.isfinite(value) and value < 10  # the prior keeps the baseline above zero
 
 
 def test_cells_of_strata_without_controls_are_left_out(tmp_path):
@@ -293,7 +294,6 @@ def test_the_dispersion_is_unbiased_over_many_small_strata():
     """The residuals are about each stratum's own baseline, which costs a
     degree of freedom per stratum: subtracting the full Poisson term biased
     alpha down by 1/n_b, to the floor over hundreds of two-cell strata."""
-    from crispyx.de import _offset_baseline
 
     rng = np.random.default_rng(3)
     alpha, n_genes = 0.3, 400
@@ -384,3 +384,19 @@ def test_the_cell_block_is_shared_between_the_threads(tmp_path, monkeypatch):
     _run(tmp_path / "s.h5ad", tmp_path / "one.h5ad", memory_limit_gb=budget_gb, n_jobs=1, **NO_FILTERS)
     _run(tmp_path / "s.h5ad", tmp_path / "four.h5ad", memory_limit_gb=budget_gb, n_jobs=4, **NO_FILTERS)
     assert seen[0] == 4096 and seen[-1] == 1024, seen
+
+
+def test_a_stratum_baseline_moves_from_the_pooled_mean_only_as_far_as_its_expected_count_allows():
+    # 2 strata of 500 controls. Gene 0 is rare (one read, in stratum 0): stratum 1 expected ~0.5 reads and saw
+    # none, which says little. Gene 1 has 1000 reads, all in stratum 0: stratum 1 expected ~500, so it is absent.
+    counts = sp.lil_matrix((1000, 2))
+    counts[0, 0] = 1
+    counts[:500, 1] = 2
+    strata = np.repeat([0, 1], 500)
+    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1)
+    pooled = base.pooled_mean
+    assert 0.5 < base.mean[1, 0] / pooled[0] < 1.0       # one cell of prior put it at pooled / 501
+    assert base.mean[1, 1] / pooled[1] < 0.01
+    one = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), np.zeros(1000, int), 1, 2,
+                           dispersion=0.1)
+    np.testing.assert_allclose(one.mean[0], one.pooled_mean)
