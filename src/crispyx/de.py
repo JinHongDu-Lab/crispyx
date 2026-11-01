@@ -5217,7 +5217,11 @@ def shrink_lfc_arrays(
         shared response wherever it is significant, and one against the
         median would drop every count of a gene whose median sits at the
         floor. Entries that are excluded, invalid or have ``se == 0`` are
-        left out of the centre too.
+        left out of the centre too. The pool needs the perturbations with no
+        count of a gene as well, at the fitted-mean floor: the DE tests'
+        default ``min_cells_pert=1`` leaves them NaN, which keeps only the
+        perturbations that happened to have a count of a rare gene and biases
+        its centre upward, so fit with ``min_cells_pert=0``.
     n_cells
         With ``centre="pooled"``, the cells behind each row (the weights
         ``n_p``); None weighs the rows equally.

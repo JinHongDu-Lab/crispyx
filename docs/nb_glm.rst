@@ -418,6 +418,10 @@ constrain a fit, and a single count lifts it far above the mean count it
 reflects), and entries more than three standard errors from the centre,
 found by iterating from the pool of every entry, so that a few strong
 effects do not lift it while a response every perturbation shares stays in.
+The pool also needs the perturbations with no count of a gene, at the
+fitted-mean floor; the tests' default ``min_cells_pert=1`` leaves them NaN,
+which keeps only the perturbations that happened to have a count of a rare
+gene, so fit with ``min_cells_pert=0`` for a pooled centre.
 
 .. code-block:: python
 
