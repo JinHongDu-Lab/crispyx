@@ -34,7 +34,10 @@ distance outlier replacement is not done (see :ref:`pydeseq2-parity`).
   asked for, each with an equal share of ``memory_limit_gb``; a fit holds
   its genes dense a block at a time, the block sized to half that share, so
   memory grows with the cells times the block rather than times every gene.
-  The time still grows with the number of controls, and every fit refits
+  A one-hot covariate (strata, batches) costs the dispersion search little:
+  its Cox-Reid term goes through the Schur complement of those columns, so
+  hundreds of levels do not mean factorising a matrix of hundreds of columns
+  at every step. The time still grows with the number of controls, and every fit refits
   them: the first fit's wall time and the number of fits are printed at
   ``verbose=1``, so a multi-day run is visible before it is committed to.
   Where the controls are many and the perturbations small,

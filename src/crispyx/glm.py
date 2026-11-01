@@ -344,12 +344,28 @@ def fit_dispersion_trend(
     return np.maximum(trend, 1e-8)
 
 
-def _design_csr(design: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """``design`` as the CSR arrays the MAP kernels take for their Cox-Reid
-    adjustment: ``(indptr, indices, data, n_features)``."""
-    csr = sp.csr_matrix(np.asarray(design, dtype=np.float64))
+def _design_csr(design: np.ndarray, protected_columns: Sequence[int] = ()) -> tuple:
+    """``design`` as the MAP kernels take it for their Cox-Reid adjustment:
+    ``(indptr, indices, data, n_features, group, n_groups)``. A block of
+    disjoint one-hot columns outside ``protected_columns``
+    (:func:`detect_onehot_block`, as :func:`fit_nb_glm_batch_auto` finds
+    it) becomes each cell's column in it, ``group`` (-1 for none), and the
+    other columns the CSR arrays, so the kernels take ``log det XᵀWX``
+    through the block's Schur complement."""
+    design = np.asarray(design, dtype=np.float64)
+    candidates = np.setdiff1d(np.arange(design.shape[1]), np.asarray(protected_columns, dtype=int))
+    block = np.array([], dtype=int)
+    if candidates.size >= 2:
+        found = detect_onehot_block(design[:, candidates], min_block=2)
+        block = candidates[found] if found.size else block
+    group = np.full(design.shape[0], -1, dtype=np.int64)
+    if block.size:
+        rows, cols = np.nonzero(design[:, block])
+        group[rows] = cols
+    rest = np.setdiff1d(np.arange(design.shape[1]), block)
+    csr = sp.csr_matrix(design[:, rest])
     return (csr.indptr.astype(np.int64), csr.indices.astype(np.int64),
-            csr.data.astype(np.float64), int(csr.shape[1]))
+            csr.data.astype(np.float64), int(csr.shape[1]), group, int(block.size))
 
 
 def _estimate_apeglm_prior_scale(
@@ -3028,7 +3044,7 @@ def fit_glm_deseq2(
     estimate = dispersion is None
     if estimate:
         log_lo, log_hi = np.log(min_disp), np.log(max_disp)
-        x_csr = _design_csr(design)
+        x_csr = _design_csr(design, protected_columns=(0, test_column, *protected_columns))
         # A projection of the rows has no more distinct values than there
         # are distinct rows, so more than p of them settle it without
         # sorting the rows (17 s for 536k cells and 147 columns).
