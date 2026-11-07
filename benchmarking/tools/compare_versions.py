@@ -13,13 +13,31 @@ def cmp_mat(a, b, name):
     nan_mismatch = int((np.isnan(a) ^ np.isnan(b)).sum())
     mx = np.nanmax(d) if d.size else 0
     return f"{name}: max|diff| {mx:.3g}, NaN mismatches {nan_mismatch}" + (" (identical)" if mx == 0 and nan_mismatch == 0 else "")
+def dense_streamed(fa, fb, rows=1000):
+    """X and every common layer of two large dense files, compared in row blocks."""
+    names = ["X"] + [f"layers/{k}" for k in sorted(set(fa.get("layers", {})) & set(fb.get("layers", {})))]
+    out = []
+    for name in names:
+        da, db = fa[name], fb[name]
+        if da.shape != db.shape:
+            out.append(f"{name}: shape {da.shape} vs {db.shape}"); continue
+        mx, nan_mismatch = 0.0, 0
+        for i in range(0, da.shape[0], rows):
+            a, b = da[i:i + rows].astype(float), db[i:i + rows].astype(float)
+            nan_mismatch += int((np.isnan(a) ^ np.isnan(b)).sum())
+            d = np.where(np.isnan(a) | np.isnan(b), 0, np.abs(a - b))
+            mx = max(mx, float(d.max(initial=0.0)))
+        out.append(f"{name}: max|diff| {mx:.3g}, NaN mismatches {nan_mismatch}" + (" (identical)" if mx == 0 and nan_mismatch == 0 else ""))
+    return f"shape {fa['X'].shape} (rows in file order); " + "; ".join(out)
 def pair_streamed(new, old, chunk=200_000_000):
     """X of two large CSR files, compared on disk chunk by chunk (no full matrix in memory)."""
     import h5py
     with h5py.File(new, "r") as fa, h5py.File(old, "r") as fb:
         xa, xb = fa["X"], fb["X"]
+        if isinstance(xa, h5py.Dataset) and isinstance(xb, h5py.Dataset):
+            return dense_streamed(fa, fb)
         if not (isinstance(xa, h5py.Group) and isinstance(xb, h5py.Group)):
-            return "X not sparse on disk; skipped"
+            return "X sparse in one file, dense in the other; skipped"
         sa, sb = tuple(xa.attrs.get("shape")), tuple(xb.attrs.get("shape"))
         out = [f"shape {sa} vs {sb}, format {xa.attrs.get('encoding-type')} vs {xb.attrs.get('encoding-type')}"]
         if sa != sb or xa.attrs.get("encoding-type") != xb.attrs.get("encoding-type"):
@@ -47,6 +65,7 @@ def pair(new, old):
     for k in sorted(set(a.layers) & set(b.layers)):
         out.append(cmp_mat(a.layers[k], b.layers[k], f"layers/{k}"))
     return "; ".join(out)
+ONLY = os.environ.get("CMP_ONLY")  # comma-separated new-file names to compare (default: all)
 for d in sys.argv[1:]:
     print(f"## {d}")
     new_root, old_root = f"{B}/results_timing/{d}", f"{B}/results/{d}"
@@ -64,6 +83,8 @@ for d in sys.argv[1:]:
         o = [x for x in o if "crispyx_pb_avg_log_avg_log" not in x or pat == "pb_avg_log"]
         if n and o: pairs.append((os.path.relpath(n[0], new_root), os.path.relpath(sorted(o)[0], old_root)))
     for n, o in pairs:
+        if ONLY and n not in ONLY.split(","):
+            continue
         try:
             print(f"  {n}  vs  {o}:\n     {pair(f'{new_root}/{n}', f'{old_root}/{o}')}")
         except Exception as e:
