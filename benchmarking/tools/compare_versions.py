@@ -13,7 +13,29 @@ def cmp_mat(a, b, name):
     nan_mismatch = int((np.isnan(a) ^ np.isnan(b)).sum())
     mx = np.nanmax(d) if d.size else 0
     return f"{name}: max|diff| {mx:.3g}, NaN mismatches {nan_mismatch}" + (" (identical)" if mx == 0 and nan_mismatch == 0 else "")
+def pair_streamed(new, old, chunk=200_000_000):
+    """X of two large CSR files, compared on disk chunk by chunk (no full matrix in memory)."""
+    import h5py
+    with h5py.File(new, "r") as fa, h5py.File(old, "r") as fb:
+        xa, xb = fa["X"], fb["X"]
+        if not (isinstance(xa, h5py.Group) and isinstance(xb, h5py.Group)):
+            return "X not sparse on disk; skipped"
+        sa, sb = tuple(xa.attrs.get("shape")), tuple(xb.attrs.get("shape"))
+        out = [f"shape {sa} vs {sb}, format {xa.attrs.get('encoding-type')} vs {xb.attrs.get('encoding-type')}"]
+        if sa != sb or xa.attrs.get("encoding-type") != xb.attrs.get("encoding-type"):
+            return "; ".join(out + ["not comparable on disk"])
+        if not np.array_equal(xa["indptr"][:], xb["indptr"][:]):
+            return "; ".join(out + ["indptr differs (different sparsity pattern)"])
+        n, mx, idx_diff = xa["data"].shape[0], 0.0, 0
+        for i in range(0, n, chunk):
+            j = min(n, i + chunk)
+            idx_diff += int((xa["indices"][i:j] != xb["indices"][i:j]).sum())
+            mx = max(mx, float(np.max(np.abs(xa["data"][i:j].astype(float) - xb["data"][i:j].astype(float)), initial=0.0)))
+        out.append(f"nnz {n}; indices differing {idx_diff}; X: max|diff| {mx:.3g}" + (" (identical)" if mx == 0 and idx_diff == 0 else ""))
+    return "; ".join(out)
 def pair(new, old):
+    if min(os.path.getsize(new), os.path.getsize(old)) > 20e9:
+        return pair_streamed(new, old)
     a, b = ad.read_h5ad(new), ad.read_h5ad(old)
     out = [f"cells {a.n_obs} vs {b.n_obs}, genes {a.n_vars} vs {b.n_vars}"]
     same_obs = list(a.obs_names) == list(b.obs_names); same_var = list(a.var_names) == list(b.var_names)
