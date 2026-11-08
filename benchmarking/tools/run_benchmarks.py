@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -1437,7 +1438,9 @@ def run_nb_glm_base(
         gene_name_column=gene_name_column,
         profiling=profiling,
         memory_limit_gb=memory_limit_gb,
-        max_dense_fraction=max_dense_fraction,
+        # crispyx >= 0.2.4 keeps the controls sparse and dropped this option.
+        **({"max_dense_fraction": max_dense_fraction}
+           if "max_dense_fraction" in inspect.signature(nb_glm_test).parameters else {}),
     )
     t_base_end = time.perf_counter()
     base_seconds_wall = t_base_end - t_base_start
