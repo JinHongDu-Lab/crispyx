@@ -73,6 +73,11 @@ def main(config_path: str) -> None:
     config = yaml.safe_load(open(config_path))
     dataset_stem = Path(config["dataset_path"]).stem
     output_dir = REPO_ROOT / config["output_dir"]
+    if os.environ.get("NBGLM_INPUT") == "qc":
+        # The NB-GLM input since crispyx 0.2.3: the QC-filtered counts (plan
+        # 2026-10-25 §4), sorted next to it as crispyx_qc_filtered_sorted.h5ad.
+        _sort(output_dir / "preprocessing" / "crispyx_qc_filtered.h5ad")
+        return
     standardized = output_dir / ".cache" / f"standardized_{dataset_stem}.h5ad"
     if not standardized.exists():
         raise FileNotFoundError(f"Standardized file not found: {standardized}")
@@ -89,7 +94,12 @@ def main(config_path: str) -> None:
 
         nbglm_input.parent.mkdir(parents=True, exist_ok=True)
         run_preprocess_csr(standardized, nbglm_input, chunk_size=config.get("chunk_size"))
+    _sort(nbglm_input)
 
+
+def _sort(nbglm_input: Path) -> None:
+    if not nbglm_input.exists():
+        raise FileNotFoundError(f"NB-GLM input not found: {nbglm_input}")
     if not needs_sorting_for_nbglm(nbglm_input, perturbation_column=PERTURBATION_COLUMN):
         print(f"{nbglm_input.name}: already sorted by perturbation, nothing to do")
         return

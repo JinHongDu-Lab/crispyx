@@ -35,10 +35,12 @@ BINDS="--bind $PROJECT_ROOT:/workspace:rw"
 if [ "${STAGE_LOCAL:-0}" = 1 ]; then
     D="${CONFIG_FILE%.yaml}"
     SRC="$(readlink -f "$PROJECT_ROOT/benchmarking/results/$D/.cache/standardized_$D.h5ad")"
+    # NBGLM_INPUT=qc: the NB-GLM input is the QC-filtered counts (crispyx >= 0.2.3).
+    [ "${NBGLM_INPUT:-}" = qc ] && SRC="$(readlink -f "$PROJECT_ROOT/benchmarking/results/$D/preprocessing/crispyx_qc_filtered.h5ad")"
     # crispyx >= 0.2 writes a small standardized file whose matrices are HDF5
     # external links to the raw file (config dataset_path, repo-relative);
     # stage that raw file instead -- it is what the sort reads.
-    if [ "$(stat -c %s "$SRC")" -lt 2000000000 ]; then
+    if [ "${NBGLM_INPUT:-}" != qc ] && [ "$(stat -c %s "$SRC")" -lt 2000000000 ]; then
         RAW="$(sed -n 's/^dataset_path: *"\{0,1\}\([^"# ]*\).*/\1/p' "$PROJECT_ROOT/benchmarking/config/$CONFIG_FILE")"
         case "$RAW" in /*) ;; *) RAW="$PROJECT_ROOT/$RAW" ;; esac
         SRC="$(readlink -f "$RAW")"
@@ -73,6 +75,7 @@ singularity exec $BINDS \
     --pwd /workspace \
     --env "PYTHONPATH=/workspace/src:/workspace" \
     --env "PYTHONUNBUFFERED=1" \
+    --env "NBGLM_INPUT=${NBGLM_INPUT:-}" \
     "$SIF_FILE" \
     python -m "benchmarking.tools.$TOOL" "benchmarking/config/$CONFIG_FILE"
 

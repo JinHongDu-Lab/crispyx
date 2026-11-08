@@ -42,6 +42,15 @@ for f in "$SRC_DIR"/.cache/standardized_"$D".h5ad "$SRC_DIR"/.cache/standardized
     # absolute /lustre1 targets would dangle in there.
     [ -e "$f" ] && ln -sfnr "$f" "$T/${f#"$SRC_DIR"/}" && INPUTS+=("$(readlink -f "$f")")
 done
+# NB-GLM reads the QC-filtered counts (and their sorted copy, made by
+# NBGLM_INPUT=qc slurm_presort.sh). Linked only when QC itself is not re-timed:
+# crispyx_qc_filtered would otherwise write through the link into results/.
+case " $METHODS " in
+    *" crispyx_qc_filtered "*) ;;
+    *) for f in "$SRC_DIR"/preprocessing/crispyx_qc_filtered.h5ad "$SRC_DIR"/preprocessing/crispyx_qc_filtered_sorted.h5ad; do
+           [ -e "$f" ] && ln -sfnr "$f" "$T/${f#"$SRC_DIR"/}" && INPUTS+=("$(readlink -f "$f")")
+       done ;;
+esac
 # Same config, results redirected to the timing directory.
 sed "s#^output_dir: .*#output_dir: \"benchmarking/results_timing/$D\"#" \
     "$BENCH/config/$D.yaml" > "$BENCH/config/timing/$D.yaml"
@@ -62,8 +71,9 @@ if [ "${STAGE_LOCAL:-0}" = 1 ]; then
     case "$RAW" in /*) ;; *) INPUTS+=("$(readlink -f "$PROJECT_ROOT/$RAW")") ;; esac
     IN_BYTES=0; for f in "${INPUTS[@]}"; do IN_BYTES=$(( IN_BYTES + $(stat -c %s "$f") )); done
     # Outputs: the sizes of the same crispyx outputs in the real results.
-    OUT_BYTES=$(find -L "$SRC_DIR/preprocessing" "$SRC_DIR/de" -maxdepth 1 -type f \
-        \( -name 'crispyx_*.h5ad' -o -name 'preprocessed_*.h5ad' -o -name 'pb_*.h5ad' -o -name 'de_cx_*' \) \
+    OUT_GLOB=(\( -name 'crispyx_*.h5ad' -o -name 'preprocessed_*.h5ad' -o -name 'pb_*.h5ad' -o -name 'de_cx_*' \))
+    [ "$METHODS" = crispyx_de_nb_glm ] && OUT_GLOB=(-name 'crispyx_de_nb_glm.h5ad')
+    OUT_BYTES=$(find -L "$SRC_DIR/preprocessing" "$SRC_DIR/de" -maxdepth 1 -type f "${OUT_GLOB[@]}" \
         -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')
     NEED=$(( IN_BYTES + OUT_BYTES * 12 / 10 + 10 * 1024**3 ))
     AVAIL=$(df --output=avail -B1 "${TMPDIR:-/tmp}" | tail -1)
