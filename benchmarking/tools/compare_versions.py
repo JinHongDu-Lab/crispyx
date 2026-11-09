@@ -73,7 +73,8 @@ for d in sys.argv[1:]:
         try: return json.load(open(f"{old_root}/.benchmark_cache/{m}.json"))["result_path"]
         except Exception: return None
     pairs = [("preprocessing/crispyx_qc_filtered.h5ad", "preprocessing/crispyx_qc_filtered.h5ad")]
-    for m, n in (("crispyx_de_t_test", "de/de_cx_t_test.h5ad"), ("crispyx_de_wilcoxon", "de/de_cx_wilcoxon.h5ad")):
+    for m, n in (("crispyx_de_t_test", "de/de_cx_t_test.h5ad"), ("crispyx_de_wilcoxon", "de/de_cx_wilcoxon.h5ad"),
+                 ("crispyx_de_nb_glm", "de/crispyx_de_nb_glm.h5ad")):
         if old_de(m): pairs.append((n, old_de(m)))
     pre_new = glob.glob(f"{new_root}/preprocessing/preprocessed_standardized*.h5ad"); pre_old = glob.glob(f"{old_root}/preprocessing/preprocessed_standardized*.h5ad")
     pre_new = [p for p in pre_new if "_csc_" not in p]; pre_old = [p for p in pre_old if "_csc_" not in p and "_csr_" not in p] or [p for p in pre_old if "_csc_" not in p]
