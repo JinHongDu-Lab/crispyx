@@ -1,0 +1,41 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 4729.643659143302,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 0,
+  "error_details": [
+    {
+      "error": "Exceeded time limit of 21600 seconds",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "Exceeded time limit of 21600 seconds",
+      "method": "pertpy_de_pydeseq2"
+    }
+  ],
+  "memory_limit_count": 0,
+  "non_success_count": 2,
+  "original_dataset_path": "/data/origin/Nadig-JURKAT.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 21600 seconds"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 100,
+    "min_cells_per_perturbation": 28,
+    "min_genes": 50
+  },
+  "recovered_count": 1,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Nadig-JURKAT/.cache/standardized_Nadig-JURKAT.h5ad",
+  "status_counts": {
+    "recovered": 1,
+    "success": 12,
+    "timeout": 2
+  },
+  "success_count": 13,
+  "success_rate": 0.8666666666666667,
+  "timeout_count": 2,
+  "total_methods": 15
+}

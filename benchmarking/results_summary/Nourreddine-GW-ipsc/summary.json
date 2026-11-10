@@ -1,0 +1,45 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 6803.702956502593,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 0,
+  "error_details": [
+    {
+      "error": "MemoryError: Unable to allocate 29.1 GiB for an array with shape (7818423035,) and data type float32",
+      "method": "scanpy_de_t_test"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 29.1 GiB for an array with shape (7818423035,) and data type float32",
+      "method": "scanpy_de_wilcoxon"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 58.7 GiB for an array with shape (7872183461,) and data type int64",
+      "method": "scanpy_qc_filtered"
+    }
+  ],
+  "memory_limit_count": 3,
+  "non_success_count": 3,
+  "original_dataset_path": "/data/origin/Nourreddine-GW-ipsc.h5ad",
+  "other_errors": [
+    "MemoryError: Unable to allocate 29.1 GiB for an array with shape (7818423035,) and data type float32",
+    "MemoryError: Unable to allocate 58.7 GiB for an array with shape (7872183461,) and data type int64"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Nourreddine-GW-ipsc/.cache/standardized_Nourreddine-GW-ipsc.h5ad",
+  "status_counts": {
+    "memory_limit": 3,
+    "success": 16
+  },
+  "success_count": 16,
+  "success_rate": 0.8421052631578947,
+  "timeout_count": 0,
+  "total_methods": 19
+}

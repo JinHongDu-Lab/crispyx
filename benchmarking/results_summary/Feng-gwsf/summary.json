@@ -1,0 +1,54 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 4504.374567972854,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 2,
+  "error_details": [
+    {
+      "error": "Worker process crashed (exitcode=2)",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "Error: cannot allocate vector of size 52.4 Gb\n",
+      "method": "edger_de_glm_subset"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 4.90 GiB for an array with shape (1315451992,) and data type int32",
+      "method": "pertpy_de_pydeseq2"
+    },
+    {
+      "error": "Exceeded time limit of 32400 seconds",
+      "method": "scanpy_de_wilcoxon"
+    }
+  ],
+  "memory_limit_count": 1,
+  "non_success_count": 4,
+  "original_dataset_path": "/data/origin/Feng-gwsf.h5ad",
+  "other_errors": [
+    "Error: cannot allocate vector of size 52.4 Gb\n",
+    "Exceeded time limit of 32400 seconds",
+    "MemoryError: Unable to allocate 4.90 GiB for an array with shape (1315451992,) and data type int32",
+    "Worker process crashed (exitcode=2)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 15,
+    "min_genes": 50
+  },
+  "recovered_count": 1,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Feng-gwsf/.cache/standardized_Feng-gwsf.h5ad",
+  "status_counts": {
+    "error": 2,
+    "memory_limit": 1,
+    "recovered": 1,
+    "success": 16,
+    "timeout": 1
+  },
+  "success_count": 17,
+  "success_rate": 0.8095238095238095,
+  "timeout_count": 1,
+  "total_methods": 21
+}

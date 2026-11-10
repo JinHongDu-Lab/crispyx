@@ -1,0 +1,43 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 6400.191686658433,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 1,
+  "error_details": [
+    {
+      "error": "Worker process crashed (exitcode=2)",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "Exceeded time limit of 86400 seconds",
+      "method": "scanpy_de_wilcoxon"
+    }
+  ],
+  "memory_limit_count": 0,
+  "non_success_count": 2,
+  "original_dataset_path": "/data/origin/Replogle-GW-k562.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 86400 seconds",
+    "Worker process crashed (exitcode=2)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 100,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 1,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Replogle-GW-k562/.cache/standardized_Replogle-GW-k562.h5ad",
+  "status_counts": {
+    "error": 1,
+    "recovered": 1,
+    "success": 17,
+    "timeout": 1
+  },
+  "success_count": 18,
+  "success_rate": 0.9,
+  "timeout_count": 1,
+  "total_methods": 20
+}

@@ -1,0 +1,36 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 404.4809028697929,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 0,
+  "error_details": [
+    {
+      "error": "Exceeded time limit of 3600 seconds",
+      "method": "edger_de_glm"
+    }
+  ],
+  "memory_limit_count": 0,
+  "non_success_count": 1,
+  "original_dataset_path": "/data/origin/Tian-crispra.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 3600 seconds"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Tian-crispra/.cache/standardized_Tian-crispra.h5ad",
+  "status_counts": {
+    "success": 13,
+    "timeout": 1
+  },
+  "success_count": 13,
+  "success_rate": 0.9285714285714286,
+  "timeout_count": 1,
+  "total_methods": 14
+}
