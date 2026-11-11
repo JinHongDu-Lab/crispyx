@@ -844,9 +844,25 @@ def compute_de_comparison_metrics(
     if method_a is None or method_b is None or method_a.empty or method_b.empty:
         return metrics
 
+    # A gene name that occurs twice in a dataset (e.g. MATR3 in Feng-ts) cannot be
+    # matched between methods by name: the loaders make such names unique
+    # ("MATR3", "MATR3-1") in each file's own row order, which differs between
+    # methods. Every copy of such a name is left out on both sides.
+    key = ["perturbation", "gene"]
+
+    def _without_repeated_names(frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame[~frame.duplicated(key, keep=False)]
+        genes = frame["gene"].astype(str)
+        base = genes.str.replace(r"-\d+$", "", regex=True)
+        names = set(genes)
+        repeated = set(base[(base != genes) & base.isin(names)])
+        return frame[~(genes.isin(repeated) | base.isin(repeated))]
+
+    method_a = _without_repeated_names(method_a)
+    method_b = _without_repeated_names(method_b)
     merged = method_a.merge(
         method_b,
-        on=["perturbation", "gene"],
+        on=key,
         suffixes=("_method_a", "_method_b"),
         how="inner",
     )

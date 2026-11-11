@@ -1,0 +1,51 @@
+{
+  "adaptive_qc": false,
+  "adaptive_qc_mode": null,
+  "average_runtime_seconds": 20342.52187253227,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 1,
+  "error_details": [
+    {
+      "error": "Worker process crashed (exitcode=-9)",
+      "method": "pertpy_de_pydeseq2_subset"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 215. GiB for an array with shape (28904027252,) and data type int64",
+      "method": "scanpy_de_t_test"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 215. GiB for an array with shape (28904027252,) and data type int64",
+      "method": "scanpy_de_wilcoxon"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 217. GiB for an array with shape (29136391388,) and data type int64",
+      "method": "scanpy_qc_filtered"
+    }
+  ],
+  "memory_limit_count": 3,
+  "non_success_count": 4,
+  "original_dataset_path": "/workspace/data/origin/Huang-HEK293T.h5ad",
+  "other_errors": [
+    "MemoryError: Unable to allocate 215. GiB for an array with shape (28904027252,) and data type int64",
+    "MemoryError: Unable to allocate 217. GiB for an array with shape (29136391388,) and data type int64",
+    "Worker process crashed (exitcode=-9)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Huang-HEK293T/.cache/standardized_Huang-HEK293T.h5ad",
+  "status_counts": {
+    "error": 1,
+    "memory_limit": 3,
+    "success": 17
+  },
+  "success_count": 17,
+  "success_rate": 0.8095238095238095,
+  "timeout_count": 0,
+  "total_methods": 21
+}

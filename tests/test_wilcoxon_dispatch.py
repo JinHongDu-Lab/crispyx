@@ -891,6 +891,7 @@ class TestDenseGeneBinarySearch:
         path = tmp_path / "allzero.h5ad"
         adata.write(path)
         result = wilcoxon_test(path, perturbation_column="perturbation",
-                               control_label="control", output_dir=tmp_path)
+                               control_label="control", output_dir=tmp_path,
+                               min_pct_both=0.0, min_mean_ctrl=0.0)
         for label in [f"p{i}" for i in range(n_perts)]:
             assert result[label].pvalue[0] == 1.0, "All-zero gene should have p=1"

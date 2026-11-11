@@ -293,23 +293,20 @@ class Profiler:
     
     def get_stats(self) -> dict:
         """Get profiling statistics as a dict.
-        
+
         Returns
         -------
         dict
-            Dictionary with structure:
-            {
-                "timing": {
-                    "total_seconds": float,
-                    "sections": {label: {"seconds": float, "percent": float}, ...}
-                },
-                "memory": {
-                    "peak_mb": float,
-                    "snapshots": {label: {"timestamp_s": float, "current_mb": float}, ...},
-                    "samples": [(timestamp, memory_mb), ...],  # if sampling enabled
-                    "top_allocations": [...]  # if tracemalloc
-                }
-            }
+            Dictionary with keys ``"timing"`` and ``"memory"``.
+
+            The ``"timing"`` entry contains ``"total_seconds"`` (float) and
+            ``"sections"`` (a mapping of label to ``{"seconds": float,
+            "percent": float}``).
+
+            The ``"memory"`` entry contains ``"peak_mb"`` (float),
+            ``"snapshots"`` (a mapping of label to snapshot data),
+            ``"samples"`` (list of timestamp/memory pairs if sampling is
+            enabled), and ``"top_allocations"`` (if tracemalloc is used).
         """
         stats = {}
         

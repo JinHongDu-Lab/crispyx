@@ -1,0 +1,42 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 10817.318126945815,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 0,
+  "error_details": [
+    {
+      "error": "Exceeded time limit of 86400 seconds",
+      "method": "scanpy_de_wilcoxon"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 35.1 GiB for an array with shape (4714522126,) and data type int64",
+      "method": "scanpy_qc_filtered"
+    }
+  ],
+  "memory_limit_count": 1,
+  "non_success_count": 2,
+  "original_dataset_path": "/data/origin/Pan-GW-hESC.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 86400 seconds",
+    "MemoryError: Unable to allocate 35.1 GiB for an array with shape (4714522126,) and data type int64"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Pan-GW-hESC/.cache/standardized_Pan-GW-hESC.h5ad",
+  "status_counts": {
+    "memory_limit": 1,
+    "success": 17,
+    "timeout": 1
+  },
+  "success_count": 17,
+  "success_rate": 0.8947368421052632,
+  "timeout_count": 1,
+  "total_methods": 19
+}

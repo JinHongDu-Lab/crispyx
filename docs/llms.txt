@@ -1,0 +1,64 @@
+# crispyx
+
+> crispyx is a Python package for memory-efficient, streaming analysis of
+> large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files.
+
+## Purpose
+
+crispyx solves a specific problem: genome-wide CRISPR screens produce datasets
+with hundreds of thousands to millions of cells. Standard tools (Scanpy,
+Pertpy) load the full count matrix into RAM, requiring 30–120 GB or more.
+crispyx streams directly from .h5ad files on disk so that quality control,
+normalization, pseudobulk aggregation, and differential expression all run
+without materializing the full matrix.
+
+## Key capabilities
+
+- Streaming QC and preprocessing (filter cells, perturbations, genes;
+  normalize and log-transform) without loading the full matrix
+- Pseudobulk aggregation: average log expression and pseudobulk count matrices
+- Differential expression: t-test, Wilcoxon rank-sum, negative binomial GLM
+  with apeGLM log-fold-change shrinkage
+- Memory-efficient PCA and KNN graph construction on backed AnnData
+- Scanpy-compatible API: cx.pp, cx.pb, cx.tl, cx.pl namespaces
+- HPC support: resume/checkpoint, configurable memory_limit_gb, Docker and
+  Singularity images
+
+## Intended users
+
+Computational biologists analyzing large-scale CRISPR or Perturb-seq datasets
+who cannot load the full count matrix into memory, or who work on HPC systems
+with per-job memory limits. Also useful for anyone running multiple DE methods
+at scale (t-test, Wilcoxon, NB-GLM) on the same dataset.
+
+## Relationship to other tools
+
+- **vs Scanpy**: crispyx uses the same AnnData-based API and produces
+  identical results (Pearson r > 0.9999 for t-test and Wilcoxon), but uses
+  2–43x less time and 2–6x less memory by streaming from disk rather than
+  loading into RAM.
+- **vs Pertpy/PyDESeq2**: crispyx's NB-GLM is 2x faster and runs within 64 GB
+  where Pertpy/PyDESeq2 exceeds 120 GB or fails on genome-wide datasets.
+  Pearson r > 0.97 vs PyDESeq2 for LFC estimates.
+- **vs edgeR**: edgeR times out or errors on most genome-wide datasets tested.
+  crispyx completes all 12 benchmark datasets.
+
+## Benchmarks
+
+Benchmarked across 12 public CRISPR screen datasets (21K–1.97M cells):
+- crispyx completes all 12 datasets; Scanpy times out or OOMs on large screens;
+  Pertpy and edgeR fail on most genome-wide datasets.
+- t-test: 2–11x faster than Scanpy with identical results
+- Wilcoxon: 2–43x faster than Scanpy with identical results
+- NB-GLM: 2x faster than Pertpy, completes where Pertpy runs out of memory
+
+## Links
+
+- GitHub: https://github.com/jinhongdu-lab/crispyx
+- PyPI: https://pypi.org/project/crispyx
+- Documentation: https://crispyx.readthedocs.io
+- Installation: https://crispyx.readthedocs.io/en/latest/installation.html
+- Tutorial: https://crispyx.readthedocs.io/en/latest/crispyx_tutorial.html
+- API reference: https://crispyx.readthedocs.io/en/latest/api.html
+- Benchmarks: https://crispyx.readthedocs.io/en/latest/benchmarking.html
+- Comparison: https://crispyx.readthedocs.io/en/latest/comparison.html

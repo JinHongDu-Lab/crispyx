@@ -21,7 +21,7 @@ DEFAULT_CONFIGS=(
     # "Adamson_subset.yaml"
     # "Adamson.yaml"
     # "Feng-gwsf.yaml"
-    "Feng-gwsnf.yaml"
+    # "Feng-gwsnf.yaml"
     "Feng-ts.yaml"
     # "Frangieh.yaml"
     # "Nadig-HEPG2.yaml"

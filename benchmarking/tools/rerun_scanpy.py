@@ -45,7 +45,6 @@ from crispyx.data import (
     resolve_control_label,
     calculate_adaptive_qc_thresholds,
     standardize_dataset,
-    normalize_total_log1p,
 )
 
 from .run_benchmarks import (
@@ -306,22 +305,22 @@ def run_reference_extraction(
     finally:
         backed.file.close()
     
-    # Create preprocessed dataset for t-test (requires log-normalized data)
+    # Use the preprocessed file produced by crispyx during the main benchmark
+    # (crispyx_qc_filtered -> crispyx_preprocess). It is already QC-filtered and
+    # log-normalized, matching exactly what scanpy DE methods receive in the benchmark.
     preprocessing_dir = config.output_dir / "preprocessing"
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
     preprocessed_path = preprocessing_dir / f"preprocessed_{standardized_path.name}"
-    
-    if "scanpy_de_t_test" in methods_to_run and not preprocessed_path.exists():
-        if verbose:
-            print("\nCreating preprocessed (normalized) dataset for t-test...")
-        normalize_total_log1p(
-            standardized_path,
-            preprocessed_path,
-            chunk_size=qc_params.get("chunk_size", 2048),
-            verbose=verbose,
+
+    needs_preprocessed = any(
+        m in methods_to_run for m in ("scanpy_de_t_test", "scanpy_de_wilcoxon")
+    )
+    if needs_preprocessed and not preprocessed_path.exists():
+        raise FileNotFoundError(
+            f"Crispyx preprocessed dataset not found: {preprocessed_path}\n"
+            "Run the crispyx benchmark first so that crispyx_qc_filtered and "
+            "crispyx_preprocess produce this file."
         )
-        if verbose:
-            print(f"  ✓ Created: {preprocessed_path.name}")
     
     # Load existing marker data
     marker_data = _load_marker(config.output_dir)
@@ -364,12 +363,12 @@ def run_reference_extraction(
             )
         elif method_name == "scanpy_de_wilcoxon":
             result = extract_scanpy_de(
-                dataset_path=standardized_path,
+                dataset_path=preprocessed_path,
                 output_dir=config.output_dir,
                 perturbation_column="perturbation",
                 control_label=control_label,
                 method="wilcoxon",
-                preprocess=True,  # Wilcoxon runs on raw counts, Scanpy normalizes internally
+                preprocess=False,  # preprocessed_path is already normalized
                 verbose=verbose,
             )
         else:

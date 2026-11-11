@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 
@@ -32,7 +33,7 @@ from crispyx.data import (
     write_obs,
     write_var,
 )
-from crispyx.pseudobulk import compute_average_log_expression
+from crispyx.pseudobulk import compute_normalized_effects
 
 
 def _create_dataset(tmp_path: Path) -> Path:
@@ -77,6 +78,23 @@ def test_resolve_control_label_infers_ctrl(caplog):
     assert "Inferred control label" in caplog.text
 
 
+def test_resolve_control_label_prints_by_default(capsys):
+    """verbose defaults to True: the inferred label should be visible on
+    stdout without the caller configuring logging (unlike the logger.info
+    channel, which is silent by default)."""
+    inferred = resolve_control_label(["KO", "CTRL_cells"], None)
+
+    assert inferred == "CTRL_cells"
+    out = capsys.readouterr().out
+    assert "[cx] resolve_control_label:" in out
+    assert "CTRL_cells" in out
+
+
+def test_resolve_control_label_verbose_false_is_silent(capsys):
+    resolve_control_label(["KO", "CTRL_cells"], None, verbose=False)
+    assert capsys.readouterr().out == ""
+
+
 def test_read_h5ad_ondisk_returns_backed_object(tmp_path, capsys):
     path = _create_dataset(tmp_path)
 
@@ -90,14 +108,15 @@ def test_read_h5ad_ondisk_returns_backed_object(tmp_path, capsys):
     adata_ro.close()
 
 
-def test_compute_average_log_expression_infers_control(tmp_path, caplog):
+def test_compute_normalized_effects_infers_control(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="crispyx.data")
     path = _create_dataset(tmp_path)
 
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         path,
         perturbation_column="perturbation",
         control_label=None,
+        method="mean_log1p",
         gene_name_column="gene_symbol",
     )
 
@@ -292,6 +311,89 @@ class TestBackedMetadataEditing:
         with _pytest.raises(ValueError, match="rows"):
             write_var(path, df)
 
+    # ------------------------------------------------------------------
+    # Tests for bytes-encoded HDF5 attrs (anndata <=0.8 / S-dtype style)
+    # ------------------------------------------------------------------
+
+    def _write_h5ad_with_bytes_attrs(self, path: Path) -> None:
+        """Write a minimal h5ad with S-dtype (bytes) column-order attribute.
+
+        This reproduces the on-disk format produced by anndata <= 0.8 and by
+        any writer that calls ``np.array([...], dtype='S...')`` for the
+        'column-order' attribute.  h5py reads S-dtype arrays back as
+        ``np.bytes_`` objects rather than Python strings.
+        """
+        import h5py as _h5py
+        import scipy.sparse as sp
+
+        str_dt = _h5py.string_dtype(encoding="utf-8")
+
+        # Write a skeleton obs/var/X so anndata can read the file back.
+        x = np.ones((3, 2), dtype=np.float32)
+        obs = pd.DataFrame(
+            {"perturbation": ["ctrl", "KO1", "KO2"]},
+            index=["c0", "c1", "c2"],
+        )
+        var = pd.DataFrame({"gene_symbol": ["BRCA1", "TP53"]}, index=["BRCA1", "TP53"])
+        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+        adata.write(path)
+
+        # Now overwrite the obs 'column-order' attr with S-dtype bytes.
+        with _h5py.File(path, "r+") as f:
+            f["obs"].attrs["column-order"] = np.array(
+                list(obs.columns), dtype="S40"
+            )
+            f["var"].attrs["column-order"] = np.array(
+                list(var.columns), dtype="S40"
+            )
+
+    def test_load_obs_bytes_column_order_no_duplicates(self, tmp_path):
+        """load_obs must not duplicate columns when column-order is S-dtype bytes."""
+        path = tmp_path / "bytes_attrs.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_obs(path)
+        assert list(df.columns) == ["perturbation"], (
+            f"Expected ['perturbation'], got {list(df.columns)}"
+        )
+
+    def test_load_obs_bytes_column_order_correct_values(self, tmp_path):
+        """Column values must be read correctly when column-order uses S-dtype."""
+        path = tmp_path / "bytes_attrs.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_obs(path)
+        assert list(df["perturbation"]) == ["ctrl", "KO1", "KO2"]
+
+    def test_load_var_bytes_column_order_no_duplicates(self, tmp_path):
+        """load_var must not duplicate columns when column-order is S-dtype bytes."""
+        path = tmp_path / "bytes_attrs_var.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_var(path)
+        assert list(df.columns) == ["gene_symbol"], (
+            f"Expected ['gene_symbol'], got {list(df.columns)}"
+        )
+
+    def test_load_obs_bytes_index_key_attr(self, tmp_path):
+        """load_obs works when the _index attr is stored as bytes (np.bytes_)."""
+        import h5py as _h5py
+        import scipy.sparse as sp
+
+        # Write a normal file, then monkey-patch _index to bytes.
+        x = np.ones((2, 1), dtype=np.float32)
+        obs = pd.DataFrame({"pert": ["ctrl", "KO1"]}, index=["c0", "c1"])
+        var = pd.DataFrame(index=["g0"])
+        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+        path = tmp_path / "bytes_index.h5ad"
+        adata.write(path)
+
+        with _h5py.File(path, "r+") as f:
+            # Replace string attr with bytes scalar (np.bytes_ round-trips via h5py)
+            del f["obs"].attrs["_index"]
+            f["obs"].attrs["_index"] = np.bytes_(b"_index")
+
+        df = load_obs(path)
+        assert list(df.index) == ["c0", "c1"]
+        assert "pert" in df.columns
+
 
 # ============================================================================
 # Feature 2: standardise_gene_names
@@ -468,6 +570,21 @@ class TestAutoDetect:
         assert result["perturbation_column"] == "perturbation"
         assert result["gene_name_column"] == "gene_symbols"
 
+    def test_detect_perturbation_column_prints_by_default(self, tmp_path, capsys):
+        path = _create_full_dataset(tmp_path)
+        col = detect_perturbation_column(path)
+        assert col == "perturbation"
+        out = capsys.readouterr().out
+        assert "[cx] detect_perturbation_column:" in out
+        assert "perturbation" in out
+
+    def test_detect_gene_symbol_column_prints_by_default(self, tmp_path, capsys):
+        path = _create_full_dataset(tmp_path)
+        col = detect_gene_symbol_column(path)
+        assert col == "gene_symbols"
+        out = capsys.readouterr().out
+        assert "[cx] detect_gene_symbol_column:" in out
+
 
 # ============================================================================
 # Feature 5: compute_overlap / OverlapResult
@@ -524,3 +641,33 @@ class TestComputeOverlap:
     def test_returns_overlap_result_instance(self):
         result = compute_overlap({"X": {"a"}, "Y": {"b"}})
         assert isinstance(result, OverlapResult)
+
+
+class TestUpdateH5adDataframe:
+    """`_update_h5ad_dataframe` must recognise every string-like column
+    dtype, not just plain numpy ``object``/``U``/``S`` -- pandas'
+    ``StringDtype`` (and, since pandas 3.0, its default string dtype for
+    plain-text columns) reports ``.dtype.kind == 'O'`` but
+    ``.dtype == object`` is False, which previously fell through to the
+    numeric branch and crashed h5py with
+    ``TypeError: Object dtype dtype('O') has no native HDF5 equivalent``.
+    """
+
+    def test_pandas_string_dtype_column_is_written_as_vlen_string(self, tmp_path):
+        from crispyx.data import _update_h5ad_dataframe
+
+        df = pd.DataFrame(
+            {
+                "label": pd.array(["a", "b", "c"], dtype="string"),
+                "count": np.array([1, 2, 3], dtype=np.int64),
+            },
+            index=pd.Index(["r0", "r1", "r2"], name="index"),
+        )
+        h5ad_path = tmp_path / "update.h5ad"
+        ad.AnnData(np.zeros((3, 1)), obs=df.iloc[:, :0].copy()).write(h5ad_path)
+        with h5py.File(h5ad_path, "r+") as f:
+            _update_h5ad_dataframe(f, "obs", df)
+
+        result = ad.read_h5ad(h5ad_path)
+        assert list(result.obs["label"]) == ["a", "b", "c"]
+        assert list(result.obs["count"]) == [1, 2, 3]

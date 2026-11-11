@@ -22,11 +22,18 @@ SLURM_SCRIPT="$PROJECT_ROOT/benchmarking/singularity/slurm_rerun_scanpy.sh"
 # Small datasets usually complete in benchmark, so skip by default
 DEFAULT_CONFIGS=(
     "Feng-ts.yaml"
-    # "Replogle-GW-k562.yaml"
+    #"Replogle-GW-k562.yaml"
     # "Replogle-E-k562.yaml"
     # "Replogle-E-rpe1.yaml"
     # "Huang-HCT116.yaml"
     # "Huang-HEK293T.yaml"
+    # "Frangieh.yaml"
+    # "Nadig-HEPG2.yaml"
+    # "Nadig-JURKAT.yaml"
+    # "Replogle-E-k562.yaml"
+    # "Replogle-E-rpe1.yaml"
+    #"Feng-gwsnf.yaml"
+    #"Feng-gwsf.yaml"
 )
 
 # Script-specific flags that should be forwarded to Python script
@@ -91,7 +98,7 @@ fi
 
 # Fixed resource allocation for rerun (same parallelism as benchmark)
 N_CORES=32       # Same as benchmark
-SLURM_MEMORY="500G"  # Large memory limit to avoid OOM on big datasets
+SLURM_MEMORY="750G"  # Large memory limit to avoid OOM on big datasets
 
 # Process each config file
 for CONFIG_FILE in "${CONFIGS[@]}"; do

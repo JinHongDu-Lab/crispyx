@@ -1,0 +1,56 @@
+{
+  "adaptive_qc": false,
+  "adaptive_qc_mode": null,
+  "average_runtime_seconds": 11941.19908283638,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 2,
+  "error_details": [
+    {
+      "error": "Error: cannot allocate vector of size 40.3 Gb\n",
+      "method": "edger_de_glm_subset"
+    },
+    {
+      "error": "PyDESeq2 failed for all 50 perturbations; first error: ABCB9: MemoryError: Unable to allocate 43.4 GiB for an array with shape (165942, 35117) and data type float64",
+      "method": "pertpy_de_pydeseq2_subset"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 128. GiB for an array with shape (17152914017,) and data type int64",
+      "method": "scanpy_de_t_test"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 128. GiB for an array with shape (17152914017,) and data type int64",
+      "method": "scanpy_de_wilcoxon"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 130. GiB for an array with shape (17414414157,) and data type int64",
+      "method": "scanpy_qc_filtered"
+    }
+  ],
+  "memory_limit_count": 3,
+  "non_success_count": 5,
+  "original_dataset_path": "/workspace/data/origin/Huang-HCT116.h5ad",
+  "other_errors": [
+    "Error: cannot allocate vector of size 40.3 Gb\n",
+    "MemoryError: Unable to allocate 128. GiB for an array with shape (17152914017,) and data type int64",
+    "MemoryError: Unable to allocate 130. GiB for an array with shape (17414414157,) and data type int64",
+    "PyDESeq2 failed for all 50 perturbations; first error: ABCB9: MemoryError: Unable to allocate 43.4 GiB for an array with shape (165942, 35117) and data type float64"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 47,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Huang-HCT116/.cache/standardized_Huang-HCT116.h5ad",
+  "status_counts": {
+    "error": 2,
+    "memory_limit": 3,
+    "success": 17
+  },
+  "success_count": 17,
+  "success_rate": 0.7727272727272727,
+  "timeout_count": 0,
+  "total_methods": 22
+}

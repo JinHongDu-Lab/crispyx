@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1061,6 +1061,65 @@ def _generate_improved_markdown(
 # Main Evaluation Function
 # ============================================================================
 
+ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
+
+
+def _accuracy_perturbations(output_dir: Path) -> Optional[set]:
+    """The dataset's accuracy subset (plan 2026-10-25 §3.2), or None.
+
+    Drawn exactly as the reference reruns draw theirs: the runner's
+    ``_seeded_perturbation_subset`` over the QC-filtered perturbations.
+    Recorded in ``.accuracy_perturbations.json``.
+    """
+    spec_path = output_dir / ".accuracy_subset.json"
+    qc_path = output_dir / "preprocessing" / "crispyx_qc_filtered.h5ad"
+    if not spec_path.exists() or not qc_path.exists():
+        return None
+    import anndata as ad
+    from .run_benchmarks import _seeded_perturbation_subset
+
+    spec = json.loads(spec_path.read_text())
+    backed = ad.read_h5ad(str(qc_path), backed="r")
+    try:
+        all_labels = backed.obs["perturbation"].astype(str)
+        labels = all_labels.unique()
+        n_control = int((all_labels == "control").sum())
+    finally:
+        backed.file.close()
+    chosen = _seeded_perturbation_subset(
+        labels, "control", int(spec.get("n_perturbations", 50)), int(spec.get("seed", 0))
+    )
+    cap = spec.get("max_control_cells")
+    (output_dir / ".accuracy_perturbations.json").write_text(
+        json.dumps({**spec, "control_cells": n_control,
+                    "control_capped": bool(cap and n_control > int(cap)),
+                    "perturbations": chosen}, indent=1)
+    )
+    return set(chosen)
+
+
+def _accuracy_control_capped(output_dir: Path) -> Optional[bool]:
+    """Whether the dataset's accuracy comparisons use the capped control.
+
+    Decided by the data alone (plan 2026-10-25 §3.2, revised 2026-10-30): the
+    control is capped when it holds more than ``max_control_cells`` cells, for
+    every method, whatever ran or failed on which machine.
+    """
+    path = output_dir / ".accuracy_perturbations.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("control_capped")
+
+
+def _accuracy_role(comparison: str, capped: Optional[bool]) -> Tuple[str, str]:
+    """(control, role) of a DE accuracy comparison: the control its cells hold,
+    and whether that is the dataset's primary comparison or a supplementary one."""
+    control = "capped" if "_subset_ctrl" in comparison else "full"
+    if capped is None:
+        return control, ""
+    return control, "primary" if (control == "capped") == capped else "supplementary"
+
+
 def evaluate_benchmarks(output_dir: Path) -> None:
     """Evaluate benchmark results and generate report.
     
@@ -1107,11 +1166,15 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         # Memory metrics (including step-wise for NB-GLM)
         "peak_memory_mb", "avg_memory_mb",
         "base_peak_memory_mb", "shrinkage_peak_memory_mb",
-        "cells_kept", "genes_kept", "groups"
+        "cells_kept", "genes_kept", "groups", "control_cells"
     ]
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
+    # Accuracy reruns of references (*_subset, *_subset_ctrl) are not performance rows.
+    accuracy_rerun_df = pd.DataFrame()
     if "method" in perf_df.columns:
-        perf_df = perf_df.sort_values("method")
+        is_rerun = perf_df["method"].astype(str).str.endswith(ACCURACY_SUBSET_SUFFIXES)
+        accuracy_rerun_df = perf_df[is_rerun].copy()
+        perf_df = perf_df[~is_rerun].sort_values("method")
     
     # Load reference extraction marker to annotate rerun data
     marker_path = output_dir / ".reference_extracted"
@@ -1150,16 +1213,30 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     # - lfcShrink crispyx also vs edgeR (as a reference baseline)
     comparisons = [
         ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
-        # DE GLM - base NB-GLM vs external tools (base LFCs)
-        ("crispyx_de_nb_glm", "edger_de_glm", "de"),
-        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
+        # DE GLM: NB-GLM accuracy uses only the *_subset reruns below, which
+        # share crispyx's size factors (plan 2026-10-25 §4); the full-data
+        # PyDESeq2/edgeR runs (their own size factors) are performance rows.
         # DE GLM - standalone lfcShrink vs PyDESeq2 lfcShrink
         ("crispyx_de_lfcshrink", "pertpy_de_lfcshrink", "de_lfcshrink"),
-        # DE GLM - external tool comparison (base)
-        ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
+        # DE GLM - external tool comparison, same size factors
+        ("edger_de_glm_subset", "pertpy_de_pydeseq2_subset", "de"),
+        ("edger_de_glm_subset_ctrl", "pertpy_de_pydeseq2_subset_ctrl", "de"),
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
+        # Accuracy reruns (plan 2026-10-25 §3.2). "_subset": the accuracy subset
+        # against the full control, so crispyx's full-data result is compared
+        # directly. Which pairs are primary depends on the control's size alone
+        # (see _accuracy_role): a control over the cap uses the "_subset_ctrl" pairs.
+        ("crispyx_de_t_test", "scanpy_de_t_test_subset", "de"),
+        ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon_subset", "de"),
+        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2_subset", "de"),
+        ("crispyx_de_nb_glm", "edger_de_glm_subset", "de"),
+        # "_subset_ctrl": control capped; crispyx rerun on the same cells.
+        ("crispyx_de_t_test_subset_ctrl", "scanpy_de_t_test_subset_ctrl", "de"),
+        ("crispyx_de_wilcoxon_subset_ctrl", "scanpy_de_wilcoxon_subset_ctrl", "de"),
+        ("crispyx_de_nb_glm_subset_ctrl", "pertpy_de_pydeseq2_subset_ctrl", "de"),
+        ("crispyx_de_nb_glm_subset_ctrl", "edger_de_glm_subset_ctrl", "de"),
     ]
     
     # Add conditional comparisons for optional PyDESeq2-parity lfcShrink method (only if it was run)
@@ -1175,6 +1252,9 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 ("crispyx_de_lfcshrink", "crispyx_de_lfcshrink_pydeseq2", "de_lfcshrink"),
             ])
     
+    accuracy_perts = _accuracy_perturbations(output_dir)
+    control_capped = _accuracy_control_capped(output_dir)
+
     def _load_de_result(method_name: str, result_path_val: Optional[str], use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
         """Load and standardize a DE result from file.
         
@@ -1188,15 +1268,26 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         try:
             if str(result_path).endswith('.h5ad'):
                 import anndata as ad
-                adata = ad.read_h5ad(str(result_path))
+                if accuracy_perts is not None:
+                    # Read only the accuracy subset's rows.
+                    backed = ad.read_h5ad(str(result_path), backed="r")
+                    try:
+                        keep = backed.obs["perturbation"].astype(str).isin(accuracy_perts).to_numpy()
+                        adata = backed[np.flatnonzero(keep)].to_memory()
+                    finally:
+                        backed.file.close()
+                else:
+                    adata = ad.read_h5ad(str(result_path))
                 if use_raw_lfc:
                     result_dict = _anndata_to_de_dict_raw(adata)
                 else:
                     result_dict = _anndata_to_de_dict(adata)
                 return _streaming_de_to_frame(result_dict)
             else:
-                result_df = pd.read_csv(result_path)
-                return standardise_de_dataframe(result_df)
+                result_df = standardise_de_dataframe(pd.read_csv(result_path))
+                if accuracy_perts is not None and "perturbation" in result_df.columns:
+                    result_df = result_df[result_df["perturbation"].astype(str).isin(accuracy_perts)]
+                return result_df
         except Exception as e:
             print(f"Warning: Could not load DE result for {method_name}: {e}")
             return None
@@ -1384,6 +1475,10 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         except Exception as e:
             print(f"Error comparing {method_a_name} vs {method_b_name}: {e}")
     
+    for acc in accuracy_results:
+        if acc.get("comp_type") in ("de", "de_raw", "de_lfcshrink"):
+            acc["control"], acc["role"] = _accuracy_role(acc["comparison"], control_capped)
+
     # Generate overlap heatmaps
     overlap_heatmaps: Dict[str, Path] = {}
     if de_results_for_heatmaps:
@@ -1486,9 +1581,46 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         shrinkage_quality,
         skipped_comparisons,
     )
-        
+    md += _accuracy_subset_markdown(accuracy_rerun_df, accuracy_perts, output_dir)
+    if not accuracy_rerun_df.empty:
+        accuracy_rerun_df.to_csv(output_dir / "benchmark_accuracy_reruns.csv", index=False)
+
     with open(output_dir / "benchmark_report.md", "w") as f:
         f.write(md)
+
+
+def _accuracy_subset_markdown(rerun_df: pd.DataFrame, accuracy_perts: Optional[set], output_dir: Path) -> str:
+    """Report section: the accuracy subset and the reference reruns made on it."""
+    if accuracy_perts is None and rerun_df.empty:
+        return ""
+    md = "\n## Accuracy subset\n\n"
+    if accuracy_perts is not None:
+        spec = json.loads((output_dir / ".accuracy_subset.json").read_text())
+        md += (f"Accuracy metrics use the same {len(accuracy_perts)} seeded perturbations "
+               f"(seed {spec.get('seed', 0)}) for every method; the list is in "
+               "`.accuracy_perturbations.json`.\n\n")
+    if not rerun_df.empty:
+        md += ("Reruns on that subset, for accuracy only: they are not performance rows, and their "
+               "time and memory (kept in `benchmark_accuracy_reruns.csv` for the record) are not compared. "
+               "Performance uses the full-data runs, where a failure (timeout, memory limit) is the result. "
+               "`_subset` = full control; `_subset_ctrl` = control capped, crispyx rerun on the same cells.\n\n")
+    spec_path = output_dir / ".accuracy_perturbations.json"
+    if spec_path.exists():
+        spec = json.loads(spec_path.read_text())
+        n_ctrl, cap = spec.get("control_cells"), spec.get("max_control_cells")
+        if n_ctrl is not None and cap:
+            md += (f"Control: {n_ctrl:,} cells, cap {int(cap):,}. By the rule (decided by the control's size, "
+                   "not by which runs fit on a machine), this dataset's primary accuracy comparisons use the "
+                   + ("**capped** control (`_subset_ctrl` pairs, every method on the same cells); comparisons "
+                      "on the full control are supplementary.\n\n" if spec.get("control_capped") else
+                      "**full** control (the cap does not bind).\n\n"))
+    if not rerun_df.empty:
+        md += "| method | status | perturbations | control cells |\n| --- | --- | --- | --- |\n"
+        for _, row in rerun_df.sort_values("method").iterrows():
+            cells = row.get("control_cells")
+            cells = "" if cells is None or (isinstance(cells, float) and np.isnan(cells)) else f"{int(cells):,}"
+            md += f"| {row['method']} | {row.get('status', '')} | {row.get('groups', '')} | {cells} |\n"
+    return md
 
 
 # ============================================================================

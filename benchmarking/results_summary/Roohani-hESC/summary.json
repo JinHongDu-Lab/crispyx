@@ -1,0 +1,58 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 12432.760740223608,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 2,
+  "error_details": [
+    {
+      "error": "Worker process crashed (exitcode=-6)",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "PyDESeq2 failed for all 298 perturbations; first error: CHMP3: MemoryError: Unable to allocate 15.4 GiB for an array with shape (115694, 17851) and data type float64",
+      "method": "pertpy_de_pydeseq2"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 3.79 GiB for an array with shape (1017527740,) and data type float32",
+      "method": "pertpy_de_pydeseq2_subset"
+    },
+    {
+      "error": "Exceeded time limit of 86400 seconds",
+      "method": "scanpy_de_wilcoxon"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 32.0 GiB for an array with shape (4288967098,) and data type int64",
+      "method": "scanpy_qc_filtered"
+    }
+  ],
+  "memory_limit_count": 2,
+  "non_success_count": 5,
+  "original_dataset_path": "/workspace/data/origin/Roohani-hESC.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 86400 seconds",
+    "MemoryError: Unable to allocate 3.79 GiB for an array with shape (1017527740,) and data type float32",
+    "MemoryError: Unable to allocate 32.0 GiB for an array with shape (4288967098,) and data type int64",
+    "PyDESeq2 failed for all 298 perturbations; first error: CHMP3: MemoryError: Unable to allocate 15.4 GiB for an array with shape (115694, 17851) and data type float64",
+    "Worker process crashed (exitcode=-6)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 0,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Roohani-hESC/.cache/standardized_Roohani-hESC.h5ad",
+  "status_counts": {
+    "error": 2,
+    "memory_limit": 2,
+    "success": 16,
+    "timeout": 1
+  },
+  "success_count": 16,
+  "success_rate": 0.7619047619047619,
+  "timeout_count": 1,
+  "total_methods": 21
+}

@@ -39,9 +39,15 @@ for dt in (np.float32, np.float64):
     p = np.ones((6, 32), dtype=np.float64)
     e = np.zeros((6, 32), dtype=np.float64)
 
-    _wilcoxon_batch_perts_presorted_numba(
-        ctrl, flat, off, nnz, nz, tie_sums, stk, offsets, vm,
-        True, _ZERO_PARTITION_THRESHOLD, u, z, p, e,
-    )
+    try:
+        _wilcoxon_batch_perts_presorted_numba(
+            ctrl, flat, off, nnz, nz, tie_sums, stk, offsets, vm,
+            True, _ZERO_PARTITION_THRESHOLD, u, z, p, e,
+        )
+    except TypeError as exc:
+        # The kernel's arguments changed (crispyx 0.2.6 added one). The warm-up only
+        # saves compile time; the benchmark compiles on first use instead.
+        print(f"Numba warm-up skipped, kernel signature differs in this crispyx: {exc}")
+        sys.exit(0)
 
 print("Numba JIT cache warm-up complete (float32 + float64).")

@@ -19,8 +19,7 @@ from scipy.stats import norm, rankdata, t as t_dist
 import scanpy as sc
 
 from crispyx import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
+    compute_normalized_effects,
     quality_control_summary,
     t_test,
     wilcoxon_test,
@@ -152,14 +151,15 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
     control_mean_log = toolkit_log[control_mask].mean(axis=0)
     control_bulk = np.log1p(toolkit_norm[control_mask].mean(axis=0))
 
-    avg_effects_handle = compute_average_log_expression(
+    avg_effects_handle = compute_normalized_effects(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
+        method="mean_log1p",
         gene_name_column="gene_symbols",
         chunk_size=CHUNK_SIZE,
         output_dir=tmp_path,
-        data_name="scanpy_parity",
+        data_name="scanpy_parity_avg",
     )
     avg_effects_mem = avg_effects_handle.to_memory()
     avg_effects = pd.DataFrame(
@@ -168,14 +168,15 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
         columns=avg_effects_mem.var_names,
     )
 
-    pseudo_effects_handle = compute_pseudobulk_expression(
+    pseudo_effects_handle = compute_normalized_effects(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
+        method="log_mean",
         gene_name_column="gene_symbols",
         chunk_size=CHUNK_SIZE,
         output_dir=tmp_path,
-        data_name="scanpy_parity",
+        data_name="scanpy_parity_pseudo",
     )
     pseudo_effects_mem = pseudo_effects_handle.to_memory()
     pseudo_effects = pd.DataFrame(

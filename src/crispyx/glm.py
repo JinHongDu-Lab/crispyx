@@ -3,57 +3,51 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
-from typing import Sequence, Literal, Tuple
+from typing import Sequence, Literal
 
-import numba as nb
 import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from numpy.typing import ArrayLike
-from scipy.linalg import cho_factor, cho_solve, solve as scipy_solve
-from scipy.optimize import minimize_scalar, minimize, brentq
-from scipy.special import gammaln, digamma, polygamma
+from scipy.linalg import qr as scipy_qr
+from scipy.optimize import minimize, brentq
+from scipy.special import polygamma
 
 # Import Numba kernels from separate module
 from ._kernels import (
     gammaln_nb,
     _nb_loglik_grid_numba,
-    _nb_ll_for_alpha,
-    _compute_mle_dispersion_numba,
-    _nb_map_grid_search_numba,
     _nb_map_grid_search_with_refinement_numba,
-    _wls_solve_2x2_numba,
     _irls_batch_numba,
+    _accumulate_control_summary,
+    _two_group_dispersions,
+    _two_group_lfc,
 )
 
-# Import profiling utilities from dedicated module
-from .profiling import Profiler, MemoryProfiler, TimingProfiler
-
-# Import memory utilities
-from ._memory import (
-    _get_available_memory_mb,
-    _estimate_dense_memory_gb,
-    _estimate_gene_batch_size_fitter,
-    _estimate_max_workers,
+from ._irls import (
+    EPS,
+    ETA_MAX,
+    ETA_MIN,
+    PIVOT_FLOOR,
+    Deviance,
+    OneHotGroups,
+    eta_floor,
+    gram_batched,
+    irls_weights,
+    precondition_columns,
+    schur_complement,
+    schur_solve,
+    schur_variances,
+    solve_spd_2x2,
 )
+from ._memory import _estimate_gene_batch_size_fitter
 
 logger = logging.getLogger(__name__)
 
 
-
-@dataclass
-class NBGLMResult:
-    """Result of fitting a negative binomial GLM for a single gene."""
-
-    coef: np.ndarray
-    se: np.ndarray
-    dispersion: float
-    converged: bool
-    n_iter: int
-    deviance: float
-    max_cooks: float | None = None
+#: Maximum Newton step halvings before a gene's step is accepted as-is.
+_MAX_STEP_HALVINGS = 8
 
 
 @dataclass
@@ -66,1408 +60,6 @@ class NBGLMBatchResult:
     converged: np.ndarray  # Shape: (n_genes,) bool
     n_iter: np.ndarray  # Shape: (n_genes,) int
     deviance: np.ndarray  # Shape: (n_genes,)
-
-
-@dataclass
-class ControlStatisticsCache:
-    """Cached statistics for control cells to avoid redundant computation.
-    
-    When fitting independent NB-GLM models for multiple perturbations, each
-    comparison includes the same control cells. This cache precomputes and
-    stores control cell contributions to the IRLS normal equations, allowing
-    them to be reused across all perturbation comparisons instead of being
-    redundantly computed.
-    
-    The cache stores:
-    - Control cell intercept (β₀): baseline log-expression per gene
-    - Control dispersion: estimated from control cells only
-    - XᵀWX contribution from control cells (for intercept column)
-    - XᵀWz contribution from control cells
-    - Global size factors (optional): precomputed on all cells for consistency
-    - Global dispersion (optional): precomputed MAP dispersion using all cells
-    - Global dispersion prior variance: for MAP shrinkage
-    
-    Memory optimization: We store control_matrix as dense (not mu/weights)
-    since mu and weights change during IRLS and must be recomputed anyway.
-    Storing the dense matrix avoids repeated .toarray() calls in workers.
-    
-    This reduces IRLS complexity from O(n_perturbations × n_control × n_genes × n_iter)
-    to O(n_control × n_genes × n_iter) for control-related computations.
-    """
-    
-    # Control cell data (stored as dense for efficiency)
-    control_matrix: np.ndarray  # Shape: (n_control, n_genes) - always dense
-    control_n: int  # Number of control cells
-    control_offset: np.ndarray  # Shape: (n_control,) log size factors
-    
-    # Precomputed intercept (baseline expression for control)
-    beta_intercept: np.ndarray  # Shape: (n_genes,)
-    
-    # Control dispersion (estimated from control cells only)
-    control_dispersion: np.ndarray  # Shape: (n_genes,)
-    
-    # XᵀWX contribution from control (for intercept only, since X[control, perturbation] = 0)
-    # For a simple intercept+perturbation design:
-    # XᵀWX[0,0] from control = sum of weights for control cells per gene
-    control_xtwx_intercept: np.ndarray  # Shape: (n_genes,)
-    
-    # XᵀWz contribution from control
-    # For intercept: XᵀWz[0] from control = sum of (W * z) for control cells per gene  
-    control_xtwz_intercept: np.ndarray  # Shape: (n_genes,)
-    
-    # Mean expression for control (for dispersion trend fitting)
-    control_mean_expr: np.ndarray  # Shape: (n_genes,)
-    
-    # Expression counts for control cells
-    control_expr_counts: np.ndarray  # Shape: (n_genes,)
-    
-    # Proportion of control cells expressing each gene
-    pts_rest: np.ndarray  # Shape: (n_genes,)
-    
-    # Global size factors (optional): precomputed on all cells for consistency
-    # When provided, all comparisons use the same size factors (faster, more consistent)
-    global_size_factors: np.ndarray | None = None  # Shape: (n_cells_total,)
-    
-    # Global MAP dispersion (optional): precomputed using all cells
-    # When provided, workers skip per-comparison MAP dispersion computation
-    global_dispersion: np.ndarray | None = None  # Shape: (n_genes,)
-    global_dispersion_trend: np.ndarray | None = None  # Shape: (n_genes,)
-    
-    # Prior variance for dispersion shrinkage (from global trend fitting)
-    global_disp_prior_var: float | None = None
-    
-    # Dispersion scope: 'global' or 'per_comparison'
-    # When 'global', workers use precomputed global_dispersion and skip MoM/trend
-    dispersion_scope: str | None = None
-    
-    # Frozen control sufficient statistics (for memory-efficient parallel fitting)
-    # When these are set, workers don't need the raw control_matrix
-    # This reduces per-worker pickle size from ~5GB to ~1MB for large datasets
-    frozen_control_W_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control weights
-    frozen_control_Wz_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control W*z
-    frozen_control_mu_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control mu (for dispersion)
-    frozen_control_resid_sq_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of (Y-mu)^2 (for dispersion)
-    frozen_control_Y_sum: np.ndarray | None = None  # Shape: (n_genes,) - sum of control counts
-    use_frozen_control: bool = False  # Flag to indicate frozen mode is active
-
-
-def precompute_control_statistics(
-    control_matrix: np.ndarray | sp.csr_matrix,
-    control_offset: np.ndarray,
-    *,
-    max_iter: int = 10,
-    tol: float = 1e-6,
-    min_mu: float = 0.5,
-    dispersion_method: Literal["moments", "cox-reid"] = "moments",
-    global_size_factors: np.ndarray | None = None,
-    freeze_control: bool = False,
-) -> ControlStatisticsCache:
-    """Precompute control cell statistics for reuse across perturbation comparisons.
-    
-    This function fits a simple intercept-only model to control cells to estimate
-    the baseline expression level (β₀) per gene. The resulting intercept, mean
-    expression, weights, and XᵀWX/XᵀWz contributions are cached for reuse.
-    
-    Parameters
-    ----------
-    control_matrix
-        Expression matrix for control cells, shape (n_control, n_genes).
-    control_offset
-        Log size factors for control cells, shape (n_control,).
-    max_iter
-        Maximum IRLS iterations for intercept estimation.
-    tol
-        Convergence tolerance.
-    min_mu
-        Minimum fitted mean value.
-    dispersion_method
-        Method for dispersion estimation.
-    global_size_factors
-        Optional precomputed size factors for all cells (n_cells_total,).
-        When provided, stored in cache for use across all comparisons.
-    freeze_control
-        If True, compute frozen sufficient statistics (W_sum, Wz_sum, etc.) and
-        set control_matrix to None to save memory. This reduces per-worker pickle
-        size from ~5GB to ~1MB for large datasets. Workers can use the frozen
-        stats with `fit_batch_with_frozen_control()` instead of the raw matrix.
-        Default False.
-        
-    Returns
-    -------
-    ControlStatisticsCache
-        Cached statistics for control cells.
-    """
-    # Check sparsity and determine strategy
-    is_sparse = sp.issparse(control_matrix)
-    if is_sparse:
-        nnz = control_matrix.nnz
-        total = control_matrix.shape[0] * control_matrix.shape[1]
-        sparsity = 1.0 - (nnz / total) if total > 0 else 0.0
-    else:
-        nnz = np.count_nonzero(control_matrix)
-        sparsity = 1.0 - (nnz / control_matrix.size) if control_matrix.size > 0 else 0.0
-    
-    if is_sparse:
-        control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
-        n_control, n_genes = control_matrix.shape
-        logger.debug(f"Control matrix sparsity: {sparsity:.1%} ({n_control} cells × {n_genes} genes)")
-    else:
-        control_expr_counts = np.sum(control_matrix > 0, axis=0)
-        n_control, n_genes = control_matrix.shape
-    
-    offset = np.asarray(control_offset, dtype=np.float64)
-    
-    # Compute pts_rest (proportion of control cells expressing each gene)
-    pts_rest = control_expr_counts / n_control if n_control > 0 else np.zeros(n_genes, dtype=np.float32)
-    
-    # Compute normalized mean expression - use sparse operations if highly sparse
-    if is_sparse and sparsity > 0.8:
-        # For highly sparse matrices, use sparse mean
-        control_mean_expr = np.asarray(control_matrix.mean(axis=0)).ravel() / np.exp(offset).mean()
-        mean_counts = np.asarray(control_matrix.mean(axis=0)).ravel()
-    else:
-        # Densify for IRLS computations
-        if is_sparse:
-            Y = np.asarray(control_matrix.toarray(), dtype=np.float64)
-        else:
-            Y = np.asarray(control_matrix, dtype=np.float64)
-        normalized = Y / np.exp(offset)[:, None]
-        control_mean_expr = normalized.mean(axis=0)
-        mean_counts = Y.mean(axis=0)
-    
-    # Always densify for IRLS (required for efficient vectorized operations)
-    if is_sparse:
-        Y = np.asarray(control_matrix.toarray(), dtype=np.float64)
-    else:
-        Y = np.asarray(control_matrix, dtype=np.float64)
-    
-    # Initialize intercept: log of mean normalized counts
-    mean_offset = np.exp(offset).mean()
-    beta_intercept = np.log(np.maximum(mean_counts / mean_offset, 1e-10))
-    
-    # Initialize dispersion
-    alpha = np.full(n_genes, 0.1, dtype=np.float64)
-    
-    # IRLS for intercept-only model
-    log_min_mu = np.log(min_mu)
-    offset_col = offset[:, None]
-    
-    mu = np.empty((n_control, n_genes), dtype=np.float64)
-    weights = np.empty_like(mu)
-    z = np.empty_like(mu)
-    
-    for iteration in range(max_iter):
-        # Compute mu = exp(β₀ + offset)
-        eta = beta_intercept[None, :] + offset_col
-        np.clip(eta, log_min_mu, 20.0, out=eta)
-        np.exp(eta, out=mu)
-        np.maximum(mu, min_mu, out=mu)
-        
-        # Compute weights: W = μ² / (μ + α * μ²)
-        variance = mu + alpha[None, :] * mu * mu
-        np.divide(mu * mu, np.maximum(variance, min_mu), out=weights)
-        
-        # Working response: z = η + (Y - μ) / μ
-        resid = Y - mu
-        z = eta + resid / np.maximum(mu, min_mu)
-        
-        # Solve for intercept: β₀ = sum(W * (z - offset)) / sum(W)
-        z_centered = z - offset_col
-        xtwx = np.sum(weights, axis=0)  # (n_genes,)
-        xtwz = np.sum(weights * z_centered, axis=0)  # (n_genes,)
-        
-        beta_new = xtwz / np.maximum(xtwx, 1e-10)
-        
-        # Check convergence
-        if np.max(np.abs(beta_new - beta_intercept)) < tol:
-            beta_intercept = beta_new
-            break
-        
-        beta_intercept = beta_new
-        
-        # Update dispersion (method of moments)
-        resid_sq = resid * resid
-        numerator = np.sum((resid_sq - Y) / np.maximum(mu * mu, min_mu), axis=0)
-        dof = max(n_control - 1, 1)
-        alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-        alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-    
-    # Final mu and weights
-    eta = beta_intercept[None, :] + offset_col
-    np.clip(eta, log_min_mu, 20.0, out=eta)
-    np.exp(eta, out=mu)
-    np.maximum(mu, min_mu, out=mu)
-    
-    variance = mu + alpha[None, :] * mu * mu
-    np.divide(mu * mu, np.maximum(variance, min_mu), out=weights)
-    
-    # Compute XᵀWX and XᵀWz for control (intercept column only)
-    z_centered = eta + (Y - mu) / np.maximum(mu, min_mu) - offset_col
-    control_xtwx_intercept = np.sum(weights, axis=0)  # (n_genes,)
-    control_xtwz_intercept = np.sum(weights * z_centered, axis=0)  # (n_genes,)
-    
-    # Compute frozen control sufficient statistics if requested
-    # These allow workers to skip the raw control_matrix entirely
-    frozen_control_W_sum = None
-    frozen_control_Wz_sum = None
-    frozen_control_mu_sum = None
-    frozen_control_resid_sq_sum = None
-    frozen_control_Y_sum = None
-    use_frozen = False
-    
-    if freeze_control:
-        # Compute frozen statistics for memory-efficient parallel fitting
-        # These are the sufficient statistics needed for NB-GLM fitting
-        frozen_control_W_sum = control_xtwx_intercept.copy()  # Same as sum of weights
-        frozen_control_Wz_sum = control_xtwz_intercept.copy()  # Same as sum of W*z
-        frozen_control_mu_sum = np.sum(mu, axis=0)  # For dispersion updates
-        resid = Y - mu
-        frozen_control_resid_sq_sum = np.sum(resid * resid, axis=0)  # For dispersion
-        frozen_control_Y_sum = np.sum(Y, axis=0)  # For dispersion variance term
-        use_frozen = True
-        
-        # Set control_matrix to None to save memory
-        # Workers will use frozen stats instead
-        Y_to_store = None
-        logger.debug(
-            f"Frozen control stats computed: control_n={n_control}, n_genes={n_genes}, "
-            f"memory saved: {n_control * n_genes * 8 / 1e6:.1f} MB"
-        )
-    else:
-        Y_to_store = Y
-    
-    # Free temporary arrays
-    del mu, weights, z_centered, eta
-    
-    return ControlStatisticsCache(
-        control_matrix=Y_to_store,  # None if freeze_control=True
-        control_n=n_control,
-        control_offset=offset if not freeze_control else None,  # Not needed if frozen
-        beta_intercept=beta_intercept,
-        control_dispersion=alpha,
-        control_xtwx_intercept=control_xtwx_intercept,
-        control_xtwz_intercept=control_xtwz_intercept,
-        control_mean_expr=control_mean_expr,
-        control_expr_counts=control_expr_counts.astype(np.int32),
-        pts_rest=pts_rest.astype(np.float32),
-        global_size_factors=global_size_factors,
-        frozen_control_W_sum=frozen_control_W_sum,
-        frozen_control_Wz_sum=frozen_control_Wz_sum,
-        frozen_control_mu_sum=frozen_control_mu_sum,
-        frozen_control_resid_sq_sum=frozen_control_resid_sq_sum,
-        frozen_control_Y_sum=frozen_control_Y_sum,
-        use_frozen_control=use_frozen,
-    )
-
-
-def precompute_control_statistics_streaming(
-    path: "str | Path",
-    control_mask: np.ndarray,
-    control_offset: np.ndarray,
-    *,
-    max_iter: int = 10,
-    tol: float = 1e-6,
-    min_mu: float = 0.5,
-    global_size_factors: np.ndarray | None = None,
-    freeze_control: bool = True,
-    chunk_size: int = 4096,
-) -> ControlStatisticsCache:
-    """Streaming version of precompute_control_statistics for very large control groups.
-
-    Instead of densifying the full control matrix (which can exceed 100+ GiB for
-    large datasets), this function reads control cells from disk in chunks and
-    accumulates sufficient statistics for the intercept-only IRLS model.
-
-    Peak memory is O(chunk_size × n_genes) instead of O(n_control × n_genes).
-
-    Parameters
-    ----------
-    path
-        Path to the h5ad file containing the count matrix.
-    control_mask
-        Boolean mask over all cells indicating control cells, shape (n_cells,).
-    control_offset
-        Log size factors for control cells, shape (n_control,).
-    max_iter
-        Maximum IRLS iterations for intercept estimation.
-    tol
-        Convergence tolerance.
-    min_mu
-        Minimum fitted mean value.
-    global_size_factors
-        Optional precomputed size factors for all cells (n_cells_total,).
-    freeze_control
-        Must be True for streaming mode (raw control_matrix is never materialised).
-    chunk_size
-        Number of control cells to process per chunk. Default 4096.
-
-    Returns
-    -------
-    ControlStatisticsCache
-        Cached statistics with frozen control sufficient statistics.
-    """
-    from pathlib import Path as _Path
-    from .data import read_backed
-
-    if not freeze_control:
-        raise ValueError(
-            "Streaming precompute_control_statistics requires freeze_control=True "
-            "because the raw control matrix is never materialised."
-        )
-
-    path = _Path(path)
-    offset = np.asarray(control_offset, dtype=np.float64)
-    control_indices = np.where(control_mask)[0]
-    n_control = len(control_indices)
-
-    # Get n_genes from file
-    backed = read_backed(path)
-    n_genes = backed.n_vars
-    backed.file.close()
-
-    log_min_mu = np.log(min_mu)
-
-    # ---- Helper to iterate control cells in chunks from disk ----
-    def _iter_control_chunks():
-        """Yield (Y_chunk, offset_chunk) for control cells."""
-        bk = read_backed(path)
-        try:
-            for start in range(0, n_control, chunk_size):
-                end = min(start + chunk_size, n_control)
-                idx = control_indices[start:end]
-                chunk = bk.X[idx, :]
-                if sp.issparse(chunk):
-                    chunk = np.asarray(chunk.toarray(), dtype=np.float64)
-                else:
-                    chunk = np.asarray(chunk, dtype=np.float64)
-                yield chunk, offset[start:end]
-        finally:
-            bk.file.close()
-
-    # ---- Pass 0: Compute expression counts & mean counts (single pass) ----
-    expr_counts = np.zeros(n_genes, dtype=np.int64)
-    count_sum = np.zeros(n_genes, dtype=np.float64)
-    norm_sum = np.zeros(n_genes, dtype=np.float64)
-
-    for Y_chunk, off_chunk in _iter_control_chunks():
-        expr_counts += np.asarray((Y_chunk > 0).sum(axis=0)).ravel()
-        count_sum += Y_chunk.sum(axis=0)
-        norm_sum += (Y_chunk / np.exp(off_chunk)[:, None]).sum(axis=0)
-
-    mean_counts = count_sum / n_control
-    control_mean_expr = norm_sum / n_control
-    pts_rest = (expr_counts / n_control).astype(np.float32) if n_control > 0 else np.zeros(n_genes, dtype=np.float32)
-
-    # ---- Initialise intercept & dispersion ----
-    mean_offset = np.exp(offset).mean()
-    beta_intercept = np.log(np.maximum(mean_counts / mean_offset, 1e-10))
-    alpha = np.full(n_genes, 0.1, dtype=np.float64)
-
-    # ---- IRLS loop (each iteration streams through control cells) ----
-    for iteration in range(max_iter):
-        xtwx = np.zeros(n_genes, dtype=np.float64)
-        xtwz = np.zeros(n_genes, dtype=np.float64)
-        mom_numerator = np.zeros(n_genes, dtype=np.float64)
-
-        for Y_chunk, off_chunk in _iter_control_chunks():
-            n_chunk = Y_chunk.shape[0]
-            # eta = beta_intercept + offset
-            eta = beta_intercept[None, :] + off_chunk[:, None]
-            np.clip(eta, log_min_mu, 20.0, out=eta)
-            mu = np.exp(eta)
-            np.maximum(mu, min_mu, out=mu)
-
-            # Weights: W = mu^2 / var, var = mu + alpha * mu^2
-            variance = mu + alpha[None, :] * mu * mu
-            W = mu * mu / np.maximum(variance, min_mu)
-
-            # Working response z = eta + (Y - mu) / mu
-            resid = Y_chunk - mu
-            z = eta + resid / np.maximum(mu, min_mu)
-            z_centered = z - off_chunk[:, None]
-
-            xtwx += W.sum(axis=0)
-            xtwz += (W * z_centered).sum(axis=0)
-
-            # MoM numerator: sum((y-mu)^2 - y) / mu^2
-            mom_numerator += ((resid * resid - Y_chunk) / np.maximum(mu * mu, min_mu)).sum(axis=0)
-
-        beta_new = xtwz / np.maximum(xtwx, 1e-10)
-
-        if np.max(np.abs(beta_new - beta_intercept)) < tol:
-            beta_intercept = beta_new
-            break
-        beta_intercept = beta_new
-
-        # Update dispersion (MoM)
-        dof = max(n_control - 1, 1)
-        alpha_new = np.clip(mom_numerator / dof, 1e-8, 1e6)
-        alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-
-    # ---- Final pass: compute frozen sufficient statistics ----
-    frozen_W_sum = np.zeros(n_genes, dtype=np.float64)
-    frozen_Wz_sum = np.zeros(n_genes, dtype=np.float64)
-    frozen_mu_sum = np.zeros(n_genes, dtype=np.float64)
-    frozen_resid_sq_sum = np.zeros(n_genes, dtype=np.float64)
-    frozen_Y_sum = np.zeros(n_genes, dtype=np.float64)
-
-    for Y_chunk, off_chunk in _iter_control_chunks():
-        eta = beta_intercept[None, :] + off_chunk[:, None]
-        np.clip(eta, log_min_mu, 20.0, out=eta)
-        mu = np.exp(eta)
-        np.maximum(mu, min_mu, out=mu)
-
-        variance = mu + alpha[None, :] * mu * mu
-        W = mu * mu / np.maximum(variance, min_mu)
-
-        resid = Y_chunk - mu
-        z = eta + resid / np.maximum(mu, min_mu)
-        z_centered = z - off_chunk[:, None]
-
-        frozen_W_sum += W.sum(axis=0)
-        frozen_Wz_sum += (W * z_centered).sum(axis=0)
-        frozen_mu_sum += mu.sum(axis=0)
-        frozen_resid_sq_sum += (resid * resid).sum(axis=0)
-        frozen_Y_sum += Y_chunk.sum(axis=0)
-
-    logger.info(
-        f"Streaming control statistics computed: {n_control:,} cells × {n_genes:,} genes "
-        f"in chunks of {chunk_size} "
-        f"(peak memory saved: {n_control * n_genes * 8 / 1e9:.1f} GB)"
-    )
-
-    return ControlStatisticsCache(
-        control_matrix=None,
-        control_n=n_control,
-        control_offset=None,
-        beta_intercept=beta_intercept,
-        control_dispersion=alpha,
-        control_xtwx_intercept=frozen_W_sum,
-        control_xtwz_intercept=frozen_Wz_sum,
-        control_mean_expr=control_mean_expr,
-        control_expr_counts=expr_counts.astype(np.int32),
-        pts_rest=pts_rest,
-        global_size_factors=global_size_factors,
-        frozen_control_W_sum=frozen_W_sum,
-        frozen_control_Wz_sum=frozen_Wz_sum,
-        frozen_control_mu_sum=frozen_mu_sum,
-        frozen_control_resid_sq_sum=frozen_resid_sq_sum,
-        frozen_control_Y_sum=frozen_Y_sum,
-        use_frozen_control=True,
-    )
-
-
-def precompute_global_dispersion(
-    control_cache: ControlStatisticsCache,
-    all_cell_matrix: np.ndarray | sp.csr_matrix,
-    all_cell_offset: np.ndarray,
-    *,
-    n_grid: int = 25,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-    fit_type: Literal["parametric", "local", "mean"] = "parametric",
-    fast_mode: bool = True,
-    max_dense_fraction: float = 0.3,
-    memory_limit_gb: float | None = None,
-) -> ControlStatisticsCache:
-    """Precompute global dispersion trend using all cells and update cache.
-    
-    This function computes a global dispersion trend using all cells in the
-    dataset (control + all perturbations), similar to how DESeq2/PyDESeq2
-    estimates dispersion from all samples. The trend is then used for MAP
-    shrinkage in all per-perturbation comparisons.
-    
-    Using global dispersion has several advantages:
-    1. More stable estimates (larger sample size for trend fitting)
-    2. ~10× faster per-perturbation fitting (skips MAP estimation)
-    3. More consistent results across perturbations
-    
-    Memory-adaptive behavior:
-    If the estimated memory for densifying the matrix exceeds
-    max_dense_fraction × min(available_memory, memory_limit_gb), 
-    the function switches to chunk-wise streaming processing.
-    
-    Parameters
-    ----------
-    control_cache
-        Precomputed control cell statistics cache.
-    all_cell_matrix
-        Count matrix for all cells, shape (n_cells, n_genes).
-    all_cell_offset
-        Log size factors for all cells, shape (n_cells,).
-    n_grid
-        Number of grid points for dispersion MAP estimation.
-    min_disp
-        Minimum dispersion value.
-    max_disp
-        Maximum dispersion value.
-    fit_type
-        Type of trend fitting ("parametric", "local", or "mean").
-    fast_mode
-        If True, use simple trend shrinkage (MoM → trend) instead of expensive
-        MAP estimation. This is ~50× faster and suitable for most use cases.
-        If False, use full MAP estimation with grid search + refinement.
-    max_dense_fraction
-        Maximum fraction of available memory to use for dense matrix.
-        If estimated memory exceeds this, switch to streaming mode.
-        Default is 0.3 (30% of available memory).
-    memory_limit_gb
-        Optional explicit memory limit in GB. If provided, the effective
-        memory budget is min(available_memory, memory_limit_gb).
-        
-    Returns
-    -------
-    ControlStatisticsCache
-        Updated cache with global_dispersion, global_dispersion_trend, and
-        global_disp_prior_var fields populated.
-    """
-    from scipy.special import polygamma
-    
-    # Get matrix dimensions
-    if sp.issparse(all_cell_matrix):
-        n_cells, n_genes = all_cell_matrix.shape
-    else:
-        n_cells, n_genes = all_cell_matrix.shape
-    
-    # Estimate memory required for dense processing
-    # Need ~3 copies: Y (data), mu (fitted values), and work arrays
-    estimated_memory_gb = _estimate_dense_memory_gb(n_cells, n_genes, n_copies=3)
-    
-    # Compute effective memory budget
-    available_memory_gb = _get_available_memory_mb() / 1000.0
-    if memory_limit_gb is not None:
-        effective_limit_gb = min(available_memory_gb, memory_limit_gb)
-    else:
-        effective_limit_gb = available_memory_gb
-    
-    memory_budget_gb = max_dense_fraction * effective_limit_gb
-    
-    # Check if we need streaming mode
-    if estimated_memory_gb > memory_budget_gb:
-        logger.warning(
-            f"Dense matrix would require ~{estimated_memory_gb:.1f} GB "
-            f"(budget: {memory_budget_gb:.1f} GB = {max_dense_fraction:.0%} of "
-            f"{effective_limit_gb:.1f} GB). Switching to streaming mode."
-        )
-        return _precompute_global_dispersion_streaming(
-            control_cache=control_cache,
-            all_cell_matrix=all_cell_matrix,
-            all_cell_offset=all_cell_offset,
-            min_disp=min_disp,
-            max_disp=max_disp,
-            fit_type=fit_type,
-        )
-    
-    # Standard dense processing path
-    # Densify if sparse
-    if sp.issparse(all_cell_matrix):
-        Y = np.asarray(all_cell_matrix.toarray(), dtype=np.float64)
-    else:
-        Y = np.asarray(all_cell_matrix, dtype=np.float64)
-    
-    n_cells, n_genes = Y.shape
-    offset = np.asarray(all_cell_offset, dtype=np.float64)
-    
-    # Compute mean expression (for trend fitting)
-    normalized = Y / np.exp(offset)[:, None]
-    mean_expr = normalized.mean(axis=0)
-    
-    # Initial MLE dispersion using method of moments
-    # First fit a simple intercept model to get mu
-    beta0 = np.log(np.maximum(mean_expr * np.exp(offset).mean(), 1e-10))
-    eta = beta0[None, :] + offset[:, None]
-    np.clip(eta, -30, 30, out=eta)
-    mu = np.exp(eta)
-    np.maximum(mu, 1e-10, out=mu)
-    
-    # MoM dispersion
-    resid = Y - mu
-    dof = max(n_cells - 1, 1)
-    alpha_mle = np.sum((resid * resid - Y) / np.maximum(mu * mu, 1e-10), axis=0) / dof
-    alpha_mle = np.clip(alpha_mle, min_disp, max_disp)
-    
-    # Fit dispersion trend
-    trend = fit_dispersion_trend(mean_expr, alpha_mle, fit_type=fit_type)
-    
-    # Estimate prior variance for MAP shrinkage (PyDESeq2 style)
-    log_alpha = np.log(np.maximum(alpha_mle, min_disp))
-    log_trend = np.log(np.maximum(trend, min_disp))
-    valid = np.isfinite(log_alpha) & np.isfinite(log_trend)
-    
-    if np.sum(valid) > 10:
-        residuals = log_alpha[valid] - log_trend[valid]
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2  # intercept + perturbation
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
-        prior_var = max(squared_logres - polygamma_corr, 0.25)
-    else:
-        prior_var = 0.25
-    
-    if fast_mode:
-        # FAST MODE: Use simple trend shrinkage (similar to shrink_dispersions)
-        # This is ~50× faster than MAP and gives comparable results for global estimation
-        # Shrink MoM dispersion toward trend using weighted average
-        # Weight by reliability: use trend more for genes with extreme MoM estimates
-        log_alpha_shrunk = np.where(
-            valid,
-            (log_alpha + log_trend) / 2,  # Simple average in log space
-            log_trend  # Fall back to trend for invalid genes
-        )
-        global_dispersion = np.exp(np.clip(log_alpha_shrunk, np.log(min_disp), np.log(max_disp)))
-    else:
-        # FULL MODE: Compute MAP dispersion using vectorized grid search
-        log_min = np.log(min_disp)
-        log_max = np.log(max_disp)
-        log_alpha_grid = np.linspace(log_min, log_max, n_grid)
-        
-        # Use fused kernel with Brent refinement
-        best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
-            tol=1e-4,
-            max_refine_iter=20,
-        )
-        global_dispersion = np.exp(np.clip(best_log_alpha, log_min, log_max))
-    
-    # Update cache with global dispersion
-    control_cache.global_dispersion = global_dispersion
-    control_cache.global_dispersion_trend = trend
-    control_cache.global_disp_prior_var = prior_var
-    
-    return control_cache
-
-
-def _precompute_global_dispersion_streaming(
-    control_cache: ControlStatisticsCache,
-    all_cell_matrix: np.ndarray | sp.csr_matrix,
-    all_cell_offset: np.ndarray,
-    *,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-    fit_type: Literal["parametric", "local", "mean"] = "parametric",
-    chunk_size: int = 2048,
-) -> ControlStatisticsCache:
-    """Streaming version of global dispersion precomputation for large datasets.
-    
-    This function estimates dispersion by streaming through the data in chunks,
-    avoiding the need to densify the full matrix. Uses method-of-moments
-    estimation accumulated across chunks.
-    
-    Parameters
-    ----------
-    control_cache
-        Precomputed control cell statistics cache.
-    all_cell_matrix
-        Count matrix for all cells, shape (n_cells, n_genes). Can be sparse.
-    all_cell_offset
-        Log size factors for all cells, shape (n_cells,).
-    min_disp
-        Minimum dispersion value.
-    max_disp
-        Maximum dispersion value.
-    fit_type
-        Type of trend fitting ("parametric", "local", or "mean").
-    chunk_size
-        Number of cells to process per chunk.
-        
-    Returns
-    -------
-    ControlStatisticsCache
-        Updated cache with global_dispersion, global_dispersion_trend, and
-        global_disp_prior_var fields populated.
-    """
-    from scipy.special import polygamma
-    
-    # Get dimensions
-    if sp.issparse(all_cell_matrix):
-        n_cells, n_genes = all_cell_matrix.shape
-    else:
-        n_cells, n_genes = all_cell_matrix.shape
-    
-    offset = np.asarray(all_cell_offset, dtype=np.float64)
-    
-    # Pass 1: Compute mean expression (for intercept estimation and trend fitting)
-    # Accumulate sum and count
-    expr_sum = np.zeros(n_genes, dtype=np.float64)
-    
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        
-        if sp.issparse(all_cell_matrix):
-            chunk = np.asarray(all_cell_matrix[start:end].toarray(), dtype=np.float64)
-        else:
-            chunk = np.asarray(all_cell_matrix[start:end], dtype=np.float64)
-        
-        # Normalize by size factors for mean computation
-        offset_chunk = offset[start:end]
-        normalized_chunk = chunk / np.exp(offset_chunk)[:, None]
-        expr_sum += normalized_chunk.sum(axis=0)
-    
-    mean_expr = expr_sum / n_cells
-    
-    # Compute intercept from mean expression
-    mean_offset = np.exp(offset).mean()
-    beta0 = np.log(np.maximum(mean_expr * mean_offset, 1e-10))
-    
-    # Pass 2: Compute MoM dispersion by streaming
-    # MoM: alpha = sum((y - mu)^2 - y) / mu^2 / dof
-    numerator_sum = np.zeros(n_genes, dtype=np.float64)
-    
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        
-        if sp.issparse(all_cell_matrix):
-            chunk = np.asarray(all_cell_matrix[start:end].toarray(), dtype=np.float64)
-        else:
-            chunk = np.asarray(all_cell_matrix[start:end], dtype=np.float64)
-        
-        offset_chunk = offset[start:end]
-        
-        # Compute fitted values
-        eta = beta0[None, :] + offset_chunk[:, None]
-        np.clip(eta, -30, 30, out=eta)
-        mu = np.exp(eta)
-        np.maximum(mu, 1e-10, out=mu)
-        
-        # MoM numerator: (y - mu)^2 - y over mu^2
-        resid = chunk - mu
-        numerator = (resid * resid - chunk) / np.maximum(mu * mu, 1e-10)
-        numerator_sum += numerator.sum(axis=0)
-    
-    dof = max(n_cells - 1, 1)
-    alpha_mle = np.clip(numerator_sum / dof, min_disp, max_disp)
-    
-    # Fit dispersion trend
-    trend = fit_dispersion_trend(mean_expr, alpha_mle, fit_type=fit_type)
-    
-    # Estimate prior variance (PyDESeq2 style)
-    log_alpha = np.log(np.maximum(alpha_mle, min_disp))
-    log_trend = np.log(np.maximum(trend, min_disp))
-    valid = np.isfinite(log_alpha) & np.isfinite(log_trend)
-    
-    if np.sum(valid) > 10:
-        residuals = log_alpha[valid] - log_trend[valid]
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
-        prior_var = max(squared_logres - polygamma_corr, 0.25)
-    else:
-        prior_var = 0.25
-    
-    # Use simple trend shrinkage (equivalent to fast_mode=True)
-    # Streaming mode always uses this for memory efficiency
-    log_alpha_shrunk = np.where(
-        valid,
-        (log_alpha + log_trend) / 2,
-        log_trend
-    )
-    global_dispersion = np.exp(np.clip(log_alpha_shrunk, np.log(min_disp), np.log(max_disp)))
-    
-    # Update cache
-    control_cache.global_dispersion = global_dispersion
-    control_cache.global_dispersion_trend = trend
-    control_cache.global_disp_prior_var = prior_var
-    
-    logger.info(
-        f"Streaming dispersion estimation complete: "
-        f"processed {n_cells} cells in chunks of {chunk_size}"
-    )
-    
-    return control_cache
-
-
-def precompute_global_dispersion_from_path(
-    path: str | Path,
-    control_cache: ControlStatisticsCache,
-    all_cell_offset: np.ndarray,
-    *,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-    fit_type: Literal["parametric", "local", "mean"] = "parametric",
-    chunk_size: int = 4096,
-) -> ControlStatisticsCache:
-    """Path-based streaming global dispersion for very large datasets.
-    
-    This function estimates dispersion by streaming directly from an h5ad file,
-    avoiding the need to load the entire matrix into memory. Uses method-of-moments
-    estimation accumulated across chunks read from disk.
-    
-    This is the preferred method for datasets that exceed available memory
-    (e.g., Replogle-GW-k562 with ~2M cells × 8K genes = ~131 GB).
-    
-    Parameters
-    ----------
-    path
-        Path to the h5ad file containing the count matrix.
-    control_cache
-        Precomputed control cell statistics cache.
-    all_cell_offset
-        Log size factors for all cells, shape (n_cells,).
-    min_disp
-        Minimum dispersion value.
-    max_disp
-        Maximum dispersion value.
-    fit_type
-        Type of trend fitting ("parametric", "local", or "mean").
-    chunk_size
-        Number of cells to process per chunk. Larger chunks are faster
-        but use more memory. Default 4096 balances speed and memory.
-        
-    Returns
-    -------
-    ControlStatisticsCache
-        Updated cache with global_dispersion, global_dispersion_trend, and
-        global_disp_prior_var fields populated.
-    """
-    from pathlib import Path
-    from scipy.special import polygamma
-    from .data import read_backed
-    
-    path = Path(path)
-    offset = np.asarray(all_cell_offset, dtype=np.float64)
-    
-    # Get dimensions from backed file
-    backed = read_backed(path)
-    n_cells, n_genes = backed.shape
-    backed.file.close()
-    
-    logger.info(
-        f"Computing global dispersion from path (streaming): "
-        f"{n_cells:,} cells × {n_genes:,} genes"
-    )
-    
-    # Pass 1: Compute mean expression (for intercept estimation and trend fitting)
-    expr_sum = np.zeros(n_genes, dtype=np.float64)
-    
-    backed = read_backed(path)
-    try:
-        for start in range(0, n_cells, chunk_size):
-            end = min(start + chunk_size, n_cells)
-            chunk = backed.X[start:end, :]
-            
-            if sp.issparse(chunk):
-                chunk = np.asarray(chunk.toarray(), dtype=np.float64)
-            else:
-                chunk = np.asarray(chunk, dtype=np.float64)
-            
-            # Normalize by size factors for mean computation
-            offset_chunk = offset[start:end]
-            normalized_chunk = chunk / np.exp(offset_chunk)[:, None]
-            expr_sum += normalized_chunk.sum(axis=0)
-    finally:
-        backed.file.close()
-    
-    mean_expr = expr_sum / n_cells
-    
-    # Compute intercept from mean expression
-    mean_offset = np.exp(offset).mean()
-    beta0 = np.log(np.maximum(mean_expr * mean_offset, 1e-10))
-    
-    # Pass 2: Compute MoM dispersion by streaming from disk
-    # MoM: alpha = sum((y - mu)^2 - y) / mu^2 / dof
-    numerator_sum = np.zeros(n_genes, dtype=np.float64)
-    
-    backed = read_backed(path)
-    try:
-        for start in range(0, n_cells, chunk_size):
-            end = min(start + chunk_size, n_cells)
-            chunk = backed.X[start:end, :]
-            
-            if sp.issparse(chunk):
-                chunk = np.asarray(chunk.toarray(), dtype=np.float64)
-            else:
-                chunk = np.asarray(chunk, dtype=np.float64)
-            
-            offset_chunk = offset[start:end]
-            
-            # Compute fitted values
-            eta = beta0[None, :] + offset_chunk[:, None]
-            np.clip(eta, -30, 30, out=eta)
-            mu = np.exp(eta)
-            np.maximum(mu, 1e-10, out=mu)
-            
-            # MoM numerator: (y - mu)^2 - y over mu^2
-            resid = chunk - mu
-            numerator = (resid * resid - chunk) / np.maximum(mu * mu, 1e-10)
-            numerator_sum += numerator.sum(axis=0)
-    finally:
-        backed.file.close()
-    
-    dof = max(n_cells - 1, 1)
-    alpha_mle = np.clip(numerator_sum / dof, min_disp, max_disp)
-    
-    # Fit dispersion trend
-    trend = fit_dispersion_trend(mean_expr, alpha_mle, fit_type=fit_type)
-    
-    # Estimate prior variance (PyDESeq2 style)
-    log_alpha = np.log(np.maximum(alpha_mle, min_disp))
-    log_trend = np.log(np.maximum(trend, min_disp))
-    valid = np.isfinite(log_alpha) & np.isfinite(log_trend)
-    
-    if np.sum(valid) > 10:
-        residuals = log_alpha[valid] - log_trend[valid]
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        squared_logres = (1.4826 * mad) ** 2
-        num_vars = 2
-        polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
-        prior_var = max(squared_logres - polygamma_corr, 0.25)
-    else:
-        prior_var = 0.25
-    
-    # Use simple trend shrinkage (equivalent to fast_mode=True)
-    log_alpha_shrunk = np.where(
-        valid,
-        (log_alpha + log_trend) / 2,
-        log_trend
-    )
-    global_dispersion = np.exp(np.clip(log_alpha_shrunk, np.log(min_disp), np.log(max_disp)))
-    
-    # Update cache
-    control_cache.global_dispersion = global_dispersion
-    control_cache.global_dispersion_trend = trend
-    control_cache.global_disp_prior_var = prior_var
-    
-    logger.info(
-        f"Path-based streaming dispersion complete: "
-        f"processed {n_cells:,} cells in chunks of {chunk_size}"
-    )
-    
-    return control_cache
-
-
-class NBGLMFitter:
-    """L-BFGS-B solver for negative binomial GLMs.
-
-    Parameters
-    ----------
-    design:
-        The design matrix with shape ``(n_samples, n_features)``.
-    offset:
-        Optional log-scale offset (e.g. library size) per sample.
-    dispersion:
-        Optional dispersion (alpha) for the negative binomial. If ``None`` the
-        dispersion is re-estimated at each iteration using a method-of-moments
-        update similar to the one used in statsmodels.
-    max_iter:
-        Maximum number of outer iterations for alternating optimization.
-    tol:
-        Absolute tolerance on the coefficient updates for convergence.
-    poisson_init_iter:
-        Maximum number of iterations for the Poisson initialisation stage. If
-        set to ``0`` the Poisson warm start is skipped and coefficients are
-        initialised at zero.
-    ridge_penalty:
-        Small diagonal ridge penalty added to the weighted normal equations to
-        improve numerical stability. This does not change the estimator when
-        the system is well conditioned but prevents failures when the Hessian
-        is nearly singular.
-    min_mu:
-        Lower bound on the fitted mean to avoid issues with extremely small
-        predicted counts for lowly expressed genes.
-    min_total_count:
-        Genes with a total count below this threshold are not fitted (the
-        resulting ``NBGLMResult`` will report ``converged=False``).
-    dispersion_method:
-        Method for estimating dispersion when ``dispersion`` is None:
-        - "moments": Method-of-moments (fast but less accurate)
-        - "cox-reid": Cox-Reid adjusted profile likelihood (slower but more
-          accurate, similar to DESeq2)
-    """
-
-    def __init__(
-        self,
-        design: ArrayLike,
-        *,
-        offset: ArrayLike | None = None,
-        dispersion: float | None = None,
-        max_iter: int = 50,
-        tol: float = 1e-6,
-        poisson_init_iter: int = 20,
-        ridge_penalty: float = 1e-6,
-        min_mu: float = 0.5,
-        min_total_count: float = 1.0,
-        compute_cooks: bool = False,
-        dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
-    ) -> None:
-        self.design = np.asarray(design, dtype=np.float64)
-        if self.design.ndim != 2:
-            raise ValueError("design must be a 2D array")
-        self.n_samples, self.n_features = self.design.shape
-        self.offset = (
-            np.asarray(offset, dtype=np.float64)
-            if offset is not None
-            else np.zeros(self.n_samples, dtype=np.float64)
-        )
-        if self.offset.shape != (self.n_samples,):
-            raise ValueError("offset must have shape (n_samples,)")
-        self.dispersion = dispersion
-        self.max_iter = int(max_iter)
-        self.tol = tol
-        self.poisson_init_iter = int(max(0, poisson_init_iter))
-        self.ridge_penalty = ridge_penalty
-        self.min_mu = min_mu
-        self.min_total_count = min_total_count
-        self.compute_cooks = compute_cooks
-        self.dispersion_method = dispersion_method
-
-    def fit_gene(self, counts: ArrayLike) -> NBGLMResult:
-        """Fit NB GLM for a single gene using L-BFGS-B optimization."""
-        y = np.asarray(counts, dtype=np.float64)
-        if y.shape != (self.n_samples,):
-            raise ValueError("counts must have shape (n_samples,)")
-        total = float(y.sum())
-        if total < self.min_total_count or not np.isfinite(total):
-            zeros = np.zeros(self.n_features, dtype=np.float64)
-            return NBGLMResult(
-                coef=zeros,
-                se=np.full(self.n_features, np.inf, dtype=np.float64),
-                dispersion=float("nan"),
-                converged=False,
-                n_iter=0,
-                deviance=float("nan"),
-                max_cooks=None,
-            )
-        
-        return self._fit_gene_lbfgsb(y)
-
-    def fit_matrix(self, matrix: ArrayLike, *, batch_size: int | None = None) -> list[NBGLMResult]:
-        """Fit NB GLM for every gene (column) in a count matrix.
-
-        Parameters
-        ----------
-        matrix : array-like of shape (n_samples, n_genes)
-            Raw count matrix.  Sparse (CSC) and dense formats are accepted.
-        batch_size : int or None, optional
-            Number of genes to densify at once when *matrix* is sparse.
-            ``None`` processes all genes in one batch.
-
-        Returns
-        -------
-        list of NBGLMResult
-            One result per gene, in column order.
-        """
-        if sp.issparse(matrix):
-            sparse_matrix = sp.csc_matrix(matrix, dtype=np.float64)
-            n_genes = sparse_matrix.shape[1]
-            batch = batch_size or n_genes
-            if sparse_matrix.shape[0] != self.n_samples:
-                raise ValueError("matrix must have shape (n_samples, n_genes)")
-            results: list[NBGLMResult] = []
-            for start in range(0, n_genes, batch):
-                end = min(start + batch, n_genes)
-                dense_block = np.asarray(sparse_matrix[:, start:end].toarray())
-                for col in range(dense_block.shape[1]):
-                    results.append(self.fit_gene(dense_block[:, col]))
-            return results
-
-        y = np.asarray(matrix, dtype=np.float64)
-        if y.ndim != 2 or y.shape[0] != self.n_samples:
-            raise ValueError("matrix must have shape (n_samples, n_genes)")
-
-        batch = batch_size or y.shape[1]
-        results: list[NBGLMResult] = []
-        for start in range(0, y.shape[1], batch):
-            end = min(start + batch, y.shape[1])
-            block = y[:, start:end]
-            for col in range(block.shape[1]):
-                results.append(self.fit_gene(block[:, col]))
-        return results
-
-    def _fit_gene_lbfgsb(self, y: np.ndarray) -> NBGLMResult:
-        """Fit NB GLM using L-BFGS-B optimization (PyDESeq2 style).
-        
-        This method directly optimizes the negative binomial log-likelihood
-        using scipy's L-BFGS-B optimizer, which is the approach used by PyDESeq2.
-        It alternates between optimizing coefficients (beta) and dispersion (alpha).
-        """
-        # Initialize with Poisson warm start
-        beta = np.zeros(self.n_features, dtype=np.float64)
-        if self.poisson_init_iter > 0:
-            beta = self._poisson_warm_start(y, beta.copy())
-        
-        # Initial dispersion estimate using method of moments
-        eta = self.offset + self.design @ beta
-        mu = np.exp(np.clip(eta, np.log(self.min_mu), 20.0))
-        mu = np.maximum(mu, self.min_mu)
-        alpha = self._update_alpha(y, mu, 0.1)
-        
-        converged = False
-        n_iter = 0
-        
-        # Alternate between optimizing beta and alpha
-        for outer_iter in range(self.max_iter):
-            # Optimize beta given alpha using L-BFGS-B
-            def neg_log_likelihood(beta_vec: np.ndarray) -> float:
-                eta = self.offset + self.design @ beta_vec
-                mu = np.exp(np.clip(eta, np.log(self.min_mu), 20.0))
-                mu = np.maximum(mu, self.min_mu)
-                r = 1.0 / max(alpha, 1e-10)
-                # NB log-likelihood (using numba-accelerated gammaln)
-                ll = np.sum(
-                    gammaln_nb(y + r)
-                    - gammaln_nb(r)
-                    - gammaln_nb(y + 1)
-                    + r * np.log(r / (r + mu))
-                    + y * np.log(mu / (r + mu + 1e-12))
-                )
-                return -ll
-            
-            def gradient(beta_vec: np.ndarray) -> np.ndarray:
-                eta = self.offset + self.design @ beta_vec
-                mu = np.exp(np.clip(eta, np.log(self.min_mu), 20.0))
-                mu = np.maximum(mu, self.min_mu)
-                r = 1.0 / max(alpha, 1e-10)
-                # Gradient: d(-ll)/d(beta) = X^T @ (mu - y * (1 + r) / (mu + r))
-                # Simplified: X^T @ (mu * (y + r) / (mu + r) - y)
-                w = (y + r) / (mu + r)
-                grad = self.design.T @ (mu * w - y)
-                return -grad  # Negative because we're minimizing negative LL
-            
-            beta_old = beta.copy()
-            try:
-                result = minimize(
-                    neg_log_likelihood,
-                    beta,
-                    method='L-BFGS-B',
-                    jac=gradient,
-                    options={'maxiter': 50, 'gtol': self.tol, 'ftol': 1e-10}
-                )
-                if result.success or result.fun < neg_log_likelihood(beta):
-                    beta = result.x
-                n_iter = outer_iter + 1
-            except Exception:
-                pass
-            
-            # Update mu with new beta
-            eta = self.offset + self.design @ beta
-            mu = np.exp(np.clip(eta, np.log(self.min_mu), 20.0))
-            mu = np.maximum(mu, self.min_mu)
-            
-            # Update dispersion
-            if self.dispersion is not None:
-                alpha = self.dispersion
-            else:
-                alpha_old = alpha
-                alpha = self._update_alpha(y, mu, alpha)
-                
-                # Refine with Cox-Reid if requested
-                if self.dispersion_method == "cox-reid":
-                    variance = mu + alpha * (mu**2)
-                    weights = (mu**2) / np.maximum(variance, self.min_mu)
-                    alpha = self.estimate_dispersion_cox_reid(
-                        y, mu, weights, initial_alpha=alpha
-                    )
-            
-            # Check convergence
-            beta_diff = float(np.max(np.abs(beta - beta_old)))
-            if beta_diff < self.tol:
-                converged = True
-                break
-        
-        # Compute final statistics
-        eta = self.offset + self.design @ beta
-        mu = np.exp(np.clip(eta, np.log(self.min_mu), 20.0))
-        mu = np.maximum(mu, self.min_mu)
-        variance = mu + alpha * (mu**2)
-        weights = (mu**2) / np.maximum(variance, self.min_mu)
-        
-        # Compute covariance matrix (inverse Hessian)
-        cov_beta = self._hessian_inverse(weights)
-        se = np.sqrt(np.maximum(np.diag(cov_beta), self.min_mu))
-        
-        # Compute deviance
-        deviance = self._compute_deviance(y, mu, alpha)
-        
-        # Cook's distance if requested
-        max_cooks = None
-        if self.compute_cooks:
-            hat_diag = self._hat_diagonal(weights, cov_beta)
-            pearson_resid = (y - mu) / np.sqrt(np.maximum(variance, self.min_mu))
-            denom = np.maximum((1.0 - hat_diag) ** 2, self.min_mu)
-            cooks = (pearson_resid**2 / max(self.n_features, 1)) * (hat_diag / denom)
-            max_cooks = float(np.nanmax(cooks)) if cooks.size else None
-        
-        return NBGLMResult(
-            coef=beta,
-            se=se,
-            dispersion=alpha,
-            converged=converged,
-            n_iter=n_iter,
-            deviance=deviance,
-            max_cooks=max_cooks,
-        )
-
-    def _poisson_warm_start(self, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
-        for _ in range(self.poisson_init_iter):
-            eta = self.offset + self.design @ beta
-            mu = np.exp(np.clip(eta, a_min=np.log(self.min_mu), a_max=None))
-            mu = np.maximum(mu, self.min_mu)
-            weights = mu
-            z = eta + (y - mu) / np.maximum(mu, self.min_mu)
-            working_response = z - self.offset
-            beta_new, _ = self._weighted_least_squares(weights, working_response)
-            if np.max(np.abs(beta_new - beta)) < self.tol:
-                return beta_new
-            beta = beta_new
-        return beta
-
-    def _weighted_least_squares(self, weights: np.ndarray, y_working: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if weights.shape != (self.n_samples,):
-            raise ValueError("weights must have shape (n_samples,)")
-        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
-        x_weighted = self.design * w_sqrt[:, None]
-        z_weighted = y_working * w_sqrt
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        xtwz = x_weighted.T @ z_weighted
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            beta = cho_solve((c, lower), xtwz, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            try:
-                beta = np.linalg.solve(xtwx, xtwz)
-            except np.linalg.LinAlgError:
-                beta = np.linalg.pinv(xtwx) @ xtwz
-            try:
-                inv_hessian = np.linalg.inv(xtwx)
-            except np.linalg.LinAlgError:
-                inv_hessian = np.linalg.pinv(xtwx)
-        return beta, inv_hessian
-
-    def _hessian_inverse(self, weights: np.ndarray) -> np.ndarray:
-        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
-        x_weighted = self.design * w_sqrt[:, None]
-        xtwx = x_weighted.T @ x_weighted
-        if self.ridge_penalty:
-            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
-        try:
-            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
-            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
-        except np.linalg.LinAlgError:
-            inv_hessian = np.linalg.pinv(xtwx)
-        return inv_hessian
-
-    def _hat_diagonal(self, weights: np.ndarray, inv_hessian: np.ndarray) -> np.ndarray:
-        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
-        x_weighted = self.design * w_sqrt[:, None]
-        projection = x_weighted @ inv_hessian
-        hat = np.sum(x_weighted * projection, axis=1)
-        return np.clip(hat, 0.0, 1.0)
-
-    @staticmethod
-    def _compute_deviance(y: np.ndarray, mu: np.ndarray, alpha: float) -> float:
-        mu = np.maximum(mu, 1e-12)
-        if alpha <= 0:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                terms = np.where(y > 0, y * np.log(np.maximum(y, 1e-12) / mu) - (y - mu), -mu)
-            return 2.0 * float(np.nansum(terms))
-        r = 1.0 / alpha
-        with np.errstate(divide="ignore", invalid="ignore"):
-            term1 = y * np.log(np.maximum(y, 1e-12) / mu)
-            term2 = (y + r) * np.log((y + r) / (mu + r))
-            dev = 2.0 * float(np.nansum(term1 - term2))
-        return dev
-
-    def _update_alpha(self, y: np.ndarray, mu: np.ndarray, current_alpha: float) -> float:
-        # Method-of-moments style update used as a cheap approximation to
-        # maximize the profile likelihood for alpha.
-        resid = y - mu
-        denom = np.maximum(mu**2, self.min_mu)
-        numerator = np.sum((resid**2 - y) / denom)
-        dof = max(y.size - self.n_features, 1)
-        alpha = numerator / dof
-        if not np.isfinite(alpha):
-            alpha = current_alpha
-        alpha = float(np.clip(alpha, 1e-8, 1e6))
-        if alpha <= 0:
-            alpha = 1e-8
-        return alpha
-
-    def estimate_dispersion_cox_reid(
-        self,
-        y: np.ndarray,
-        mu: np.ndarray,
-        weights: np.ndarray,
-        *,
-        initial_alpha: float = 0.1,
-        bounds: tuple[float, float] = (1e-8, 1e3),
-    ) -> float:
-        """Estimate dispersion using Cox-Reid adjusted profile likelihood.
-        
-        This method maximizes the adjusted profile log-likelihood for the
-        dispersion parameter, which includes a bias correction term based on
-        the Cox-Reid adjustment. This approach is similar to DESeq2's dispersion
-        estimation.
-        
-        Parameters
-        ----------
-        y
-            Count vector of shape (n_samples,).
-        mu
-            Current fitted mean values of shape (n_samples,).
-        weights
-            IRLS weights from the current fit.
-        initial_alpha
-            Starting value for the optimization.
-        bounds
-            Lower and upper bounds for the dispersion parameter.
-            
-        Returns
-        -------
-        float
-            Estimated dispersion parameter.
-        """
-        n = len(y)
-        p = self.n_features
-        
-        def neg_log_likelihood(alpha: float) -> float:
-            if alpha <= 0:
-                return np.inf
-            r = 1.0 / alpha
-            
-            # Negative binomial log-likelihood (using numba-accelerated gammaln)
-            ll = np.sum(
-                gammaln_nb(y + r)
-                - gammaln_nb(r)
-                - gammaln_nb(y + 1)
-                + r * np.log(r / (r + mu))
-                + y * np.log(mu / (r + mu + 1e-12))
-            )
-            
-            # Cox-Reid adjustment: -0.5 * log(det(X^T W X))
-            # This accounts for the fact that we're profiling over beta
-            variance = mu + alpha * (mu**2)
-            w = (mu**2) / np.maximum(variance, self.min_mu)
-            w_sqrt = np.sqrt(np.clip(w, self.min_mu, None))
-            x_weighted = self.design * w_sqrt[:, None]
-            xtwx = x_weighted.T @ x_weighted
-            try:
-                sign, log_det = np.linalg.slogdet(xtwx)
-                if sign > 0:
-                    ll -= 0.5 * log_det
-            except np.linalg.LinAlgError:
-                pass
-            
-            return -ll
-        
-        # Use bounded optimization
-        try:
-            result = minimize_scalar(
-                neg_log_likelihood,
-                bounds=bounds,
-                method="bounded",
-                options={"xatol": 1e-4, "maxiter": 50},
-            )
-            if result.success and np.isfinite(result.x):
-                return float(np.clip(result.x, bounds[0], bounds[1]))
-        except Exception:
-            pass
-        
-        # Fallback to method-of-moments
-        return self._update_alpha(y, mu, initial_alpha)
 
 
 def build_design_matrix(
@@ -1517,7 +109,11 @@ def build_design_matrix(
         if column not in obs_frame.columns:
             raise KeyError(f"Covariate '{column}' not found in obs_frame")
         series = obs_frame[column]
-        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            # A level with no samples in this frame (a batch absent from one
+            # comparison's cells) would be an all-zero column.
+            series = series.cat.remove_unused_categories()
+        if series.dtype.kind in {"O", "U"} or isinstance(series.dtype, pd.CategoricalDtype):
             dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
             if dummies.shape[1] == 0:
                 continue
@@ -1530,6 +126,41 @@ def build_design_matrix(
     return design, column_names
 
 
+def check_full_rank(design: np.ndarray, column_names: list[str], context: str) -> None:
+    """Raise ``ValueError`` naming the columns of ``design`` that are linear
+    combinations of earlier ones, so a confounded design fails with a reason
+    instead of fitting a singular system.
+
+    ``context`` says which fit the design belongs to (e.g. a comparison).
+
+    One QR of ``design``: column ``j`` lies in the span of the columns
+    before it exactly when ``R[j, j]`` vanishes, at ``matrix_rank``'s
+    tolerance.
+    """
+    if design.shape[1] == 0:
+        return
+    diag = np.abs(np.diag(scipy_qr(design, mode="r", check_finite=False)[0]))
+    tol = diag.max() * max(design.shape) * np.finfo(np.float64).eps
+    dependent = [column_names[j] for j in np.flatnonzero(diag <= tol)]
+    if not dependent:
+        return
+    raise ValueError(
+        f"{context}: the design is rank-deficient; {', '.join(map(repr, dependent))} "
+        "is a linear combination of the other columns. A covariate is confounded with "
+        "the perturbation (e.g. a batch with no control samples) or with another "
+        "covariate; drop or merge it."
+    )
+
+
+def _mean_dispersion_trend(dispersions: np.ndarray, min_disp: float = 1e-8) -> float:
+    """PyDESeq2's fallback trend: the 0.1%-trimmed mean of the gene-wise
+    dispersions above 10 * min_disp."""
+    from scipy.stats import trim_mean
+
+    use = dispersions[np.isfinite(dispersions) & (dispersions > 10 * min_disp)]
+    return float(trim_mean(use, proportiontocut=0.001)) if use.size else 0.1
+
+
 def fit_dispersion_trend(
     means: ArrayLike,
     dispersions: ArrayLike,
@@ -1539,14 +170,14 @@ def fit_dispersion_trend(
     n_iter: int = 10,
 ) -> np.ndarray:
     """Fit a smooth mean-dispersion trend using DESeq2/PyDESeq2-style Gamma GLM.
-    
-    The parametric trend models dispersion as:
-        dispersion = asymptDisp + extraPois / mean
-    
+
+    The parametric trend models dispersion as
+    ``dispersion = asymptDisp + extraPois / mean``.
+
     This matches PyDESeq2's fitDispersionTrend which uses iteratively reweighted
-    least squares (IRLS) with a Gamma family and log link, fitting:
-        E[disp] = a0 + a1 / mean
-    
+    least squares (IRLS) with a Gamma family and log link, fitting
+    ``E[disp] = a0 + a1 / mean``.
+
     Outliers are iteratively removed based on prediction ratio bounds.
     
     Parameters
@@ -1619,8 +250,6 @@ def fit_dispersion_trend(
             max_outer_iter = 20
             for outer_iter in range(max_outer_iter):
                 # Check convergence
-                if not (params > 1e-10).all():
-                    break
                 log_change = np.log(np.abs(params / old_params)) ** 2
                 if log_change.sum() < 1e-6 and outer_iter > 0:
                     break
@@ -1641,20 +270,18 @@ def fit_dispersion_trend(
                         axis=0
                     )
                 
-                try:
-                    res = minimize(
-                        loss,
-                        x0=params,
-                        jac=grad,
-                        method="L-BFGS-B",
-                        bounds=[(1e-12, np.inf), (1e-12, np.inf)],
-                    )
-                    if not res.success:
-                        break
-                    params = res.x
-                    predictions = X_current @ params
-                except Exception:
-                    break
+                res = minimize(
+                    loss,
+                    x0=params,
+                    jac=grad,
+                    method="L-BFGS-B",
+                    bounds=[(1e-12, np.inf), (1e-12, np.inf)],
+                )
+                if not res.success or (res.x <= 1e-10).any():
+                    # PyDESeq2 then switches to a mean trend
+                    return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
+                params = res.x
+                predictions = X_current @ params
                 
                 # Outlier removal (PyDESeq2 style): keep genes with 1e-4 <= ratio < 15
                 pred_ratios = y_current / np.maximum(predictions, 1e-10)
@@ -1672,10 +299,9 @@ def fit_dispersion_trend(
             trend = params[0] + params[1] / np.maximum(means_arr, 1e-8)
             trend = np.maximum(trend, 1e-8)
             return trend
-            
-        except Exception:
-            # Fall back to polynomial fit
-            pass
+
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            return np.full_like(means_arr, _mean_dispersion_trend(disp_arr), dtype=np.float64)
     
     # Fallback: log-quadratic polynomial fit (original method)
     x = np.log(np.clip(means_arr[valid_for_fit], min_mean, None))
@@ -1696,256 +322,12 @@ def fit_dispersion_trend(
     return np.maximum(trend, 1e-8)
 
 
-def shrink_dispersions(
-    raw: ArrayLike,
-    trend: ArrayLike,
-    *,
-    prior_df: float | None = None,
-    min_prior_df: float = 1.0,
-    max_prior_df: float = 100.0,
-    outlier_sigma: float = 2.0,
-    n_iter: int = 5,
-) -> np.ndarray:
-    """Shrink dispersions toward fitted trend using empirical Bayes.
-    
-    This implements a DESeq2/PyDESeq2-style empirical Bayes shrinkage where the
-    prior variance is estimated from the distribution of log-dispersion residuals
-    around the trend using an iterative trimmed variance estimator.
-    
-    Genes with dispersions more than `outlier_sigma` standard deviations above 
-    the trend keep their MLE (not shrunken), matching PyDESeq2's outlier handling.
-    
-    The shrinkage formula is:
-        log(shrunk) = (prior_df * log(trend) + log(raw)) / (prior_df + 1)
-    
-    This is equivalent to a posterior mean estimate under a log-normal prior.
-    
-    Parameters
-    ----------
-    raw
-        Raw MLE dispersion estimates.
-    trend
-        Fitted mean-dispersion trend values.
-    prior_df
-        Prior degrees of freedom controlling shrinkage strength.
-        If None, estimated empirically from the data using iterative trimming.
-    min_prior_df
-        Minimum allowed prior degrees of freedom.
-    max_prior_df
-        Maximum allowed prior degrees of freedom.
-    outlier_sigma
-        Number of standard deviations above trend beyond which genes
-        keep their MLE dispersion (not shrunken). Set to inf to disable.
-    
-    Returns
-    -------
-    np.ndarray
-        Shrunken dispersion estimates.
-    """
-    raw_arr = np.asarray(raw, dtype=np.float64)
-    trend_arr = np.asarray(trend, dtype=np.float64)
-    shrunk = np.array(raw_arr, copy=True)
-    mask = (
-        np.isfinite(raw_arr)
-        & np.isfinite(trend_arr)
-        & (raw_arr > 0)
-        & (trend_arr > 0)
-    )
-    if not np.any(mask):
-        return shrunk
-    
-    log_raw = np.log(raw_arr[mask])
-    log_trend = np.log(trend_arr[mask])
-    residuals = log_raw - log_trend
-    
-    # PyDESeq2-style iterative trimmed variance estimator
-    # Iteratively exclude residuals outside 2.5 MAD of median to get robust prior_var
-    trim_threshold = 2.5
-    use_for_var = np.ones(len(residuals), dtype=bool)
-    
-    for _ in range(n_iter):
-        resid_subset = residuals[use_for_var]
-        if len(resid_subset) < 3:
-            break
-            
-        median_resid = np.median(resid_subset)
-        mad = np.median(np.abs(resid_subset - median_resid))
-        sigma_resid = 1.4826 * mad  # Scale MAD to approximate std dev
-        
-        if sigma_resid < 1e-8:
-            # Fallback to sample std
-            sigma_resid = max(np.std(resid_subset, ddof=1), 1e-4)
-        
-        # Update mask: include only residuals within trim_threshold * sigma
-        abs_dev = np.abs(residuals - median_resid)
-        use_for_var = abs_dev < trim_threshold * sigma_resid
-        
-        if use_for_var.sum() < 3:
-            use_for_var = np.ones(len(residuals), dtype=bool)
-            break
-    
-    # Final variance estimate from trimmed residuals
-    resid_subset = residuals[use_for_var]
-    median_resid = np.median(resid_subset)
-    mad = np.median(np.abs(resid_subset - median_resid))
-    sigma_resid = 1.4826 * mad
-    
-    # If variance is very small, use sample variance from trimmed set
-    if sigma_resid < 1e-4:
-        sigma_resid = max(np.std(resid_subset, ddof=1), 1e-4)
-    
-    prior_var = sigma_resid ** 2
-    
-    if prior_df is None:
-        # PyDESeq2 estimates prior_df from the variance of log-dispersion residuals
-        # Using the relationship: Var(log_disp) = trigamma(prior_df)
-        # Approximate: prior_df ≈ 1 / prior_var for log-normal approximation
-        if prior_var > 1e-8:
-            # Use trigamma inverse approximation for better accuracy
-            # For small prior_var, prior_df is large
-            prior_df = 1.0 / prior_var
-        else:
-            prior_df = max_prior_df
-        
-        prior_df = float(np.clip(prior_df, min_prior_df, max_prior_df))
-    
-    # Identify outliers: genes with dispersion > outlier_sigma * sigma above trend
-    # These genes keep their MLE (not shrunken) - PyDESeq2 behavior
-    is_outlier = residuals > outlier_sigma * sigma_resid
-    
-    # Apply shrinkage to non-outliers
-    log_post = (prior_df * log_trend + log_raw) / (prior_df + 1.0)
-    
-    # Non-outliers get shrunken values, outliers keep MLE
-    shrunk_values = np.where(is_outlier, np.exp(log_raw), np.exp(log_post))
-    shrunk[mask] = shrunk_values
-    
-    return shrunk
-
-
-def estimate_dispersion_map(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    trend: np.ndarray,
-    *,
-    prior_var: float | None = None,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-    n_grid: int = 25,
-    refine: bool = True,
-    n_jobs: int = -1,
-) -> np.ndarray:
-    """Estimate MAP dispersion using vectorized grid search + optional refinement.
-    
-    This implements PyDESeq2-style MAP estimation where the dispersion
-    is estimated by maximizing:
-        log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)
-    
-    The prior is log-normal: log(alpha) ~ N(log(trend), prior_var)
-    
-    **Optimization (v5)**: Uses fused Numba kernel that combines grid search
-    with Brent's method refinement in a single parallel pass over genes.
-    This eliminates joblib process spawning overhead, achieving ~2-3× speedup
-    over the previous joblib-based refinement while maintaining identical
-    accuracy to scipy's minimize_scalar.
-    
-    Default is n_grid=25, refine=True which provides optimal balance of
-    speed and accuracy. The Brent refinement makes grid size largely
-    irrelevant for accuracy (all grid sizes 15-50 achieve perfect correlation).
-    
-    Parameters
-    ----------
-    Y
-        Count matrix of shape (n_cells, n_genes).
-    mu
-        Fitted mean matrix of shape (n_cells, n_genes).
-    trend
-        Dispersion trend values of shape (n_genes,).
-    prior_var
-        Variance of the log-normal prior. If None, estimated from data
-        using the variance of log-dispersion residuals around trend.
-    min_disp
-        Minimum allowed dispersion value.
-    max_disp
-        Maximum allowed dispersion value.
-    n_grid
-        Number of grid points for initial search. More points = better
-        initial estimate but slower grid search. Default is 50 for good
-        accuracy (96% Top-100 overlap with PyDESeq2 without refinement).
-    refine
-        If True, refine the grid search result using Brent's method.
-        Default is True for best accuracy (99% Top-100 overlap with PyDESeq2).
-        Set to False for ~2× speedup if slight accuracy loss is acceptable.
-    n_jobs
-        Number of parallel jobs for refinement. -1 uses all cores.
-    
-    Returns
-    -------
-    np.ndarray
-        MAP dispersion estimates of shape (n_genes,).
-    """
-    from scipy.special import polygamma
-    
-    n_cells, n_genes = Y.shape
-    # Avoid copies if already float64
-    if Y.dtype != np.float64:
-        Y = np.asarray(Y, dtype=np.float64)
-    if mu.dtype != np.float64:
-        mu = np.asarray(mu, dtype=np.float64)
-    trend = np.asarray(trend, dtype=np.float64)
-    
-    # Clip mu in-place to avoid creating a copy
-    np.maximum(mu, 1e-10, out=mu)
-    
-    # Memory-optimized MLE estimation using Numba for speed
-    # Computes per-gene MLE dispersion without large intermediate arrays
-    dof = max(n_cells - 2, 1)
-    alpha_mle = _compute_mle_dispersion_numba(Y, mu, dof)
-    alpha_mle = np.clip(alpha_mle, min_disp, max_disp)
-    
-    # Estimate prior variance if not provided (PyDESeq2 style)
-    if prior_var is None:
-        log_alpha = np.log(np.maximum(alpha_mle, min_disp))
-        log_trend_arr = np.log(np.maximum(trend, min_disp))
-        valid = np.isfinite(log_alpha) & np.isfinite(log_trend_arr)
-        if np.sum(valid) > 10:
-            residuals = log_alpha[valid] - log_trend_arr[valid]
-            # Robust estimate using MAD (mean absolute deviation)
-            mad = np.median(np.abs(residuals - np.median(residuals)))
-            squared_logres = (1.4826 * mad) ** 2
-            # PyDESeq2 formula: max(squared_logres - polygamma_correction, 0.25)
-            num_vars = 2  # intercept + perturbation
-            polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
-            prior_var = max(squared_logres - polygamma_corr, 0.25)
-        else:
-            prior_var = 0.25
-    
-    log_trend = np.log(np.maximum(trend, min_disp))
-    log_min = np.log(min_disp)
-    log_max = np.log(max_disp)
-    
-    # Create grid of log-alpha values
-    log_alpha_grid = np.linspace(log_min, log_max, n_grid)
-    
-    # =========================================================================
-    # Fused grid search + golden section refinement (Numba-parallel)
-    # This is ~3-4× faster than separate grid search + joblib refinement
-    # by eliminating process spawning overhead and keeping everything in Numba
-    # =========================================================================
-    if refine:
-        # Use fused kernel with golden section refinement
-        best_log_alpha = _nb_map_grid_search_with_refinement_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var,
-            tol=1e-4,
-            max_refine_iter=20,
-        )
-        return np.exp(np.clip(best_log_alpha, log_min, log_max))
-    else:
-        # Grid search only (no refinement)
-        best_log_alpha, best_idx = _nb_map_grid_search_numba(
-            Y, mu, log_trend, log_alpha_grid, prior_var
-        )
-        return np.exp(np.clip(best_log_alpha, log_min, log_max))
+def _design_csr(design: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """``design`` as the CSR arrays the MAP kernels take for their Cox-Reid
+    adjustment: ``(indptr, indices, data, n_features)``."""
+    csr = sp.csr_matrix(np.asarray(design, dtype=np.float64))
+    return (csr.indptr.astype(np.int64), csr.indices.astype(np.int64),
+            csr.data.astype(np.float64), int(csr.shape[1]))
 
 
 def _estimate_apeglm_prior_scale(
@@ -1954,11 +336,11 @@ def _estimate_apeglm_prior_scale(
     init_scale: float = 1.0,
 ) -> float:
     """Estimate apeGLM prior scale parameter using PyDESeq2's adaptive method.
-    
+
     This implements the prior variance estimation from PyDESeq2's `fit_prior_var`
     function, which finds the scale parameter that balances the data likelihood
     with the Cauchy prior.
-    
+
     Parameters
     ----------
     mle_lfc
@@ -1967,32 +349,48 @@ def _estimate_apeglm_prior_scale(
         Standard errors of the MLE estimates.
     init_scale
         Initial guess for the scale parameter.
-    
+
     Returns
     -------
     float
         Estimated prior scale parameter for the Cauchy prior.
     """
-    mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
-    if not np.any(mask):
+    return _apeglm_prior_scale_from_blocks(lambda: [(mle_lfc, se)], init_scale)
+
+
+def _apeglm_prior_scale_from_blocks(blocks, init_scale: float = 1.0) -> float:
+    """:func:`_estimate_apeglm_prior_scale` over ``(mle_lfc, se)`` pieces:
+    ``blocks()`` yields them afresh for each evaluation of the objective, so
+    a result too large to hold can be read a block at a time. With one block
+    the sums, and so the scale, are exactly those of the whole arrays."""
+
+    def pieces():
+        for mle_lfc, se in blocks():
+            mle_lfc, se = np.asarray(mle_lfc), np.asarray(se)
+            mask = np.isfinite(mle_lfc) & np.isfinite(se) & (se > 0)
+            if np.any(mask):
+                yield mle_lfc[mask] ** 2, se[mask] ** 2
+
+    if next(pieces(), None) is None:
         return init_scale
-    
-    S = mle_lfc[mask] ** 2
-    D = se[mask] ** 2
-    
+
     def objective(a: float) -> float:
         """Objective function: find a such that weighted mean of (S-D) equals a."""
-        coeff = 1.0 / (2.0 * (a + D) ** 2)
-        return float(((S - D) * coeff).sum() / coeff.sum() - a)
-    
+        numerator = denominator = 0.0
+        for S, D in pieces():
+            coeff = 1.0 / (2.0 * (a + D) ** 2)
+            numerator += ((S - D) * coeff).sum()
+            denominator += coeff.sum()
+        return float(numerator / denominator - a)
+
     # Match PyDESeq2's _fit_prior_var exactly:
     # - If objective(min_var) < 0, return min_var (maximum shrinkage)
     # - Otherwise, find root in [min_var, max_var]
     min_var, max_var = 1e-6, 400.0
-    
+
     try:
         f_min = objective(min_var)
-        
+
         if f_min < 0:
             # No root exists above min_var, use min_var (max shrinkage)
             # This is the PyDESeq2 behavior when Var(LFC) < median(SE^2)
@@ -2003,7 +401,7 @@ def _estimate_apeglm_prior_scale(
     except Exception:
         # Fallback: use min_var for maximum shrinkage
         scale_sq = min_var
-    
+
     # PyDESeq2: prior_scale = min(sqrt(prior_var), 1.0)
     # No minimum floor on prior_scale - allow aggressive shrinkage
     return min(np.sqrt(scale_sq), 1.0)
@@ -2056,7 +454,9 @@ def _fit_gene_apeglm_lbfgsb(
     tol : float
         Convergence tolerance.
     mle_se_j : float
-        MLE standard error for fallback.
+        MLE standard error, returned unchanged whenever this function does not
+        fit the gene.  ``NaN`` there means the gene was never tested, and it
+        stays ``NaN`` rather than becoming a number that looks like a result.
         
     Returns
     -------
@@ -2073,7 +473,7 @@ def _fit_gene_apeglm_lbfgsb(
     
     # Skip genes with invalid data
     if not np.isfinite(disp) or disp <= 0 or not np.all(np.isfinite(beta_init)):
-        return beta_init, mle_se_j if np.isfinite(mle_se_j) else 1.0, False
+        return beta_init, mle_se_j, False
     
     # Safety check for very low dispersion genes (near-Poisson behavior)
     # With very low dispersion, the NB likelihood becomes flat and optimization
@@ -2081,7 +481,7 @@ def _fit_gene_apeglm_lbfgsb(
     # it uses per-comparison dispersion which produces more reasonable estimates.
     # For genes with disp < 0.01 and small MLE LFC, return MLE (no shrinkage).
     if disp < 0.01 and abs(beta_init[shrink_index]) < 1.0:
-        return beta_init, mle_se_j if np.isfinite(mle_se_j) else 1.0, True
+        return beta_init, mle_se_j, True
     
     size = 1.0 / disp  # NB size parameter (r in NB(r, p))
     
@@ -2215,10 +615,11 @@ def _fit_gene_apeglm_lbfgsb(
         cauchy_hess = 2 * (prior_scale_sq - beta_lfc**2) / (prior_scale_sq + beta_lfc**2)**2
         XtWX[shrink_index, shrink_index] += cauchy_hess
         
-        inv_hess = np.linalg.inv(XtWX)
-        se_map = np.sqrt(max(inv_hess[shrink_index, shrink_index], 1e-10))
+        unit = np.zeros(n_params)
+        unit[shrink_index] = 1.0
+        se_map = np.sqrt(max(np.linalg.solve(XtWX, unit)[shrink_index], 1e-10))
     except (np.linalg.LinAlgError, ValueError):
-        se_map = mle_se_j if np.isfinite(mle_se_j) else 1.0
+        se_map = mle_se_j
     
     return beta_map, se_map, converged
 
@@ -2369,27 +770,27 @@ def shrink_lfc_apeglm_from_stats(
     hybrid_base_mean_threshold: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Apply apeGLM-style shrinkage using pre-computed MLE statistics.
-    
+
     This is a memory-efficient, fully vectorized version of apeGLM shrinkage
     that uses pre-computed MLE coefficients and standard errors without
     requiring access to the full count matrix. It applies a Cauchy prior and
     finds the MAP estimate using a damped Newton-Raphson optimization across
     all genes simultaneously.
-    
-    **Accuracy improvements (v2)**:
-    1. Gene-specific prior scales based on expression level (sqrt(base_mean))
-    2. Moment-corrected SE using observed Fisher information approximation
-    3. Hybrid fallback: marks genes with |MLE|/SE > threshold or low expression
-       for full NB-GLM re-fitting to achieve Eff ρ ≥ 0.98
-    
-    The posterior mode is found by solving:
-        beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }
-    
+
+    Accuracy improvements (v2):
+
+    1. Gene-specific prior scales based on expression level (sqrt(base_mean)).
+    2. Moment-corrected SE using observed Fisher information approximation.
+    3. Hybrid fallback: marks genes with ``abs(MLE)/SE`` > threshold or low
+       expression for full NB-GLM re-fitting to achieve Eff rho >= 0.98.
+
+    The posterior mode is found by solving
+    ``beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }``
     which is the negative log posterior with a Cauchy prior.
-    
+
     This implementation uses a robust damped Newton method with Hessian
     clamping to ensure convergence even when the standard Hessian becomes
-    negative (which can happen when |beta| > prior_scale). This matches
+    negative (which can happen when ``abs(beta)`` > prior_scale). This matches
     PyDESeq2's behavior which uses L-BFGS-B for robustness.
     
     Parameters
@@ -2418,9 +819,9 @@ def shrink_lfc_apeglm_from_stats(
         be shrunk more aggressively. Default True.
     hybrid_fallback
         If True, return a mask indicating genes that need full NB-GLM re-fitting
-        due to problematic statistics (large |MLE|/SE or low expression).
+        due to problematic statistics (large ``abs(MLE)/SE`` or low expression).
     hybrid_mle_se_threshold
-        Genes with |MLE|/SE > this threshold are marked for full re-fitting.
+        Genes with ``abs(MLE)/SE`` > this threshold are marked for full re-fitting.
     hybrid_base_mean_threshold
         Genes with base_mean < this threshold are marked for full re-fitting.
     
@@ -2575,606 +976,6 @@ def shrink_lfc_apeglm_from_stats(
     return shrunk_lfc, shrunk_se, converged, needs_full_refit
 
 
-def compute_cooks_distance_batch(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    dispersion: np.ndarray,
-    n_params: int = 2,
-) -> np.ndarray:
-    """Compute Cook's distance for each observation in a batch of genes.
-    
-    Cook's distance measures the influence of each observation on the fitted
-    model. Large values indicate potential outliers that disproportionately
-    affect the estimates.
-    
-    For GLMs, Cook's distance is computed as:
-        D_i = (r_i^2 / p) * (h_ii / (1 - h_ii)^2)
-    
-    where r_i is the Pearson residual, p is the number of parameters,
-    and h_ii is the leverage (diagonal of the hat matrix).
-    
-    Parameters
-    ----------
-    Y
-        Count matrix of shape (n_cells, n_genes).
-    mu
-        Fitted mean matrix of shape (n_cells, n_genes).
-    dispersion
-        Dispersion estimates of shape (n_genes,).
-    n_params
-        Number of model parameters (default 2 for intercept + treatment).
-    
-    Returns
-    -------
-    np.ndarray
-        Cook's distance matrix of shape (n_cells, n_genes).
-    """
-    n_cells, n_genes = Y.shape
-    
-    # Compute variance: V = mu + dispersion * mu^2
-    variance = mu + dispersion[None, :] * mu ** 2
-    variance = np.maximum(variance, 1e-10)
-    
-    # Pearson residuals: r = (Y - mu) / sqrt(V)
-    resid = (Y - mu) / np.sqrt(variance)
-    
-    # Weights for NB GLM: W = mu^2 / V
-    weights = mu ** 2 / variance
-    
-    # Approximate leverage using average weight contribution
-    # For balanced designs: h_ii ≈ W_i / sum(W)
-    sum_weights = np.sum(weights, axis=0, keepdims=True)
-    leverage = weights / np.maximum(sum_weights, 1e-10)
-    
-    # Clip leverage to avoid division by zero
-    leverage = np.clip(leverage, 1e-10, 1 - 1e-10)
-    
-    # Cook's distance: D = (r^2 / p) * (h / (1-h)^2)
-    cooks = (resid ** 2 / n_params) * (leverage / (1 - leverage) ** 2)
-    
-    return cooks
-
-
-def filter_outliers_cooks(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    dispersion: np.ndarray,
-    *,
-    n_params: int = 2,
-    threshold_quantile: float = 0.99,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Identify and replace outlier counts based on Cook's distance.
-    
-    Following DESeq2's approach:
-    1. Compute Cook's distance for each observation
-    2. Identify outliers where Cook's D > F(threshold_quantile, p, n-p)
-    3. Replace outlier counts with trimmed mean from non-outlier samples
-    
-    Parameters
-    ----------
-    Y
-        Count matrix of shape (n_cells, n_genes).
-    mu
-        Fitted mean matrix of shape (n_cells, n_genes).
-    dispersion
-        Dispersion estimates of shape (n_genes,).
-    n_params
-        Number of model parameters.
-    threshold_quantile
-        Quantile of F distribution for outlier threshold.
-    
-    Returns
-    -------
-    Tuple[np.ndarray, np.ndarray]
-        - Y_filtered: Count matrix with outliers replaced
-        - outlier_mask: Boolean matrix indicating outliers (n_cells, n_genes)
-    """
-    from scipy import stats
-    
-    n_cells, n_genes = Y.shape
-    
-    # Compute Cook's distance
-    cooks = compute_cooks_distance_batch(Y, mu, dispersion, n_params)
-    
-    # F distribution threshold
-    dfn = n_params
-    dfd = max(n_cells - n_params, 1)
-    threshold = stats.f.ppf(threshold_quantile, dfn, dfd)
-    
-    # Identify outliers
-    outlier_mask = cooks > threshold
-    
-    # Replace outliers with trimmed mean
-    Y_filtered = Y.copy()
-    
-    for g in range(n_genes):
-        outliers_g = outlier_mask[:, g]
-        if np.any(outliers_g):
-            non_outlier_counts = Y[~outliers_g, g]
-            if len(non_outlier_counts) > 0:
-                # Use trimmed mean (exclude top/bottom 10%)
-                trimmed_mean = stats.trim_mean(non_outlier_counts, 0.1)
-                Y_filtered[outliers_g, g] = trimmed_mean
-    
-    return Y_filtered, outlier_mask
-
-
-def estimate_covariate_effects_streaming(
-    backed_adata,
-    *,
-    obs_df: "pd.DataFrame",
-    perturbation_labels: np.ndarray,
-    control_label: str,
-    covariate_columns: Sequence[str],
-    size_factors: np.ndarray,
-    chunk_size: int = 2048,
-    poisson_iter: int = 10,
-    tol: float = 1e-6,
-    return_intercept: bool = False,
-) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
-    """Estimate global intercept and covariate effects using control cells only.
-    
-    This function fits a Poisson regression using only control cells to estimate:
-    - An intercept (baseline expression for control cells)
-    - Covariate effects (if any covariates are specified)
-    
-    By using only control cells, the intercept represents the true control baseline
-    that can then be used as an offset in per-perturbation fitting. This ensures
-    that perturbation effects are properly estimated as deviations from control.
-    
-    For the intercept-only case (no covariates), the closed-form MLE is used:
-        intercept = log(sum(Y) / sum(size_factors))
-    
-    When covariates are present, IRLS is used with proper per-gene weighting.
-    
-    Parameters
-    ----------
-    backed_adata
-        Backed AnnData object opened in read mode.
-    obs_df
-        Full obs DataFrame with all cells (already loaded).
-    perturbation_labels
-        Array of perturbation labels for all cells.
-    control_label
-        The label identifying control cells.
-    covariate_columns
-        List of covariate column names to include.
-    size_factors
-        Per-cell size factors (length n_cells).
-    chunk_size
-        Number of cells to process per chunk.
-    poisson_iter
-        Number of Poisson IRLS iterations.
-    tol
-        Convergence tolerance.
-    return_intercept
-        If True, also return the global intercept coefficients. This is useful
-        for joint fitting where the intercept should be shared across all
-        perturbation comparisons.
-        
-    Returns
-    -------
-    np.ndarray or tuple
-        If return_intercept is False:
-            Covariate effects of shape (n_covariates, n_genes). These are the
-            log-scale regression coefficients for each covariate.
-        If return_intercept is True:
-            Tuple of (covariate_effects, intercept) where:
-            - covariate_effects has shape (n_covariates, n_genes)
-            - intercept has shape (n_genes,) representing the control baseline
-    """
-    import pandas as pd
-    from .data import iter_matrix_chunks
-    
-    n_cells = backed_adata.n_obs
-    n_genes = backed_adata.n_vars
-    
-    # Identify control cells
-    control_mask = (perturbation_labels == control_label)
-    control_indices = np.where(control_mask)[0]
-    n_control = len(control_indices)
-    
-    if n_control == 0:
-        raise ValueError(f"No control cells found with label '{control_label}'")
-    
-    # Build covariate portion of design matrix (for control cells only)
-    cov_matrices = []
-    cov_names: list[str] = []
-    for column in covariate_columns:
-        if column not in obs_df.columns:
-            raise KeyError(f"Covariate '{column}' not found in obs_df")
-        series = obs_df[column].iloc[control_indices]
-        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
-            dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
-            if dummies.shape[1] > 0:
-                cov_matrices.append(dummies.to_numpy(dtype=np.float64))
-                cov_names.extend(dummies.columns.astype(str).tolist())
-        else:
-            cov_matrices.append(series.to_numpy(dtype=np.float64).reshape(-1, 1))
-            cov_names.append(str(column))
-    
-    n_covariates = sum(m.shape[1] for m in cov_matrices) if cov_matrices else 0
-    
-    # Size factors for control cells
-    size_factors_control = size_factors[control_indices]
-    
-    if n_covariates == 0:
-        # No covariates: use closed-form MLE for intercept
-        # intercept = log(sum(Y) / sum(size_factors)) for each gene
-        # This is the exact MLE for Poisson with offset
-        
-        sum_counts = np.zeros(n_genes, dtype=np.float64)
-        
-        control_idx = 0
-        for slc, chunk in iter_matrix_chunks(
-            backed_adata, axis=0, chunk_size=chunk_size, convert_to_dense=True
-        ):
-            chunk_control_mask = control_mask[slc]
-            if not np.any(chunk_control_mask):
-                continue
-            
-            Y_chunk_control = np.asarray(chunk[chunk_control_mask], dtype=np.float64)
-            sum_counts += Y_chunk_control.sum(axis=0)
-        
-        sum_size_factors = size_factors_control.sum()
-        beta_intercept = np.log(np.maximum(sum_counts / sum_size_factors, 1e-12))
-        beta_cov = np.zeros((0, n_genes), dtype=np.float64)
-        
-        if return_intercept:
-            return beta_cov, beta_intercept
-        return beta_cov
-    
-    # With covariates: use IRLS with proper per-gene weighting
-    # We need to solve separately for each gene since weights differ per gene
-    cov_matrix_control = np.hstack(cov_matrices)  # (n_control, n_covariates)
-    
-    # Design matrix: intercept + covariates (control cells only)
-    # Shape: (n_control, 1 + n_covariates)
-    n_features = 1 + n_covariates
-    
-    # Initialize beta coefficients
-    beta = np.zeros((n_features, n_genes), dtype=np.float64)
-    
-    # Log size factors for control cells
-    log_size_factors_control = np.log(np.maximum(size_factors[control_indices], 1e-12))
-    
-    # Poisson IRLS with streaming - only process control cells
-    # We need to map global chunk indices to control cell indices
-    for iteration in range(poisson_iter):
-        # Accumulate X^T W X and X^T W z across chunks
-        xtwx_accum = np.zeros((n_features, n_features), dtype=np.float64)
-        xtwz_accum = np.zeros((n_features, n_genes), dtype=np.float64)
-        
-        control_idx = 0  # Track position within control cells
-        for slc, chunk in iter_matrix_chunks(
-            backed_adata, axis=0, chunk_size=chunk_size, convert_to_dense=True
-        ):
-            # Find which cells in this chunk are control cells
-            chunk_control_mask = control_mask[slc]
-            
-            if not np.any(chunk_control_mask):
-                continue
-            
-            # Extract control cells from this chunk
-            Y_chunk_control = np.asarray(chunk[chunk_control_mask], dtype=np.float64)
-            n_chunk_control = Y_chunk_control.shape[0]
-            
-            # Get indices of control cells in this chunk (relative to all control cells)
-            chunk_control_count = chunk_control_mask.sum()
-            control_slice = slice(control_idx, control_idx + chunk_control_count)
-            control_idx += chunk_control_count
-            
-            # Build design for control cells in this chunk
-            X_chunk = np.empty((n_chunk_control, n_features), dtype=np.float64)
-            X_chunk[:, 0] = 1.0  # Intercept
-            if n_covariates > 0:
-                X_chunk[:, 1:] = cov_matrix_control[control_slice]
-            
-            offset_chunk = log_size_factors_control[control_slice]
-            
-            # Compute eta, mu for this chunk
-            eta = X_chunk @ beta + offset_chunk[:, None]
-            eta = np.clip(eta, -20.0, 20.0)
-            mu = np.exp(eta)
-            mu = np.maximum(mu, 1e-6)
-            
-            # Poisson weights = mu
-            W = mu  # (n_chunk_control, n_genes)
-            
-            # Working response: z = eta - offset + (y - mu) / mu
-            z = eta - offset_chunk[:, None] + (Y_chunk_control - mu) / np.maximum(mu, 1e-6)
-            
-            # Accumulate X^T W X: sum over genes, then over samples
-            # X^T W X = sum_g sum_i W[i,g] * X[i,:,None] * X[i,None,:]
-            # We use average weights across genes for a shared XtWX
-            W_sum = W.sum(axis=1)  # (n_chunk_control,)
-            xtwx_accum += X_chunk.T @ (W_sum[:, None] * X_chunk)
-            
-            # Accumulate X^T W z per gene
-            Wz = W * z  # (n_chunk_control, n_genes)
-            xtwz_accum += X_chunk.T @ Wz  # (n_features, n_genes)
-        
-        # Solve for beta: (X^T W X) beta = X^T W z
-        # Add ridge penalty for stability
-        ridge = 1e-6 * np.eye(n_features)
-        try:
-            beta_new = np.linalg.solve(xtwx_accum + ridge, xtwz_accum)
-        except np.linalg.LinAlgError:
-            beta_new = np.linalg.lstsq(xtwx_accum + ridge, xtwz_accum, rcond=None)[0]
-        
-        # Check convergence
-        max_diff = np.max(np.abs(beta_new - beta))
-        beta = beta_new
-        
-        if max_diff < tol:
-            break
-    
-    # Extract intercept (first row)
-    beta_intercept = beta[0, :]  # (n_genes,)
-    
-    # Extract covariate effects
-    beta_cov = beta[1:, :]  # (n_covariates, n_genes)
-    
-    if return_intercept:
-        return beta_cov, beta_intercept
-    return beta_cov
-
-
-def _nb_deviance(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    alpha: float,
-) -> float:
-    """Compute negative binomial deviance.
-    
-    Deviance = 2 * sum(y * log(y/mu) - (y + r) * log((y + r) / (mu + r)))
-    where r = 1/alpha and terms with y=0 use limit y*log(y) -> 0.
-    
-    Parameters
-    ----------
-    Y : (n_samples,) or (n_samples, n_genes)
-        Observed counts.
-    mu : same shape as Y
-        Fitted mean values.
-    alpha : float
-        Dispersion parameter.
-        
-    Returns
-    -------
-    deviance : float
-        Total deviance.
-    """
-    r = 1.0 / max(alpha, 1e-10)
-    Y_safe = np.maximum(Y, 1e-10)
-    mu_safe = np.maximum(mu, 1e-10)
-    
-    # Term 1: y * log(y/mu), with limit 0 when y=0
-    term1 = np.where(Y > 0, Y * np.log(Y_safe / mu_safe), 0.0)
-    
-    # Term 2: (y + r) * log((y + r) / (mu + r))
-    term2 = (Y + r) * np.log((Y + r) / (mu_safe + r))
-    
-    return float(2.0 * np.sum(term1 - term2))
-
-
-def estimate_global_dispersion_streaming(
-    backed_adata,
-    *,
-    obs_df: "pd.DataFrame",
-    perturbation_labels: np.ndarray,
-    control_label: str,
-    covariate_columns: Sequence[str],
-    size_factors: np.ndarray,
-    beta_intercept: np.ndarray,
-    beta_cov: np.ndarray | None = None,
-    beta_perturbation: np.ndarray | None = None,
-    chunk_size: int = 2048,
-    dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
-    poisson_iter: int = 10,
-    tol: float = 1e-6,
-) -> np.ndarray:
-    """Estimate global per-gene dispersion using all cells via streaming.
-    
-    This function streams through all cells to estimate dispersion for each gene
-    using a full design matrix. The dispersion is estimated using all conditions
-    together, which provides more stable estimates than per-perturbation estimation,
-    similar to how PyDESeq2 estimates dispersion from all samples.
-    
-    The function uses the pre-estimated intercept, perturbation effects, and 
-    covariate effects to compute fitted values (mu), then estimates dispersion 
-    from the residuals using method-of-moments.
-    
-    Parameters
-    ----------
-    backed_adata
-        Backed AnnData object opened in read mode.
-    obs_df
-        Full obs DataFrame with all cells (already loaded).
-    perturbation_labels
-        Array of perturbation labels for all cells.
-    control_label
-        The label identifying control cells (used as reference level).
-    covariate_columns
-        List of covariate column names to include.
-    size_factors
-        Per-cell size factors (length n_cells).
-    beta_intercept
-        Pre-estimated global intercept coefficients, shape (n_genes,).
-    beta_cov
-        Pre-estimated covariate effects, shape (n_covariates, n_genes).
-        If None or empty, no covariate adjustment is applied.
-    beta_perturbation
-        Pre-estimated perturbation effects, shape (n_perturbations, n_genes).
-        If None, perturbation effects are estimated via Poisson IRLS.
-    chunk_size
-        Number of cells to process per chunk.
-    dispersion_method
-        Method for dispersion estimation:
-        - "moments": Method-of-moments (fast but less accurate)
-        - "cox-reid": Cox-Reid adjusted profile likelihood (more accurate)
-    poisson_iter
-        Number of Poisson IRLS iterations for refining mu estimates.
-        Only used if beta_perturbation is None.
-    tol
-        Convergence tolerance.
-        
-    Returns
-    -------
-    np.ndarray
-        Dispersion estimates of shape (n_genes,). These are the alpha values
-        for the negative binomial distribution: Var(Y) = mu + alpha * mu^2.
-    """
-    import pandas as pd
-    from .data import iter_matrix_chunks
-    
-    n_cells = backed_adata.n_obs
-    n_genes = backed_adata.n_vars
-    
-    # Build perturbation indicator matrix (one-hot, control as reference)
-    unique_labels = np.unique(perturbation_labels)
-    non_control = unique_labels[unique_labels != control_label]
-    n_perturbations = len(non_control)
-    
-    # Create label-to-index mapping
-    label_to_idx = {label: i for i, label in enumerate(non_control)}
-    cell_pert_idx = np.full(n_cells, -1, dtype=np.int32)
-    for i, label in enumerate(perturbation_labels):
-        if label != control_label:
-            cell_pert_idx[i] = label_to_idx[label]
-    
-    # Build covariate matrix
-    cov_matrices = []
-    for column in covariate_columns:
-        if column not in obs_df.columns:
-            continue
-        series = obs_df[column]
-        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
-            dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
-            if dummies.shape[1] > 0:
-                cov_matrices.append(dummies.to_numpy(dtype=np.float64))
-        else:
-            cov_matrices.append(series.to_numpy(dtype=np.float64).reshape(-1, 1))
-    
-    if cov_matrices:
-        cov_matrix = np.hstack(cov_matrices)
-    else:
-        cov_matrix = np.zeros((n_cells, 0), dtype=np.float64)
-    n_covariates = cov_matrix.shape[1]
-    
-    # Full design: intercept + perturbations + covariates
-    n_features = 1 + n_perturbations + n_covariates
-    
-    # Log size factors for offset
-    log_size_factors = np.log(np.maximum(size_factors, 1e-12))
-    
-    # Use provided perturbation effects or estimate them
-    if beta_perturbation is not None:
-        # Use pre-computed perturbation effects
-        beta_pert = beta_perturbation.copy()
-    else:
-        # Estimate perturbation effects via Poisson IRLS
-        beta_pert = np.zeros((n_perturbations, n_genes), dtype=np.float64)
-        
-        for iteration in range(poisson_iter):
-            # Accumulate for perturbation effects (diagonal structure)
-            pert_xtwx_diag = np.zeros(n_perturbations, dtype=np.float64)
-            pert_xtwz = np.zeros((n_perturbations, n_genes), dtype=np.float64)
-            
-            for slc, chunk in iter_matrix_chunks(
-                backed_adata, axis=0, chunk_size=chunk_size, convert_to_dense=True
-            ):
-                Y_chunk = np.asarray(chunk, dtype=np.float64)
-                n_chunk = Y_chunk.shape[0]
-                
-                offset_chunk = log_size_factors[slc]
-                pert_idx_chunk = cell_pert_idx[slc]
-                cov_chunk = cov_matrix[slc] if n_covariates > 0 else None
-                
-                # Compute eta
-                eta = beta_intercept[None, :] + offset_chunk[:, None]
-                pert_mask = pert_idx_chunk >= 0
-                if np.any(pert_mask):
-                    eta[pert_mask] += beta_pert[pert_idx_chunk[pert_mask], :]
-                if n_covariates > 0 and cov_chunk is not None and beta_cov is not None:
-                    eta += cov_chunk @ beta_cov
-                
-                eta = np.clip(eta, -20.0, 20.0)
-                mu = np.exp(eta)
-                mu = np.maximum(mu, 1e-6)
-                
-                # Poisson weights
-                W = mu
-                W_sum = W.sum(axis=1)
-                
-                # Working response
-                z_full = eta - offset_chunk[:, None] + (Y_chunk - mu) / np.maximum(mu, 1e-6)
-                # Subtract fixed effects
-                z_pert = z_full - beta_intercept[None, :]
-                if n_covariates > 0 and cov_chunk is not None and beta_cov is not None:
-                    z_pert = z_pert - cov_chunk @ beta_cov
-                
-                Wz = W * z_pert
-                
-                # Accumulate (diagonal structure)
-                for i in range(n_chunk):
-                    p_idx = pert_idx_chunk[i]
-                    if p_idx >= 0:
-                        pert_xtwx_diag[p_idx] += W_sum[i]
-                        pert_xtwz[p_idx, :] += Wz[i, :]
-            
-            # Solve for perturbation effects (diagonal system)
-            ridge = 1e-6
-            D_inv = 1.0 / np.maximum(pert_xtwx_diag + ridge, 1e-12)
-            beta_pert_new = D_inv[:, None] * pert_xtwz
-            
-            max_diff = np.max(np.abs(beta_pert_new - beta_pert))
-            beta_pert = beta_pert_new
-            
-            if max_diff < tol:
-                break
-    
-    # Now compute dispersion using method of moments, streaming through data
-    numerator_sum = np.zeros(n_genes, dtype=np.float64)
-    n_total = 0
-    
-    for slc, chunk in iter_matrix_chunks(
-        backed_adata, axis=0, chunk_size=chunk_size, convert_to_dense=True
-    ):
-        Y_chunk = np.asarray(chunk, dtype=np.float64)
-        n_chunk = Y_chunk.shape[0]
-        n_total += n_chunk
-        
-        offset_chunk = log_size_factors[slc]
-        pert_idx_chunk = cell_pert_idx[slc]
-        cov_chunk = cov_matrix[slc] if n_covariates > 0 else None
-        
-        # Compute mu using full model
-        eta = beta_intercept[None, :] + offset_chunk[:, None]
-        pert_mask = pert_idx_chunk >= 0
-        if np.any(pert_mask):
-            eta[pert_mask] += beta_pert[pert_idx_chunk[pert_mask], :]
-        if n_covariates > 0 and cov_chunk is not None and beta_cov is not None:
-            eta += cov_chunk @ beta_cov
-        
-        eta = np.clip(eta, -20.0, 20.0)
-        mu = np.exp(eta)
-        mu = np.maximum(mu, 1e-6)
-        
-        # Method of moments: (y - mu)^2 - y over mu^2
-        resid = Y_chunk - mu
-        numerator = (resid * resid - Y_chunk) / np.maximum(mu * mu, 1e-12)
-        numerator_sum += numerator.sum(axis=0)
-    
-    # Degrees of freedom
-    dof = max(n_total - n_features, 1)
-    dispersion = np.clip(numerator_sum / dof, 1e-8, 1e6)
-    
-    # Handle invalid values
-    dispersion = np.where(np.isfinite(dispersion), dispersion, 0.1)
-    
-    return dispersion
-
-
 class NBGLMBatchFitter:
     """Vectorized batch fitter for NB GLM across multiple genes.
     
@@ -3200,6 +1001,12 @@ class NBGLMBatchFitter:
         Minimum fitted mean to avoid numerical issues.
     min_total_count
         Minimum total count for a gene to be fitted.
+    family
+        ``"nb"`` (default) fits a negative binomial and estimates the
+        dispersion; ``"poisson"`` fits a genuine Poisson GLM, whose variance
+        is the mean.  A Poisson fit is not an NB fit with a small estimated
+        dispersion: the weights are ``mu`` rather than ``mu / (1 + alpha mu)``
+        and no dispersion is estimated.  ``dispersion`` is reported as 0.
     """
     
     def __init__(
@@ -3211,9 +1018,10 @@ class NBGLMBatchFitter:
         tol: float = 1e-6,
         poisson_init_iter: int = 5,
         dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
-        min_mu: float = 0.5,
+        min_mu: float = 0.0,
         min_total_count: float = 1.0,
         ridge_penalty: float = 1e-6,
+        family: Literal["nb", "poisson"] = "nb",
     ) -> None:
         self.design = np.asarray(design, dtype=np.float64)
         if self.design.ndim != 2:
@@ -3224,22 +1032,34 @@ class NBGLMBatchFitter:
             if offset is not None
             else np.zeros(self.n_samples, dtype=np.float64)
         )
+        if family not in ("nb", "poisson"):
+            raise ValueError(f"family must be 'nb' or 'poisson', got {family!r}")
+        self.family = family
         self.max_iter = int(max_iter)
         self.tol = tol
         self.poisson_init_iter = int(max(0, poisson_init_iter))
         self.dispersion_method = dispersion_method
         self.min_mu = min_mu
+        self._eta_min = eta_floor(min_mu)
         self.min_total_count = min_total_count
         self.ridge_penalty = ridge_penalty
         
-        # Precompute X^T X for efficiency
-        self._xtx = self.design.T @ self.design
+        # The normal equations are solved in a unit-root-mean-square column
+        # basis and the coefficients are mapped back, so a design whose columns
+        # differ by orders of magnitude does not make X'WX ill-conditioned.
+        # Callers see the original parameterisation throughout.
+        self._design_scaled, self._col_scale = precondition_columns(self.design)
+        # A ridge of `r` on the scaled coefficients is a ridge of
+        # `r * scale_j**2` on the caller's, so the penalty has to be divided
+        # by the scale to mean what the caller asked for.
+        self._ridge_scaled = self.ridge_penalty / self._col_scale**2
     
     def fit_batch(
         self, 
         counts: ArrayLike,
         gene_batch_size: int | Literal["auto"] | None = "auto",
         use_numba: bool = True,
+        fixed_dispersion: ArrayLike | None = None,
     ) -> NBGLMBatchResult:
         """Fit NB GLM for all genes in the count matrix.
         
@@ -3257,6 +1077,9 @@ class NBGLMBatchFitter:
         use_numba
             Whether to use Numba-accelerated IRLS for 2-feature models.
             Default True for better memory efficiency.
+        fixed_dispersion
+            Per-gene NB dispersion of shape ``(n_genes,)`` to hold fixed
+            instead of estimating it.  Ignored when ``family="poisson"``.
             
         Returns
         -------
@@ -3283,6 +1106,16 @@ class NBGLMBatchFitter:
         n_iter = np.zeros(n_genes, dtype=np.int32)
         deviance = np.full(n_genes, np.nan, dtype=np.float64)
         
+        if fixed_dispersion is None:
+            fixed_alpha = None
+        else:
+            fixed_alpha = np.asarray(fixed_dispersion, dtype=np.float64).ravel()
+            if fixed_alpha.shape != (n_genes,):
+                raise ValueError(
+                    f"fixed_dispersion must have shape ({n_genes},), "
+                    f"got {fixed_alpha.shape}"
+                )
+
         # Check which genes have sufficient counts
         total_counts = Y.sum(axis=0)
         valid_genes = total_counts >= self.min_total_count
@@ -3301,21 +1134,22 @@ class NBGLMBatchFitter:
         # Calculate gene batch size
         if gene_batch_size == "auto":
             gene_batch_size = _estimate_gene_batch_size_fitter(
-                self.n_samples, n_valid, n_work_arrays=4, target_mb=100.0
+                self.n_samples, n_valid, n_work_arrays=8, target_mb=100.0
             )
         elif gene_batch_size is None:
             gene_batch_size = n_valid  # Process all at once
         
         # Use Numba path for 2-feature case (intercept + perturbation)
         # This is much more memory efficient as it uses per-gene loops
-        if use_numba and n_features == 2:
+        if use_numba and n_features == 2 and self.family == "nb" and fixed_alpha is None:
             return self._fit_batch_numba(
                 Y, Y_valid, valid_genes, valid_indices, n_genes, gene_batch_size
             )
         
         # Fallback to batched NumPy implementation
         return self._fit_batch_numpy_batched(
-            Y, Y_valid, valid_genes, valid_indices, n_genes, gene_batch_size
+            Y, Y_valid, valid_genes, valid_indices, n_genes, gene_batch_size,
+            fixed_alpha=fixed_alpha,
         )
     
     def _fit_batch_numba(
@@ -3331,6 +1165,14 @@ class NBGLMBatchFitter:
         
         Uses per-gene Numba loops which are more memory efficient than
         vectorized operations across all genes.
+
+        The kernel holds the dispersion fixed, so -- as in
+        :meth:`_fit_batch_numpy_batched` -- it is run twice: once at the
+        dispersion the warm-start means imply, and again at the dispersion the
+        resulting NB means imply.  Fitting once at a placeholder dispersion and
+        reporting a separately estimated one would mean the coefficients,
+        their standard errors and the reported dispersion did not describe the
+        same model.
         """
         n_valid = Y_valid.shape[1]
         n_features = self.n_features
@@ -3349,40 +1191,50 @@ class NBGLMBatchFitter:
         # Poisson warm start
         if self.poisson_init_iter > 0:
             beta_init = self._poisson_warm_start_batch(Y_valid, beta_init)
-        
-        # Initial dispersion (MoM)
-        alpha = np.full(n_valid, 0.1, dtype=np.float64)
-        
-        # Run Numba IRLS
-        beta_result, se_result, conv_result, iter_result = _irls_batch_numba(
-            Y_valid,
-            self.design,
-            self.offset,
-            alpha,
-            beta_init,
-            self.max_iter,
-            self.tol,
-            self.min_mu,
-            self.ridge_penalty,
+
+        def run(alpha_fixed, beta_start):
+            beta_out, conv_out, iter_out = _irls_batch_numba(
+                Y_valid,
+                self.design,
+                self.offset,
+                alpha_fixed,
+                beta_start,
+                self.max_iter,
+                self.tol,
+                self.min_mu,
+                self.ridge_penalty,
+            )
+            eta_out = self.offset[:, None] + self.design @ beta_out
+            np.clip(eta_out, self._eta_min, ETA_MAX, out=eta_out)
+            return beta_out, conv_out, iter_out, np.exp(eta_out)
+
+        # Dispersion from the warm-start means, then a fit with it held fixed.
+        mu_start = np.exp(
+            np.clip(
+                self.offset[:, None] + self.design @ beta_init,
+                self._eta_min,
+                ETA_MAX,
+            )
         )
-        
-        # Compute final dispersion using MoM
-        mu_final = np.zeros_like(Y_valid)
-        for g in range(n_valid):
-            eta = self.offset + self.design @ beta_result[:, g]
-            eta = np.clip(eta, np.log(self.min_mu), 20.0)
-            mu_final[:, g] = np.exp(eta)
-        mu_final = np.maximum(mu_final, self.min_mu)
-        
-        resid = Y_valid - mu_final
-        dof = max(self.n_samples - n_features, 1)
-        alpha_final = np.sum((resid * resid - Y_valid) / np.maximum(mu_final * mu_final, self.min_mu), axis=0) / dof
-        alpha_final = np.clip(alpha_final, 1e-8, 1e6)
-        
-        # Cox-Reid refinement if requested
+        alpha = self._moments_dispersion_batch(Y_valid, mu_start)
+        beta_result, _, first_iters, mu_first = run(alpha, beta_init)
+
+        # Re-estimate from the fitted means and refit, so the returned
+        # coefficients, standard errors and dispersion agree.
+        alpha_final = self._moments_dispersion_batch(Y_valid, mu_first)
         if self.dispersion_method == "cox-reid":
-            alpha_final = self._refine_dispersion_cox_reid_batch(Y_valid, mu_final, alpha_final)
-        
+            alpha_final = self._refine_dispersion_cox_reid_batch(
+                Y_valid, mu_first, alpha_final
+            )
+        beta_result, conv_result, second_iters, mu_final = run(
+            alpha_final, beta_result
+        )
+        iter_result = first_iters + second_iters
+        # Standard errors from the unfloored mean; see _wald_weights.
+        se_result = self._compute_se_batch(
+            self._wald_weights(beta_result, alpha_final)
+        )
+
         # Compute deviance
         dev_valid = self._compute_deviance_batch(Y_valid, mu_final, alpha_final)
         
@@ -3399,6 +1251,208 @@ class NBGLMBatchFitter:
             converged=converged, n_iter=n_iter, deviance=deviance
         )
     
+    def _moments_dispersion_batch(
+        self, Y: np.ndarray, mu: np.ndarray
+    ) -> np.ndarray:
+        """Method-of-moments NB dispersion from fitted means.
+
+        ``alpha = sum((y - mu)^2 - mu) / sum(mu^2)`` per gene with a
+        degrees-of-freedom correction, clipped to a sane range.
+        """
+        resid = Y - mu
+        numerator = np.sum((resid * resid - Y) / np.maximum(mu * mu, EPS), axis=0)
+        dof = max(self.n_samples - self.n_features, 1)
+        alpha = numerator / dof
+        return np.clip(np.where(np.isfinite(alpha), alpha, 1e-8), 1e-8, 1e6)
+
+    def _irls_at_fixed_dispersion(
+        self,
+        Y: np.ndarray,
+        alpha: np.ndarray | None,
+        beta: np.ndarray,
+        *,
+        family: Literal["nb", "poisson"] = "nb",
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """IRLS to convergence with the dispersion held fixed.
+
+        Three properties distinguish this from a plain Newton loop:
+
+        * **Convergence on relative deviance *and* coefficient change.** The
+          deviance is the quantity being minimised and a coefficient-change
+          test alone can stop early on a flat direction, but near the optimum
+          the deviance is quadratic in the coefficients, so a relative
+          deviance tolerance of ``t`` only pins the coefficients to about
+          ``sqrt(t)``.  Requiring both keeps ``tol`` meaning what it has
+          always meant here -- a coefficient tolerance -- while still refusing
+          to call a gene converged on a step that raised its deviance.
+        * **Step halving.** A Newton step that increases the deviance is
+          retried at half the distance towards the *same* full Newton point,
+          up to ``_MAX_STEP_HALVINGS`` times, and a shortened step is taken
+          only if it improves on the deviance the iteration started from.
+          This is what keeps genes with extreme counts from diverging.  A gene
+          for which no step in that range improves the deviance is left where
+          it was and reported as not converged, rather than being moved
+          uphill -- unless it is resting on the mean floor, where the line
+          search says nothing about the fit (see the loop).
+        * **An active set.** A gene that has converged -- or that ran out of
+          step halvings -- is frozen and dropped from later iterations, so the
+          per-iteration cost follows the number of genes still moving rather
+          than the whole batch.
+
+        Parameters
+        ----------
+        Y
+            Counts, shape ``(n_samples, n_genes)``.
+        alpha
+            NB dispersion per gene, held fixed.  Ignored for Poisson.
+        beta
+            Starting coefficients, shape ``(n_features, n_genes)``.
+        family
+            ``"nb"`` or ``"poisson"``.
+
+        Returns
+        -------
+        beta, mu, deviance, converged, n_iter
+        """
+        X = self.design
+        offset_col = self.offset[:, None]
+        n_genes = Y.shape[1]
+        alpha = None if family == "poisson" else alpha
+
+        deviance_of = Deviance(Y, family, alpha)
+        beta = np.array(beta, dtype=np.float64, copy=True)
+        eta = np.clip(X @ beta + offset_col, self._eta_min, ETA_MAX)
+        mu = np.exp(eta)
+        dev = deviance_of.total(eta, mu)
+
+        converged = np.zeros(n_genes, dtype=bool)
+        stalled = np.zeros(n_genes, dtype=bool)
+        n_iter = np.zeros(n_genes, dtype=np.int32)
+        active = np.arange(n_genes)
+
+        for iteration in range(1, self.max_iter + 1):
+            # On the first iteration every gene is active; slicing then would
+            # copy the whole batch four times over to no purpose.
+            whole = active.size == n_genes
+            Y_a = Y if whole else Y[:, active]
+            beta_a = beta if whole else beta[:, active]
+            eta_a = eta if whole else eta[:, active]
+            mu_a = mu if whole else mu[:, active]
+            dev_a = dev if whole else dev[active]
+            deviance_a = deviance_of if whole else deviance_of.subset(active, Y_a)
+            alpha_a = None if alpha is None else (alpha if whole else alpha[active])
+
+            weights = irls_weights(mu_a, alpha_a)
+            z = eta_a - offset_col + (Y_a - mu_a) / np.maximum(mu_a, EPS)
+            beta_full = self._weighted_least_squares_batch(weights, z)
+
+            beta_new = beta_full.copy()
+            eta_new = np.clip(X @ beta_new + offset_col, self._eta_min, ETA_MAX)
+            mu_new = np.exp(eta_new)
+            dev_new = deviance_a.total(eta_new, mu_new)
+
+            # Shorten the step for genes whose deviance increased, recomputing
+            # only those genes.  Each retry interpolates between the current
+            # iterate and the full Newton point ``beta_full``, so the step
+            # really does halve; interpolating against ``beta_new`` instead
+            # would compound the shortening and stall the gene.  A shortened
+            # step is accepted only if it beats ``dev_a``, the deviance this
+            # iteration started from.
+            on_floor = (
+                np.any(eta_a <= self._eta_min, axis=0)
+                if self.min_mu > 0.0
+                else np.zeros(active.size, dtype=bool)
+            )
+
+            # A gene whose fit rests on the mean floor does not take a
+            # shortened step: a floored cell's fitted mean does not move with
+            # the coefficients, so it carries no gradient while still carrying
+            # its full weight in X'WX, and no step length repairs a direction
+            # the floor has flattened.  Those genes take the full Newton step,
+            # which is what DESeq2's iteration does everywhere -- it has no
+            # line search -- and they are judged below by its deviance ratio.
+            ceiling = dev_a + 1e-9 * np.abs(dev_a)
+            rose = dev_new > ceiling
+            worse = rose & ~on_floor
+            scale = np.maximum(np.abs(dev_a), 1e-8)
+            # Smallest relative deviance increase over the steps tried, which
+            # is what decides the fate of a gene that never finds an improving
+            # one.
+            excess = (dev_new - dev_a) / scale
+            step = 1.0
+            for _ in range(_MAX_STEP_HALVINGS):
+                if not np.any(worse):
+                    break
+                step *= 0.5
+                idx = np.flatnonzero(worse)
+                beta_half = beta_a[:, idx] + step * (beta_full[:, idx] - beta_a[:, idx])
+                eta_half = np.clip(X @ beta_half + offset_col, self._eta_min, ETA_MAX)
+                mu_half = np.exp(eta_half)
+                dev_half = deviance_a.subset(idx).total(eta_half, mu_half)
+                excess[idx] = np.minimum(excess[idx], (dev_half - dev_a[idx]) / scale[idx])
+                take = dev_half <= ceiling[idx]
+                taken = idx[take]
+                beta_new[:, taken] = beta_half[:, take]
+                eta_new[:, taken] = eta_half[:, take]
+                mu_new[:, taken] = mu_half[:, take]
+                dev_new[taken] = dev_half[take]
+                worse[taken] = False
+
+            # Genes still rising after the last halving.  Off the floor that
+            # is a real stall -- the deviance is smooth there and the Newton
+            # step is a descent direction, so finding nothing means the fit
+            # has stopped moving: keep the iterate the gene came in with,
+            # since committing the uphill step would break the monotonicity
+            # the convergence test assumes, and stop working on it.  On the
+            # floor it is not a stall and the full step stands.
+            fixed_point = rose & on_floor
+            if np.any(worse):
+                keep = np.flatnonzero(worse)
+                beta_new[:, keep] = beta_a[:, keep]
+                eta_new[:, keep] = eta_a[:, keep]
+                mu_new[:, keep] = mu_a[:, keep]
+                dev_new[keep] = dev_a[keep]
+                stalled[active[keep]] = True
+
+            relative_change = np.abs(dev_new - dev_a) / scale
+            # DESeq2's deviance ratio, for the floor-resting genes below.  It
+            # is formed here, with ``relative_change``, because ``dev_a``
+            # aliases ``dev`` while the whole batch is active: computing it
+            # after ``dev[active] = dev_new`` would compare ``dev_new`` with
+            # itself and make the ratio identically zero.
+            deviance_ratio = np.abs(dev_new - dev_a) / (np.abs(dev_new) + 0.1)
+            coef_change = np.max(np.abs(beta_new - beta_a), axis=0)
+
+            beta[:, active] = beta_new
+            eta[:, active] = eta_new
+            mu[:, active] = mu_new
+            dev[active] = dev_new
+            n_iter[active] = iteration
+            # A gene that took no step moved nowhere, so judging it by how
+            # far it moved would call every stalled gene converged -- the
+            # failure the damping exists to prevent.  It is judged instead by
+            # the steps it refused: converged only if none of them could lower
+            # the deviance by more than ``tol``.
+            # DESeq2's deviance ratio for the genes the floor is holding, the
+            # descent test for the rest.  The ratio is paired with the same
+            # coefficient-change test the other branch uses: on its own it can
+            # fire on the first step, when a warm start happens to leave the
+            # deviance flat while the coefficients are still moving.
+            converged[active] = np.select(
+                [fixed_point, worse],
+                [
+                    (deviance_ratio < self.tol) & (coef_change < self.tol),
+                    excess < self.tol,
+                ],
+                default=(relative_change < self.tol) & (coef_change < self.tol),
+            )
+
+            active = np.flatnonzero(~converged & ~stalled)
+            if active.size == 0:
+                break
+
+        return beta, mu, dev, converged, n_iter
+
     def _fit_batch_numpy_batched(
         self,
         Y: np.ndarray,
@@ -3407,16 +1461,21 @@ class NBGLMBatchFitter:
         valid_indices: np.ndarray,
         n_genes: int,
         gene_batch_size: int,
+        fixed_alpha: np.ndarray | None = None,
     ) -> NBGLMBatchResult:
         """NumPy-based IRLS with gene batching to reduce memory.
-        
-        Processes genes in batches to limit work array memory usage.
-        Reduced from 7 to 4 work arrays via memory reuse.
+
+        Genes are processed in batches so that the ``(n_samples, batch)`` work
+        arrays stay within a memory target.  Within a batch the fit is: estimate
+        the dispersion from a Poisson warm start, run IRLS to convergence with
+        it fixed, re-estimate it from the fitted means, and refit.  See
+        :meth:`_irls_at_fixed_dispersion` for why the dispersion is not updated
+        inside the IRLS loop.
         """
         n_valid = Y_valid.shape[1]
         n_features = self.n_features
         X = self.design
-        
+
         # Initialize outputs
         coef = np.zeros((n_genes, n_features), dtype=np.float64)
         se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
@@ -3424,599 +1483,92 @@ class NBGLMBatchFitter:
         converged_arr = np.zeros(n_genes, dtype=bool)
         n_iter_arr = np.zeros(n_genes, dtype=np.int32)
         deviance = np.full(n_genes, np.nan, dtype=np.float64)
-        
+
         # Initialize beta for all valid genes
         beta_all = np.zeros((n_features, n_valid), dtype=np.float64)
-        
+
         # Poisson warm start
         if self.poisson_init_iter > 0:
             beta_all = self._poisson_warm_start_batch(Y_valid, beta_all)
-        
-        # Initialize dispersion
-        alpha_all = np.full(n_valid, 0.1, dtype=np.float64)
+
+        alpha_all = np.zeros(n_valid, dtype=np.float64)
+        mu_all = np.empty((self.n_samples, n_valid), dtype=np.float64)
         gene_converged = np.zeros(n_valid, dtype=bool)
         gene_n_iter = np.zeros(n_valid, dtype=np.int32)
-        
-        # Precompute constants
-        log_min_mu = np.log(self.min_mu)
+        gene_deviance = np.full(n_valid, np.nan, dtype=np.float64)
+
         offset_col = self.offset[:, None]
-        
+
         # Process genes in batches
         for batch_start in range(0, n_valid, gene_batch_size):
             batch_end = min(batch_start + gene_batch_size, n_valid)
-            batch_size = batch_end - batch_start
-            batch_slice = slice(batch_start, batch_end)
-            
-            Y_batch = Y_valid[:, batch_slice]
-            beta_batch = beta_all[:, batch_slice]
-            alpha_batch = alpha_all[batch_slice]
-            batch_converged = np.zeros(batch_size, dtype=bool)
-            
-            # Allocate work arrays for this batch only (4 arrays instead of 7)
-            eta = np.empty((self.n_samples, batch_size), dtype=np.float64)
-            mu = np.empty_like(eta)
-            # variance_weights: used for both variance and weights (sequential)
-            variance_weights = np.empty_like(eta)
-            # z_working: used for z, working_response, and resid (sequential)
-            z_working = np.empty_like(eta)
-            
-            for iteration in range(1, self.max_iter + 1):
-                # Compute eta and mu
-                np.dot(X, beta_batch, out=eta)
-                eta += offset_col
-                np.clip(eta, log_min_mu, 20.0, out=eta)
-                np.exp(eta, out=mu)
-                np.maximum(mu, self.min_mu, out=mu)
-                
-                # Compute variance: V = mu + alpha * mu^2
-                np.multiply(mu, mu, out=variance_weights)
-                variance_weights *= alpha_batch[None, :]
-                variance_weights += mu
-                
-                # Compute weights in-place: W = mu^2 / V
-                mu_sq = mu * mu  # Temporary for numerator
-                np.divide(mu_sq, np.maximum(variance_weights, self.min_mu), out=variance_weights)
-                # Now variance_weights contains weights
-                
-                # Working response: z = eta + (Y - mu) / mu - offset
-                np.subtract(Y_batch, mu, out=z_working)  # z_working = Y - mu
-                np.divide(z_working, np.maximum(mu, self.min_mu), out=z_working)
-                z_working += eta
-                z_working -= offset_col
-                # Now z_working contains working_response
-                
-                # Solve weighted least squares
-                beta_new = self._weighted_least_squares_batch(variance_weights, z_working)
-                
-                # Check convergence
-                beta_diff = np.max(np.abs(beta_new - beta_batch), axis=0)
-                newly_converged = (beta_diff < self.tol) & ~batch_converged
-                batch_converged |= newly_converged
-                
-                # Update iteration count for non-converged genes
-                for i in range(batch_size):
-                    if not batch_converged[i]:
-                        gene_n_iter[batch_start + i] = iteration
-                
-                beta_batch = beta_new
-                
-                # Update dispersion (MoM)
-                np.subtract(Y_batch, mu, out=z_working)  # resid = Y - mu
-                np.multiply(z_working, z_working, out=eta)  # reuse eta as temp
-                eta -= Y_batch
-                denom = np.maximum(mu * mu, self.min_mu)
-                numerator = np.sum(eta / denom, axis=0)
-                dof = max(self.n_samples - n_features, 1)
-                alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-                alpha_batch = np.where(np.isfinite(alpha_new), alpha_new, alpha_batch)
-                
-                if np.all(batch_converged):
-                    break
-            
-            # Store batch results
-            beta_all[:, batch_slice] = beta_batch
-            alpha_all[batch_slice] = alpha_batch
-            gene_converged[batch_start:batch_end] = batch_converged
-            
-            # Clean up batch arrays
-            del eta, mu, variance_weights, z_working, mu_sq
-        
-        # Final mu computation and dispersion refinement
-        eta_final = np.dot(X, beta_all) + offset_col
-        np.clip(eta_final, log_min_mu, 20.0, out=eta_final)
-        mu_final = np.exp(eta_final)
-        np.maximum(mu_final, self.min_mu, out=mu_final)
-        
-        if self.dispersion_method == "cox-reid":
-            alpha_all = self._refine_dispersion_cox_reid_batch(Y_valid, mu_final, alpha_all)
-        
-        # Compute SE and deviance
-        variance_final = mu_final + alpha_all[None, :] * mu_final * mu_final
-        weights_final = mu_final * mu_final / np.maximum(variance_final, self.min_mu)
-        se_valid = self._compute_se_batch(weights_final)
-        dev_valid = self._compute_deviance_batch(Y_valid, mu_final, alpha_all)
-        
+            batch = slice(batch_start, batch_end)
+            Y_batch = Y_valid[:, batch]
+            beta_batch = beta_all[:, batch]
+
+            if self.family == "poisson":
+                # The Poisson variance is the mean; there is no dispersion to
+                # estimate and one fit suffices.
+                alpha_batch = np.zeros(batch_end - batch_start, dtype=np.float64)
+                beta_batch, mu_batch, dev_batch, conv, first_iters = (
+                    self._irls_at_fixed_dispersion(
+                        Y_batch, None, beta_batch, family="poisson"
+                    )
+                )
+                second_iters = 0
+            elif fixed_alpha is not None:
+                alpha_batch = fixed_alpha[valid_indices][batch]
+                beta_batch, mu_batch, dev_batch, conv, first_iters = (
+                    self._irls_at_fixed_dispersion(Y_batch, alpha_batch, beta_batch)
+                )
+                second_iters = 0
+            else:
+                # Dispersion from the warm-start means, then a fixed-dispersion
+                # fit; then re-estimate from the fitted means and refit, so the
+                # returned coefficients and dispersion describe the same model.
+                eta_start = np.clip(X @ beta_batch + offset_col, self._eta_min, ETA_MAX)
+                alpha_batch = self._moments_dispersion_batch(Y_batch, np.exp(eta_start))
+
+                beta_batch, mu_batch, _, _, first_iters = self._irls_at_fixed_dispersion(
+                    Y_batch, alpha_batch, beta_batch
+                )
+
+                alpha_batch = self._moments_dispersion_batch(Y_batch, mu_batch)
+                if self.dispersion_method == "cox-reid":
+                    alpha_batch = self._refine_dispersion_cox_reid_batch(
+                        Y_batch, mu_batch, alpha_batch
+                    )
+
+                beta_batch, mu_batch, dev_batch, conv, second_iters = (
+                    self._irls_at_fixed_dispersion(Y_batch, alpha_batch, beta_batch)
+                )
+
+            beta_all[:, batch] = beta_batch
+            mu_all[:, batch] = mu_batch
+            alpha_all[batch] = alpha_batch
+            gene_converged[batch] = conv
+            gene_n_iter[batch] = first_iters + second_iters
+            gene_deviance[batch] = dev_batch
+
+        # Standard errors from the unfloored fitted mean; see _wald_weights.
+        se_valid = self._compute_se_batch(self._wald_weights(beta_all, alpha_all))
+
         # Store to output arrays
         coef[valid_indices] = beta_all.T
         se[valid_indices] = se_valid.T
         dispersion[valid_indices] = alpha_all
         converged_arr[valid_indices] = gene_converged
         n_iter_arr[valid_indices] = gene_n_iter
-        deviance[valid_indices] = dev_valid
-        
+        deviance[valid_indices] = gene_deviance
+
         return NBGLMBatchResult(
             coef=coef, se=se, dispersion=dispersion,
             converged=converged_arr, n_iter=n_iter_arr, deviance=deviance
         )
     
-    def fit_batch_with_covariate_offset(
-        self, 
-        counts: ArrayLike, 
-        covariate_offset: np.ndarray,
-    ) -> NBGLMBatchResult:
-        """Fit NB GLM with pre-computed covariate offset.
-        
-        This method is used in the joint fitting approach where covariate effects
-        are estimated globally and then held fixed during per-perturbation fitting.
-        The covariate offset is subtracted from the working response during IRLS.
-        
-        Parameters
-        ----------
-        counts
-            Count matrix of shape ``(n_samples, n_genes)``.
-        covariate_offset
-            Pre-computed covariate offset of shape ``(n_samples, n_genes)``,
-            representing X_cov @ beta_cov for the covariate portion of the design.
-            
-        Returns
-        -------
-        NBGLMBatchResult
-            Results for all genes with vectorized arrays.
-        """
-        if sp.issparse(counts):
-            Y = np.asarray(counts.toarray(), dtype=np.float64)
-        else:
-            Y = np.asarray(counts, dtype=np.float64)
-        
-        if Y.ndim != 2 or Y.shape[0] != self.n_samples:
-            raise ValueError(f"counts must have shape ({self.n_samples}, n_genes)")
-        
-        n_genes = Y.shape[1]
-        covariate_offset = np.asarray(covariate_offset, dtype=np.float64)
-        if covariate_offset.shape != (self.n_samples, n_genes):
-            raise ValueError(
-                f"covariate_offset must have shape ({self.n_samples}, {n_genes})"
-            )
-        
-        X = self.design
-        n_features = self.n_features
-        
-        # Initialize outputs
-        coef = np.zeros((n_genes, n_features), dtype=np.float64)
-        se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
-        dispersion = np.full(n_genes, np.nan, dtype=np.float64)
-        converged = np.zeros(n_genes, dtype=bool)
-        n_iter = np.zeros(n_genes, dtype=np.int32)
-        deviance = np.full(n_genes, np.nan, dtype=np.float64)
-        
-        # Check which genes have sufficient counts
-        total_counts = Y.sum(axis=0)
-        valid_genes = total_counts >= self.min_total_count
-        n_valid = valid_genes.sum()
-        
-        if n_valid == 0:
-            return NBGLMBatchResult(
-                coef=coef, se=se, dispersion=dispersion,
-                converged=converged, n_iter=n_iter, deviance=deviance
-            )
-        
-        # Work only with valid genes
-        Y_valid = Y[:, valid_genes]  # (n_samples, n_valid)
-        cov_offset_valid = covariate_offset[:, valid_genes]  # (n_samples, n_valid)
-        valid_indices = np.where(valid_genes)[0]
-        
-        # Initialize beta for all valid genes: (n_features, n_valid)
-        beta = np.zeros((n_features, n_valid), dtype=np.float64)
-        
-        # Poisson warm start with covariate offset
-        if self.poisson_init_iter > 0:
-            beta = self._poisson_warm_start_with_offset(Y_valid, beta, cov_offset_valid)
-        
-        # Initialize dispersion estimates (method of moments)
-        alpha = np.full(n_valid, 0.1, dtype=np.float64)
-        
-        # IRLS iterations
-        gene_converged = np.zeros(n_valid, dtype=bool)
-        gene_n_iter = np.zeros(n_valid, dtype=np.int32)
-        
-        # Pre-allocate work arrays
-        eta = np.empty((self.n_samples, n_valid), dtype=np.float64)
-        mu = np.empty_like(eta)
-        variance = np.empty_like(eta)
-        weights = np.empty_like(eta)
-        z = np.empty_like(eta)
-        working_response = np.empty_like(eta)
-        resid = np.empty_like(eta)
-        
-        log_min_mu = np.log(self.min_mu)
-        offset_col = self.offset[:, None]
-        
-        for iteration in range(1, self.max_iter + 1):
-            # Compute eta including covariate offset
-            # eta = X @ beta + offset + covariate_offset
-            np.dot(X, beta, out=eta)
-            eta += offset_col
-            eta += cov_offset_valid  # Add pre-computed covariate contribution
-            np.clip(eta, log_min_mu, 20.0, out=eta)
-            np.exp(eta, out=mu)
-            np.maximum(mu, self.min_mu, out=mu)
-            
-            # Compute variance and weights
-            np.multiply(mu, mu, out=variance)
-            variance *= alpha[None, :]
-            variance += mu
-            np.divide(mu * mu, np.maximum(variance, self.min_mu), out=weights)
-            
-            # Working response (subtract covariate offset from z)
-            np.subtract(Y_valid, mu, out=resid)
-            np.divide(resid, np.maximum(mu, self.min_mu), out=z)
-            z += eta
-            # Remove covariate offset and regular offset to get working response for X @ beta
-            np.subtract(z, offset_col, out=working_response)
-            working_response -= cov_offset_valid
-            
-            # Solve weighted least squares
-            beta_new = self._weighted_least_squares_batch(weights, working_response)
-            
-            # Check convergence
-            beta_diff = np.max(np.abs(beta_new - beta), axis=0)
-            newly_converged = (beta_diff < self.tol) & ~gene_converged
-            gene_converged |= newly_converged
-            gene_n_iter[~gene_converged] = iteration
-            
-            beta = beta_new
-            
-            # Update dispersion using method of moments
-            np.subtract(Y_valid, mu, out=resid)
-            np.multiply(resid, resid, out=variance)
-            variance -= Y_valid
-            denom = np.maximum(mu * mu, self.min_mu)
-            numerator = np.sum(variance / denom, axis=0)
-            dof = max(self.n_samples - n_features, 1)
-            alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-            alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-            
-            if np.all(gene_converged):
-                break
-        
-        # Final dispersion refinement with Cox-Reid if requested
-        if self.dispersion_method == "cox-reid":
-            alpha = self._refine_dispersion_cox_reid_batch(Y_valid, mu, alpha)
-        
-        # Compute final mu, weights, and standard errors
-        np.dot(X, beta, out=eta)
-        eta += offset_col
-        eta += cov_offset_valid
-        np.clip(eta, log_min_mu, 20.0, out=eta)
-        np.exp(eta, out=mu)
-        np.maximum(mu, self.min_mu, out=mu)
-        np.multiply(mu, mu, out=variance)
-        variance *= alpha[None, :]
-        variance += mu
-        np.divide(mu * mu, np.maximum(variance, self.min_mu), out=weights)
-        
-        # Compute SE
-        se_valid = self._compute_se_batch(weights)
-        
-        # Compute deviance
-        dev_valid = self._compute_deviance_batch(Y_valid, mu, alpha)
-        
-        # Store results
-        coef[valid_indices] = beta.T
-        se[valid_indices] = se_valid.T
-        dispersion[valid_indices] = alpha
-        converged[valid_indices] = gene_converged
-        n_iter[valid_indices] = gene_n_iter
-        deviance[valid_indices] = dev_valid
-        
-        return NBGLMBatchResult(
-            coef=coef, se=se, dispersion=dispersion,
-            converged=converged, n_iter=n_iter, deviance=deviance
-        )
     
-    def fit_batch_with_joint_offsets(
-        self, 
-        counts: ArrayLike, 
-        *,
-        intercept_offset: np.ndarray | None = None,
-        covariate_offset: np.ndarray | None = None,
-        fixed_dispersion: np.ndarray | None = None,
-    ) -> NBGLMBatchResult:
-        """Fit NB GLM with pre-computed intercept and covariate offsets.
-        
-        This method is used in the joint fitting approach where the global
-        intercept (and optionally covariates and dispersion) are estimated 
-        using all cells and then held fixed during per-perturbation fitting.
-        
-        The design matrix should NOT include an intercept column when using
-        intercept_offset, as the global intercept is added as an offset.
-        
-        Parameters
-        ----------
-        counts
-            Count matrix of shape ``(n_samples, n_genes)``.
-        intercept_offset
-            Pre-computed global intercept of shape ``(n_genes,)``. If provided,
-            the design matrix should not include an intercept column.
-        covariate_offset
-            Pre-computed covariate offset of shape ``(n_samples, n_genes)``,
-            representing X_cov @ beta_cov for the covariate portion.
-        fixed_dispersion
-            If provided, use these dispersion values instead of estimating.
-            Shape ``(n_genes,)``.
-            
-        Returns
-        -------
-        NBGLMBatchResult
-            Results for all genes with vectorized arrays.
-        """
-        if sp.issparse(counts):
-            Y = np.asarray(counts.toarray(), dtype=np.float64)
-        else:
-            Y = np.asarray(counts, dtype=np.float64)
-        
-        if Y.ndim != 2 or Y.shape[0] != self.n_samples:
-            raise ValueError(f"counts must have shape ({self.n_samples}, n_genes)")
-        
-        n_genes = Y.shape[1]
-        X = self.design
-        n_features = self.n_features
-        
-        # Validate and prepare offsets
-        if intercept_offset is not None:
-            intercept_offset = np.asarray(intercept_offset, dtype=np.float64)
-            if intercept_offset.shape != (n_genes,):
-                raise ValueError(f"intercept_offset must have shape ({n_genes},)")
-        
-        if covariate_offset is not None:
-            covariate_offset = np.asarray(covariate_offset, dtype=np.float64)
-            if covariate_offset.shape != (self.n_samples, n_genes):
-                raise ValueError(
-                    f"covariate_offset must have shape ({self.n_samples}, {n_genes})"
-                )
-        
-        if fixed_dispersion is not None:
-            fixed_dispersion = np.asarray(fixed_dispersion, dtype=np.float64)
-            if fixed_dispersion.shape != (n_genes,):
-                raise ValueError(f"fixed_dispersion must have shape ({n_genes},)")
-        
-        # Initialize outputs
-        coef = np.zeros((n_genes, n_features), dtype=np.float64)
-        se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
-        dispersion = np.full(n_genes, np.nan, dtype=np.float64)
-        converged = np.zeros(n_genes, dtype=bool)
-        n_iter = np.zeros(n_genes, dtype=np.int32)
-        deviance = np.full(n_genes, np.nan, dtype=np.float64)
-        
-        # Check which genes have sufficient counts
-        total_counts = Y.sum(axis=0)
-        valid_genes = total_counts >= self.min_total_count
-        n_valid = valid_genes.sum()
-        
-        if n_valid == 0:
-            return NBGLMBatchResult(
-                coef=coef, se=se, dispersion=dispersion,
-                converged=converged, n_iter=n_iter, deviance=deviance
-            )
-        
-        # Work only with valid genes
-        Y_valid = Y[:, valid_genes]
-        valid_indices = np.where(valid_genes)[0]
-        
-        # Prepare valid gene offsets
-        intercept_valid = intercept_offset[valid_genes] if intercept_offset is not None else None
-        cov_offset_valid = covariate_offset[:, valid_genes] if covariate_offset is not None else None
-        
-        # Initialize beta
-        beta = np.zeros((n_features, n_valid), dtype=np.float64)
-        
-        # Poisson warm start
-        if self.poisson_init_iter > 0:
-            beta = self._poisson_warm_start_with_joint_offsets(
-                Y_valid, beta, intercept_valid, cov_offset_valid
-            )
-        
-        # Initialize or use fixed dispersion
-        if fixed_dispersion is not None:
-            alpha = fixed_dispersion[valid_genes].copy()
-            use_fixed_dispersion = True
-        else:
-            alpha = np.full(n_valid, 0.1, dtype=np.float64)
-            use_fixed_dispersion = False
-        
-        # IRLS iterations
-        gene_converged = np.zeros(n_valid, dtype=bool)
-        gene_n_iter = np.zeros(n_valid, dtype=np.int32)
-        
-        # Pre-allocate work arrays
-        eta = np.empty((self.n_samples, n_valid), dtype=np.float64)
-        mu = np.empty_like(eta)
-        variance = np.empty_like(eta)
-        weights = np.empty_like(eta)
-        z = np.empty_like(eta)
-        working_response = np.empty_like(eta)
-        resid = np.empty_like(eta)
-        
-        log_min_mu = np.log(self.min_mu)
-        offset_col = self.offset[:, None]
-        
-        for iteration in range(1, self.max_iter + 1):
-            # Compute eta = X @ beta + offset + intercept_offset + covariate_offset
-            np.dot(X, beta, out=eta)
-            eta += offset_col
-            if intercept_valid is not None:
-                eta += intercept_valid[None, :]  # Broadcast (n_genes,) to (n_samples, n_genes)
-            if cov_offset_valid is not None:
-                eta += cov_offset_valid
-            np.clip(eta, log_min_mu, 20.0, out=eta)
-            np.exp(eta, out=mu)
-            np.maximum(mu, self.min_mu, out=mu)
-            
-            # Compute variance and weights
-            np.multiply(mu, mu, out=variance)
-            variance *= alpha[None, :]
-            variance += mu
-            np.divide(mu * mu, np.maximum(variance, self.min_mu), out=weights)
-            
-            # Working response
-            np.subtract(Y_valid, mu, out=resid)
-            np.divide(resid, np.maximum(mu, self.min_mu), out=z)
-            z += eta
-            # Remove all offsets to get working response for X @ beta
-            np.subtract(z, offset_col, out=working_response)
-            if intercept_valid is not None:
-                working_response -= intercept_valid[None, :]
-            if cov_offset_valid is not None:
-                working_response -= cov_offset_valid
-            
-            # Solve weighted least squares
-            beta_new = self._weighted_least_squares_batch(weights, working_response)
-            
-            # Check convergence
-            beta_diff = np.max(np.abs(beta_new - beta), axis=0)
-            newly_converged = (beta_diff < self.tol) & ~gene_converged
-            gene_converged |= newly_converged
-            gene_n_iter[~gene_converged] = iteration
-            
-            beta = beta_new
-            
-            # Update dispersion if not fixed
-            if not use_fixed_dispersion:
-                np.subtract(Y_valid, mu, out=resid)
-                np.multiply(resid, resid, out=variance)
-                variance -= Y_valid
-                denom = np.maximum(mu * mu, self.min_mu)
-                numerator = np.sum(variance / denom, axis=0)
-                dof = max(self.n_samples - n_features, 1)
-                alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-                alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-            
-            if np.all(gene_converged):
-                break
-        
-        # Final dispersion refinement if not using fixed dispersion
-        if not use_fixed_dispersion and self.dispersion_method == "cox-reid":
-            alpha = self._refine_dispersion_cox_reid_batch(Y_valid, mu, alpha)
-        
-        # Compute final mu, weights, and standard errors
-        np.dot(X, beta, out=eta)
-        eta += offset_col
-        if intercept_valid is not None:
-            eta += intercept_valid[None, :]
-        if cov_offset_valid is not None:
-            eta += cov_offset_valid
-        np.clip(eta, log_min_mu, 20.0, out=eta)
-        np.exp(eta, out=mu)
-        np.maximum(mu, self.min_mu, out=mu)
-        np.multiply(mu, mu, out=variance)
-        variance *= alpha[None, :]
-        variance += mu
-        np.divide(mu * mu, np.maximum(variance, self.min_mu), out=weights)
-        
-        # Compute SE
-        se_valid = self._compute_se_batch(weights)
-        
-        # Compute deviance
-        dev_valid = self._compute_deviance_batch(Y_valid, mu, alpha)
-        
-        # Store results
-        coef[valid_indices] = beta.T
-        se[valid_indices] = se_valid.T
-        dispersion[valid_indices] = alpha
-        converged[valid_indices] = gene_converged
-        n_iter[valid_indices] = gene_n_iter
-        deviance[valid_indices] = dev_valid
-        
-        return NBGLMBatchResult(
-            coef=coef, se=se, dispersion=dispersion,
-            converged=converged, n_iter=n_iter, deviance=deviance
-        )
     
-    def _poisson_warm_start_with_joint_offsets(
-        self, 
-        Y: np.ndarray, 
-        beta: np.ndarray, 
-        intercept_offset: np.ndarray | None,
-        covariate_offset: np.ndarray | None,
-    ) -> np.ndarray:
-        """Poisson warm start with pre-computed intercept and covariate offsets."""
-        X = self.design
-        n_samples, n_genes = Y.shape
-        log_min_mu = np.log(self.min_mu)
-        offset_col = self.offset[:, None]
-        
-        eta = np.empty((n_samples, n_genes), dtype=np.float64)
-        mu = np.empty_like(eta)
-        z = np.empty_like(eta)
-        working_response = np.empty_like(eta)
-        
-        for _ in range(self.poisson_init_iter):
-            np.dot(X, beta, out=eta)
-            eta += offset_col
-            if intercept_offset is not None:
-                eta += intercept_offset[None, :]
-            if covariate_offset is not None:
-                eta += covariate_offset
-            np.clip(eta, log_min_mu, 20.0, out=eta)
-            np.exp(eta, out=mu)
-            np.maximum(mu, self.min_mu, out=mu)
-            
-            # Poisson working response
-            z[:] = eta + (Y - mu) / np.maximum(mu, self.min_mu)
-            np.subtract(z, offset_col, out=working_response)
-            if intercept_offset is not None:
-                working_response -= intercept_offset[None, :]
-            if covariate_offset is not None:
-                working_response -= covariate_offset
-            
-            # Solve with Poisson weights (= mu)
-            beta = self._weighted_least_squares_batch(mu, working_response)
-        
-        return beta
     
-    def _poisson_warm_start_with_offset(
-        self, Y: np.ndarray, beta: np.ndarray, covariate_offset: np.ndarray
-    ) -> np.ndarray:
-        """Poisson warm start with pre-computed covariate offset."""
-        X = self.design
-        n_samples, n_genes = Y.shape
-        log_min_mu = np.log(self.min_mu)
-        offset_col = self.offset[:, None]
-        
-        eta = np.empty((n_samples, n_genes), dtype=np.float64)
-        mu = np.empty_like(eta)
-        z = np.empty_like(eta)
-        working_response = np.empty_like(eta)
-        
-        for _ in range(self.poisson_init_iter):
-            np.dot(X, beta, out=eta)
-            eta += offset_col
-            eta += covariate_offset  # Include covariate contribution
-            np.clip(eta, log_min_mu, 20.0, out=eta)
-            np.exp(eta, out=mu)
-            np.maximum(mu, self.min_mu, out=mu)
-            
-            np.subtract(Y, mu, out=z)
-            np.divide(z, np.maximum(mu, self.min_mu), out=z)
-            z += eta
-            np.subtract(z, offset_col, out=working_response)
-            working_response -= covariate_offset  # Remove covariate offset
-            
-            beta_new = self._weighted_least_squares_batch(mu, working_response)
-            if np.max(np.abs(beta_new - beta)) < self.tol:
-                return beta_new
-            beta = beta_new
-        return beta
     
     def _poisson_warm_start_batch(
         self, Y: np.ndarray, beta: np.ndarray
@@ -4024,7 +1576,7 @@ class NBGLMBatchFitter:
         """Vectorized Poisson warm start for all genes."""
         X = self.design
         n_samples, n_genes = Y.shape
-        log_min_mu = np.log(self.min_mu)
+        log_min_mu = eta_floor(self.min_mu)
         offset_col = self.offset[:, None]
         
         # Pre-allocate work arrays
@@ -4041,7 +1593,7 @@ class NBGLMBatchFitter:
             np.maximum(mu, self.min_mu, out=mu)
             # Poisson weights = mu
             np.subtract(Y, mu, out=z)
-            np.divide(z, np.maximum(mu, self.min_mu), out=z)
+            np.divide(z, np.maximum(mu, EPS), out=z)
             z += eta
             np.subtract(z, offset_col, out=working_response)
             beta_new = self._weighted_least_squares_batch(mu, working_response)
@@ -4071,8 +1623,11 @@ class NBGLMBatchFitter:
         n_samples, n_genes = weights.shape
         n_features = self.n_features
         
-        # Clip weights for numerical stability
-        W = np.clip(weights, self.min_mu, None)  # (n_samples, n_genes)
+        # Weights enter the normal equations unmodified.  Clamping them at the
+        # fitted-mean floor would overstate the leverage of every cell whose
+        # fitted mean falls below it (at mu=0.1, alpha=1 the true weight is
+        # 0.091 and a 0.5 clamp makes it 0.5).
+        W = weights  # (n_samples, n_genes)
         
         # Efficient X^T W X computation using blocked approach
         # X^T W X [g,i,j] = sum_k X[k,i] * W[k,g] * X[k,j]
@@ -4101,27 +1656,19 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # Solve 2x2 systems analytically using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            beta0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
+            beta0, beta1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, xtwz_0, xtwz_1)
             
             beta = np.vstack([beta0, beta1])  # (n_features, n_genes)
             return beta
         else:
-            # General case using einsum
-            xtwx = np.einsum('ki,kg,kj->gij', X, W, X, optimize=True)
-            
-            # Add ridge penalty to diagonal
-            if self.ridge_penalty:
-                ridge = self.ridge_penalty * np.eye(n_features, dtype=np.float64)
-                xtwx = xtwx + ridge[None, :, :]
-            
+            # Per-gene normal equations, formed with BLAS in cell-sized chunks
+            # and solved in the preconditioned column basis.
+            Xs = self._design_scaled
+            xtwx = gram_batched(Xs, W, ridge=self._ridge_scaled)
+
             # Compute X^T W z for all genes: (n_genes, n_features)
             Wz = W * y_working  # (n_samples, n_genes)
-            xtwz = np.einsum('ki,kg->gi', X, Wz, optimize=True)
+            xtwz = (Xs.T @ Wz).T
             
             # Solve all systems at once using batched solve
             # Need to add dimension for broadcasting: (n_genes, n_features, 1)
@@ -4136,16 +1683,56 @@ class NBGLMBatchFitter:
                     except np.linalg.LinAlgError:
                         beta[g] = np.linalg.lstsq(xtwx[g], xtwz[g], rcond=None)[0]
             
-            return beta.T  # (n_features, n_genes)
+            # Back to the caller's parameterisation.
+            return (beta / self._col_scale[None, :]).T  # (n_features, n_genes)
     
+    def _wald_weights(
+        self,
+        beta: np.ndarray,
+        alpha: np.ndarray,
+        extra_offset: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """IRLS weights for the reported covariance, from the *unfloored* mean.
+
+        ``min_mu`` stabilises the iteration; it is not part of the model whose
+        uncertainty is being reported, and DESeq2 keeps it out of the Wald
+        standard error -- ``irls_solver`` returns an unthresholded ``mu`` "as
+        in the R code" and ``wald_test`` rebuilds ``W`` from that.  Leaving the
+        floor in overstates how much every floored cell knows: at 0.05 counts
+        per cell it made the standard errors a quarter too small and the Wald
+        statistics correspondingly too large.
+
+        The linear predictor is still clipped, but at the generic
+        ``ETA_MIN``/``ETA_MAX`` divergence bounds rather than at the mean
+        floor, so a diverging gene stays finite.
+
+        Parameters
+        ----------
+        beta
+            Coefficients, shape ``(n_features, n_genes)``.
+        alpha
+            Per-gene dispersion, or ``None``/zeros for Poisson.
+        extra_offset
+            Additional ``(n_samples, n_genes)`` offset, for the callers that
+            fit with a covariate or control offset folded in.
+        """
+        eta = self.design @ beta + self.offset[:, None]
+        if extra_offset is not None:
+            eta = eta + extra_offset
+        np.clip(eta, ETA_MIN, ETA_MAX, out=eta)
+        return irls_weights(np.exp(eta), alpha)
+
     def _compute_se_batch(self, weights: np.ndarray) -> np.ndarray:
         """Compute standard errors for all genes using vectorized operations."""
         X = self.design  # (n_samples, n_features)
         n_samples, n_genes = weights.shape
         n_features = self.n_features
         
-        # Clip weights for numerical stability
-        W = np.clip(weights, self.min_mu, None)  # (n_samples, n_genes)
+        # Weights enter the normal equations unmodified.  Clamping them at the
+        # fitted-mean floor would overstate the leverage of every cell whose
+        # fitted mean falls below it (at mu=0.1, alpha=1 the true weight is
+        # 0.091 and a 0.5 clamp makes it 0.5).
+        W = weights  # (n_samples, n_genes)
         
         if n_features == 2:
             # Fast path for 2-feature design: use analytical inverse of 2x2 matrix
@@ -4161,14 +1748,9 @@ class NBGLMBatchFitter:
                 xtwx_00 = xtwx_00 + self.ridge_penalty
                 xtwx_11 = xtwx_11 + self.ridge_penalty
             
-            # 2x2 matrix inverse diagonal elements:
-            # For M = [[a, b], [b, c]], M^-1 = (1/det) * [[c, -b], [-b, a]]
-            # So diag(M^-1) = [c/det, a/det]
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)  # Avoid division by zero
-            
-            inv_diag_0 = xtwx_11 / det  # Variance of beta_0 (intercept)
-            inv_diag_1 = xtwx_00 / det  # Variance of beta_1 (perturbation effect)
+            # diag(M^-1): component k of the solution of M v = e_k.
+            inv_diag_0 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 1.0, 0.0)[0]  # intercept
+            inv_diag_1 = solve_spd_2x2(xtwx_00, xtwx_01, xtwx_11, 0.0, 1.0)[1]  # perturbation
             
             se = np.vstack([
                 np.sqrt(np.maximum(inv_diag_0, 1e-12)),
@@ -4176,30 +1758,26 @@ class NBGLMBatchFitter:
             ])  # (n_features, n_genes)
             return se
         else:
-            # General case
-            # Compute X^T W X for all genes: (n_genes, n_features, n_features)
-            xtwx = np.einsum('ki,kg,kj->gij', X, W, X, optimize=True)
+            # Per-gene normal equations, formed with BLAS in cell-sized chunks
+            # and inverted in the preconditioned column basis.
+            xtwx = gram_batched(self._design_scaled, W, ridge=self._ridge_scaled)
             
-            # Add ridge penalty to diagonal
-            if self.ridge_penalty:
-                ridge = self.ridge_penalty * np.eye(n_features, dtype=np.float64)
-                xtwx = xtwx + ridge[None, :, :]
-            
-            # Invert all matrices at once and extract diagonal
+            # diag(M^-1)_j = ||L^-1 e_j||^2 for the Cholesky factor M = L L';
+            # a gene whose matrix is not positive definite keeps SE = inf.
             se = np.full((n_features, n_genes), np.inf, dtype=np.float64)
+            eye = np.eye(n_features)
             try:
-                inv_xtwx = np.linalg.inv(xtwx)  # (n_genes, n_features, n_features)
-                # Extract diagonal of each inverse matrix
-                diag_inv = np.diagonal(inv_xtwx, axis1=1, axis2=2)  # (n_genes, n_features)
+                factor = np.linalg.cholesky(xtwx)  # (n_genes, n_features, n_features)
+                diag_inv = (np.linalg.solve(factor, np.broadcast_to(eye, xtwx.shape)) ** 2).sum(axis=1)
                 se = np.sqrt(np.maximum(diag_inv, 1e-12)).T  # (n_features, n_genes)
             except np.linalg.LinAlgError:
-                # Fallback to per-gene inversion for singular matrices
                 for g in range(n_genes):
                     try:
-                        inv_xtwx_g = np.linalg.inv(xtwx[g])
-                        se[:, g] = np.sqrt(np.maximum(np.diag(inv_xtwx_g), 1e-12))
+                        factor_g = np.linalg.cholesky(xtwx[g])
                     except np.linalg.LinAlgError:
-                        pass
+                        continue
+                    se[:, g] = np.sqrt(np.maximum((np.linalg.solve(factor_g, eye) ** 2).sum(axis=0), 1e-12))
+            se /= self._col_scale[:, None]
             
             return se
     
@@ -4258,19 +1836,18 @@ class NBGLMBatchFitter:
             X1_sq = X1 ** 2
         
         for a_idx, a in enumerate(alpha_grid):
-            variance = mu + a * (mu ** 2)
-            W = (mu ** 2) / np.maximum(variance, self.min_mu)
+            W = irls_weights(mu, a)
             
             if n_features == 2:
                 # Fast path for 2-feature design: analytical determinant
                 xtwx_00 = np.sum(W, axis=0)
                 xtwx_01 = X1 @ W
                 xtwx_11 = np.sum(X1_sq[:, None] * W, axis=0)
-                det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-                log_det = np.log(np.maximum(det, 1e-12))
+                # log det from the LDL' pivots, as solve_spd_2x2 factors it.
+                d0 = np.maximum(xtwx_00, PIVOT_FLOOR)
+                log_det = np.log(d0) + np.log(np.maximum(xtwx_11 - xtwx_01 ** 2 / d0, PIVOT_FLOOR))
             else:
-                # General case using einsum
-                XtWX = np.einsum('ki,kg,kj->gij', X, W, X, optimize=True)
+                XtWX = gram_batched(X, W)
                 try:
                     sign, log_det = np.linalg.slogdet(XtWX)
                     log_det = np.where(sign > 0, log_det, 0.0)
@@ -4289,507 +1866,1147 @@ class NBGLMBatchFitter:
         
         return alpha
 
-    def fit_batch_with_control_cache(
+
+# ---------------------------------------------------------------------------
+# Structured GLM: designs of the form [covariates | one-hot groups]
+# ---------------------------------------------------------------------------
+
+
+def detect_onehot_block(design: ArrayLike, min_block: int = 2) -> np.ndarray:
+    """Find a maximal block of disjoint one-hot columns in a design matrix.
+
+    A column qualifies if it is binary and its support does not overlap the
+    support of any column already selected.  Columns are scanned from the
+    smallest support upwards, because a wide binary covariate (sex, say,
+    covering about half the cells) would otherwise be selected first and block
+    every narrow group column it overlaps.
+
+    This exists for callers that hold a design matrix in which the structure
+    has already been flattened.  A caller that still knows which columns are
+    the group indicators should pass them to
+    :class:`StructuredGLMBatchFitter` directly rather than rediscover them.
+
+    Parameters
+    ----------
+    design
+        Design matrix of shape ``(n_samples, n_features)``.
+    min_block
+        Minimum number of qualifying columns; below this an empty array is
+        returned.
+
+    Returns
+    -------
+    numpy.ndarray
+        Indices of the block, sorted in the original column order, or an empty
+        array when fewer than ``min_block`` columns qualify.
+    """
+    design = np.asarray(design)
+    if design.ndim != 2:
+        raise ValueError("design must be a 2D array")
+    n_samples, n_features = design.shape
+
+    binary = [
+        j for j in range(n_features)
+        if np.all((design[:, j] == 0) | (design[:, j] == 1)) and design[:, j].any()
+    ]
+    binary.sort(key=lambda j: int(design[:, j].sum()))
+
+    taken = np.zeros(n_samples, dtype=bool)
+    block: list[int] = []
+    for j in binary:
+        column = design[:, j] == 1
+        if not np.any(taken & column):
+            block.append(j)
+            taken |= column
+    if len(block) < min_block:
+        return np.array([], dtype=int)
+    return np.sort(np.asarray(block, dtype=int))
+
+
+@dataclass
+class StructuredGLMResult:
+    """Result of fitting a batch of GLMs on a ``[covariates | groups]`` design.
+
+    ``coef`` and ``se`` are laid out with the covariate columns first, in the
+    order of ``design``, followed by the group columns in the order of
+    ``groups``.
+    """
+
+    coef: np.ndarray
+    se: np.ndarray
+    dispersion: np.ndarray
+    deviance: np.ndarray
+    converged: np.ndarray
+    n_iter: np.ndarray
+    mu: np.ndarray | None = None
+    dev_resid: np.ndarray | None = None
+
+
+class StructuredGLMBatchFitter:
+    """Batched IRLS for designs ``[X | G]`` with ``G`` one-hot.
+
+    Every perturbation screen has this shape: a few dense covariates (an
+    intercept, library size, continuous covariates) beside many indicator
+    columns, one per perturbation or per batch/donor level, at most one of
+    which is set for any cell.  Because the indicator supports are disjoint,
+    ``G' W G`` is diagonal and each Newton step can be taken through the Schur
+    complement of that diagonal block, at ``O(n p d_X^2 + p a d_X^2)`` instead
+    of the ``O(n p (d_X + a)^2)`` a dense solver pays.  The result is the exact
+    IRLS solution of the same GLM, not an approximation.
+
+    When to prefer this over :class:`NBGLMBatchFitter`: the advantage grows
+    with ``a / d_X`` and is not automatic. Measured on one Newton step at
+    ``n=3,000, p=8,563``: 20.9x at ``d_X=31, a=200``; 9.4x at ``d_X=12,
+    a=100``; 4.4x at ``d_X=2, a=50``; but only 1.5x at ``d_X=12, a=20``.  The
+    crossover is near ``a ~ d_X``.  Memory is the other argument: the dense
+    per-gene Hessian at ``d=231, p=8,563`` is 3.66 GB against 0.42 GB for the
+    structured blocks.
+
+    Parameters
+    ----------
+    design
+        Dense covariates ``X``, shape ``(n_samples, n_features)``.  Include the
+        intercept here.
+    groups
+        One-hot indicators ``G``, shape ``(n_samples, n_groups)``, dense or
+        sparse.  Rows that are all zero are cells belonging to no group.
+    offset
+        Log-scale offset (e.g. log size factors) per cell.
+    family
+        ``"nb"`` or ``"poisson"``.
+    max_iter, tol
+        IRLS iteration cap and convergence tolerance; a gene is converged when
+        both its relative deviance change and its largest coefficient change
+        fall below ``tol``.
+    ridge
+        L2 penalty on the covariate block.
+    ridge_group
+        L2 penalty on the group block.  A group whose cells carry no counts
+        for a gene has an unbounded coefficient (the MLE is ``-inf``); this
+        penalty plus ``clip_group`` is what keeps it finite and defined rather
+        than leaving it wherever the iteration happened to stop.
+    clip_group
+        Bound on the magnitude of a group coefficient, on the log scale.
+    min_mu
+        Floor on the fitted mean.  ``0`` (the default) applies no floor.
+    dispersion_method
+        How the NB dispersion is estimated when it is not supplied:
+        ``"moments"`` or ``"cox-reid"``.  Matches
+        :class:`NBGLMBatchFitter`, so the two solvers are interchangeable on
+        a design both can express.
+    """
+
+    def __init__(
         self,
-        perturbation_matrix: np.ndarray | sp.csr_matrix,
-        perturbation_offset: np.ndarray,
-        control_cache: "ControlStatisticsCache",
+        design: ArrayLike,
+        groups,
         *,
-        perturbation_indicator: np.ndarray,
-        valid_mask: np.ndarray | None = None,
-    ) -> NBGLMBatchResult:
-        """Fit NB GLM using precomputed control cell statistics.
-        
-        This method provides significant speedup by reusing control cell
-        contributions (XᵀWX, XᵀWz) from a precomputed cache instead of
-        redundantly computing them for each perturbation comparison.
-        
-        The design matrix is [1, perturbation_indicator] where:
-        - Control cells have indicator = 0
-        - Perturbation cells have indicator = 1
-        
-        The control contribution to XᵀWX and XᵀWz is taken from the cache,
-        and only perturbation cell contributions are computed fresh.
-        
+        offset: ArrayLike | None = None,
+        family: Literal["nb", "poisson"] = "nb",
+        max_iter: int = 50,
+        tol: float = 1e-8,
+        ridge: float = 1e-6,
+        ridge_group: float = 1e-4,
+        clip_group: float = 10.0,
+        min_mu: float = 0.0,
+        dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
+    ) -> None:
+        self.design = np.asarray(design, dtype=np.float64)
+        if self.design.ndim != 2:
+            raise ValueError("design must be a 2D array")
+        if family not in ("nb", "poisson"):
+            raise ValueError(f"family must be 'nb' or 'poisson', got {family!r}")
+
+        self.groups = OneHotGroups(groups)
+        if self.groups.n_samples != self.design.shape[0]:
+            raise ValueError("design and groups must have the same number of rows")
+
+        self.n_samples, self.n_features = self.design.shape
+        self.n_groups = self.groups.n_groups
+        self.family = family
+        self.dispersion_method = dispersion_method
+        self.max_iter = int(max_iter)
+        self.tol = float(tol)
+        self.ridge = float(ridge)
+        self.ridge_group = float(ridge_group)
+        self.clip_group = float(clip_group)
+        self.min_mu = float(min_mu)
+        self._eta_min = eta_floor(min_mu)
+        self.offset = (
+            np.zeros(self.n_samples, dtype=np.float64)
+            if offset is None
+            else np.asarray(offset, dtype=np.float64).ravel()
+        )
+        if self.offset.shape != (self.n_samples,):
+            raise ValueError("offset must have shape (n_samples,)")
+
+        # Cells reordered so each group is a contiguous block, for the
+        # per-group BLAS products in OneHotGroups.cross.
+        self._design_sorted = self.groups.sort(self.design)
+        self._poisson: "StructuredGLMBatchFitter | None" = None
+
+    # -- internals ---------------------------------------------------------
+
+    def _poisson_twin(self) -> "StructuredGLMBatchFitter":
+        """A Poisson fitter over the same design, for the warm-start means.
+
+        Built once and reused, so fitting the genes in batches does not
+        rebuild the group layout per batch.
+        """
+        if self._poisson is None:
+            self._poisson = StructuredGLMBatchFitter(
+                self.design, self.groups.matrix, offset=self.offset,
+                family="poisson", max_iter=self.max_iter, tol=self.tol,
+                ridge=self.ridge, ridge_group=self.ridge_group,
+                clip_group=self.clip_group, min_mu=self.min_mu,
+            )
+        return self._poisson
+
+    def _linear_predictor(self, beta_features, beta_groups):
+        eta = self.offset[:, None] + self.design @ beta_features.T
+        eta += self.groups.expand(beta_groups)
+        return np.clip(eta, self._eta_min, ETA_MAX, out=eta)
+
+    def _hessian_blocks(self, weights):
+        """The three blocks of the arrowhead Hessian for the given weights."""
+        gram = gram_batched(self.design, weights, ridge=self.ridge)
+        cross = self.groups.cross(self._design_sorted, self.groups.sort(weights))
+        diagonal = self.groups.sums(weights) + self.ridge_group
+        return gram, cross, diagonal
+
+    def _newton_step(self, counts, eta, mu, alpha):
+        weights = irls_weights(mu, alpha)
+        working = eta - self.offset[:, None] + (counts - mu) / np.maximum(mu, EPS)
+        weighted = weights * working
+
+        gram, cross, diagonal = self._hessian_blocks(weights)
+        beta_features, beta_groups, _ = schur_solve(
+            gram, cross, diagonal, (self.design.T @ weighted).T,
+            self.groups.sums(weighted),
+        )
+        np.clip(beta_groups, -self.clip_group, self.clip_group, out=beta_groups)
+        return beta_features, beta_groups
+
+    def _log_det_hessian(self, weights):
+        """``log det H`` per gene for the arrowhead Hessian.
+
+        ``det [[C, B], [B', D]] = det(D) det(C - B D^-1 B')``, so the
+        determinant a Cox-Reid adjustment needs costs a ``d_X`` determinant
+        plus a sum of logs, instead of a ``(d_X + a)`` one.
+        """
+        gram, cross, diagonal = self._hessian_blocks(weights)
+        schur = schur_complement(gram, cross, diagonal)
+        sign, log_det_schur = np.linalg.slogdet(schur)
+        log_det_schur = np.where(sign > 0, log_det_schur, 0.0)
+        return np.log(np.maximum(diagonal, EPS)).sum(axis=0) + log_det_schur
+
+    def _refine_dispersion_cox_reid(self, counts, mu, alpha):
+        """Cox-Reid adjusted profile likelihood over a dispersion grid.
+
+        Mirrors :meth:`NBGLMBatchFitter._refine_dispersion_cox_reid_batch`,
+        including its grid, so the two solvers agree on a design both can
+        express.
+        """
+        alpha_grid = 10.0 ** np.linspace(-3, 2, 10)
+        loglik = _nb_loglik_grid_numba(counts, mu, alpha_grid, gammaln_nb(counts + 1))
+        for index, value in enumerate(alpha_grid):
+            loglik[index] -= 0.5 * self._log_det_hessian(irls_weights(mu, value))
+        return np.clip(alpha_grid[np.argmin(-loglik, axis=0)], 1e-8, 1e3)
+
+    def _irls(self, counts, alpha, *, final_blocks: bool = True):
+        """IRLS to convergence with the dispersion held fixed.
+
+        Damping, convergence and the active set work exactly as in
+        :meth:`NBGLMBatchFitter._irls_at_fixed_dispersion`; see it for why a
+        shortened step always interpolates towards the full Newton point and
+        why a gene that runs out of halvings is left where it was.
+
+        ``final_blocks=False`` skips the terminal Hessian blocks, which exist
+        only so that standard errors can reuse the factorisation.  A fit whose
+        means are wanted for a dispersion estimate does not need them.
+        """
+        n_genes = counts.shape[1]
+        deviance_of = Deviance(counts, self.family, alpha)
+
+        # Constant starting predictor at each gene's offset-adjusted mean,
+        # carried by whichever design column is a constant (the intercept).
+        # ``eta`` is then derived from the coefficients rather than set beside
+        # them, so a design with no such column starts from a consistent
+        # ``beta = 0`` instead of an ``eta`` the coefficients do not describe.
+        mean_counts = counts.mean(axis=0)
+        eta_start = np.log(np.maximum(mean_counts, 1e-3) / np.exp(self.offset).mean())
+        beta_features = np.zeros((n_genes, self.n_features))
+        constant = np.flatnonzero(
+            np.all(self.design == self.design[0], axis=0) & (self.design[0] != 0.0)
+        )
+        if constant.size:
+            beta_features[:, constant[0]] = eta_start / self.design[0, constant[0]]
+        beta_groups = np.zeros((n_genes, self.n_groups))
+
+        eta = self._linear_predictor(beta_features, beta_groups)
+        mu = np.exp(eta)
+        deviance = deviance_of.total(eta, mu)
+
+        converged = np.zeros(n_genes, dtype=bool)
+        stalled = np.zeros(n_genes, dtype=bool)
+        n_iter = np.zeros(n_genes, dtype=np.int32)
+        active = np.arange(n_genes)
+
+        for iteration in range(1, self.max_iter + 1):
+            whole = active.size == n_genes
+            counts_a = counts if whole else counts[:, active]
+            eta_a = eta if whole else eta[:, active]
+            mu_a = mu if whole else mu[:, active]
+            features_a = beta_features if whole else beta_features[active]
+            groups_a = beta_groups if whole else beta_groups[active]
+            deviance_a = deviance if whole else deviance[active]
+            deviance_fn = deviance_of if whole else deviance_of.subset(active, counts_a)
+            alpha_a = None if alpha is None else (alpha if whole else alpha[active])
+
+            full_features, full_groups = self._newton_step(
+                counts_a, eta_a, mu_a, alpha_a
+            )
+            new_features = full_features.copy()
+            new_groups = full_groups.copy()
+            new_eta = self._linear_predictor(new_features, new_groups)
+            new_mu = np.exp(new_eta)
+            new_deviance = deviance_fn.total(new_eta, new_mu)
+
+            on_floor = (
+                np.any(eta_a <= self._eta_min, axis=0)
+                if self.min_mu > 0.0
+                else np.zeros(active.size, dtype=bool)
+            )
+
+            # See NBGLMBatchFitter._irls_at_fixed_dispersion: a gene resting
+            # on the mean floor takes the full Newton step rather than a
+            # shortened one, and is judged by the deviance ratio.
+            ceiling = deviance_a + 1e-9 * np.abs(deviance_a)
+            rose = new_deviance > ceiling
+            worse = rose & ~on_floor
+            scale = np.maximum(np.abs(deviance_a), 1e-8)
+            excess = (new_deviance - deviance_a) / scale
+            step = 1.0
+            for _ in range(_MAX_STEP_HALVINGS):
+                if not np.any(worse):
+                    break
+                step *= 0.5
+                idx = np.flatnonzero(worse)
+                half_features = features_a[idx] + step * (full_features[idx] - features_a[idx])
+                half_groups = groups_a[idx] + step * (full_groups[idx] - groups_a[idx])
+                half_eta = self._linear_predictor(half_features, half_groups)
+                half_mu = np.exp(half_eta)
+                half_deviance = deviance_fn.subset(idx).total(half_eta, half_mu)
+                excess[idx] = np.minimum(
+                    excess[idx], (half_deviance - deviance_a[idx]) / scale[idx]
+                )
+                take = half_deviance <= ceiling[idx]
+                taken = idx[take]
+                new_features[taken] = half_features[take]
+                new_groups[taken] = half_groups[take]
+                new_eta[:, taken] = half_eta[:, take]
+                new_mu[:, taken] = half_mu[:, take]
+                new_deviance[taken] = half_deviance[take]
+                worse[taken] = False
+
+            fixed_point = rose & on_floor
+            if np.any(worse):
+                keep = np.flatnonzero(worse)
+                new_features[keep] = features_a[keep]
+                new_groups[keep] = groups_a[keep]
+                new_eta[:, keep] = eta_a[:, keep]
+                new_mu[:, keep] = mu_a[:, keep]
+                new_deviance[keep] = deviance_a[keep]
+                stalled[active[keep]] = True
+
+            relative_change = np.abs(new_deviance - deviance_a) / scale
+            # Formed before ``deviance[active] = new_deviance`` below, for the
+            # reason given in NBGLMBatchFitter._irls_at_fixed_dispersion:
+            # ``deviance_a`` aliases ``deviance`` while the whole batch is
+            # active, so a ratio read after that write is always zero.
+            deviance_ratio = np.abs(new_deviance - deviance_a) / (
+                np.abs(new_deviance) + 0.1
+            )
+            coef_change = np.maximum(
+                np.max(np.abs(new_features - features_a), axis=1),
+                np.max(np.abs(new_groups - groups_a), axis=1) if self.n_groups else 0.0,
+            )
+
+            beta_features[active] = new_features
+            beta_groups[active] = new_groups
+            eta[:, active] = new_eta
+            mu[:, active] = new_mu
+            deviance[active] = new_deviance
+            n_iter[active] = iteration
+            # See NBGLMBatchFitter._irls_at_fixed_dispersion for why a gene
+            # that took no step is judged by the steps it refused.
+            converged[active] = np.select(
+                [fixed_point, worse],
+                [
+                    (deviance_ratio < self.tol) & (coef_change < self.tol),
+                    excess < self.tol,
+                ],
+                default=(relative_change < self.tol) & (coef_change < self.tol),
+            )
+
+            active = np.flatnonzero(~converged & ~stalled)
+            if active.size == 0:
+                break
+
+        blocks = None
+        if final_blocks:
+            # Standard errors need the blocks at the converged fit for *every*
+            # gene; the iterations only ever formed them for the active subset.
+            # They are also built from the unfloored mean, because ``min_mu``
+            # steadies the iteration and has no place in the reported
+            # covariance -- see NBGLMBatchFitter._wald_weights.  With no floor
+            # the two weight sets are the same array, so nothing extra is
+            # formed on the default path.
+            weights = irls_weights(mu, alpha)
+            if self.min_mu > 0.0:
+                eta_wald = np.clip(
+                    self.offset[:, None]
+                    + self.design @ beta_features.T
+                    + self.groups.expand(beta_groups),
+                    ETA_MIN,
+                    ETA_MAX,
+                )
+                weights = irls_weights(np.exp(eta_wald), alpha)
+            gram, cross, diagonal = self._hessian_blocks(weights)
+            blocks = (cross, diagonal, schur_complement(gram, cross, diagonal))
+
+        return (
+            beta_features, beta_groups, eta, mu, deviance, converged, n_iter,
+            blocks,
+        )
+
+    def _moments_dispersion(self, counts, mu):
+        """Method-of-moments NB dispersion from fitted means."""
+        residual = counts - mu
+        dof = max(self.n_samples - self.n_features - self.n_groups, 1)
+        moments = np.sum(
+            (residual * residual - counts) / np.maximum(mu * mu, EPS), axis=0
+        ) / dof
+        return np.clip(np.where(np.isfinite(moments), moments, 1e-8), 1e-8, 1e6)
+
+    # -- public ------------------------------------------------------------
+
+    def fit_batch(
+        self,
+        counts: ArrayLike,
+        *,
+        dispersion: ArrayLike | None = None,
+        return_mu: bool = True,
+        return_dev_resid: bool = True,
+        gene_batch_size: int | Literal["auto"] | None = "auto",
+    ) -> StructuredGLMResult:
+        """Fit one GLM per gene.
+
         Parameters
         ----------
-        perturbation_matrix
-            Expression matrix for perturbation cells only, shape (n_pert, n_genes).
-        perturbation_offset
-            Log size factors for perturbation cells, shape (n_pert,).
-        control_cache
-            Precomputed control cell statistics from `precompute_control_statistics`.
-        perturbation_indicator
-            Binary indicator for perturbation cells in the combined design.
-            Should be shape (n_control + n_pert,) with 0 for control, 1 for perturbation.
-        valid_mask
-            Optional boolean mask for genes to fit, shape (n_genes,).
-            
-        Returns
-        -------
-        NBGLMBatchResult
-            Fitted coefficients and statistics.
+        counts
+            Count matrix of shape ``(n_samples, n_genes)``.
+        dispersion
+            Per-gene NB dispersion to hold fixed.  Ignored for Poisson.  When
+            ``None`` and ``family="nb"``, it is estimated by method of moments
+            from a Poisson fit and the model is then refitted with it, so the
+            returned coefficients and dispersion describe the same model.
+        return_mu, return_dev_resid
+            Whether to return the ``(n_samples, n_genes)`` fitted means and
+            deviance residuals.  Both are large; skip what is not needed.
+        gene_batch_size
+            Genes fitted at a time.  A Newton step holds a dozen
+            ``(n_samples, batch)`` work arrays, so this is what bounds peak
+            memory; ``"auto"`` sizes it for ~100 MB of them, as
+            :class:`NBGLMBatchFitter` does.  ``None`` fits every gene in one
+            batch.  (``counts`` itself is held whole either way.)
         """
-        # Densify perturbation matrix if needed
-        if sp.issparse(perturbation_matrix):
-            Y_pert = np.asarray(perturbation_matrix.toarray(), dtype=np.float64)
-        else:
-            Y_pert = np.asarray(perturbation_matrix, dtype=np.float64)
-        
-        n_pert, n_genes = Y_pert.shape
-        n_control = control_cache.control_n
-        n_total = n_control + n_pert
-        
-        # Get control data from cache (already dense, no need for .toarray())
-        Y_control = control_cache.control_matrix  # Already np.ndarray
-        
-        # Initialize outputs
-        n_features = 2  # intercept + perturbation
-        coef = np.zeros((n_genes, n_features), dtype=np.float64)
-        se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
-        dispersion = np.full(n_genes, np.nan, dtype=np.float64)
-        converged = np.zeros(n_genes, dtype=bool)
-        n_iter_arr = np.zeros(n_genes, dtype=np.int32)
-        deviance = np.full(n_genes, np.nan, dtype=np.float64)
-        
-        # Determine valid genes
-        if valid_mask is None:
-            total_counts = Y_control.sum(axis=0) + Y_pert.sum(axis=0)
-            valid_mask = total_counts >= self.min_total_count
-        
-        valid_indices = np.where(valid_mask)[0]
-        n_valid = len(valid_indices)
-        
-        if n_valid == 0:
-            return NBGLMBatchResult(
-                coef=coef, se=se, dispersion=dispersion,
-                converged=converged, n_iter=n_iter_arr, deviance=deviance
-            )
-        
-        # Work with valid genes only
-        Y_control_valid = Y_control[:, valid_mask]
-        Y_pert_valid = Y_pert[:, valid_mask]
-        
-        # Initialize beta from cache: [β₀_cached, 0]
-        beta = np.zeros((n_features, n_valid), dtype=np.float64)
-        beta[0, :] = control_cache.beta_intercept[valid_mask]
-        
-        # Use cached control dispersion as starting point
-        alpha = control_cache.control_dispersion[valid_mask].copy()
-        
-        # Precompute offsets
-        offset_control = control_cache.control_offset[:, None]
-        offset_pert = perturbation_offset[:, None]
-        log_min_mu = np.log(self.min_mu)
-        
-        # Work arrays
-        mu_control = np.empty((n_control, n_valid), dtype=np.float64)
-        mu_pert = np.empty((n_pert, n_valid), dtype=np.float64)
-        W_control = np.empty_like(mu_control)
-        W_pert = np.empty_like(mu_pert)
-        
-        # Convergence tracking
-        gene_converged = np.zeros(n_valid, dtype=bool)
-        gene_n_iter = np.zeros(n_valid, dtype=np.int32)
-        
-        for iteration in range(1, self.max_iter + 1):
-            beta_intercept = beta[0, :]  # (n_valid,)
-            beta_pert = beta[1, :]  # (n_valid,)
-            
-            # Control cells: eta = β₀ + offset (perturbation indicator = 0)
-            eta_control = beta_intercept[None, :] + offset_control
-            np.clip(eta_control, log_min_mu, 20.0, out=eta_control)
-            np.exp(eta_control, out=mu_control)
-            np.maximum(mu_control, self.min_mu, out=mu_control)
-            
-            # Perturbation cells: eta = β₀ + β₁ + offset (perturbation indicator = 1)
-            eta_pert = beta_intercept[None, :] + beta_pert[None, :] + offset_pert
-            np.clip(eta_pert, log_min_mu, 20.0, out=eta_pert)
-            np.exp(eta_pert, out=mu_pert)
-            np.maximum(mu_pert, self.min_mu, out=mu_pert)
-            
-            # Weights: W = μ² / (μ + α * μ²)
-            var_control = mu_control + alpha[None, :] * mu_control * mu_control
-            np.divide(mu_control * mu_control, np.maximum(var_control, self.min_mu), out=W_control)
-            
-            var_pert = mu_pert + alpha[None, :] * mu_pert * mu_pert
-            np.divide(mu_pert * mu_pert, np.maximum(var_pert, self.min_mu), out=W_pert)
-            
-            # Working responses
-            z_control = eta_control + (Y_control_valid - mu_control) / np.maximum(mu_control, self.min_mu)
-            z_pert = eta_pert + (Y_pert_valid - mu_pert) / np.maximum(mu_pert, self.min_mu)
-            
-            # Remove offsets for working response
-            z_control_centered = z_control - offset_control
-            z_pert_centered = z_pert - offset_pert
-            
-            # Compute XᵀWX and XᵀWz
-            # For design [1, p] where p is perturbation indicator:
-            # XᵀWX = [[sum_all(W), sum_pert(W)],
-            #         [sum_pert(W), sum_pert(W)]]
-            # XᵀWz = [sum_all(W*z), sum_pert(W*z)]
-            
-            W_control_sum = np.sum(W_control, axis=0)  # (n_valid,)
-            W_pert_sum = np.sum(W_pert, axis=0)  # (n_valid,)
-            
-            Wz_control_sum = np.sum(W_control * z_control_centered, axis=0)  # (n_valid,)
-            Wz_pert_sum = np.sum(W_pert * z_pert_centered, axis=0)  # (n_valid,)
-            
-            # XᵀWX elements
-            xtwx_00 = W_control_sum + W_pert_sum  # sum over all cells
-            xtwx_01 = W_pert_sum  # only perturbation cells contribute
-            xtwx_11 = W_pert_sum  # perturbation indicator is 1 for pert cells
-            
-            # XᵀWz elements
-            xtwz_0 = Wz_control_sum + Wz_pert_sum  # all cells
-            xtwz_1 = Wz_pert_sum  # only perturbation cells
-            
-            # Add ridge penalty
-            ridge = self.ridge_penalty
-            xtwx_00 = xtwx_00 + ridge
-            xtwx_11 = xtwx_11 + ridge
-            
-            # Solve 2x2 system using Cramer's rule
-            det = xtwx_00 * xtwx_11 - xtwx_01 ** 2
-            det = np.where(np.abs(det) < 1e-12, 1e-12, det)
-            
-            beta_new_0 = (xtwx_11 * xtwz_0 - xtwx_01 * xtwz_1) / det
-            beta_new_1 = (xtwx_00 * xtwz_1 - xtwx_01 * xtwz_0) / det
-            
-            beta_new = np.vstack([beta_new_0, beta_new_1])
-            
-            # Check convergence
-            beta_diff = np.max(np.abs(beta_new - beta), axis=0)
-            newly_converged = (beta_diff < self.tol) & ~gene_converged
-            gene_converged |= newly_converged
-            gene_n_iter[~gene_converged] = iteration
-            
-            beta = beta_new
-            
-            # Update dispersion (method of moments)
-            resid_control = Y_control_valid - mu_control
-            resid_pert = Y_pert_valid - mu_pert
-            
-            numerator = (
-                np.sum((resid_control ** 2 - Y_control_valid) / np.maximum(mu_control ** 2, self.min_mu), axis=0)
-                + np.sum((resid_pert ** 2 - Y_pert_valid) / np.maximum(mu_pert ** 2, self.min_mu), axis=0)
-            )
-            dof = max(n_total - n_features, 1)
-            alpha_new = np.clip(numerator / dof, 1e-8, 1e6)
-            alpha = np.where(np.isfinite(alpha_new), alpha_new, alpha)
-            
-            if np.all(gene_converged):
-                break
-        
-        # Compute final standard errors using sandwich estimator (PyDESeq2 style)
-        # SE = sqrt(c' @ H @ M @ H @ c) where:
-        #   M = XᵀWX (unregularized Fisher information)
-        #   Mr = M + ridge*I (regularized)
-        #   H = inv(Mr)
-        #   c = [0, 1] for perturbation effect
-        
-        # Recompute XᵀWX for final weights
-        W_control_sum = np.sum(W_control, axis=0)
-        W_pert_sum = np.sum(W_pert, axis=0)
-        
-        # Unregularized M
-        M00 = W_control_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2: inv = (1/det) * [[d, -b], [-c, a]]
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For contrast c = [0, 1]: Hc = [H[0,1], H[1,1]] = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        # = Hc0² * M00 + 2 * Hc0 * Hc1 * M01 + Hc1² * M11
-        var_pert = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
-        se_pert = np.sqrt(np.maximum(var_pert, 1e-12))
-        
-        # For intercept, contrast c = [1, 0]: Hc = [H00, H01]
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
-        se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
-        
-        se_valid = np.vstack([se_intercept, se_pert])  # (n_features, n_valid)
-        
-        # Store results
-        coef[valid_indices] = beta.T
-        se[valid_indices] = se_valid.T
-        dispersion[valid_indices] = alpha
-        converged[valid_indices] = gene_converged
-        n_iter_arr[valid_indices] = gene_n_iter
-        
-        return NBGLMBatchResult(
-            coef=coef, se=se, dispersion=dispersion,
-            converged=converged, n_iter=n_iter_arr, deviance=deviance
+        counts = np.asarray(
+            counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
         )
-    def fit_batch_with_frozen_control(
+        if counts.ndim != 2 or counts.shape[0] != self.n_samples:
+            raise ValueError(f"counts must have shape ({self.n_samples}, n_genes)")
+        n_genes = counts.shape[1]
+
+        alpha = None
+        if self.family == "nb" and dispersion is not None:
+            alpha = np.asarray(dispersion, dtype=np.float64).ravel()
+            if alpha.shape != (n_genes,):
+                raise ValueError(
+                    f"dispersion must have shape ({n_genes},), got {alpha.shape}"
+                )
+
+        if gene_batch_size == "auto":
+            gene_batch_size = _estimate_gene_batch_size_fitter(
+                self.n_samples, n_genes, n_work_arrays=12, target_mb=100.0
+            )
+        elif gene_batch_size is None:
+            gene_batch_size = n_genes
+        gene_batch_size = max(1, int(gene_batch_size))
+
+        n_coef = self.n_features + self.n_groups
+        out = StructuredGLMResult(
+            coef=np.zeros((n_genes, n_coef), dtype=np.float64),
+            se=np.full((n_genes, n_coef), np.inf, dtype=np.float64),
+            dispersion=np.zeros(n_genes, dtype=np.float64),
+            deviance=np.full(n_genes, np.nan, dtype=np.float64),
+            converged=np.zeros(n_genes, dtype=bool),
+            n_iter=np.zeros(n_genes, dtype=np.int32),
+            mu=np.empty((self.n_samples, n_genes)) if return_mu else None,
+            dev_resid=np.empty((self.n_samples, n_genes)) if return_dev_resid else None,
+        )
+
+        for start in range(0, n_genes, gene_batch_size):
+            batch = slice(start, min(start + gene_batch_size, n_genes))
+            self._fit_genes(
+                counts[:, batch],
+                None if alpha is None else alpha[batch],
+                out,
+                batch,
+                return_mu=return_mu,
+                return_dev_resid=return_dev_resid,
+            )
+        return out
+
+    def _fit_genes(
+        self, counts, alpha, out, batch, *, return_mu, return_dev_resid
+    ) -> None:
+        """Fit one batch of genes, writing into ``out[batch]``."""
+        if self.family == "nb" and alpha is None:
+            # Mirror the dense fitter: a first dispersion from the Poisson
+            # means, an NB fit with it held fixed, then the dispersion that
+            # the fitted NB means imply.  The final fit below then uses that,
+            # so the returned coefficients and dispersion describe the same
+            # model rather than being one step out of step.  Neither
+            # intermediate fit needs standard errors, so neither forms the
+            # blocks they would come from.
+            _, _, _, poisson_mu, _, _, _, _ = self._poisson_twin()._irls(
+                counts, None, final_blocks=False
+            )
+            alpha = self._moments_dispersion(counts, poisson_mu)
+            _, _, _, first_mu, _, _, _, _ = self._irls(
+                counts, alpha, final_blocks=False
+            )
+            alpha = self._moments_dispersion(counts, first_mu)
+            if self.dispersion_method == "cox-reid":
+                alpha = self._refine_dispersion_cox_reid(counts, first_mu, alpha)
+
+        (
+            beta_features, beta_groups, eta, mu, deviance, converged, n_iter,
+            (cross, diagonal, schur),
+        ) = self._irls(counts, alpha)
+
+        feature_variance, group_variance = schur_variances(schur, cross, diagonal)
+
+        out.coef[batch] = np.c_[beta_features, beta_groups]
+        out.se[batch] = np.c_[
+            np.sqrt(np.maximum(feature_variance, 0.0)),
+            np.sqrt(np.maximum(group_variance, 0.0)),
+        ]
+        if alpha is not None:
+            out.dispersion[batch] = alpha
+        out.deviance[batch] = deviance
+        out.converged[batch] = converged
+        out.n_iter[batch] = n_iter
+        if return_mu:
+            out.mu[:, batch] = mu
+        if return_dev_resid:
+            out.dev_resid[:, batch] = Deviance(
+                counts, self.family, alpha
+            ).residuals(eta, mu)
+
+    def counterfactual_means(
         self,
-        perturbation_matrix: np.ndarray | sp.csr_matrix,
-        perturbation_offset: np.ndarray,
-        control_cache: "ControlStatisticsCache",
+        result: StructuredGLMResult,
         *,
-        valid_mask: np.ndarray | None = None,
-    ) -> NBGLMBatchResult:
-        """Fit NB GLM using frozen control sufficient statistics (memory-efficient).
-        
-        This method uses precomputed sufficient statistics from control cells
-        instead of the raw control_matrix, reducing per-worker memory from
-        ~5GB to ~1MB for large datasets.
-        
-        Key differences from fit_batch_with_control_cache:
-        - β₀ (intercept) is FROZEN to the value estimated from control cells
-        - Only β₁ (perturbation effect) is estimated
-        - Control contributions (W_sum, Wz_sum) are pre-computed constants
-        - No access to raw control_matrix (control_cache.control_matrix is None)
-        
-        The design matrix is [1, perturbation_indicator] where:
-        - Control cells have indicator = 0 (contributions are frozen)
-        - Perturbation cells have indicator = 1
-        
-        Parameters
-        ----------
-        perturbation_matrix
-            Expression matrix for perturbation cells only, shape (n_pert, n_genes).
-        perturbation_offset
-            Log size factors for perturbation cells, shape (n_pert,).
-        control_cache
-            Precomputed control cell statistics with use_frozen_control=True.
-            Must have frozen_control_W_sum and frozen_control_Wz_sum set.
-        valid_mask
-            Optional boolean mask for genes to fit, shape (n_genes,).
-            
+        design: np.ndarray | None = None,
+        offset: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Fitted means with every group off, and with each group on in turn.
+
+        Answers "what would these cells have expressed under each
+        perturbation, and under none", which is the quantity a counterfactual
+        or log-fold-change estimate is built from.
+
         Returns
         -------
-        NBGLMBatchResult
-            Fitted coefficients and statistics.
-            
-        Notes
-        -----
-        This method is designed for parallel processing where each worker
-        handles a subset of perturbations. By using frozen control stats:
-        
-        - Per-worker pickle size: ~5GB → ~1MB (control_matrix not needed)
-        - Memory enables: 2 workers → 32 workers (for 128GB memory limit)
-        - Time reduction: ~300h → ~10h (for genome-wide screens)
-        
-        Mathematical justification:
-        With global dispersion and fixed β₀, the control cells' contribution
-        to XᵀWX and XᵀWz is constant across all perturbation comparisons:
-        
-        - μ_control = exp(β₀ + offset) is fixed (no perturbation indicator)
-        - W_control = μ²/(μ + α*μ²) depends only on μ and global α
-        - z_control = η + (Y - μ)/μ - offset = β₀ + (Y - μ)/μ
-        
-        Therefore, sum(W_control) and sum(W_control * z_centered) are constants
-        that can be pre-computed once and reused across all comparisons.
+        baseline
+            Shape ``(n_cells, n_genes)`` -- all group indicators zero.
+        per_group
+            Shape ``(n_cells, n_genes, n_groups)`` -- group ``k`` set for all
+            cells.  This is the large one; ``n_cells * n_genes * n_groups``
+            float64 values.
         """
-        if not control_cache.use_frozen_control:
-            raise ValueError(
-                "control_cache.use_frozen_control must be True. "
-                "Use precompute_control_statistics(..., freeze_control=True) to create the cache."
-            )
-        
-        if control_cache.frozen_control_W_sum is None or control_cache.frozen_control_Wz_sum is None:
-            raise ValueError(
-                "Frozen control statistics not available. "
-                "control_cache.frozen_control_W_sum and frozen_control_Wz_sum must be set."
-            )
-        
-        # Densify perturbation matrix if needed
-        if sp.issparse(perturbation_matrix):
-            Y_pert = np.asarray(perturbation_matrix.toarray(), dtype=np.float64)
-        else:
-            Y_pert = np.asarray(perturbation_matrix, dtype=np.float64)
-        
-        n_pert, n_genes = Y_pert.shape
-        n_control = control_cache.control_n
-        n_total = n_control + n_pert
-        
-        # Initialize outputs
-        n_features = 2  # intercept + perturbation
-        coef = np.zeros((n_genes, n_features), dtype=np.float64)
-        se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
-        dispersion = np.full(n_genes, np.nan, dtype=np.float64)
-        converged = np.zeros(n_genes, dtype=bool)
-        n_iter_arr = np.zeros(n_genes, dtype=np.int32)
-        deviance = np.full(n_genes, np.nan, dtype=np.float64)
-        
-        # Determine valid genes (use control-side total for validation)
-        if valid_mask is None:
-            # Without raw control_matrix, use frozen_control_Y_sum
-            control_total = control_cache.frozen_control_Y_sum  # (n_genes,)
-            pert_total = Y_pert.sum(axis=0)
-            total_counts = control_total + pert_total
-            valid_mask = total_counts >= self.min_total_count
-        
-        valid_indices = np.where(valid_mask)[0]
-        n_valid = len(valid_indices)
-        
-        if n_valid == 0:
-            return NBGLMBatchResult(
-                coef=coef, se=se, dispersion=dispersion,
-                converged=converged, n_iter=n_iter_arr, deviance=deviance
-            )
-        
-        # Work with valid genes only
-        Y_pert_valid = Y_pert[:, valid_mask]
-        
-        # Frozen control sufficient statistics (pre-computed, constant)
-        frozen_W_sum = control_cache.frozen_control_W_sum[valid_mask]  # (n_valid,)
-        frozen_Wz_sum = control_cache.frozen_control_Wz_sum[valid_mask]  # (n_valid,)
-        
-        # For dispersion updates (method of moments)
-        frozen_resid_sq_sum = control_cache.frozen_control_resid_sq_sum[valid_mask]
-        frozen_Y_sum = control_cache.frozen_control_Y_sum[valid_mask]
-        frozen_mu_sum = control_cache.frozen_control_mu_sum[valid_mask]
-        
-        # β₀ is FROZEN from control cells (this is the key insight!)
-        beta_intercept = control_cache.beta_intercept[valid_mask].copy()  # (n_valid,)
-        
-        # β₁ (perturbation effect) is initialized to 0
-        beta_pert = np.zeros(n_valid, dtype=np.float64)
-        
-        # Use global dispersion from control cache
-        alpha = control_cache.control_dispersion[valid_mask].copy()
-        
-        # If global dispersion is available, use it (more stable)
-        if control_cache.global_dispersion is not None:
-            alpha = control_cache.global_dispersion[valid_mask].copy()
-        
-        # Precompute perturbation offsets
-        offset_pert = perturbation_offset[:, None]  # (n_pert, 1)
-        log_min_mu = np.log(self.min_mu)
-        
-        # Work arrays for perturbation cells only (no control arrays needed!)
-        mu_pert = np.empty((n_pert, n_valid), dtype=np.float64)
-        W_pert = np.empty_like(mu_pert)
-        
-        # Convergence tracking
-        gene_converged = np.zeros(n_valid, dtype=bool)
-        gene_n_iter = np.zeros(n_valid, dtype=np.int32)
-        
-        for iteration in range(1, self.max_iter + 1):
-            # Perturbation cells: eta = β₀ + β₁ + offset
-            eta_pert = beta_intercept[None, :] + beta_pert[None, :] + offset_pert
-            np.clip(eta_pert, log_min_mu, 20.0, out=eta_pert)
-            np.exp(eta_pert, out=mu_pert)
-            np.maximum(mu_pert, self.min_mu, out=mu_pert)
-            
-            # Weights: W = μ² / (μ + α * μ²)
-            var_pert = mu_pert + alpha[None, :] * mu_pert * mu_pert
-            np.divide(mu_pert * mu_pert, np.maximum(var_pert, self.min_mu), out=W_pert)
-            
-            # Working responses for perturbation cells
-            z_pert = eta_pert + (Y_pert_valid - mu_pert) / np.maximum(mu_pert, self.min_mu)
-            z_pert_centered = z_pert - offset_pert  # Remove offset
-            
-            # Perturbation contributions to XᵀWX and XᵀWz
-            W_pert_sum = np.sum(W_pert, axis=0)  # (n_valid,)
-            Wz_pert_sum = np.sum(W_pert * z_pert_centered, axis=0)  # (n_valid,)
-            
-            # XᵀWX elements (2x2 matrix per gene)
-            # Control contributions are FROZEN, perturbation contributions are fresh
-            xtwx_00 = frozen_W_sum + W_pert_sum  # sum over all cells
-            xtwx_01 = W_pert_sum  # only perturbation cells have indicator=1
-            xtwx_11 = W_pert_sum  # perturbation indicator is 1 for pert cells
-            
-            # XᵀWz elements
-            xtwz_0 = frozen_Wz_sum + Wz_pert_sum  # all cells
-            xtwz_1 = Wz_pert_sum  # only perturbation cells
-            
-            # Add ridge penalty
-            ridge = self.ridge_penalty
-            xtwx_00_reg = xtwx_00 + ridge
-            xtwx_11_reg = xtwx_11 + ridge
-            
-            # Solve 2x2 system using Cramer's rule
-            # BUT: β₀ is FROZEN, so we only update β₁
-            # 
-            # The full system is:
-            # [xtwx_00  xtwx_01] [β₀]   [xtwz_0]
-            # [xtwx_01  xtwx_11] [β₁] = [xtwz_1]
-            #
-            # With β₀ frozen, we solve for β₁ from the second row:
-            # xtwx_01 * β₀ + xtwx_11 * β₁ = xtwz_1
-            # β₁ = (xtwz_1 - xtwx_01 * β₀) / xtwx_11_reg
-            
-            beta_pert_new = (xtwz_1 - xtwx_01 * beta_intercept) / np.maximum(xtwx_11_reg, 1e-12)
-            
-            # Check convergence
-            beta_diff = np.abs(beta_pert_new - beta_pert)
-            newly_converged = (beta_diff < self.tol) & ~gene_converged
-            gene_converged |= newly_converged
-            gene_n_iter[~gene_converged] = iteration
-            
-            beta_pert = beta_pert_new
-            
-            if np.all(gene_converged):
-                break
-        
-        # Compute final standard errors using sandwich estimator
-        # For frozen β₀, we use the conditional variance of β₁ given β₀
-        
-        # Recompute XᵀWX for final weights
-        W_pert_sum = np.sum(W_pert, axis=0)
-        
-        # Unregularized M for SE calculation
-        M00 = frozen_W_sum + W_pert_sum
-        M01 = W_pert_sum
-        M11 = W_pert_sum
-        
-        # Regularized Mr = M + ridge*I
-        ridge = self.ridge_penalty
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # H = inv(Mr) for 2x2
-        det_r = Mr00 * Mr11 - Mr01 * Mr01
-        det_r = np.where(np.abs(det_r) < 1e-12, 1e-12, det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # For β₁ contrast c = [0, 1]: Hc = [H01, H11]
-        Hc0 = H01
-        Hc1 = H11
-        
-        # Sandwich variance: Hc.T @ M @ Hc
-        var_pert_effect = Hc0**2 * M00 + 2 * Hc0 * Hc1 * M01 + Hc1**2 * M11
-        se_pert = np.sqrt(np.maximum(var_pert_effect, 1e-12))
-        
-        # For intercept SE (using frozen β₀'s original SE would be more accurate,
-        # but we approximate with the sandwich estimator for consistency)
-        var_intercept = H00**2 * M00 + 2 * H00 * H01 * M01 + H01**2 * M11
-        se_intercept = np.sqrt(np.maximum(var_intercept, 1e-12))
-        
-        # Store results
-        beta = np.vstack([beta_intercept, beta_pert])  # (2, n_valid)
-        se_valid = np.vstack([se_intercept, se_pert])  # (2, n_valid)
-        
-        coef[valid_indices] = beta.T
-        se[valid_indices] = se_valid.T
-        dispersion[valid_indices] = alpha
-        converged[valid_indices] = gene_converged
-        n_iter_arr[valid_indices] = gene_n_iter
-        
+        design = self.design if design is None else np.asarray(design, dtype=np.float64)
+        offset = self.offset if offset is None else np.asarray(offset, dtype=np.float64).ravel()
+        if design.shape[0] != offset.shape[0]:
+            raise ValueError("design and offset must describe the same cells")
+
+        beta_features = result.coef[:, : self.n_features]
+        beta_groups = result.coef[:, self.n_features :]
+        eta = offset[:, None] + design @ beta_features.T
+        baseline = np.exp(np.clip(eta, self._eta_min, ETA_MAX))
+        per_group = np.exp(
+            np.clip(eta[:, :, None] + beta_groups[None, :, :], self._eta_min, ETA_MAX)
+        )
+        return baseline, per_group
+
+
+def fit_glm_onehot(
+    counts: ArrayLike,
+    design: ArrayLike,
+    groups,
+    *,
+    family: Literal["nb", "poisson"] = "nb",
+    dispersion: ArrayLike | None = None,
+    offset: ArrayLike | None = None,
+    **kwargs,
+) -> StructuredGLMResult:
+    """Fit ``[design | groups]`` GLMs for every gene in ``counts``.
+
+    One-shot wrapper around :class:`StructuredGLMBatchFitter`; see it for the
+    parameters and for when this solver is the right choice.
+    """
+    return_mu = kwargs.pop("return_mu", True)
+    return_dev_resid = kwargs.pop("return_dev_resid", True)
+    gene_batch_size = kwargs.pop("gene_batch_size", "auto")
+    fitter = StructuredGLMBatchFitter(
+        design, groups, offset=offset, family=family, **kwargs
+    )
+    return fitter.fit_batch(
+        counts, dispersion=dispersion, return_mu=return_mu,
+        return_dev_resid=return_dev_resid, gene_batch_size=gene_batch_size,
+    )
+
+
+def fit_nb_glm_batch_auto(
+    design: ArrayLike,
+    counts: ArrayLike,
+    *,
+    offset: ArrayLike | None = None,
+    protected_columns: Sequence[int] = (),
+    max_iter: int = 25,
+    tol: float = 1e-6,
+    poisson_init_iter: int = 5,
+    dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
+    min_mu: float = 0.0,
+    min_total_count: float = 1.0,
+    ridge_penalty: float = 1e-6,
+    fixed_dispersion: ArrayLike | None = None,
+) -> NBGLMBatchResult:
+    """Fit a batch NB GLM, using the structured solver when it pays.
+
+    A design built from a categorical covariate with many levels -- batch,
+    donor, lane -- carries a block of disjoint indicator columns, which makes
+    the per-gene Hessian arrowhead-structured and lets
+    :class:`StructuredGLMBatchFitter` take each Newton step far more cheaply
+    than the dense path.  The advantage grows with the number of groups
+    relative to the number of remaining covariates and is not automatic (it
+    was measured at only 1.5x for 20 groups beside 12 covariates), so the
+    structured solver is used only when the groups outnumber the covariates.
+
+    Results are returned in the column order of ``design`` either way, so this
+    is a drop-in replacement for ``NBGLMBatchFitter(design, ...).fit_batch()``.
+
+    Parameters
+    ----------
+    design
+        Design matrix of shape ``(n_samples, n_features)``.
+    counts
+        Count matrix of shape ``(n_samples, n_genes)``.
+    protected_columns
+        Columns that must stay in the covariate block even if they would
+        qualify as group indicators -- the intercept and any column whose
+        coefficient is the quantity being estimated.  ``clip_group`` bounds
+        group coefficients, which is appropriate for nuisance level effects
+        and not for an effect under test.
+    offset, max_iter, tol, poisson_init_iter, dispersion_method, min_mu, min_total_count, ridge_penalty
+        As for :class:`NBGLMBatchFitter`.
+    fixed_dispersion
+        Per-gene dispersion of shape ``(n_genes,)`` to hold fixed instead of
+        estimating it; ``dispersion_method`` is then unused.
+    """
+    design = np.asarray(design, dtype=np.float64)
+    n_features = design.shape[1]
+
+    candidates = np.setdiff1d(np.arange(n_features), np.asarray(protected_columns, dtype=int))
+    group_columns = np.array([], dtype=int)
+    if candidates.size >= 2:
+        found = detect_onehot_block(design[:, candidates], min_block=2)
+        if found.size:
+            group_columns = candidates[found]
+
+    covariate_columns = np.setdiff1d(np.arange(n_features), group_columns)
+    if group_columns.size <= covariate_columns.size:
+        return NBGLMBatchFitter(
+            design, offset=offset, max_iter=max_iter, tol=tol,
+            poisson_init_iter=poisson_init_iter, dispersion_method=dispersion_method,
+            min_mu=min_mu, min_total_count=min_total_count, ridge_penalty=ridge_penalty,
+        ).fit_batch(counts, fixed_dispersion=fixed_dispersion)
+
+    counts = np.asarray(
+        counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64
+    )
+    n_genes = counts.shape[1]
+    coef = np.zeros((n_genes, n_features), dtype=np.float64)
+    se = np.full((n_genes, n_features), np.inf, dtype=np.float64)
+    dispersion = np.full(n_genes, np.nan, dtype=np.float64)
+    converged = np.zeros(n_genes, dtype=bool)
+    n_iter = np.zeros(n_genes, dtype=np.int32)
+    deviance = np.full(n_genes, np.nan, dtype=np.float64)
+
+    valid = counts.sum(axis=0) >= min_total_count
+    if not np.any(valid):
         return NBGLMBatchResult(
             coef=coef, se=se, dispersion=dispersion,
-            converged=converged, n_iter=n_iter_arr, deviance=deviance
+            converged=converged, n_iter=n_iter, deviance=deviance,
         )
+    valid_indices = np.flatnonzero(valid)
+
+    result = StructuredGLMBatchFitter(
+        design[:, covariate_columns], design[:, group_columns], offset=offset,
+        family="nb", max_iter=max_iter, tol=tol, ridge=ridge_penalty,
+        min_mu=min_mu, dispersion_method=dispersion_method,
+    ).fit_batch(
+        counts[:, valid], return_mu=False, return_dev_resid=False,
+        dispersion=None if fixed_dispersion is None else np.asarray(fixed_dispersion, dtype=np.float64)[valid],
+    )
+
+    n_covariates = covariate_columns.size
+    coef[np.ix_(valid_indices, covariate_columns)] = result.coef[:, :n_covariates]
+    coef[np.ix_(valid_indices, group_columns)] = result.coef[:, n_covariates:]
+    se[np.ix_(valid_indices, covariate_columns)] = result.se[:, :n_covariates]
+    se[np.ix_(valid_indices, group_columns)] = result.se[:, n_covariates:]
+    dispersion[valid_indices] = result.dispersion
+    converged[valid_indices] = result.converged
+    n_iter[valid_indices] = result.n_iter
+    deviance[valid_indices] = result.deviance
+
+    return NBGLMBatchResult(
+        coef=coef, se=se, dispersion=dispersion,
+        converged=converged, n_iter=n_iter, deviance=deviance,
+    )
+
+
+# =============================================================================
+# Two-group DESeq2 against a control summary
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ControlSummary:
+    """The controls of a screen reduced to what every comparison with them needs.
+
+    In a comparison of one perturbation with the controls under the design
+    ``[intercept, perturbation]``, every control term of DESeq2's objectives
+    depends only on the controls and the dispersion (see the kernels'
+    section header). The controls are binned by size factor (occupied bins
+    only); ``s_mom[k, b]`` is the k-th moment of the size factors about bin
+    ``b``'s centre, ``y_mom[k, g, b]`` the same weighted by gene ``g``'s
+    counts, and smooth terms are evaluated to third order about the
+    centres. ``hist_*`` hold each gene's histogram of non-zero counts (CSR
+    by gene).
+    """
+
+    n_cells: int
+    centre: np.ndarray        # (bins,)
+    s_mom: np.ndarray         # (4, bins): count, sum (s - c)^k for k = 1..3
+    s_log: np.ndarray         # (bins,): sum(log s)
+    y_mom: np.ndarray         # (4, genes, bins)
+    hist_ptr: np.ndarray      # (genes + 1,)
+    hist_val: np.ndarray
+    hist_cnt: np.ndarray
+    norm_mean: np.ndarray     # (genes,): mean of counts / size factor
+    total: np.ndarray         # (genes,): sum of counts
+    nnz: np.ndarray           # (genes,): cells with a count
+
+
+def _size_factor_bins(s: np.ndarray, bin_width: float):
+    """Occupied bins of width ``bin_width`` on log ``s`` (one per distinct
+    value when 0): centres, each value's bin, the moments of ``s`` about the
+    centres (4, bins) and the sums of log ``s``."""
+    if bin_width > 0:
+        lo = np.log(s.min())
+        raw = np.floor((np.log(s) - lo) / bin_width).astype(np.int64)
+        used, bin_of = np.unique(raw, return_inverse=True)
+        centre = np.exp(lo + (used + 0.5) * bin_width)
+    else:
+        centre, bin_of = np.unique(s, return_inverse=True)
+    bin_of = bin_of.astype(np.int64).ravel()
+    d = s - centre[bin_of]
+    n_bins = centre.size
+    mom = np.vstack([np.bincount(bin_of, weights=d ** k, minlength=n_bins) for k in range(4)])
+    return centre, bin_of, mom, np.bincount(bin_of, weights=np.log(s), minlength=n_bins)
+
+
+def summarize_controls(
+    blocks,
+    size_factors: np.ndarray,
+    n_genes: int,
+    *,
+    bin_width: float = 0.02,
+    small_count_max: int = 64,
+) -> ControlSummary:
+    """Summarise the control cells in one pass.
+
+    Parameters
+    ----------
+    blocks
+        Iterable of ``(rows, csr)``: integer positions into ``size_factors``
+        and the CSR counts of those control cells.
+    size_factors
+        Every control cell's size factor.
+    n_genes
+        Number of genes (columns).
+    bin_width
+        Width of the size-factor bins on the log scale. Smooth terms are
+        evaluated to third order about the bin centres; the larger error is
+        a gene whose mean s*m crosses the floor ``min_mu`` inside a bin, which
+        is held wholly on one side of it. At the default, dispersions move by
+        at most about 2e-4 relative to one bin per distinct size factor
+        (``0``, exact), standard errors by 3e-5.
+    small_count_max
+        Counts up to this value are tallied in a dense per-gene table.
+    """
+    s = np.asarray(size_factors, dtype=np.float64)
+    centre, bin_of, s_mom, s_log = _size_factor_bins(s, bin_width)
+    n_bins = centre.size
+
+    y_mom = np.zeros((4, n_genes, n_bins), dtype=np.float64)
+    small_hist = np.zeros((n_genes, small_count_max + 1), dtype=np.float64)
+    big_genes, big_values = [], []
+    norm_sum = np.zeros(n_genes, dtype=np.float64)
+    total = np.zeros(n_genes, dtype=np.float64)
+    nnz = np.zeros(n_genes, dtype=np.int64)
+    for rows, block in blocks:
+        csr = sp.csr_matrix(block, dtype=np.float64)
+        csr.sum_duplicates()
+        csr.eliminate_zeros()  # a stored zero is not an expressing cell (nnz, pts_rest)
+        rows = np.asarray(rows)
+        buf_g = np.empty(csr.nnz, dtype=np.int64)
+        buf_v = np.empty(csr.nnz, dtype=np.float64)
+        n_big = _accumulate_control_summary(
+            csr.data, csr.indices.astype(np.int64), csr.indptr.astype(np.int64), bin_of[rows], s[rows],
+            centre, y_mom, small_hist, buf_g, buf_v, 0,
+        )
+        big_genes.append(buf_g[:n_big])
+        big_values.append(buf_v[:n_big])
+        norm_sum += np.asarray((sp.diags(1.0 / s[rows]) @ csr).sum(axis=0)).ravel()
+        total += np.asarray(csr.sum(axis=0)).ravel()
+        nnz += np.bincount(csr.indices, minlength=n_genes)
+
+    gene_small, value_small = np.nonzero(small_hist[:, 1:])
+    gene_all = np.concatenate([gene_small] + big_genes)
+    value_all = np.concatenate([value_small + 1.0] + big_values)
+    count_all = np.concatenate([small_hist[gene_small, value_small + 1], np.ones(sum(map(len, big_genes)))])
+    keys, inverse = np.unique(np.stack([gene_all, value_all]), axis=1, return_inverse=True)
+    counts = np.bincount(inverse.ravel(), weights=count_all, minlength=keys.shape[1])
+    hist_ptr = np.zeros(n_genes + 1, dtype=np.int64)
+    np.add.at(hist_ptr, keys[0].astype(np.int64) + 1, 1)
+    return ControlSummary(
+        n_cells=int(s.size), centre=centre, s_mom=s_mom, s_log=s_log, y_mom=y_mom,
+        hist_ptr=np.cumsum(hist_ptr), hist_val=keys[1].astype(np.float64), hist_cnt=counts,
+        norm_mean=norm_sum / s.size, total=total, nnz=nnz,
+    )
+
+
+@dataclass(frozen=True)
+class DESeq2Result:
+    """DESeq2 on one perturbation against the controls, per gene (NaN where untested).
+
+    ``lfc`` and ``se`` are natural-log; ``intercept`` is the intercept
+    coefficient (the controls' log mean without covariates). ``prior_var`` is
+    NaN when no MAP step ran. ``coef`` and ``coef_se`` hold every coefficient
+    and its Wald standard error ``(genes, design columns)``, and
+    ``coef_converged`` whether each gene's IRLS converged, from
+    :func:`fit_glm_deseq2` only (several perturbations fitted together are
+    tested from them, one column each)."""
+
+    genewise_dispersion: np.ndarray
+    trend: np.ndarray
+    map_dispersion: np.ndarray
+    dispersion: np.ndarray
+    lfc: np.ndarray
+    se: np.ndarray
+    statistic: np.ndarray
+    pvalue: np.ndarray
+    intercept: np.ndarray
+    base_mean: np.ndarray
+    converged: np.ndarray
+    prior_var: float
+    coef: np.ndarray | None = None
+    coef_se: np.ndarray | None = None
+    coef_converged: np.ndarray | None = None
+
+
+def fit_two_group_deseq2(
+    controls: ControlSummary,
+    counts: np.ndarray,
+    size_factors: np.ndarray,
+    genes: np.ndarray | None = None,
+    *,
+    dispersion: ArrayLike | float | None = None,
+    shrink: bool = True,
+    min_mu: float = 0.5,
+    min_disp: float = 1e-8,
+    max_disp: float = 10.0,
+    n_grid: int = 31,
+    tol: float = 1e-6,
+    ridge: float = 1e-6,
+    bin_width: float = 0.02,
+) -> DESeq2Result:
+    """DESeq2's Wald test of one perturbation against the controls, as PyDESeq2
+    runs it on the design ``~ condition`` with the given size factors.
+
+    The steps are PyDESeq2's: means from the linear model (group means of the
+    normalised counts, floored at ``min_mu``); gene-wise Cox-Reid dispersions;
+    the parametric trend (mean trend if it fails); the prior variance from the
+    MAD of log residuals of genes above ``100 * min_disp``, less
+    ``trigamma((n - 2) / 2)``, at least 0.25; MAP dispersions; genes whose
+    gene-wise dispersion is more than two residual SDs above the trend keep
+    it; IRLS for the coefficients at those dispersions; the Wald test. The
+    controls enter through ``controls`` only, so the cost does not grow with
+    their number. Cook's distance outlier replacement is not done.
+
+    Parameters
+    ----------
+    controls
+        The controls' :class:`ControlSummary`.
+    counts
+        The perturbed cells' counts (cells, genes), sparse or dense.
+    size_factors
+        The perturbed cells' size factors.
+    genes
+        Indices of the genes to test (default all); others are NaN.
+    dispersion
+        A dispersion (one, or one per gene) to test at instead of estimating
+        one.
+    shrink
+        Test at the MAP dispersions (DESeq2); ``False`` tests at the
+        gene-wise ones.
+    min_mu, min_disp, max_disp
+        PyDESeq2's bounds; the upper dispersion bound is
+        ``max(max_disp, number of cells)``.
+    n_grid, tol
+        Gene-wise dispersion search: grid points over the log range, then
+        golden-section search to ``tol`` on log dispersion. The MAP search
+        uses 7 points between the gene-wise estimate and the trend.
+    bin_width
+        The perturbed cells' size-factor bins (as :func:`summarize_controls`).
+    ridge
+        PyDESeq2's ridge on the coefficients.
+    """
+    from scipy.stats import norm as _norm
+
+    # The perturbed cells: size factors binned for the dense terms, each
+    # gene's non-zero counts (CSC) summed exactly.
+    csc = sp.csc_matrix(counts, dtype=np.float64)
+    csc.sum_duplicates()
+    csc.eliminate_zeros()
+    s = np.asarray(size_factors, dtype=np.float64)
+    n_genes = csc.shape[1]
+    n_c, n_t = controls.n_cells, csc.shape[0]
+    n = n_c + n_t
+    m_c = controls.norm_mean
+    m_t = np.asarray((sp.diags(1.0 / s) @ csc).sum(axis=0)).ravel() / n_t
+    base_mean = (n_c * m_c + n_t * m_t) / n
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
+    tested &= (controls.total + np.asarray(csc.sum(axis=0)).ravel()) > 0
+    idx = np.flatnonzero(tested).astype(np.int64)
+    log_lo, log_hi = np.log(min_disp), np.log(max(max_disp, float(n)))
+    t_centre, _bin, t_mom, _log = _size_factor_bins(s, bin_width)
+    t_args = (csc.indptr.astype(np.int64), csc.data, s[csc.indices])
+    summary_args = (controls.centre, controls.s_mom, controls.y_mom, controls.hist_ptr, controls.hist_val,
+                    controls.hist_cnt, t_centre, t_mom)
+
+    def nan():
+        return np.full(n_genes, np.nan)
+
+    genewise, trend, map_disp, final = nan(), nan(), nan(), nan()
+    lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
+    converged = np.zeros(n_genes, dtype=bool)
+    prior_var = float("nan")
+    if idx.size == 0:
+        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                            base_mean, converged, prior_var)
+
+    if dispersion is not None:
+        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
+    else:
+        full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
+        genewise[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *full,
+                                               np.zeros(idx.size), 0.0, n_grid, tol)
+        trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
+        final[idx] = genewise[idx]
+        if shrink:
+            log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
+            # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - 2) / 2), 0.25))
+            # The MAP lies between the gene-wise estimate and the trend (the
+            # prior's mean) where the likelihood has one mode; a short grid
+            # over that bracket keeps a second mode from being missed.
+            log_gw, log_trend = np.log(genewise[idx]), np.log(trend[idx])
+            bracket = (np.clip(np.minimum(log_gw, log_trend) - 0.1, log_lo, log_hi),
+                       np.clip(np.maximum(log_gw, log_trend) + 0.1, log_lo, log_hi))
+            map_disp[idx] = _two_group_dispersions(idx, m_c, m_t, *t_args, min_mu, *summary_args, *bracket,
+                                                   log_trend, prior_var, 7, tol)
+            final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])
+
+    a, b, se_ln, ok = _two_group_lfc(
+        idx, final[idx], np.log(np.maximum(m_c[idx], 1e-3)), np.log(np.maximum(m_t[idx], 1e-3)), *t_args, s,
+        min_mu, controls.centre, controls.s_mom, controls.s_log, controls.y_mom, ridge, 250, 1e-10,
+    )
+    lfc[idx] = b - a
+    se[idx] = se_ln
+    stat[idx] = lfc[idx] / se_ln
+    pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
+    intercept[idx] = a
+    converged[idx] = ok
+    return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                        base_mean, converged, float(prior_var))
+
+
+def _log_residuals(genewise: np.ndarray, trend: np.ndarray, min_disp: float) -> tuple[np.ndarray, float]:
+    """Each gene's log gene-wise dispersion less the trend's, and DESeq2's robust
+    variance of them (squared MAD-based SD over genes above ``100 * min_disp``)."""
+    from scipy.stats import norm as _norm
+
+    log_resid = np.log(genewise) - np.log(trend)
+    resid = log_resid[genewise >= 100 * min_disp]
+    return log_resid, float((np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2)
+
+
+def fit_glm_deseq2(
+    design: ArrayLike,
+    counts: ArrayLike,
+    size_factors: ArrayLike,
+    test_column: int,
+    genes: np.ndarray | None = None,
+    *,
+    protected_columns: Sequence[int] = (),
+    dispersion: ArrayLike | float | None = None,
+    shrink: bool = True,
+    min_mu: float = 0.5,
+    min_disp: float = 1e-8,
+    max_disp: float = 10.0,
+    n_grid: int = 31,
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    beta_tol: float = 1e-8,
+    poisson_init_iter: int = 5,
+) -> DESeq2Result:
+    """DESeq2's Wald test of one coefficient of a GLM, as PyDESeq2 runs it on
+    ``design`` with the given size factors: :func:`fit_two_group_deseq2` for a
+    design with covariates, on the comparison's cells.
+
+    The steps are PyDESeq2's: starting dispersions (the smaller of the rough
+    and the moments estimates); means from a linear model when the design has
+    one distinct row per coefficient, else from IRLS at the starting
+    dispersions; gene-wise Cox-Reid dispersions at those means; the trend
+    and prior variance as :func:`fit_two_group_deseq2`; MAP dispersions at
+    the same means; genes more than two residual SDs above the trend keep
+    their gene-wise dispersion; IRLS for the coefficients at the final
+    dispersions; the Wald test. Cook's distance outlier replacement is not
+    done.
+
+    Parameters
+    ----------
+    design
+        Design matrix ``(cells, coefficients)``, intercept first.
+    counts
+        Counts ``(cells, genes)``, dense or sparse.
+    size_factors
+        The cells' size factors.
+    test_column
+        The column of ``design`` tested.
+    protected_columns
+        Further columns estimated as effects rather than as nuisance group
+        levels (:func:`fit_nb_glm_batch_auto`), e.g. the other perturbations
+        of a fit that tests several.
+    genes, dispersion, shrink, min_mu, min_disp, max_disp, n_grid, tol
+        As for :func:`fit_two_group_deseq2`.
+    max_iter, beta_tol, poisson_init_iter
+        IRLS (:func:`fit_nb_glm_batch_auto`'s ``max_iter``, ``tol``,
+        ``poisson_init_iter``).
+    """
+    from scipy.stats import norm as _norm
+
+    design = np.asarray(design, dtype=np.float64)
+    y = np.asarray(counts.toarray() if sp.issparse(counts) else counts, dtype=np.float64)
+    s = np.asarray(size_factors, dtype=np.float64)
+    (n, p), n_genes = design.shape, y.shape[1]
+    max_disp = max(max_disp, float(n))  # PyDESeq2's bound, for the starting values and the search alike
+    normed = y / s[:, None]
+    base_mean = normed.mean(axis=0)
+    tested = np.zeros(n_genes, dtype=bool)
+    tested[np.arange(n_genes) if genes is None else np.asarray(genes)] = True
+    tested &= y.sum(axis=0) > 0
+    idx = np.flatnonzero(tested)
+
+    def nan():
+        return np.full(n_genes, np.nan)
+
+    genewise, trend, map_disp, final = nan(), nan(), nan(), nan()
+    lfc, se, stat, pvalue, intercept = nan(), nan(), nan(), nan(), nan()
+    converged = np.zeros(n_genes, dtype=bool)
+    prior_var = float("nan")
+    if idx.size == 0:
+        return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                            base_mean, converged, prior_var, np.full((n_genes, p), np.nan),
+                            np.full((n_genes, p), np.nan), np.zeros(n_genes, dtype=bool))
+
+    y_t = np.asfortranarray(y[:, idx])
+    offset = np.log(s)
+    irls = dict(offset=offset, protected_columns=(0, test_column, *protected_columns), max_iter=max_iter, tol=beta_tol,
+                poisson_init_iter=poisson_init_iter, min_mu=min_mu)
+    if dispersion is not None:
+        final[idx] = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,))[idx]
+    else:
+        # Starting dispersions: PyDESeq2's _fit_MoM_dispersions.
+        normed_t = normed[:, idx]
+        linear = design @ np.linalg.lstsq(design, normed_t, rcond=None)[0]
+        y_hat = np.maximum(linear, 1.0)
+        rough = np.maximum((((normed_t - y_hat) ** 2 - y_hat) / y_hat**2).sum(axis=0) / max(n - p, 1), 0.0)
+        mean_t = normed_t.mean(axis=0)
+        moments = np.nan_to_num((normed_t.var(axis=0, ddof=1) - np.mean(1.0 / s) * mean_t) / mean_t**2)
+        start = np.clip(np.minimum(rough, moments), min_disp, max_disp)
+        # The means both dispersion steps are evaluated at: a linear model
+        # when it fits every distinct design row exactly, else IRLS.
+        lin_mu = np.maximum(s[:, None] * linear, min_mu)
+        if np.unique(design, axis=0).shape[0] == p:
+            mu = lin_mu
+        else:
+            coef = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=start, **irls).coef
+            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
+            finite = np.isfinite(coef).all(axis=1)
+            mu[:, ~finite] = lin_mu[:, ~finite]
+        mu = np.asfortranarray(np.maximum(mu, 1e-10))
+        log_lo, log_hi = np.log(min_disp), np.log(max_disp)
+        x_csr = _design_csr(design)
+        full = (np.full(idx.size, log_lo), np.full(idx.size, log_hi))
+        genewise[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
+            y_t, mu, np.zeros(idx.size), *full, n_grid, np.inf, *x_csr, tol=tol, max_refine_iter=100))
+        trend[idx] = fit_dispersion_trend(base_mean[idx], genewise[idx])
+        final[idx] = genewise[idx]
+        if shrink:
+            log_resid, squared_logres = _log_residuals(genewise[idx], trend[idx], min_disp)
+            # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+            prior_var = float(np.fmax(squared_logres - polygamma(1, (n - p) / 2), 0.25))
+            map_disp[idx] = np.exp(_nb_map_grid_search_with_refinement_numba(
+                y_t, mu, np.log(trend[idx]), *full, n_grid, prior_var, *x_csr, tol=tol, max_refine_iter=100))
+            final[idx] = np.where(log_resid > 2 * np.sqrt(squared_logres), genewise[idx], map_disp[idx])
+
+    fit = fit_nb_glm_batch_auto(design, y_t, fixed_dispersion=final[idx], **irls)
+    b, b_se = fit.coef[:, test_column], fit.se[:, test_column]
+    ok = fit.converged & np.isfinite(b) & np.isfinite(b_se) & (b_se > 0)
+    lfc[idx], se[idx], intercept[idx] = b, b_se, fit.coef[:, 0]
+    stat[idx] = b / b_se
+    pvalue[idx] = 2 * _norm.sf(np.abs(stat[idx]))
+    converged[idx] = ok
+    coef, coef_se = np.full((n_genes, p), np.nan), np.full((n_genes, p), np.nan)
+    coef[idx], coef_se[idx] = fit.coef, fit.se
+    coef_converged = np.zeros(n_genes, dtype=bool)
+    coef_converged[idx] = fit.converged
+    return DESeq2Result(genewise, trend, map_disp, final, lfc, se, stat, pvalue, intercept,
+                        base_mean, converged, prior_var, coef, coef_se, coef_converged)

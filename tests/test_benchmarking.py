@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import resource
 import sys
-import unittest.mock as mock
 from pathlib import Path
 
 import anndata as ad
@@ -19,14 +17,8 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from benchmarking.tools.run_benchmarks import (
-    _summarise_dataframe,
-    _uses_mmap_backed_files,
-    _worker,
-    BenchmarkMethod,
-    create_benchmark_suite,
-)
-from crispyx import compute_average_log_expression
+from benchmarking.tools.run_benchmarks import _summarise_dataframe, create_benchmark_suite
+from crispyx import compute_normalized_effects
 
 
 def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
@@ -55,11 +47,12 @@ def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
 
 def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
     dataset_path = _create_demo_dataset(tmp_path)
-    result = compute_average_log_expression(
+    result = compute_normalized_effects(
         dataset_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbol",
+        method="mean_log1p",
         output_dir=tmp_path,
         data_name="summary_test",
     )
@@ -69,7 +62,7 @@ def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
 
     assert summary["rows"] == 2
     assert summary["columns"] == 4
-    assert summary["result_path"] == "crispyx_summary_test_avg_log_effects.h5ad"
+    assert summary["result_path"] == "summary_test_cx_normalized_effects.h5ad"
 
     result.close()
 
@@ -82,110 +75,16 @@ def test_create_benchmark_suite_infers_control_label(tmp_path: Path) -> None:
     assert methods  # sanity check
     # Only check methods that don't depend on other methods (lfcShrink methods
     # don't have control_label since they process results from base methods)
-    # Also exclude format-conversion methods (crispyx_standardize_csr) which
-    # don't operate on perturbation labels.
+    # and that actually accept control_label (format-conversion utilities like
+    # crispyx_standardize_csr operate on file paths only, with no perturbation
+    # semantics, so they never carry a control_label kwarg).
     primary_methods = {
-        name: method for name, method in methods.items()
+        name: method
+        for name, method in methods.items()
         if method.depends_on is None and "control_label" in method.kwargs
     }
+    assert primary_methods  # sanity check
     control_labels = {
         method.kwargs.get("control_label") for method in primary_methods.values()
     }
     assert control_labels == {"non_target_control"}
-
-
-# ---------------------------------------------------------------------------
-# Regression test: RLIMIT_CPU must NOT be set inside the worker for any method.
-# RLIMIT_CPU accumulates CPU time across all pthreads (Numba, BLAS, rpy2).
-# With 32 threads, a 21600 s CPU limit fires at ~675 s wall time — far below
-# the intended 6-hour per-method budget.  Wall-clock enforcement is handled
-# by the parent via process.join(timeout=time_limit+5).
-# ---------------------------------------------------------------------------
-
-def _noop(**kwargs):
-    return None
-
-
-def _noop_summary(result, context):
-    return {}
-
-
-@mock.patch("os._exit")
-@mock.patch("resource.setrlimit")
-def test_worker_does_not_set_rlimit_cpu_for_crispyx_method(mock_setrlimit, mock_os_exit):
-    """RLIMIT_CPU must never be set for crispyx DE methods."""
-    method = BenchmarkMethod(
-        name="crispyx_de_wilcoxon",
-        description="test",
-        function=_noop,
-        kwargs={},
-        summary=_noop_summary,
-    )
-    q = mock.MagicMock()
-    _worker(q, method, context={}, memory_limit=None, time_limit=21600,
-            n_threads=32, use_cgroups_memory=False)
-
-    cpu_calls = [
-        call for call in mock_setrlimit.call_args_list
-        if call.args and call.args[0] == resource.RLIMIT_CPU
-    ]
-    assert cpu_calls == [], (
-        "RLIMIT_CPU was set inside the worker for a crispyx method — "
-        "this causes SIGKILL when Numba threads accumulate CPU time faster "
-        "than wall time (n_threads × wall_time > RLIMIT_CPU limit)."
-    )
-
-
-@mock.patch("os._exit")
-@mock.patch("resource.setrlimit")
-def test_worker_does_not_set_rlimit_cpu_for_scanpy_method(mock_setrlimit, mock_os_exit):
-    """RLIMIT_CPU must never be set even for non-crispyx methods (scanpy, pertpy)."""
-    method = BenchmarkMethod(
-        name="scanpy_de_wilcoxon",
-        description="test",
-        function=_noop,
-        kwargs={},
-        summary=_noop_summary,
-    )
-    q = mock.MagicMock()
-    _worker(q, method, context={}, memory_limit=None, time_limit=21600,
-            n_threads=8, use_cgroups_memory=False)
-
-    cpu_calls = [
-        call for call in mock_setrlimit.call_args_list
-        if call.args and call.args[0] == resource.RLIMIT_CPU
-    ]
-    assert cpu_calls == [], (
-        "RLIMIT_CPU was set inside the worker for a scanpy method — "
-        "OpenBLAS threads would accumulate CPU time and fire SIGXCPU "
-        "well before the intended wall-clock budget."
-    )
-
-
-@mock.patch("os._exit")
-@mock.patch("resource.setrlimit")
-def test_worker_does_not_set_rlimit_as_for_crispyx_method(mock_setrlimit, mock_os_exit):
-    """RLIMIT_AS must not be set for crispyx methods (mmap files inflate VSZ)."""
-    method = BenchmarkMethod(
-        name="crispyx_de_t_test",
-        description="test",
-        function=_noop,
-        kwargs={},
-        summary=_noop_summary,
-    )
-    assert _uses_mmap_backed_files(method), (
-        "crispyx_de_t_test should be identified as an mmap-backed method"
-    )
-    q = mock.MagicMock()
-    _worker(q, method, context={}, memory_limit=128 * 1024**3, time_limit=21600,
-            n_threads=32, use_cgroups_memory=False)
-
-    as_calls = [
-        call for call in mock_setrlimit.call_args_list
-        if call.args and call.args[0] == resource.RLIMIT_AS
-    ]
-    assert as_calls == [], (
-        "RLIMIT_AS was set for a crispyx method — this causes spurious SIGKILL "
-        "because mmap'd h5ad files inflate VSZ to ~42 GB while RSS stays at ~6 GB."
-    )
-

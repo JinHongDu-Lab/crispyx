@@ -84,34 +84,15 @@ METHOD_DISPLAY = {
 # Dataset display order (by size)
 DATASET_ORDER = [
     "Tian-crispra",
-    "Tian-crispri",
+    "Tian-crispri", 
     "Adamson",
-    "Frangieh",
     "Nadig-HEPG2",
-    "Feng-ts",
-    "Replogle-E-rpe1",
+    "Frangieh",
     "Nadig-JURKAT",
     "Replogle-E-k562",
+    "Replogle-E-rpe1",
     "Feng-gwsf",
-    "Feng-gwsnf",
-    "Replogle-GW-k562",
 ]
-
-# Full dataset names for display
-DATASET_DISPLAY = {
-    "Tian-crispra": "Tian CRISPRa",
-    "Tian-crispri": "Tian CRISPRi",
-    "Adamson": "Adamson",
-    "Frangieh": "Frangieh",
-    "Nadig-HEPG2": "Nadig HepG2",
-    "Feng-ts": "Feng TS",
-    "Replogle-E-rpe1": "Replogle Essential RPE1",
-    "Nadig-JURKAT": "Nadig Jurkat",
-    "Replogle-E-k562": "Replogle Essential K562",
-    "Feng-gwsf": "Feng GW-SF",
-    "Feng-gwsnf": "Feng GW-SNF",
-    "Replogle-GW-k562": "Replogle GW K562",
-}
 
 
 # =============================================================================

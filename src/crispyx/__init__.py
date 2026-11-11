@@ -2,25 +2,37 @@
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version
+import os
 
-try:
-    __version__ = version("crispyx")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev"
+# ---------------------------------------------------------------------------
+# OpenMP conflict guard — must precede any Numba import
+# ---------------------------------------------------------------------------
+# anndata 0.11.x eagerly imports torch when it is installed, loading PyTorch's
+# libiomp5 (Intel OMP) into the same process as Numba's libomp (LLVM OMP).
+# The dual OMP runtimes crash Numba prange on macOS (Segfault 11).  Using
+# Numba's "workqueue" backend avoids OMP entirely while preserving parallelism.
+# anndata 0.12+ fixes this but requires Python >=3.11 (crispyx supports 3.10).
+# Override with NUMBA_THREADING_LAYER=omp if you manage the OMP conflict yourself.
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+
+from ._version import __version__
 
 # ---------------------------------------------------------------------------
 # Public API re-exports
 # ---------------------------------------------------------------------------
 
+from .batch import BatchReducer, BatchStatistic, batch_process
 from .data import (
     AnnData,
     OverlapResult,
+    compress_h5ad,
+    concat_h5ad,
     compute_overlap,
     convert_to_csc,
     convert_to_csr,
     detect_gene_symbol_column,
     detect_perturbation_column,
+    downsample_counts,
     ensure_gene_symbol_column,
     infer_columns,
     load_obs,
@@ -31,6 +43,7 @@ from .data import (
     read_backed,
     resolve_data_path,
     standardise_gene_names,
+    write_filtered_subset,
     write_obs,
     write_var,
 )
@@ -41,6 +54,8 @@ from .de import (
     t_test,
     wilcoxon_test,
 )
+from .hvg import highly_variable_genes
+from ._preflight import estimate_disk_usage
 from .profiling import (
     Profiler,
     MemoryProfiler,
@@ -51,6 +66,7 @@ from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
     plot_overlap_heatmap,
+    plot_control_guide_correlation,
     plot_pca,
     plot_pca_loadings,
     plot_pca_variance_ratio,
@@ -62,15 +78,21 @@ from .plotting import (
     rank_genes_groups_df,
 )
 from .pseudobulk import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
+    PseudobulkMethod,
+    aggregate_pseudobulk,
+    compute_normalized_effects,
+    compute_pseudobulk_effects,
 )
 from .qc import (
+    compare_controls,
+    control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
     quality_control_summary,
 )
+from .residual import residual_effects
+from .sample import subsample
 
 # ---------------------------------------------------------------------------
 # Scanpy-style namespace singletons: cx.pp, cx.pb, cx.tl, cx.pl
@@ -104,9 +126,22 @@ __all__ = [
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",
     "quality_control_summary",
+    "compare_controls",
+    "control_guide_correlation",
+    "plot_control_guide_correlation",
+    "highly_variable_genes",
+    # Subsampling
+    "subsample",
     # Pseudo-bulk
-    "compute_average_log_expression",
-    "compute_pseudobulk_expression",
+    "PseudobulkMethod",
+    "aggregate_pseudobulk",
+    "compute_normalized_effects",
+    "residual_effects",
+    "compute_pseudobulk_effects",
+    # Generic batch statistics
+    "BatchReducer",
+    "BatchStatistic",
+    "batch_process",
     # Differential expression
     "RankGenesGroupsResult",
     "t_test",
@@ -120,12 +155,16 @@ __all__ = [
     "read_backed",
     "resolve_data_path",
     "normalize_total_log1p",
+    "downsample_counts",
     "convert_to_csc",
     "convert_to_csr",
+    "compress_h5ad",
+    "concat_h5ad",
     "load_obs",
     "load_var",
     "write_obs",
     "write_var",
+    "write_filtered_subset",
     "standardise_gene_names",
     "normalise_perturbation_labels",
     "detect_perturbation_column",
@@ -133,6 +172,8 @@ __all__ = [
     "infer_columns",
     "OverlapResult",
     "compute_overlap",
+    # Disk-usage estimation
+    "estimate_disk_usage",
     # Profiling
     "Profiler",
     "MemoryProfiler",
@@ -152,4 +193,3 @@ __all__ = [
     "plot_qc_summary",
     "plot_overlap_heatmap",
 ]
-

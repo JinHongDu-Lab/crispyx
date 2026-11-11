@@ -1,0 +1,49 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 4319.240680908835,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 1,
+  "error_details": [
+    {
+      "error": "Worker process crashed (exitcode=2)",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "Exceeded time limit of 21600 seconds",
+      "method": "pertpy_de_pydeseq2"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 753. MiB for an array with shape (197395868,) and data type float32",
+      "method": "pertpy_de_pydeseq2_subset"
+    }
+  ],
+  "memory_limit_count": 1,
+  "non_success_count": 3,
+  "original_dataset_path": "/data/origin/Frangieh.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 21600 seconds",
+    "MemoryError: Unable to allocate 753. MiB for an array with shape (197395868,) and data type float32",
+    "Worker process crashed (exitcode=2)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 1,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Frangieh/.cache/standardized_Frangieh.h5ad",
+  "status_counts": {
+    "error": 1,
+    "memory_limit": 1,
+    "recovered": 1,
+    "success": 18,
+    "timeout": 1
+  },
+  "success_count": 19,
+  "success_rate": 0.8636363636363636,
+  "timeout_count": 1,
+  "total_methods": 22
+}

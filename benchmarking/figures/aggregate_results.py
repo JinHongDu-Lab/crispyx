@@ -16,10 +16,6 @@ def get_results_dir() -> Path:
     return Path(__file__).parent.parent / "results"
 
 
-# Directories to skip during aggregation
-EXCLUDE_DIRS = {"old", "test", "Adamson_subset", "Huang-HCT116", "Huang-HEK293T"}
-
-
 def aggregate_performance_data(results_dir: Path = None) -> pd.DataFrame:
     """
     Aggregate benchmark_performance.csv from all dataset directories.
@@ -35,8 +31,6 @@ def aggregate_performance_data(results_dir: Path = None) -> pd.DataFrame:
     
     for dataset_dir in sorted(results_dir.iterdir()):
         if not dataset_dir.is_dir():
-            continue
-        if dataset_dir.name in EXCLUDE_DIRS:
             continue
         
         perf_file = dataset_dir / "benchmark_performance.csv"
@@ -74,8 +68,6 @@ def aggregate_accuracy_data(results_dir: Path = None) -> pd.DataFrame:
     
     for dataset_dir in sorted(results_dir.iterdir()):
         if not dataset_dir.is_dir():
-            continue
-        if dataset_dir.name in EXCLUDE_DIRS:
             continue
         
         acc_file = dataset_dir / "benchmark_accuracy.csv"

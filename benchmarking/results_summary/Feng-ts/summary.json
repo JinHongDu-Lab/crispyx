@@ -1,0 +1,54 @@
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "average_runtime_seconds": 16084.388709116996,
+  "categories": [],
+  "dependency_errors": [],
+  "error_count": 1,
+  "error_details": [
+    {
+      "error": "MemoryError: Unable to allocate 158. GiB for an array with shape (1161864, 36518) and data type float32",
+      "method": "edger_de_glm"
+    },
+    {
+      "error": "Worker process crashed (exitcode=2)",
+      "method": "edger_de_glm_subset"
+    },
+    {
+      "error": "MemoryError: Unable to allocate 66.4 GiB for an array with shape (537132, 33165) and data type float32",
+      "method": "pertpy_de_pydeseq2"
+    },
+    {
+      "error": "Exceeded time limit of 259200 seconds",
+      "method": "scanpy_de_wilcoxon"
+    }
+  ],
+  "memory_limit_count": 2,
+  "non_success_count": 4,
+  "original_dataset_path": "/data/origin/Feng-ts.h5ad",
+  "other_errors": [
+    "Exceeded time limit of 259200 seconds",
+    "MemoryError: Unable to allocate 158. GiB for an array with shape (1161864, 36518) and data type float32",
+    "MemoryError: Unable to allocate 66.4 GiB for an array with shape (537132, 33165) and data type float32",
+    "Worker process crashed (exitcode=2)"
+  ],
+  "qc_params_used": {
+    "chunk_size": 4096,
+    "min_cells_per_gene": 5,
+    "min_cells_per_perturbation": 50,
+    "min_genes": 50
+  },
+  "recovered_count": 1,
+  "standardized_dataset_path": "/workspace/benchmarking/results/Feng-ts/.cache/standardized_Feng-ts.h5ad",
+  "status_counts": {
+    "error": 1,
+    "memory_limit": 2,
+    "recovered": 1,
+    "success": 16,
+    "timeout": 1
+  },
+  "success_count": 17,
+  "success_rate": 0.8095238095238095,
+  "timeout_count": 1,
+  "total_methods": 21
+}

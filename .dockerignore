@@ -1,6 +1,6 @@
 # Exclude large data files and build artifacts
 data/
-docs/tutorial_outputs/
+docs/
 
 # Benchmarking outputs (can be 100s of GB)
 benchmarking/results/
@@ -12,14 +12,7 @@ benchmarking/singularity/*.tar
 
 # Work-in-progress directories
 yida wang/
-20260107/
-20260109/
-20260110/
-20260111/
-20260112/
-20260113/
-20260114/
-20260119/
+plan/
 
 # Python cache
 __pycache__/

@@ -1,22 +1,14 @@
-"""Test configuration to keep loky backend usable in restricted environments.
-
-Some macOS sandboxed environments deny os.sysconf("SC_SEM_NSEMS_MAX"), which
-joblib/loky uses to check semaphore limits. We keep loky as the backend but
-skip the check when sysconf is not permitted.
-
-Numba thread count is fixed to 4 here (before any import triggers JIT
-initialization) so that umap-learn cannot raise "Cannot set NUMBA_NUM_THREADS
-to a different value once the threads have been launched" when running the full
-test suite in a single pytest session.
-"""
+"""Pytest configuration for the crispyx test suite."""
 
 from __future__ import annotations
 
 import os
 
-# Must be set BEFORE numba is first imported (which may happen transitively via
-# crispyx, scanpy, or umap-learn).  We use setdefault so an explicit env var
-# (e.g. NUMBA_NUM_THREADS=1 for CI) always takes priority.
+# Pin NUMBA_NUM_THREADS before any import so umap-learn / pynndescent cannot
+# raise "Cannot set NUMBA_NUM_THREADS to a different value once the threads
+# have been launched" across the full test session.
+# NUMBA_THREADING_LAYER is handled by crispyx.__init__ (workqueue, to avoid
+# the libiomp5 / libomp conflict when torch is co-installed).
 os.environ.setdefault("NUMBA_NUM_THREADS", "4")
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -72,10 +73,7 @@ from crispyx.data import (
 )
 from crispyx.de import t_test, wilcoxon_test, nb_glm_test, shrink_lfc
 from .comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
-from crispyx.pseudobulk import (
-    compute_average_log_expression,
-    compute_pseudobulk_expression,
-)
+from crispyx.pseudobulk import compute_normalized_effects
 from crispyx.qc import quality_control_summary
 
 # Import constants from centralized module
@@ -551,20 +549,134 @@ def run_wilcoxon_with_csc(
     timing breakdown (``csc_conversion_seconds``, ``wilcoxon_seconds``,
     ``was_already_csc``) as extra benchmark columns.
     """
+    import os
+    import shutil
     import time
 
     # Step 1: Ensure CSC format (cheap no-op when already CSC or cached).
+    # With CSC_SCRATCH=local the conversion (and Wilcoxon's reads of its
+    # output) run on node-local disk instead of beside the output: the
+    # conversion re-reads its source once per column band, which crawls on a
+    # network filesystem (~7 h for Huang-HCT116 on Lustre). Any staging copy
+    # is inside the timed conversion step.
     t_csc_start = time.perf_counter()
-    csc_result = run_preprocess_csc(input_path, csc_path, chunk_size=csc_chunk_size)
-    csc_seconds = time.perf_counter() - t_csc_start
-    was_already_csc = csc_result.get("was_already_csc", False)
-    data_path = Path(csc_result["result_path"])
+    scratch_dir = None
+    csc_scratch = "beside-output"
+    if os.environ.get("CSC_SCRATCH") == "local":
+        scratch_dir, input_path, csc_path, csc_scratch = _local_csc_scratch(input_path, csc_path)
+    try:
+        csc_result = run_preprocess_csc(input_path, csc_path, chunk_size=csc_chunk_size)
+        csc_seconds = time.perf_counter() - t_csc_start
+        was_already_csc = csc_result.get("was_already_csc", False)
+        data_path = Path(csc_result["result_path"])
+        return _run_wilcoxon_on_csc(
+            data_path, csc_seconds, was_already_csc, csc_scratch,
+            perturbation_column=perturbation_column, control_label=control_label,
+            output_dir=output_dir, gene_name_column=gene_name_column,
+            data_name=data_name, n_jobs=n_jobs, memory_limit_gb=memory_limit_gb,
+        )
+    finally:
+        if scratch_dir is not None:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _local_csc_scratch(input_path: Path, csc_path: Path):
+    """Pick where the CSC conversion runs on node-local disk ($TMPDIR).
+
+    Returns ``(scratch_dir, source, csc_target, layout)``. The source is
+    copied too when source and CSC copy both fit; otherwise only the CSC
+    copy goes local; if even that does not fit, nothing changes.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    from crispyx.data import get_matrix_storage_format
+
+    if get_matrix_storage_format(input_path) == "csc":
+        return None, input_path, csc_path, "already-csc"
+    base = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    source_bytes = input_path.stat().st_size
+    free = shutil.disk_usage(base).free
+    # The CSC copy holds the same non-zeros as the CSR source.
+    if free < 1.1 * source_bytes:
+        print(f"  CSC_SCRATCH=local: {base} has {free / 1e9:.0f} GB free, "
+              f"need {1.1 * source_bytes / 1e9:.0f} GB; converting beside the output")
+        return None, input_path, csc_path, "beside-output"
+    scratch_dir = Path(tempfile.mkdtemp(prefix="cx_csc_", dir=base))
+    local_csc = scratch_dir / csc_path.name
+    if free >= 2.2 * source_bytes:
+        local_source = scratch_dir / input_path.name
+        _copy_verified(input_path, local_source)
+        print(f"  CSC_SCRATCH=local: source and CSC copy on {scratch_dir}")
+        return scratch_dir, local_source, local_csc, "local-source+csc"
+    print(f"  CSC_SCRATCH=local: CSC copy on {scratch_dir} (source stays in place)")
+    return scratch_dir, input_path, local_csc, "local-csc"
+
+
+def _copy_verified(source: Path, target: Path, chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    """Chunked copy that raises instead of leaving a short file.
+
+    Both files' pages are dropped from the page cache as the copy goes (every
+    1 GiB and at the end): Slurm charges page cache to the job, so a plain
+    copy of a 63 GB input left ~125 GB of cache (source + copy) counted in
+    the job's peak memory although the method itself used ~4 GB.
+    """
+    import os
+
+    def drop(*files) -> None:
+        for f in files:
+            try:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+
+    expected = source.stat().st_size
+    with open(source, "rb") as fin, open(target, "wb") as fout:
+        since_drop = 0
+        while chunk := fin.read(chunk_bytes):
+            fout.write(chunk)
+            since_drop += len(chunk)
+            if since_drop >= 1 << 30:
+                fout.flush()
+                os.fdatasync(fout.fileno())  # dirty pages cannot be dropped
+                drop(fin, fout)
+                since_drop = 0
+        fout.flush()
+        os.fdatasync(fout.fileno())
+        drop(fin, fout)
+    if target.stat().st_size != expected:
+        raise OSError(f"Short copy of {source}: {target.stat().st_size} of {expected} bytes")
+
+
+def _run_wilcoxon_on_csc(
+    data_path: Path,
+    csc_seconds: float,
+    was_already_csc: bool,
+    csc_scratch: str,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    gene_name_column: str | None,
+    data_name: str,
+    n_jobs: int | None,
+    memory_limit_gb: float | None,
+) -> Dict[str, Any]:
+    """Step 2 of :func:`run_wilcoxon_with_csc`: Wilcoxon on the CSC file."""
+    import time
 
     # Step 2: Run Wilcoxon on the CSC file.
     # chunk_size=None: wilcoxon_test auto-calculates gene chunk size via
     # calculate_optimal_gene_chunk_size (max_chunk=512), independent of the
     # QC cell-chunk size. This avoids the O(n_ctrl * chunk_size) dense
     # allocation exploding for datasets with large control groups like Feng-gwsnf.
+    # crispyx >= 0.1.3 dropped wilcoxon_test's n_jobs (it was never read;
+    # parallelism comes from numba prange), so pass it only where accepted.
+    import inspect
+    extra_kwargs = {}
+    if "n_jobs" in inspect.signature(wilcoxon_test).parameters:
+        extra_kwargs["n_jobs"] = n_jobs
     t_de_start = time.perf_counter()
     de_result = wilcoxon_test(
         data=data_path,
@@ -573,9 +685,9 @@ def run_wilcoxon_with_csc(
         gene_name_column=gene_name_column,
         output_dir=output_dir,
         data_name=data_name,
-        n_jobs=n_jobs,
         memory_limit_gb=memory_limit_gb,
         chunk_size=None,  # auto-calculated per calculate_optimal_gene_chunk_size
+        **extra_kwargs,
     )
     de_seconds = time.perf_counter() - t_de_start
 
@@ -584,6 +696,7 @@ def run_wilcoxon_with_csc(
         "csc_conversion_seconds": 0.0 if was_already_csc else csc_seconds,
         "wilcoxon_seconds": de_seconds,
         "was_already_csc": was_already_csc,
+        "csc_scratch": csc_scratch,
     }
 
 
@@ -595,8 +708,18 @@ def run_scanpy_de(
     method: str,
     output_dir: Path,
     preprocess: bool = True,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
+    max_control_cells: int | None = None,
+    output_name: str | None = None,
 ) -> Dict[str, Any]:
-    """Run Scanpy DE on filtered dataset."""
+    """Run Scanpy DE on filtered dataset.
+
+    If ``max_perturbations`` is set, only control and a seeded random subset
+    of perturbations are read and tested (each against the full control).
+    With ``preprocess=False`` the input is already normalized over all
+    cells, so each tested perturbation's result equals the full run's.
+    """
     import gc
     import time
     
@@ -607,7 +730,18 @@ def run_scanpy_de(
     
     # Phase 1: Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+        groups = "all"
+    else:
+        if preprocess:
+            # normalize_total's default target is the median over the cells
+            # it sees, so a subset would not reproduce the full run.
+            raise ValueError("max_perturbations requires preprocess=False (pre-normalized input)")
+        adata, groups = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
+        )
     t_load_end = time.perf_counter()
     gc.collect()
     
@@ -623,6 +757,7 @@ def run_scanpy_de(
     sc.tl.rank_genes_groups(
         adata,
         groupby=perturbation_column,
+        groups=groups,
         method=method,
         reference=control_label,
         n_genes=adata.n_vars,
@@ -640,7 +775,7 @@ def run_scanpy_de(
         
     # Phase 3: Save result
     t_save_start = time.perf_counter()
-    output_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
+    output_path = output_dir / f"{output_name or 'scanpy_de_' + method.replace('-', '_')}.csv"
     df.to_csv(output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -651,6 +786,8 @@ def run_scanpy_de(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
+        "control_cells": int((adata.obs[perturbation_column].astype(str) == control_label).sum()),
     }
 
 def run_edger_de(
@@ -660,14 +797,39 @@ def run_edger_de(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
+    max_control_cells: int | None = None,
+    output_name: str = "edger_de_glm",
+    size_factor_method: str | None = None,
+    per_comparison: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> Dict[str, Any]:
-    """Run edgeR DE on filtered dataset."""
+    """Run edgeR DE on filtered dataset.
+
+    With ``max_perturbations``, only control and a seeded perturbation subset
+    are read (optionally with a seeded control sample), and the joint model is
+    fitted on those cells.
+
+    ``per_comparison=True`` fits each perturbation against the controls alone
+    (its own DGEList, dispersions and QL fit, design ~ group), as PyDESeq2 and
+    crispyx do, in parallel worker processes (R ``parallel::mclapply``) sized
+    to ``memory_limit_gb``.
+    """
     import gc
     import os
     import time
     
     # Capture function start time (before imports)
     t_func_start = time.perf_counter()
+
+    if per_comparison:
+        return _run_edger_per_comparison(
+            dataset_path, perturbation_column=perturbation_column, control_label=control_label,
+            output_dir=output_dir, n_jobs=n_jobs, max_perturbations=max_perturbations,
+            subset_seed=subset_seed, max_control_cells=max_control_cells, output_name=output_name,
+            size_factor_method=size_factor_method, memory_limit_gb=memory_limit_gb, t_func_start=t_func_start,
+        )
     
     from .env_config import get_global_env_config
     
@@ -684,7 +846,13 @@ def run_edger_de(
     
     # Phase 1: Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+    else:
+        adata, _ = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
+        )
     t_load_end = time.perf_counter()
     gc.collect()
     
@@ -715,24 +883,31 @@ def run_edger_de(
         
     with localconverter(ro.default_converter + numpy2ri.converter):
         ro.globalenv['counts'] = counts
-        ro.globalenv['groups'] = ro.StrVector(groups)
+        # R needs syntactically valid level names for makeContrasts (e.g.
+        # "NKX2-3" is not), so groups enter R as g0, g1, ... and results are
+        # labelled with the original names.
+        safe_name = {g: f"g{i}" for i, g in enumerate(np.unique(groups))}
+        ro.globalenv['groups'] = ro.StrVector([safe_name[g] for g in groups])
         ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
+        ro.globalenv['use_libsize'] = ro.BoolVector([size_factor_method == "libsize"])
         
         ro.r('''
         rownames(counts) <- gene_names
         y <- DGEList(counts=counts, group=groups)
-        y <- calcNormFactors(y)
+        # libsize: DGEList's default lib.size (column sums) with norm.factors 1,
+        # i.e. crispyx's library-size factors; otherwise TMM.
+        if (!use_libsize) y <- calcNormFactors(y)
         design <- model.matrix(~0 + groups)
         colnames(design) <- gsub("groups", "", colnames(design))
         y <- estimateDisp(y, design)
         fit <- glmQLFit(y, design)
         ''')
-        
+    
         all_results = []
         for group in unique_groups:
-            ro.globalenv['target_group'] = group
-            ro.globalenv['control'] = control_label
-            
+            ro.globalenv['target_group'] = safe_name[group]
+            ro.globalenv['control'] = safe_name[control_label]
+        
             ro.r('''
             contrast_vec <- makeContrasts(
                 contrasts = paste0(target_group, "-", control),
@@ -740,14 +915,14 @@ def run_edger_de(
             )
             lrt <- glmQLFTest(fit, contrast=contrast_vec)
             ''')
-            
+        
             genes = np.array(ro.r('rownames(lrt$table)'))
             logFC = np.array(ro.r('lrt$table$logFC'))
             logCPM = np.array(ro.r('lrt$table$logCPM'))
             F_stat = np.array(ro.r('lrt$table$F'))
             PValue = np.array(ro.r('lrt$table$PValue'))
             FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
-            
+        
             all_results.append(pd.DataFrame({
                 'gene': genes,
                 'logFC': logFC,
@@ -757,14 +932,14 @@ def run_edger_de(
                 'FDR': FDR,
                 'perturbation': group
             }))
-            
+
     final_results = pd.concat(all_results, ignore_index=True)
     t_process_end = time.perf_counter()
     gc.collect()
     
     # Phase 3: Save result
     t_save_start = time.perf_counter()
-    output_path = output_dir / "edger_de_glm.csv"
+    output_path = output_dir / f"{output_name}.csv"
     final_results.to_csv(output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -775,7 +950,138 @@ def run_edger_de(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
+        "control_cells": int((groups == control_label).sum()),
+        "size_factor_method": size_factor_method or "edgeR default (TMM)",
+        "design": "joint",
     }
+
+
+def _edger_comparisons_worker(dataset_path, perturbation_column, control_label, max_perturbations,
+                              subset_seed, max_control_cells, targets, use_libsize, r_home):
+    """One worker process: control + its share of the perturbations, one edgeR fit each
+    (own DGEList, dispersions and QL fit; design ~ group). A process of its own, with its
+    own R, so workers share nothing (forked R workers deadlocked under rpy2)."""
+    import numpy as np
+    import pandas as pd
+    configure_r_environment(r_home)
+    from rpy2 import robjects as ro
+    from rpy2.robjects import numpy2ri
+    from rpy2.robjects.conversion import localconverter
+
+    if max_perturbations is None:
+        import scanpy as sc
+        adata = sc.read_h5ad(str(dataset_path))
+    else:
+        adata, _ = _load_perturbation_subset(dataset_path, perturbation_column, control_label,
+                                             max_perturbations, subset_seed, max_control_cells=max_control_cells)
+    labels = adata.obs[perturbation_column].astype(str).to_numpy()
+    ro.r('suppressPackageStartupMessages(library(edgeR)); '
+         'tryCatch(RhpcBLASctl::blas_set_num_threads(1), error=function(e) NULL)')
+    ctrl = np.flatnonzero(labels == control_label)
+    genes = adata.var_names.astype(str).to_numpy()
+    frames, failed, first_error = [], 0, ""
+    for target in targets:
+        rows = np.concatenate([ctrl, np.flatnonzero(labels == target)])
+        counts = adata.X[rows].T
+        counts = counts.toarray() if hasattr(counts, "toarray") else np.asarray(counts)
+        with localconverter(ro.default_converter + numpy2ri.converter):
+            ro.globalenv["counts"] = counts.astype(np.float64)
+            ro.globalenv["is_target"] = ro.BoolVector((labels[rows] == target).tolist())
+            ro.globalenv["use_libsize"] = ro.BoolVector([use_libsize])
+            ro.r('''res <- tryCatch({
+                grp <- factor(ifelse(is_target, "target", "control"), levels=c("control", "target"))
+                y <- DGEList(counts=counts, group=grp)
+                if (!use_libsize) y <- calcNormFactors(y)
+                design <- model.matrix(~grp)
+                y <- estimateDisp(y, design)
+                tt <- glmQLFTest(glmQLFit(y, design), coef=2)$table
+                list(ok=TRUE, logFC=tt$logFC, logCPM=tt$logCPM, F=tt$F, PValue=tt$PValue)
+            }, error=function(e) list(ok=FALSE, msg=conditionMessage(e)))''')
+            res = {k: ro.r(f"res${k}") for k in ("ok", "msg", "logFC", "logCPM", "F", "PValue")}
+            ro.r("rm(res, counts); invisible(gc())")
+        if not bool(np.asarray(res["ok"])[0]):
+            failed += 1
+            first_error = first_error or f"{target}: {np.asarray(res['msg'])[0]}"
+            continue
+        pv = np.asarray(res["PValue"], dtype=float)
+        order = np.argsort(pv)
+        fdr = np.empty_like(pv)
+        fdr[order] = np.minimum.accumulate((pv[order] * len(pv) / np.arange(1, len(pv) + 1))[::-1])[::-1].clip(max=1)
+        frames.append(pd.DataFrame({"gene": genes, "logFC": np.asarray(res["logFC"], dtype=float),
+                                    "logCPM": np.asarray(res["logCPM"], dtype=float), "F": np.asarray(res["F"], dtype=float),
+                                    "PValue": pv, "FDR": fdr, "perturbation": target}))
+    return frames, failed, first_error
+
+
+def _run_edger_per_comparison(
+    dataset_path, *, perturbation_column, control_label, output_dir, n_jobs, max_perturbations,
+    subset_seed, max_control_cells, output_name, size_factor_method, memory_limit_gb, t_func_start,
+) -> Dict[str, Any]:
+    """edgeR per comparison (each perturbation against the controls), in spawned
+    worker processes sized to the memory limit; see run_edger_de."""
+    import multiprocessing as mp
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+    import anndata as ad
+    from .env_config import get_global_env_config
+
+    env_config = get_global_env_config()
+    r_home = env_config.r_home if env_config else None
+    t_load_start = time.perf_counter()
+    backed = ad.read_h5ad(str(dataset_path), backed="r")
+    try:
+        labels = backed.obs[perturbation_column].astype(str)
+        n_genes = backed.n_vars
+    finally:
+        backed.file.close()
+    if max_perturbations is not None:
+        targets = _seeded_perturbation_subset(labels.unique(), control_label, max_perturbations, subset_seed)
+    else:
+        targets = sorted(set(labels) - {control_label})
+    counts_per_label = labels.value_counts()
+    n_ctrl = int(min(counts_per_label.get(control_label, 0), max_control_cells or np.inf))
+    largest = int(max(counts_per_label.get(t, 0) for t in targets))
+    t_load_end = time.perf_counter()
+    # A worker holds its input (all controls + the subset's perturbations, float32 sparse)
+    # and one comparison dense in float64 many times over: edgeR's dispersion and QL fits
+    # peaked at ~12-15 copies (Nourreddine, 36k genes x 20k controls: 48-89 GB a worker).
+    per_worker_gb = n_genes * (n_ctrl + largest) * 8 * 12 / 1e9 + 2.0
+    budget_gb = 0.7 * (memory_limit_gb or 64.0)
+    n_workers = max(1, min(n_jobs or 1, len(targets), int(budget_gb // per_worker_gb)))
+    shares = [targets[i::n_workers] for i in range(n_workers)]
+    t_process_start = time.perf_counter()
+    with ProcessPoolExecutor(n_workers, mp_context=mp.get_context("spawn")) as pool:
+        parts = list(pool.map(
+            _edger_comparisons_worker,
+            *zip(*[(str(dataset_path), perturbation_column, control_label, max_perturbations, subset_seed,
+                    max_control_cells, share, size_factor_method == "libsize", r_home) for share in shares])))
+    t_process_end = time.perf_counter()
+    frames = [f for fr, _, _ in parts for f in fr]
+    n_failed = sum(n for _, n, _ in parts)
+    first_error = next((e for _, _, e in parts if e), "")
+    if not frames:
+        raise RuntimeError(f"edgeR failed for all {len(targets)} perturbations; first error: {first_error}")
+    t_save_start = time.perf_counter()
+    output_path = Path(output_dir) / f"{output_name}.csv"
+    pd.concat(frames, ignore_index=True).to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
+    return {
+        "result_path": str(output_path),
+        "groups": len(targets) - n_failed,
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
+        "subsampled": max_perturbations is not None,
+        "control_cells": n_ctrl,
+        "size_factor_method": size_factor_method or "edgeR default (TMM)",
+        "design": "per comparison",
+        "failed_groups": n_failed,
+        "first_error": first_error,
+        "workers": n_workers,
+    }
+
 
 def run_pertpy_de(
     dataset_path: Path,
@@ -1068,13 +1374,8 @@ def run_nb_glm_base(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
-    size_factor_method: str = "sparse",
-    scale_size_factors: bool = False,
+    size_factor_method: str = "libsize",
     gene_name_column: str | None = None,
-    use_control_cache: bool = True,
-    size_factor_scope: str = "global",
-    se_method: str = "sandwich",
-    dispersion_scope: str = "global",
     data_name: str = "de_nb_glm",
     profiling: bool = True,
     memory_limit_gb: float | None = None,
@@ -1098,34 +1399,21 @@ def run_nb_glm_base(
     n_jobs
         Number of parallel jobs
     size_factor_method
-        Method for size factor calculation. Default "sparse" is optimal for
-        single-cell data. The "deseq2" method (genes expressed in ALL cells)
-        provides no benefit for sparse scRNA-seq since it falls back to "sparse"
-        when too few genes qualify.
-    scale_size_factors
-        Whether to scale size factors
+        crispyx's size factors: "libsize" (default), "geomeans" or "deseq2"
+        (median of ratios against the controls; falls back to "geomeans"
+        on single cells). Dispersions are estimated per comparison, as
+        DESeq2 does (crispyx 0.2.3).
     gene_name_column
         Column name for gene names (passed to nb_glm_test)
-    use_control_cache
-        If True, precompute control cell statistics once and reuse across
-        all perturbation comparisons.
-    size_factor_scope
-        Scope for size factor computation: "global" or "per_comparison".
-    se_method
-        Method for SE computation: "sandwich" (robust) or "fisher" (PyDESeq2 parity).
-    dispersion_scope
-        Scope for dispersion estimation: "global" or "per_comparison".
     data_name
         Base name for output files (e.g., "de_nb_glm" -> crispyx_de_nb_glm.h5ad).
     profiling
         If True, enable profiling in nb_glm_test.
     memory_limit_gb
-        Optional memory limit in GB. Used for adaptive memory management:
-        - Triggers streaming mode for global dispersion if matrix too large
-        - Limits parallel worker count based on estimated memory per worker
+        Optional memory limit in GB (sizes crispyx's workers).
     max_dense_fraction
-        Maximum fraction of available memory to use for dense matrices.
-        Default is 0.3 (30%). Reduces risk of OOM during global dispersion.
+        Passed to nb_glm_test (with covariates only: the share of memory the
+        dense controls may take).
         
     Returns
     -------
@@ -1135,10 +1423,7 @@ def run_nb_glm_base(
     from typing import Literal, cast
     
     # Cast string parameters to their literal types
-    size_factor_method_lit = cast(Literal["sparse", "deseq2"], size_factor_method)
-    size_factor_scope_lit = cast(Literal["global", "per_comparison"], size_factor_scope)
-    se_method_lit = cast(Literal["sandwich", "fisher"], se_method)
-    dispersion_scope_lit = cast(Literal["global", "per_comparison"], dispersion_scope)
+    size_factor_method_lit = cast(Literal["libsize", "geomeans", "deseq2"], size_factor_method)
     
     # Run NB-GLM base fitting with profiling (no shrinkage)
     t_base_start = time.perf_counter()
@@ -1146,20 +1431,16 @@ def run_nb_glm_base(
         data=path,
         perturbation_column=perturbation_column,
         control_label=control_label,
-        output_dir=output_dir,
-        data_name=data_name,
+        output_path=output_dir / f"crispyx_{data_name}.h5ad",
         n_jobs=n_jobs,
         lfc_shrinkage_type="none",  # No shrinkage - handled by separate step
         size_factor_method=size_factor_method_lit,
-        scale_size_factors=scale_size_factors,
         gene_name_column=gene_name_column,
-        use_control_cache=use_control_cache,
-        size_factor_scope=size_factor_scope_lit,
-        se_method=se_method_lit,
-        dispersion_scope=dispersion_scope_lit,
         profiling=profiling,
         memory_limit_gb=memory_limit_gb,
-        max_dense_fraction=max_dense_fraction,
+        # crispyx >= 0.2.4 keeps the controls sparse and dropped this option.
+        **({"max_dense_fraction": max_dense_fraction}
+           if "max_dense_fraction" in inspect.signature(nb_glm_test).parameters else {}),
     )
     t_base_end = time.perf_counter()
     base_seconds_wall = t_base_end - t_base_start
@@ -1294,6 +1575,86 @@ def run_lfcshrink(
     }
 
 
+def _seeded_perturbation_subset(
+    labels, control_label: str, max_perturbations: int, seed: int
+) -> List[str]:
+    """Return a seeded random subset of perturbation labels (control excluded).
+
+    Shared by the reference methods so that, for the same size and seed,
+    PyDESeq2 and Scanpy are run on the same perturbations.
+    """
+    import numpy as np
+
+    candidates = sorted(str(p) for p in set(labels) if str(p) != control_label)
+    rng = np.random.default_rng(seed)
+    n_pick = min(max_perturbations, len(candidates))
+    return sorted(rng.choice(candidates, size=n_pick, replace=False).tolist())
+
+
+def _load_perturbation_subset(path: Path, perturbation_column: str, control_label: str,
+                              max_perturbations: int, seed: int,
+                              max_control_cells: int | None = None):
+    """Read only control + a seeded perturbation subset of ``path`` into memory.
+
+    With ``max_control_cells``, the control is also reduced to a seeded random
+    sample of that many cells (the same cells for every perturbation).
+    """
+    import numpy as np
+    import scanpy as sc
+
+    backed = sc.read_h5ad(str(path), backed="r")
+    try:
+        labels = backed.obs[perturbation_column].astype(str)
+        perturbations = _seeded_perturbation_subset(labels.unique(), control_label, max_perturbations, seed)
+        keep = labels.isin([control_label, *perturbations]).to_numpy()
+        control = np.flatnonzero((labels == control_label).to_numpy())
+        if max_control_cells is not None and len(control) > max_control_cells:
+            rng = np.random.default_rng(seed)
+            keep[np.setdiff1d(control, rng.choice(control, size=max_control_cells, replace=False))] = False
+        adata = backed[np.flatnonzero(keep)].to_memory()
+    finally:
+        backed.file.close()
+    adata.obs[perturbation_column] = adata.obs[perturbation_column].astype(str).astype("category")
+    return adata, perturbations
+
+
+def _use_library_size_factors(dds) -> None:
+    """Make PyDESeq2 (0.5.x) use library-size factors: each cell's total count,
+    scaled to geometric mean 1 -- crispyx's ``size_factor_method="libsize"``.
+
+    ``DeseqDataSet.deseq2()`` always calls ``fit_size_factors()``; replacing it
+    on the instance sets the same three fields the median-of-ratios fit sets.
+    With the same counts (QC-filtered) crispyx, PyDESeq2 and edgeR then share
+    size factors up to a constant, which cancels in fold changes and tests.
+    """
+    import numpy as np
+
+    def fit_size_factors(*args, **kwargs):
+        totals = np.asarray(dds.X.sum(axis=1), dtype=float).ravel()
+        sf = totals / np.exp(np.mean(np.log(totals)))
+        dds.obs["size_factors"] = sf
+        dds.layers["normed_counts"] = dds.X / sf[:, None]
+        dds.var["_normed_means"] = dds.layers["normed_counts"].mean(axis=0)
+
+    dds.fit_size_factors = fit_size_factors
+
+
+def _make_var_names_unique_for_pydeseq2(adata) -> Dict[str, str]:
+    """Give ``adata`` unique var names in place; return ``{unique: original}``.
+
+    PyDESeq2 (0.5.x) raises "cannot reindex on an axis with duplicate labels"
+    in ``fit_dispersion_trend`` when gene names repeat (e.g. Nadig-HEPG2), so
+    every per-perturbation fit fails. Output rows are mapped back to the
+    original names so they still line up with the other methods' results.
+    """
+    original = adata.var_names.astype(str).tolist()
+    if len(set(original)) == len(original):
+        return {name: name for name in original}
+    unique = [f"{name}__{i}" for i, name in enumerate(original)]
+    adata.var_names = unique
+    return dict(zip(unique, original))
+
+
 def run_pydeseq2_base(
     dataset_path: Path,
     *,
@@ -1301,11 +1662,21 @@ def run_pydeseq2_base(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
+    max_perturbations: int | None = None,
+    subset_seed: int = 0,
+    max_control_cells: int | None = None,
+    output_name: str = "pertpy_de_pydeseq2",
+    size_factor_method: str | None = None,
+    min_mu: float | None = None,
 ) -> Dict[str, Any]:
     """Run PyDESeq2 base DE fitting only (no shrinkage).
     
     This function runs PyDESeq2 without LFC shrinkage, saving base results.
     Shrinkage is handled by a separate run_pydeseq2_lfcshrink step.
+    
+    If ``max_perturbations`` is set, only a seeded random subset of that many
+    perturbations is fitted (each against the full control), and only those
+    cells are read into memory -- for datasets too large to load whole.
     
     Returns timing and memory metrics for the base fitting only.
     """
@@ -1325,15 +1696,24 @@ def run_pydeseq2_base(
     
     # Load data
     t_load_start = time.perf_counter()
-    adata = sc.read_h5ad(str(dataset_path))
+    if max_perturbations is None:
+        adata = sc.read_h5ad(str(dataset_path))
+        # Get unique perturbations (excluding control)
+        perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    else:
+        adata, perturbations = _load_perturbation_subset(
+            dataset_path, perturbation_column, control_label, max_perturbations, subset_seed,
+            max_control_cells=max_control_cells,
+        )
+    n_control_cells = int((adata.obs[perturbation_column] == control_label).sum())
     t_load_end = time.perf_counter()
     gc.collect()
-    
-    # Get unique perturbations (excluding control)
-    perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
     
     t_process_start = time.perf_counter()
     all_base_results = []
+    n_failed = 0
+    first_error = None
     
     for pert in perturbations:
         # Subset to control + current perturbation
@@ -1360,7 +1740,14 @@ def run_pydeseq2_base(
                     design_factors=perturbation_column,
                     refit_cooks=True,
                     n_cpus=n_jobs or 1,
+                    # The mean floor: crispyx 0.2.3 uses 1e-6 on sparse single cells, PyDESeq2 0.5
+                    # by default; a like-for-like comparison needs the same one.
+                    **({"min_mu": min_mu} if min_mu is not None else {}),
                 )
+                if size_factor_method == "libsize":
+                    _use_library_size_factors(dds)
+                elif size_factor_method is not None:
+                    raise ValueError(f"size_factor_method must be None or 'libsize', not {size_factor_method!r}")
                 dds.deseq2()
                 
                 stat_res = DeseqStats(
@@ -1376,17 +1763,29 @@ def run_pydeseq2_base(
                 base_results_df["log2FoldChange"] = -base_results_df["log2FoldChange"]
                 if "stat" in base_results_df.columns:
                     base_results_df["stat"] = -base_results_df["stat"]
-                base_results_df["gene"] = base_results_df.index
+                # Fitted (MAP) dispersions, for comparison with crispyx's
+                base_results_df["dispersion"] = dds.var["dispersions"].reindex(base_results_df.index).to_numpy()
+                base_results_df["gene"] = base_results_df.index.map(gene_name_map)
                 base_results_df[perturbation_column] = pert
                 # Store dds and stat_res references for lfcShrink step
                 base_results_df["_coeff_name"] = f"{perturbation_column}[T.{control_label}]"
                 base_results_df = base_results_df.reset_index(drop=True)
                 all_base_results.append(base_results_df)
                 
-            except Exception:
+            except Exception as exc:
+                n_failed += 1
+                if first_error is None:
+                    first_error = f"{pert}: {type(exc).__name__}: {exc}"
                 continue
     
     t_process_end = time.perf_counter()
+    
+    # Per-perturbation failures are skipped, but an all-failed run must not be
+    # reported as success with an empty CSV.
+    if not all_base_results and perturbations:
+        raise RuntimeError(
+            f"PyDESeq2 failed for all {len(perturbations)} perturbations; first error: {first_error}"
+        )
     
     # Format and save base results
     if all_base_results:
@@ -1405,7 +1804,7 @@ def run_pydeseq2_base(
         base_df = pd.DataFrame()
     
     t_save_start = time.perf_counter()
-    base_output_path = output_dir / "pertpy_de_pydeseq2.csv"
+    base_output_path = output_dir / f"{output_name}.csv"
     base_df.to_csv(base_output_path, index=False)
     t_save_end = time.perf_counter()
     
@@ -1418,6 +1817,11 @@ def run_pydeseq2_base(
         "load_seconds": t_load_end - t_load_start,
         "process_seconds": t_process_end - t_process_start,
         "save_seconds": t_save_end - t_save_start,
+        "failed_groups": n_failed,
+        "subsampled": max_perturbations is not None,
+        "control_cells": n_control_cells,
+        "size_factor_method": size_factor_method or "pydeseq2 default (median of ratios)",
+        "min_mu": min_mu if min_mu is not None else 0.5,
     }
 
 
@@ -1455,11 +1859,13 @@ def run_pydeseq2_lfcshrink(
     # Load data
     adata = sc.read_h5ad(str(dataset_path))
     gc.collect()
+    gene_name_map = _make_var_names_unique_for_pydeseq2(adata)
     
     # Get unique perturbations (excluding control)
     perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     
     all_shrunk_results = []
+    first_error = None
     total_shrinkage_seconds = 0.0
     
     for pert in perturbations:
@@ -1523,14 +1929,21 @@ def run_pydeseq2_lfcshrink(
                 shrunk_results_df["log2FoldChange"] = -shrunk_results_df["log2FoldChange"]
                 if "stat" in shrunk_results_df.columns:
                     shrunk_results_df["stat"] = -shrunk_results_df["stat"]
-                shrunk_results_df["gene"] = shrunk_results_df.index
+                shrunk_results_df["gene"] = shrunk_results_df.index.map(gene_name_map)
                 shrunk_results_df[perturbation_column] = pert
                 shrunk_results_df["shrinkage_applied"] = shrinkage_applied
                 shrunk_results_df = shrunk_results_df.reset_index(drop=True)
                 all_shrunk_results.append(shrunk_results_df)
                 
-            except Exception:
+            except Exception as exc:
+                if first_error is None:
+                    first_error = f"{pert}: {type(exc).__name__}: {exc}"
                 continue
+    
+    if not all_shrunk_results and perturbations:
+        raise RuntimeError(
+            f"PyDESeq2 lfcShrink failed for all {len(perturbations)} perturbations; first error: {first_error}"
+        )
     
     # Format and save shrunk results
     if all_shrunk_results:
@@ -1616,6 +2029,30 @@ class BenchmarkConfig:
     chunk_size: Optional[int] = None  # Override chunk size for all operations
     use_docker: bool = False  # Run benchmarks inside Docker containers
     docker_image: str = "crispyx-benchmark:latest"  # Docker image name
+    # Run the PyDESeq2 reference on a seeded random subset of perturbations
+    # (each against the full control) when the full run is infeasible, e.g.
+    # genome-wide screens. None = all perturbations.
+    pydeseq2_max_perturbations: Optional[int] = None
+    pydeseq2_subset_seed: int = 0
+    # With the subset, also fit against a seeded random sample of this many
+    # control cells (PyDESeq2 holds control + perturbation dense per fit).
+    pydeseq2_max_control_cells: Optional[int] = None
+    # Same for the Scanpy DE references, per method ("t-test", "wilcoxon"),
+    # e.g. {"wilcoxon": 300}. The same size and seed as PyDESeq2 selects
+    # the same perturbations.
+    scanpy_max_perturbations: Optional[Dict[str, int]] = None
+    scanpy_subset_seed: int = 0
+    # Per-method overrides of resource_limits, e.g.
+    # {"scanpy_de_wilcoxon": {"memory_limit": 240}}; unset keys fall back
+    # to resource_limits.
+    method_resource_limits: Optional[Dict[str, Dict[str, float]]] = None
+    # Accuracy reruns of reference methods (plan 2026-10-25 §3.2), e.g.
+    # {"n_perturbations": 50, "seed": 0, "max_control_cells": 20000,
+    #  "memory_limit": 240, "time_limit": 259200} (limits for these reruns only).
+    # Registers <reference>_subset (seeded perturbation subset, full control)
+    # and <reference>_subset_ctrl (same subset, control capped at
+    # max_control_cells); both run only when requested by name.
+    accuracy_subset: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_dict(
@@ -1701,6 +2138,13 @@ class BenchmarkConfig:
             chunk_size=chunk_size,
             use_docker=use_docker,
             docker_image=docker_image,
+            pydeseq2_max_perturbations=data.get("pydeseq2_max_perturbations"),
+            pydeseq2_subset_seed=data.get("pydeseq2_subset_seed", 0),
+            pydeseq2_max_control_cells=data.get("pydeseq2_max_control_cells"),
+            scanpy_max_perturbations=data.get("scanpy_max_perturbations"),
+            scanpy_subset_seed=data.get("scanpy_subset_seed", 0),
+            method_resource_limits=data.get("method_resource_limits"),
+            accuracy_subset=data.get("accuracy_subset"),
         )
 
     @classmethod
@@ -3535,6 +3979,8 @@ def _summarise_wilcoxon_csc(result: Any, context: Dict[str, Any]) -> Dict[str, A
     if de_secs is not None:
         summary["wilcoxon_seconds"] = round(de_secs, 3)
     summary["was_already_csc"] = was_already_csc
+    if result.get("csc_scratch"):
+        summary["csc_scratch"] = result["csc_scratch"]
 
     return summary
 
@@ -4521,6 +4967,12 @@ def create_benchmark_suite(
     n_cores: int | None = None,
     chunk_size: int | None = None,
     memory_limit_gb: float | None = None,
+    pydeseq2_max_perturbations: int | None = None,
+    pydeseq2_subset_seed: int = 0,
+    scanpy_max_perturbations: Dict[str, int] | None = None,
+    scanpy_subset_seed: int = 0,
+    pydeseq2_max_control_cells: int | None = None,
+    accuracy_subset: Dict[str, Any] | None = None,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -4623,8 +5075,7 @@ def create_benchmark_suite(
                 "chunk_size": final_chunk_size,
                 "memory_limit_gb": memory_limit_gb,
                 **shared_kwargs,
-                "output_dir": preprocessing_dir,
-                "data_name": "qc_filtered",
+                "output_path": qc_filtered_path,
             },
             summary=_summarise_quality_control,
         ),
@@ -4666,10 +5117,11 @@ def create_benchmark_suite(
         "crispyx_pb_avg_log": BenchmarkMethod(
             name="crispyx_pb_avg_log",
             description="Average log-normalised expression per perturbation",
-            function=compute_average_log_expression,
+            function=compute_normalized_effects,
             kwargs={
                 "data": dataset_path,
                 **shared_kwargs,
+                "method": "mean_log1p",
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_avg_log",
             },
@@ -4678,10 +5130,11 @@ def create_benchmark_suite(
         "crispyx_pb_pseudobulk": BenchmarkMethod(
             name="crispyx_pb_pseudobulk",
             description="Pseudo-bulk log fold-change per perturbation",
-            function=compute_pseudobulk_expression,
+            function=compute_normalized_effects,
             kwargs={
                 "data": dataset_path,
                 **shared_kwargs,
+                "method": "log_mean",
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_pseudobulk",
             },
@@ -4726,41 +5179,33 @@ def create_benchmark_suite(
             description="NB-GLM base fitting (no shrinkage)",
             function=run_nb_glm_base,
             kwargs={
-                "path": standardized_csr_path,
+                "path": qc_filtered_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
-                "size_factor_method": "deseq2",
-                "scale_size_factors": False,
-                "use_control_cache": True,
-                "size_factor_scope": "global",
+                "size_factor_method": "libsize",
                 "data_name": "de_nb_glm",
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
-            depends_on="crispyx_standardize_csr",
+            depends_on="crispyx_qc_filtered",  # the same QC-filtered counts the references read
         ),
         # NB-GLM with PyDESeq2-parity configuration (for benchmarking parity)
         "crispyx_de_nb_glm_pydeseq2": BenchmarkMethod(
             name="crispyx_de_nb_glm_pydeseq2",
-            description="NB-GLM with PyDESeq2-parity settings (fisher SE, per-comparison SF/disp)",
+            description="NB-GLM, DESeq2's median-of-ratios size factors (against the controls)",
             function=run_nb_glm_base,
             kwargs={
-                "path": standardized_csr_path,
+                "path": qc_filtered_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
                 "size_factor_method": "deseq2",
-                "scale_size_factors": False,
-                "use_control_cache": False,  # per-comparison requires fresh computation
-                "size_factor_scope": "per_comparison",
-                "se_method": "fisher",
-                "dispersion_scope": "per_comparison",
                 "data_name": "de_nb_glm_pydeseq2_nb_glm",  # End with _nb_glm to prevent suffix duplication
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
-            depends_on="crispyx_standardize_csr",
+            depends_on="crispyx_qc_filtered",  # the same QC-filtered counts the references read
         ),
         # lfcShrink with global prior scale (faster)
         "crispyx_de_lfcshrink": BenchmarkMethod(
@@ -4818,6 +5263,8 @@ def create_benchmark_suite(
                 "method": "t-test",
                 "output_dir": de_dir,
                 "preprocess": False,
+                "max_perturbations": (scanpy_max_perturbations or {}).get("t-test"),
+                "subset_seed": scanpy_subset_seed,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_preprocess",
@@ -4833,6 +5280,8 @@ def create_benchmark_suite(
                 "method": "wilcoxon",
                 "output_dir": de_dir,
                 "preprocess": False,
+                "max_perturbations": (scanpy_max_perturbations or {}).get("wilcoxon"),
+                "subset_seed": scanpy_subset_seed,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_preprocess",
@@ -4860,6 +5309,9 @@ def create_benchmark_suite(
                 "control_label": shared_kwargs["control_label"],
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
+                "max_perturbations": pydeseq2_max_perturbations,
+                "subset_seed": pydeseq2_subset_seed,
+                "max_control_cells": pydeseq2_max_control_cells,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_qc_filtered",
@@ -4880,7 +5332,147 @@ def create_benchmark_suite(
         ),
     }
 
+    if accuracy_subset:
+        methods.update(_accuracy_subset_methods(methods, accuracy_subset, qc_filtered_path))
     return methods
+
+
+def _write_accuracy_subset_spec(config: "BenchmarkConfig") -> None:
+    """Record the accuracy subset for the report, which scores every
+    comparison on this dataset's seeded perturbations."""
+    path = config.output_dir / ".accuracy_subset.json"
+    if config.accuracy_subset:
+        path.write_text(json.dumps(config.accuracy_subset, sort_keys=True))
+    elif path.exists():
+        path.unlink()
+
+
+# Reference methods that get accuracy-rerun variants, and the suffixes of
+# those variants (plan 2026-10-25 §3.2): "_subset" = seeded perturbation
+# subset against the full control; "_subset_ctrl" = the same perturbations
+# against a seeded sample of control cells.
+ACCURACY_SUBSET_REFERENCES = ("scanpy_de_t_test", "scanpy_de_wilcoxon", "pertpy_de_pydeseq2", "edger_de_glm")
+ACCURACY_SUBSET_SUFFIXES = ("_subset", "_subset_ctrl")
+
+
+def _crispyx_version() -> str:
+    """The crispyx version under test and a fingerprint of its sources
+    (pre-releases share the version number), recorded with every crispyx
+    result, e.g. "0.2.3+f70046bfe14c"."""
+    import hashlib
+    import crispyx
+
+    root = Path(crispyx.__file__).parent
+    digest = hashlib.md5()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.read_bytes())
+    return f"{getattr(crispyx, '__version__', 'unknown')}+{digest.hexdigest()[:12]}"
+
+
+def run_on_accuracy_subset(
+    *,
+    function: Callable[..., Any],
+    function_kwargs: Dict[str, Any],
+    path_key: str,
+    perturbation_column: str,
+    control_label: str,
+    max_perturbations: int,
+    subset_seed: int,
+    max_control_cells: int | None,
+    output_suffix: str,
+) -> Any:
+    """Run a crispyx method on the accuracy subset's exact cells (plan
+    2026-10-25 §3.2 rule 4): the seeded perturbations against the same seeded
+    control sample the capped references use. The subset is written to a
+    scratch file next to the outputs and removed afterwards."""
+    import shutil
+
+    source = Path(function_kwargs[path_key])
+    adata, _ = _load_perturbation_subset(
+        source, perturbation_column, control_label, max_perturbations, subset_seed,
+        max_control_cells=max_control_cells,
+    )
+    out_dir = Path(function_kwargs["output_dir"])
+    scratch = out_dir / f".accuracy_subset{output_suffix}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        subset_path = scratch / source.name
+        adata.write_h5ad(subset_path)
+        del adata
+        kwargs = dict(function_kwargs, **{path_key: subset_path})
+        if "csc_path" in kwargs:
+            kwargs["csc_path"] = scratch / f"csc_{source.name}"
+        kwargs["data_name"] = kwargs.get("data_name", "") + output_suffix
+        return function(**kwargs)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _accuracy_subset_methods(
+    methods: Dict[str, BenchmarkMethod], spec: Dict[str, Any], qc_filtered_path: Path
+) -> Dict[str, BenchmarkMethod]:
+    """``<reference>_subset`` and ``<reference>_subset_ctrl`` variants."""
+    n = int(spec.get("n_perturbations", 50))
+    seed = int(spec.get("seed", 0))
+    cap = spec.get("max_control_cells")
+    variants: Dict[str, BenchmarkMethod] = {}
+    # crispyx on the capped references' exact cells (rule 4); only the capped
+    # variant, since crispyx's full-data result already holds the
+    # uncapped comparisons.
+    if cap is not None:
+        for base, path_key in (("crispyx_de_t_test", "data"), ("crispyx_de_wilcoxon", "input_path"),
+                               ("crispyx_de_nb_glm", "path")):
+            if base not in methods:
+                continue
+            ref = methods[base]
+            variants[base + "_subset_ctrl"] = BenchmarkMethod(
+                name=base + "_subset_ctrl",
+                description=f"{ref.description} [accuracy rerun: {n} seeded perturbations, {int(cap):,} control cells]",
+                function=run_on_accuracy_subset,
+                kwargs=dict(
+                    function=ref.function, function_kwargs=ref.kwargs, path_key=path_key,
+                    perturbation_column=ref.kwargs["perturbation_column"],
+                    control_label=ref.kwargs["control_label"], max_perturbations=n,
+                    subset_seed=seed, max_control_cells=cap, output_suffix="_subset_ctrl",
+                ),
+                summary=ref.summary,
+                depends_on=ref.depends_on,
+            )
+    for base in ACCURACY_SUBSET_REFERENCES:
+        if base not in methods:
+            continue
+        ref = methods[base]
+        for suffix, control_cap in (("_subset", None), ("_subset_ctrl", cap)):
+            if suffix == "_subset_ctrl" and control_cap is None:
+                continue
+            kwargs = dict(ref.kwargs, max_perturbations=n, subset_seed=seed,
+                          max_control_cells=control_cap, output_name=base + suffix)
+            if base in ("pertpy_de_pydeseq2", "edger_de_glm"):
+                # NB-GLM references share crispyx's size factors (plan §4).
+                kwargs["size_factor_method"] = spec.get("size_factors", "libsize")
+            if base == "edger_de_glm":
+                # Each perturbation against the controls alone, as PyDESeq2 and
+                # crispyx fit it (decided 2026-10-27).
+                kwargs["per_comparison"] = True
+                kwargs["memory_limit_gb"] = float(spec.get("memory_limit", 240))
+            if base == "pertpy_de_pydeseq2":
+                # ... and its mean floor (crispyx 0.2.3 on sparse single cells: 1e-6).
+                kwargs["min_mu"] = float(spec.get("min_mu", 1e-6))
+            depends_on = ref.depends_on
+            if base == "edger_de_glm":
+                # Same perturbation universe as the other references (QC-filtered counts).
+                kwargs["dataset_path"] = qc_filtered_path
+                depends_on = "crispyx_qc_filtered"
+            label = f"{n} seeded perturbations" + (f", {int(control_cap):,} control cells" if control_cap else "")
+            variants[base + suffix] = BenchmarkMethod(
+                name=base + suffix,
+                description=f"{ref.description} [accuracy rerun: {label}]",
+                function=ref.function,
+                kwargs=kwargs,
+                summary=ref.summary,
+                depends_on=depends_on,
+            )
+    return variants
 
 
 def parse_args() -> argparse.Namespace:
@@ -5005,6 +5597,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Skip methods with existing output files (default: True). Use --no-skip-existing to force re-run of specified methods.",
+    )
+    parser.add_argument(
+        "--no-report",
+        dest="no_report",
+        action="store_true",
+        help="Skip the comparison report after running (regenerate it later with --regenerate-report).",
     )
     return parser.parse_args()
 
@@ -5262,14 +5860,26 @@ def _run_single_benchmark(
     if not config.quiet:
         print(f"\nStandardizing dataset: {config.dataset_path.name}")
     
-    standardized_path = standardize_dataset(
-        dataset_path=config.dataset_path,
-        perturbation_column=config.perturbation_column,
-        control_label=config.control_label,
-        gene_name_column=config.gene_name_column,
-        output_dir=config.output_dir,
-        force=config.force_restandardize,
+    # Reuse an existing standardized file ourselves: crispyx >= 0.1.7 only
+    # reuses outputs carrying its provenance stamp, so it would rewrite every
+    # file made by an older release (tens of GB on genome-wide data) although
+    # standardization itself is unchanged.
+    existing_standardized = (
+        config.output_dir / ".cache" / f"standardized_{config.dataset_path.stem}.h5ad"
     )
+    if existing_standardized.exists() and not config.force_restandardize:
+        standardized_path = existing_standardized
+        if not config.quiet:
+            print(f"  ✓ Reusing standardized file: {standardized_path.name}")
+    else:
+        standardized_path = standardize_dataset(
+            dataset_path=config.dataset_path,
+            perturbation_column=config.perturbation_column,
+            control_label=config.control_label,
+            gene_name_column=config.gene_name_column,
+            output_dir=config.output_dir,
+            force=config.force_restandardize,
+        )
 
     # Ensure a CSR copy exists for efficient row-wise access (adaptive QC,
     # NB-GLM, size factors).  On CSC or dense standardized files this avoids
@@ -5354,6 +5964,7 @@ def _run_single_benchmark(
     
     # Save current config to cache
     save_cache_config(config.output_dir, qc_params_used, str(standardized_path))
+    _write_accuracy_subset_spec(config)
 
     available_methods = create_benchmark_suite(
         dataset_path=standardized_csr_path,
@@ -5365,6 +5976,12 @@ def _run_single_benchmark(
         n_cores=config.n_cores,
         chunk_size=config.chunk_size,
         memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
+        pydeseq2_max_perturbations=config.pydeseq2_max_perturbations,
+        pydeseq2_max_control_cells=config.pydeseq2_max_control_cells,
+        accuracy_subset=config.accuracy_subset,
+        pydeseq2_subset_seed=config.pydeseq2_subset_seed,
+        scanpy_max_perturbations=config.scanpy_max_perturbations,
+        scanpy_subset_seed=config.scanpy_subset_seed,
     )
     
     # Define optional methods (excluded by default, only run when explicitly requested)
@@ -5389,10 +6006,12 @@ def _run_single_benchmark(
                 continue
 
             # Allow shorthand prefixes (e.g., "scanpy" -> all scanpy_* methods)
+            # Accuracy reruns (*_subset, *_subset_ctrl) run only when named.
             prefix_matches = [
                 method_name
                 for method_name in available_methods
                 if method_name.startswith(f"{name}_")
+                and not method_name.endswith(ACCURACY_SUBSET_SUFFIXES)
             ]
 
             if prefix_matches:
@@ -5408,6 +6027,7 @@ def _run_single_benchmark(
         selected_names = [
             method.name for method in ordered_methods
             if method.name not in OPTIONAL_METHODS
+            and not method.name.endswith(ACCURACY_SUBSET_SUFFIXES)
         ]
         
         # Add optional methods if explicitly enabled in config
@@ -5545,8 +6165,17 @@ def _run_single_benchmark(
             raise ValueError(f"Unknown method '{name}'. Available methods: {sorted(available_methods)}")
         method = available_methods[name]
         
+        # A crispyx method named explicitly is rerun when its cached result is
+        # from another crispyx version (dependencies keep their cached results).
+        stale_version = None
+        if method.name.startswith("crispyx_") and method.name in (config.methods_to_run or []):
+            cached = load_method_result(method.name, config.output_dir)
+            if cached is not None and cached.get("crispyx_version") != _crispyx_version():
+                stale_version = cached.get("crispyx_version", "unrecorded")
+                if not config.quiet:
+                    print(f"  Rerunning {method.name}: cached with crispyx {stale_version}, now {_crispyx_version()}")
         # Check if output already exists (for resuming interrupted benchmarks)
-        if config.skip_existing and check_output_exists(method.name, config.output_dir):
+        if stale_version is None and config.skip_existing and check_output_exists(method.name, config.output_dir):
             # Try to load cached benchmark metadata
             cached_result = load_method_result(method.name, config.output_dir)
             
@@ -5654,8 +6283,25 @@ def _run_single_benchmark(
         if show_progress:
             method_iterator.set_description(f"Running {method.name}")  # type: ignore
         
+        method_memory_limit_bytes = memory_limit_bytes
+        method_time_limit = config.resource_limits.time_limit
+        override = {}
+        if method.name.endswith(ACCURACY_SUBSET_SUFFIXES) and config.accuracy_subset:
+            # Accuracy reruns: the relaxed limits from the accuracy_subset block.
+            override = {k: config.accuracy_subset[k] for k in ("memory_limit", "time_limit")
+                        if k in config.accuracy_subset}
+        override = {**override, **(config.method_resource_limits or {}).get(method.name, {})}
+        if "memory_limit" in override:
+            method_memory_limit_bytes = (
+                int(override["memory_limit"] * 1024 * 1024 * 1024) if override["memory_limit"] > 0 else None
+            )
+        if "time_limit" in override:
+            method_time_limit = override["time_limit"]
+        if override and not config.quiet:
+            print(f"  Limits for {method.name}: {override}")
+
         result = _run_with_limits(
-            method, context, memory_limit_bytes, config.resource_limits.time_limit,
+            method, context, method_memory_limit_bytes, method_time_limit,
             use_docker=config.use_docker, docker_runner=docker_runner,
         )
         
@@ -5685,6 +6331,8 @@ def _run_single_benchmark(
             row.update(summary)
         if result.get("error"):
             row["error"] = result["error"]
+        if method.name.startswith("crispyx_"):
+            row["crispyx_version"] = _crispyx_version()
         
         rows.append(row)
         actually_executed.add(method.name)
@@ -5897,6 +6545,7 @@ def main() -> None:
                 continue
             
             print(f"Regenerating reports from cache: {config.output_dir}")
+            _write_accuracy_subset_spec(config)
             evaluate_benchmarks(config.output_dir)
             print(f"  Report: {config.output_dir / 'benchmark_report.md'}")
         return
@@ -5929,7 +6578,8 @@ def main() -> None:
         summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
         
        # Run evaluation (generate comparison tables and visualizations)
-        evaluate_benchmarks(config.output_dir)
+        if not args.no_report:
+            evaluate_benchmarks(config.output_dir)
 
         if not config.quiet:
             print(f"\nBenchmark complete for {config.dataset_name}")
