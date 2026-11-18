@@ -103,6 +103,7 @@ from ._size_factors import (
     _control_reference_size_factors,
 )
 from ._statistics import (
+    _add_group_moments,
     _tie_correction,
     _adjust_pvalue_matrix,
     _low_expr_in_both_mask,
@@ -1257,21 +1258,8 @@ def t_test(
         for slc, block in iter_matrix_chunks(
             backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False
         ):
-            slice_codes = label_codes[slc]
-            csr = sp.csr_matrix(block)
-            for code in np.unique(slice_codes):
-                # Cells of a perturbation this run does not test are coded -1,
-                # which would index the last group's row.
-                if code < 0:
-                    continue
-                row_mask = slice_codes == code
-                group_block = csr[row_mask, :]
-                # Expression count: number of nonzero per gene
-                expr_counts[code] += np.asarray(group_block.getnnz(axis=0), dtype=np.int32)
-                # Sum and sumsq using sparse ops
-                sums[code] += group_block.sum(axis=0).A1.astype(np.float64)
-                sumsq[code] += group_block.power(2).sum(axis=0).A1.astype(np.float64)
-                counts[code] += row_mask.sum()
+            # Cells of a perturbation this run does not test are coded -1.
+            _add_group_moments(sp.csr_matrix(block), label_codes[slc], sums, sumsq, expr_counts, counts)
     finally:
         backed.file.close()
 

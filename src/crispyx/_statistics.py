@@ -1,7 +1,7 @@
 """Statistical utilities for differential expression testing.
 
-This module provides functions for tie correction, p-value adjustment and
-the low-expression and non-estimability masks.
+This module provides functions for tie correction, p-value adjustment, the
+low-expression and non-estimability masks, and per-group moment sums.
 """
 
 from __future__ import annotations
@@ -9,6 +9,9 @@ from __future__ import annotations
 from typing import Literal
 
 import numpy as np
+import scipy.sparse as sp
+
+from ._kernels import _group_moments_csr
 
 
 def _low_expr_in_both_mask(
@@ -235,3 +238,24 @@ def _nonestimable_glm_mask(
     if pert_floor:
         flagged |= np.asarray(pert_expr_counts) < pert_floor
     return flagged
+
+
+def _add_group_moments(
+    block: sp.csr_matrix,
+    codes: np.ndarray,
+    sums: np.ndarray,
+    sumsq: np.ndarray,
+    expr_counts: np.ndarray,
+    counts: np.ndarray,
+) -> None:
+    """Add each group's per-gene sum, sum of squares and stored-entry count,
+    and its cell count, over the rows of ``block`` (group ``codes[i]`` for
+    row ``i``; ``-1`` rows are left out) into the accumulators, in place.
+
+    One pass over the block's stored entries in a numba kernel, where one
+    mask scan and fancy index per group took ~3x longer on an unsorted
+    chunk (thousands of groups in 4,096 rows)."""
+    _group_moments_csr(
+        block.indptr, block.indices, block.data, np.asarray(codes, dtype=np.int64),
+        sums, sumsq, expr_counts, counts,
+    )
