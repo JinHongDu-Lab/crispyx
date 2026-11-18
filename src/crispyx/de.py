@@ -1264,7 +1264,7 @@ def t_test(
         tested = label_codes >= 0
         for slc, block in iter_matrix_chunks(
             backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False,
-            selected=None if tested.all() else tested,
+            selected=None if tested.all() else tested, read_ahead=True,
         ):
             _add_group_moments(sp.csr_matrix(block), label_codes[slc], sums, sumsq, expr_counts, counts)
     finally:

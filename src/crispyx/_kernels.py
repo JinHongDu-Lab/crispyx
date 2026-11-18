@@ -1,8 +1,8 @@
 """Numba-accelerated kernels for differential expression.
 
-This module contains all Numba JIT-compiled functions used by the GLM module.
-Separating these kernels improves code organization and allows for easier
-maintenance of the performance-critical code paths.
+It holds the Numba JIT-compiled functions of the NB-GLM fits, the Wilcoxon
+rank sums and the t-test's per-group moments, kept apart from the Python
+modules that call them.
 """
 
 from __future__ import annotations
@@ -2279,7 +2279,7 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
     return coef, se, dev_out, converged, n_iter
 
 
-@nb.njit(cache=True)
+@nb.njit(cache=True, nogil=True)
 def _group_moments_csr(indptr, indices, data, codes, sums, sumsq, expr_counts, counts):
     """Add each group's per-gene sum and sum of squares (in float64), its
     stored-entry count and its cell count over CSR rows into the

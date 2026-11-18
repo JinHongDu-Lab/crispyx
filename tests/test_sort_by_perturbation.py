@@ -86,9 +86,20 @@ def test_sorted_copy_of_an_older_layout_is_rewritten(tmp_path):
     out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad", verbose=False)
     with h5py.File(out, "r+") as handle:  # as a 0.2.6 copy: sorted layout 1
         handle["uns/crispyx/schema"][()] = 1
-    before = out.stat().st_mtime_ns
     sort_by_perturbation(path, "perturbation", "ctrl", output_path=out, verbose=False)
-    assert out.stat().st_mtime_ns != before
+    with h5py.File(out, "r") as handle:
+        assert handle["uns/crispyx/schema"][()] == 2
+
+
+def test_filtering_a_file_sorted_by_an_earlier_release_drops_its_row_map():
+    from crispyx.data import filtered_sorting_metadata
+
+    obs = pd.DataFrame({"perturbation": ["ctrl", "ctrl", "B"]})
+    old = {"sorted_by": "perturbation", "control_label": "ctrl", "original_path": "raw.h5ad", "timestamp": "t",
+           "n_perturbations": 3, "perturbation_boundaries": {"ctrl": [0, 3], "A": [3, 5], "B": [5, 6]},
+           "sort_order": [0, 1, 2, 3, 4, 5]}
+    kept = filtered_sorting_metadata({"sorting_metadata": old}, obs)["sorting_metadata"]
+    assert kept == {"sorted_by": "perturbation", "control_label": "ctrl", "original_path": "raw.h5ad", "timestamp": "t"}
 
 
 def test_chunk_starts_follow_the_selected_runs():
@@ -99,6 +110,8 @@ def test_chunk_starts_follow_the_selected_runs():
     selected[[2, 3, 4, 5, 6, 15, 16]] = True
     assert chunk_starts(20, 4, selected=selected) == [2, 6, 15]  # gaps skipped, chunks at run starts
     assert chunk_starts(20, 4, selected=np.zeros(20, dtype=bool)) == []
+    with pytest.raises(ValueError, match="start_chunk"):  # no fixed grid to resume a selection on
+        chunk_starts(20, 4, start_chunk=1, selected=selected)
 
 
 def _log_screen(tmp_path):

@@ -1638,8 +1638,11 @@ def iter_matrix_chunks(
     ``warn_slow_axis=False`` suppresses the one-time logger warning about
     streaming a compressed matrix off its fast axis; callers that already
     resolved that decision through :func:`stream_on_fast_axis` pass it.
-    ``selected``, a boolean mask along ``axis``, skips (without reading) the
-    chunks that hold no selected entry; the chunks yielded are whole.
+    ``selected``, a boolean mask along ``axis``, leaves unselected stretches
+    unread: each chunk starts at the first selected entry the previous one
+    left uncovered (:func:`chunk_starts`), so chunks are off the fixed grid
+    unless every entry is selected, and ``start_chunk`` cannot be combined
+    with it.
     ``read_ahead=True`` reads the next chunk on a background thread while the
     caller works on the current one -- worth it when that work releases the
     GIL (a numba kernel), so reading and computing overlap.
@@ -1708,9 +1711,12 @@ def chunk_starts(
     offset = start_chunk * chunk_size
     if selected is None:
         return list(range(offset, length, chunk_size))
+    if start_chunk:
+        # Chunk k of a selection is not rows k * chunk_size on: no grid to resume on.
+        raise ValueError("start_chunk counts fixed-grid chunks and cannot be combined with selected")
     if len(selected) != length:
         raise ValueError(f"selected has {len(selected)} entries for an axis of {length}")
-    rows = np.flatnonzero(np.asarray(selected[offset:], dtype=bool)) + offset
+    rows = np.flatnonzero(np.asarray(selected, dtype=bool))
     starts: list[int] = []
     position = 0
     while position < rows.size:
@@ -5806,6 +5812,9 @@ def needs_sorting_for_nbglm(
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         unique_labels = np.unique(labels)
         n_perts = len(unique_labels)
+        if len(contiguous_ranges(labels)) == n_perts:  # already sorted: one exact pass
+            logger.debug(f"Dataset is already sorted by '{perturbation_column}'")
+            return False
         
         # Check perturbation count threshold
         if n_perts < min_perturbations:
@@ -5850,6 +5859,9 @@ def perturbation_sort_order(labels: np.ndarray, control_label: str) -> np.ndarra
     return np.argsort(keys, kind="stable")
 
 
+_SORTING_KEYS = ("original_path", "sorted_by", "control_label", "timestamp")
+
+
 def sorting_metadata(*, perturbation_column: str, control_label: str, original_path: Path) -> dict:
     """``uns["sorting_metadata"]`` of a file whose cells are in perturbation
     order (controls first): the column, the control and the source. Where
@@ -5878,7 +5890,9 @@ def filtered_sorting_metadata(uns: Mapping, obs: pd.DataFrame) -> dict:
     if column in obs.columns:
         labels = label_strings(obs[column])
         if len(contiguous_ranges(labels)) == len(pd.unique(labels)):
-            uns["sorting_metadata"] = metadata
+            # Only the stamp's own keys: a source sorted by an earlier release
+            # also has its row map, in the source's row positions.
+            uns["sorting_metadata"] = {key: metadata[key] for key in _SORTING_KEYS if key in metadata}
     return uns
 
 
