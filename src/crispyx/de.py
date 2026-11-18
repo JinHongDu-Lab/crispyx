@@ -1076,6 +1076,9 @@ def t_test(
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
+        Stretches of rows holding none of these or the controls are not
+        read: on a file sorted by perturbation (:func:`sort_by_perturbation`)
+        only their own row ranges are.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for
         testing. Genes below this threshold are untested: ``NaN`` in
@@ -1255,10 +1258,14 @@ def t_test(
         sumsq = np.zeros((n_groups_total, n_genes), dtype=np.float64)
         counts = np.zeros(n_groups_total, dtype=np.int64)
         expr_counts = np.zeros((n_groups_total, n_genes), dtype=np.int32)
+        # With a subset of perturbations, the cells of the others (coded -1)
+        # are not read where they fill whole stretches: all but the tested
+        # groups' row ranges of a file sorted by perturbation.
+        tested = label_codes >= 0
         for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False
+            backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False,
+            selected=None if tested.all() else tested,
         ):
-            # Cells of a perturbation this run does not test are coded -1.
             _add_group_moments(sp.csr_matrix(block), label_codes[slc], sums, sumsq, expr_counts, counts)
     finally:
         backed.file.close()

@@ -90,3 +90,47 @@ def test_sorted_copy_of_an_older_layout_is_rewritten(tmp_path):
     sort_by_perturbation(path, "perturbation", "ctrl", output_path=out, verbose=False)
     assert out.stat().st_mtime_ns != before
 
+
+def test_chunk_starts_follow_the_selected_runs():
+    from crispyx.data import chunk_starts
+
+    assert chunk_starts(10, 4, selected=np.ones(10, dtype=bool)) == [0, 4, 8]  # all selected: the grid
+    selected = np.zeros(20, dtype=bool)
+    selected[[2, 3, 4, 5, 6, 15, 16]] = True
+    assert chunk_starts(20, 4, selected=selected) == [2, 6, 15]  # gaps skipped, chunks at run starts
+    assert chunk_starts(20, 4, selected=np.zeros(20, dtype=bool)) == []
+
+
+def _log_screen(tmp_path):
+    rng = np.random.default_rng(5)
+    labels = rng.choice(["ctrl"] * 4 + [f"G{i}" for i in range(12)], 600)
+    counts = rng.poisson(3, (labels.size, 15)).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(labels.size)])
+    path = tmp_path / "scattered.h5ad"
+    ad.AnnData(sp.csr_matrix(np.log1p(counts)), obs=obs).write_h5ad(path)
+    return path, labels
+
+
+def test_t_test_on_a_subset_reads_only_its_rows_of_a_sorted_file(tmp_path, monkeypatch):
+    import crispyx as cx
+    import crispyx.de
+
+    path, labels = _log_screen(tmp_path)
+    sorted_path = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "s.h5ad", verbose=False)
+    real = crispyx.de._add_group_moments
+    rows_read = []
+    monkeypatch.setattr(crispyx.de, "_add_group_moments",
+                        lambda block, *args: (rows_read.append(block.shape[0]), real(block, *args))[1])
+    kw = dict(perturbation_column="perturbation", control_label="ctrl", perturbations=["G3", "G7"],
+              cell_chunk_size=32, verbose=False, min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0,
+              min_mean_pert=0.0)
+    on_sorted = cx.t_test(sorted_path, output_path=tmp_path / "t_sorted.h5ad", **kw)
+    wanted = int(np.isin(labels, ["ctrl", "G3", "G7"]).sum())
+    assert wanted <= sum(rows_read) < wanted + 3 * 32  # each range's last chunk may run past it
+    rows_read.clear()
+    on_scattered = cx.t_test(path, output_path=tmp_path / "t_scattered.h5ad", **kw)
+    full = cx.t_test(path, output_path=tmp_path / "t_full.h5ad", **{**kw, "perturbations": None})
+    for label in ("G3", "G7"):
+        for result in (on_scattered, full):
+            np.testing.assert_allclose(on_sorted[label].statistic, result[label].statistic, rtol=1e-10)
+            np.testing.assert_allclose(on_sorted[label].pvalue, result[label].pvalue, rtol=1e-10)

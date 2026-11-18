@@ -1696,14 +1696,28 @@ def chunk_starts(
     length: int, chunk_size: int, *, start_chunk: int = 0, selected: np.ndarray | None = None,
 ) -> list[int]:
     """First index of each chunk :func:`iter_matrix_chunks` reads: every
-    ``chunk_size``-th from chunk ``start_chunk`` on, less those holding no
-    ``selected`` entry."""
-    starts = range(start_chunk * chunk_size, length, chunk_size)
+    ``chunk_size``-th from chunk ``start_chunk`` on; with ``selected``, each
+    chunk starts at the first selected entry the previous one left uncovered.
+
+    Unselected stretches are never read, and chunks align with selected runs
+    -- a few perturbations of a file sorted by perturbation are read as
+    their own row ranges, not as the whole fixed-grid chunks they touch.
+    Covering the selected entries greedily this way takes the fewest chunks
+    of ``chunk_size`` possible, so never more than the fixed grid; when every
+    entry is selected it is the grid."""
+    offset = start_chunk * chunk_size
     if selected is None:
-        return list(starts)
+        return list(range(offset, length, chunk_size))
     if len(selected) != length:
         raise ValueError(f"selected has {len(selected)} entries for an axis of {length}")
-    return [start for start in starts if selected[start : start + chunk_size].any()]
+    rows = np.flatnonzero(np.asarray(selected[offset:], dtype=bool)) + offset
+    starts: list[int] = []
+    position = 0
+    while position < rows.size:
+        start = int(rows[position])
+        starts.append(start)
+        position = int(np.searchsorted(rows, start + chunk_size, side="left"))
+    return starts
 
 
 def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars: int):
