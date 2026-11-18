@@ -930,7 +930,7 @@ def test_the_mean_floor_does_not_make_genes_report_as_non_convergent():
     np.testing.assert_allclose(again.coef, result.coef, rtol=1e-10, atol=1e-12)
 
 
-def test_floored_genes_match_pydeseq2_irls():
+def test_floored_genes_match_pydeseq2_irls(pydeseq2_helper):
     """The floor exists for DESeq2 compatibility, so that is what it is worth
     measuring: on the genes it binds on, the coefficients must be PyDESeq2's.
 
@@ -938,8 +938,7 @@ def test_floored_genes_match_pydeseq2_irls():
     a couple of steps from the answer -- 2.8e-02 away in coefficient, against
     1.4e-06 on the genes the floor never touches.
     """
-    pytest.importorskip("pydeseq2")
-    from pydeseq2.utils import irls_solver
+    irls_solver = pydeseq2_helper("irls_solver")
 
     counts, design, size_factors, alpha = _floored_fixture()
     offset = np.log(size_factors)
@@ -957,7 +956,7 @@ def test_floored_genes_match_pydeseq2_irls():
     assert np.max(np.abs(result.coef[binds] - reference[binds])) < 1e-4
 
 
-def test_standard_errors_match_pydeseq2_wald_test():
+def test_standard_errors_match_pydeseq2_wald_test(pydeseq2_helper):
     """``min_mu`` steadies the iteration and has no place in the covariance.
 
     DESeq2 keeps it out: ``irls_solver`` returns an unthresholded ``mu`` and
@@ -965,8 +964,7 @@ def test_standard_errors_match_pydeseq2_wald_test():
     floored mean instead made the standard errors a median of 24% too small on
     floor-binding genes, and the Wald statistics correspondingly too large.
     """
-    pytest.importorskip("pydeseq2")
-    from pydeseq2.utils import wald_test
+    wald_test = pydeseq2_helper("wald_test")
 
     counts, design, size_factors, alpha = _floored_fixture()
     offset = np.log(size_factors)

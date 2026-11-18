@@ -71,12 +71,12 @@ def screen_and_reference():
     return counts, labels, sf, _pydeseq2(counts, labels, sf)
 
 
-def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
+def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference, pydeseq2_helper):
     """Every step agrees with PyDESeq2 run on the same cells and size
     factors. Where PyDESeq2's gene-wise optimiser stops at min_disp, its own
     loss is higher there than at our estimate (low-count genes whose
     moments start is clipped to the bound)."""
-    from pydeseq2.utils import fit_lin_mu, nb_nll
+    fit_lin_mu, nb_nll = pydeseq2_helper("fit_lin_mu"), pydeseq2_helper("nb_nll")
 
     counts, labels, sf, (dds, ref) = screen_and_reference
     _, res = _fit(counts, labels, sf)
@@ -102,12 +102,11 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference):
     assert res.converged.all()
 
 
-def _bound_losses_are_lower(res, dds, counts, design, sf):
+def _bound_losses_are_lower(res, dds, counts, design, sf, nb_nll):
     """Where PyDESeq2's gene-wise optimiser stops at min_disp, our estimate has
     the lower Cox-Reid loss at PyDESeq2's own means. "At" is within 1%: its
     L-BFGS-B can stop just short of the bound (1.0014e-8 with numpy 1.26 and
     SciPy 1.16)."""
-    from pydeseq2.utils import nb_nll
 
     theirs = dds.var["genewise_dispersions"].to_numpy()
     at_bound = theirs <= 1e-8 * 1.01
@@ -123,7 +122,7 @@ def _bound_losses_are_lower(res, dds, counts, design, sf):
     return at_bound
 
 
-def test_glm_with_a_covariate_matches_pydeseq2_given_the_same_size_factors():
+def test_glm_with_a_covariate_matches_pydeseq2_given_the_same_size_factors(pydeseq2_helper):
     """fit_glm_deseq2 on ~ batch + condition agrees with PyDESeq2 step by step:
     gene-wise dispersions to 1e-3 (where PyDESeq2's optimiser does not stop at
     min_disp), the trend fitted to the same gene-wise values, and the Wald
@@ -138,7 +137,7 @@ def test_glm_with_a_covariate_matches_pydeseq2_given_the_same_size_factors():
         perturbation_indicator=(labels == "KO1").astype(float), intercept=True,
     )
     res = fit_glm_deseq2(design, counts, sf, columns.index("perturbation"))
-    at_bound = _bound_losses_are_lower(res, dds, counts, design, sf)
+    at_bound = _bound_losses_are_lower(res, dds, counts, design, sf, pydeseq2_helper("nb_nll"))
     theirs = dds.var["genewise_dispersions"].to_numpy()
     np.testing.assert_allclose(res.genewise_dispersion[~at_bound], theirs[~at_bound], rtol=1e-3)
     np.testing.assert_allclose(
