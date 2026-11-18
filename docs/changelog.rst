@@ -1,6 +1,21 @@
 Changelog
 =========
 
+Version 0.2.7
+-------------
+
+*Released 2026-11-18.* Perturbation-sorted files that open and sort faster, and a much faster t-test, above all on unsorted files and on a subset of perturbations.
+
+**Changed**
+
+* A file sorted by perturbation (``sort_by_perturbation``, ``cx.pp.qc_summary(sort_by_perturbation=True)``) no longer stores each perturbation's row range in ``uns["sorting_metadata"]``, which now holds only ``sorted_by``, ``control_label``, ``original_path`` and ``timestamp``: h5ad wrote the ranges as one HDF5 dataset per perturbation, which every backed open read (1.3 s per open at 18,000 perturbations). ``nb_glm_test`` and ``nb_offset_test`` find each perturbation's contiguous rows from ``obs`` instead, so a stale range can no longer send them the wrong cells, and a perturbation that is contiguous in an otherwise unsorted file is read as one slice too. On a 300k-cell, 5,000-perturbation screen the sorted file opens in 0.08 s instead of 0.44 s and sorts in 0.6 s instead of 2.0 s. Sorted copies written by an earlier release are rewritten when next used (sorted layout 2).
+* ``cx.tl.t_test`` sums each group's moments in one numba pass over a chunk's stored entries instead of one mask and row selection per group, in float64 throughout: on the screen above a full run takes 2.8 s instead of 22 s unsorted and 2.7 s instead of 3.6 s sorted. Statistics change only by float32 rounding of the per-chunk sums (relative 1e-6), and are the same whether or not the file is sorted.
+* ``cx.tl.t_test(perturbations=...)`` does not read stretches of rows that hold none of the tested perturbations or controls: on a file sorted by perturbation it reads only their own row ranges (0.17 s instead of 0.56 s for 20 of the 5,000). Chunks streamed with a row selection (``t_test``, ``residual_effects``, filtered copies) start at the first selected row the previous chunk left uncovered rather than on a fixed grid, which never takes more chunks than the grid.
+
+**Removed**
+
+* ``crispyx.data.get_perturbation_slice``, which nothing called; ``crispyx._grouping.contiguous_ranges`` gives every contiguous label's rows at once.
+
 Version 0.2.6
 -------------
 
