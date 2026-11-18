@@ -39,7 +39,6 @@ from .data import (
     calculate_wilcoxon_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
-    get_perturbation_slice,
     iter_matrix_chunks,
     needs_sorting_for_nbglm,
     read_backed,
@@ -92,7 +91,9 @@ from . import _messages
 from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
-from ._grouping import UNLABELLED, canonical_call_args, cell_labels, label_strings, resolve_group_reference_aliases
+from ._grouping import (
+    UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, resolve_group_reference_aliases,
+)
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._irls import ETA_MAX, ETA_MIN
 from ._size_factors import (
@@ -617,6 +618,18 @@ def _group_row_indices(labels: np.ndarray, groups: Iterable[str]) -> dict[str, n
         i = position.get(str(group))
         out[group] = order[starts[i]:ends[i]] if i is not None else empty
     return out
+
+
+def _group_rows(labels: np.ndarray, groups: Iterable[str]) -> "dict[str, slice | np.ndarray]":
+    """Each of ``groups``' rows: a ``slice`` when its cells are one
+    contiguous run (every group of a file sorted by perturbation; one read
+    of the matrix's data and indices, and small to send to a worker), else
+    their ascending indices."""
+    groups = list(groups)
+    ranges = contiguous_ranges(labels)
+    scattered = [label for label in groups if label not in ranges]
+    indices = _group_row_indices(labels, scattered) if scattered else {}
+    return {label: ranges[label] if label in ranges else indices[label] for label in groups}
 
 
 #: Arguments that change how a DE call runs but not what it writes; a
@@ -1949,17 +1962,6 @@ def nb_glm_test(
         for label in candidates:
             if label not in observed:
                 raise ValueError(f"Perturbation '{label}' contains no cells")
-
-        # Check if file is sorted by perturbation for efficient I/O
-        perturbation_boundaries = None
-        if "sorting_metadata" in backed.uns:
-            metadata = backed.uns["sorting_metadata"]
-            if metadata.get("sorted_by") == perturbation_column:
-                perturbation_boundaries = metadata.get("perturbation_boundaries", {})
-                if perturbation_boundaries:
-                    logger.debug(
-                        f"Using sorted file with {len(perturbation_boundaries)} contiguous perturbation groups"
-                    )
     finally:
         backed.file.close()
 
@@ -2312,15 +2314,8 @@ def nb_glm_test(
     if run.resumed:
         _messages.vprint(verbose, "nb_glm_test", f"Resuming: {len(completed_labels)}/{n_groups} perturbations already done")
 
-    # Each comparison's rows: a slice of a file sorted by perturbation, else
-    # their indices. A worker gets only its own, not the per-cell labels.
-    boundaries = perturbation_boundaries or {}
-    unsorted = [label for label in candidates if label not in boundaries]
-    row_indices = _group_row_indices(labels, unsorted) if unsorted else {}
-    group_rows = {
-        label: slice(*boundaries[label]) if label in boundaries else row_indices[label]
-        for label in candidates
-    }
+    # A worker gets only its own comparison's rows, not the per-cell labels.
+    group_rows = _group_rows(labels, candidates)
 
     # =====================================================================
     # Workers: as many as the budget holds
@@ -3193,11 +3188,6 @@ def nb_offset_test(
                     "dispersion cannot be estimated; pass dispersion=, or use nb_glm_test, which estimates it "
                     "from every unit."
                 )
-        boundaries = {}
-        if "sorting_metadata" in backed.uns:
-            metadata = backed.uns["sorting_metadata"]
-            if metadata.get("sorted_by") == perturbation_column:
-                boundaries = metadata.get("perturbation_boundaries", {}) or {}
     finally:
         backed.file.close()
     n_strata = len(stratum_names)
@@ -3246,13 +3236,7 @@ def nb_offset_test(
     n_control = baseline.n_cells
     pts_rest = (baseline.nnz / max(n_control, 1)).astype(np.float32)
 
-    # Each perturbation's rows: a slice of a file sorted by perturbation
-    # (one read of the matrix's data and indices), else their indices.
-    unsorted = [label for label in candidates if label not in boundaries]
-    row_indices = _group_row_indices(labels, unsorted) if unsorted else {}
-    group_rows = {
-        label: slice(*boundaries[label]) if label in boundaries else row_indices[label] for label in candidates
-    }
+    group_rows = _group_rows(labels, candidates)
     # A fit holds a block of cells dense in about five cells x genes arrays
     # (baseline, mean, weight, their products), and every thread fits at
     # once: the threads' blocks together take a tenth of the budget, so

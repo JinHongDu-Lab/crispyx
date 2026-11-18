@@ -35,7 +35,7 @@ SCHEMAS = {
     "pseudobulk": 2,  # 2: profiles named by group key, constant obs columns carried over
     "pseudobulk_effects": 1,
     "batch": 1,
-    "sorted": 1,
+    "sorted": 2,  # 2: no per-label row map in uns (read off obs)
     "standardized": 1,
     "concat": 1,
     "residual_effects": 1,

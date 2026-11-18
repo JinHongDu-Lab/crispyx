@@ -57,16 +57,12 @@ def _kept_order(labels: np.ndarray, cell_mask: np.ndarray, control_label: str, s
     return perturbation_sort_order(labels[cell_mask], control_label) if sort else None
 
 
-def _stamp_sorted(
-    output_path: Path, kept_labels: np.ndarray, order: np.ndarray, *, perturbation_column: str,
-    control_label: str, source_path: Path,
-) -> None:
-    """Record in a filtered file written in ``order`` that its cells are in
-    perturbation order, as :func:`~crispyx.data.sort_by_perturbation` does."""
+def _stamp_sorted(output_path: Path, *, perturbation_column: str, control_label: str, source_path: Path) -> None:
+    """Record in a filtered file written in perturbation order that its
+    cells are, as :func:`~crispyx.data.sort_by_perturbation` does."""
     with h5py.File(output_path, "r+") as handle:
         write_elem(handle["uns"], "sorting_metadata", sorting_metadata(
-            kept_labels[order], order, perturbation_column=perturbation_column, control_label=control_label,
-            original_path=source_path,
+            perturbation_column=perturbation_column, control_label=control_label, original_path=source_path,
         ))
 
 
@@ -1032,11 +1028,10 @@ def _qc_in_memory(
         rows = rows[order]
     adata_filtered = adata[rows, gene_mask].copy()
     if order is None:
-        adata_filtered.uns = filtered_sorting_metadata(adata_filtered.uns, adata_filtered.obs, combined_cell_mask)
+        adata_filtered.uns = filtered_sorting_metadata(adata_filtered.uns, adata_filtered.obs)
     else:
         adata_filtered.uns["sorting_metadata"] = sorting_metadata(
-            labels_full[rows], order, perturbation_column=perturbation_column, control_label=control_label,
-            original_path=Path(path),
+            perturbation_column=perturbation_column, control_label=control_label, original_path=Path(path),
         )
     
     # Free original data immediately
@@ -1218,8 +1213,8 @@ def _qc_column_oriented(
         memory_limit_gb=memory_limit_gb,
     )
     if order is not None:
-        _stamp_sorted(output_path, labels[combined_cell_mask], order, perturbation_column=perturbation_column,
-                      control_label=control_label, source_path=Path(path))
+        _stamp_sorted(output_path, perturbation_column=perturbation_column, control_label=control_label,
+                      source_path=Path(path))
     
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)
@@ -1414,8 +1409,8 @@ def _qc_row_oriented(
         if chunk_cache is not None:
             chunk_cache.cleanup()
     if order is not None:
-        _stamp_sorted(output_path, labels[combined_cell_mask], order, perturbation_column=perturbation_column,
-                      control_label=control_label, source_path=Path(path))
+        _stamp_sorted(output_path, perturbation_column=perturbation_column, control_label=control_label,
+                      source_path=Path(path))
 
     filtered = AnnData(output_path)
     filtered_labels = filtered.obs[perturbation_column].astype(str)

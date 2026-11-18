@@ -56,3 +56,37 @@ def test_sorted_rows_match_the_reference(tmp_path, monkeypatch, fmt, bands):
     np.testing.assert_array_equal(got, counts[order].toarray())
     assert list(result.obs_names) == [f"c{i}" for i in order]
     assert result.uns["sorting_metadata"]["sorted_by"] == "perturbation"
+
+
+def test_contiguous_ranges_keeps_only_single_runs():
+    from crispyx._grouping import contiguous_ranges
+
+    assert contiguous_ranges(np.array([], dtype=str)) == {}
+    assert contiguous_ranges(np.array(["c", "c", "a", "b", "b"])) == {
+        "c": slice(0, 2), "a": slice(2, 3), "b": slice(3, 5)}
+    # "a" split over two runs is left out; the rest are still ranges.
+    assert contiguous_ranges(np.array(["a", "b", "a", "c"])) == {"b": slice(1, 2), "c": slice(3, 4)}
+
+
+def test_sorted_file_stores_no_per_label_map(tmp_path):
+    """One HDF5 dataset per label in uns made every backed open of a
+    genome-wide sorted file take over a second; the ranges come from obs."""
+    import h5py
+
+    path, _, _ = _screen(tmp_path, "csr")
+    out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad", verbose=False)
+    with h5py.File(out, "r") as handle:
+        assert set(handle["uns/sorting_metadata"]) == {"original_path", "sorted_by", "control_label", "timestamp"}
+
+
+def test_sorted_copy_of_an_older_layout_is_rewritten(tmp_path):
+    import h5py
+
+    path, _, _ = _screen(tmp_path, "csr")
+    out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad", verbose=False)
+    with h5py.File(out, "r+") as handle:  # as a 0.2.6 copy: sorted layout 1
+        handle["uns/crispyx/schema"][()] = 1
+    before = out.stat().st_mtime_ns
+    sort_by_perturbation(path, "perturbation", "ctrl", output_path=out, verbose=False)
+    assert out.stat().st_mtime_ns != before
+

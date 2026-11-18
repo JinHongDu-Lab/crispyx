@@ -103,3 +103,25 @@ def cell_labels(obs: pd.DataFrame, labels: str | pd.Series) -> tuple[pd.Series, 
 def label_strings(labels: pd.Series) -> np.ndarray:
     """Per-cell labels as strings, missing ones as :data:`UNLABELLED`."""
     return labels.astype(object).where(labels.notna(), UNLABELLED).astype(str).to_numpy()
+
+
+def contiguous_ranges(labels: np.ndarray) -> dict[str, slice]:
+    """Each label whose cells form one contiguous run of rows, as that run's
+    ``slice``. Labels split over several runs are left out, so a file is
+    sorted by ``labels`` exactly when every distinct label is a key.
+
+    Derived from the labels rather than stored with the file: a map stored
+    in ``uns`` is one HDF5 dataset per label, which every backed open reads
+    (over a second for a genome-wide screen) and which can go stale."""
+    codes, uniques = pd.factorize(np.asarray(labels), use_na_sentinel=False)
+    if not codes.size:
+        return {}
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    stops = np.r_[starts[1:], codes.size]
+    run_codes = codes[starts]
+    single = np.bincount(run_codes, minlength=len(uniques)) == 1
+    return {
+        str(uniques[code]): slice(int(start), int(stop))
+        for code, start, stop in zip(run_codes, starts, stops)
+        if single[code]
+    }
