@@ -379,7 +379,7 @@ def test_sort_by_perturbation_writes_the_kept_cells_in_perturbation_order(tmp_pa
     assert labels[0] == "NTC" and (np.diff(pd.factorize(labels)[0]) >= 0).all()   # each group one block
     metadata = written.uns["sorting_metadata"]
     assert metadata["sorted_by"] == "perturbation" and metadata["control_label"] == "NTC"
-    assert list(metadata["perturbation_boundaries"]["NTC"]) == [0, int((labels == "NTC").sum())]
+    assert set(metadata) == {"original_path", "sorted_by", "control_label", "timestamp"}  # no per-label map
     assert not needs_sorting_for_nbglm(out, "perturbation", min_cells=1, min_perturbations=1)
 
 
@@ -393,9 +393,10 @@ def test_qc_summary_checks_cache_mode_and_needs_an_output_to_sort(tmp_path):
 
 
 @pytest.mark.parametrize("strategy", ["memory", *_STRATEGIES])
-def test_filtering_a_sorted_file_rebuilds_its_row_ranges(tmp_path, strategy):
-    """A filter keeps a sorted file's order, so its row ranges are rebuilt
-    from the kept cells rather than copied from the source."""
+def test_filtering_a_sorted_file_keeps_it_sorted(tmp_path, strategy):
+    """A filter keeps a sorted file's order, so it keeps the sorted stamp and
+    every kept label is still one contiguous run."""
+    from crispyx._grouping import contiguous_ranges
     from crispyx.data import sort_by_perturbation
 
     path = sort_by_perturbation(_make_uneven_screen(tmp_path / "raw.h5ad", "csr"), "perturbation", "NTC",
@@ -410,8 +411,10 @@ def test_filtering_a_sorted_file_rebuilds_its_row_ranges(tmp_path, strategy):
             warnings.simplefilter("ignore", UserWarning)
             result = _STRATEGIES[strategy](path, out, **kw)
     assert not result.cell_mask.all()
-    labels = ad.read_h5ad(out).obs["perturbation"].astype(str).to_numpy()
-    boundaries = ad.read_h5ad(out).uns["sorting_metadata"]["perturbation_boundaries"]
-    assert set(boundaries) == set(labels)
-    for label, (start, stop) in boundaries.items():
-        assert (labels[start:stop] == label).all() and stop - start == (labels == label).sum()
+    written = ad.read_h5ad(out)
+    labels = written.obs["perturbation"].astype(str).to_numpy()
+    assert written.uns["sorting_metadata"]["sorted_by"] == "perturbation"
+    ranges = contiguous_ranges(labels)
+    assert set(ranges) == set(labels)
+    for label, rows in ranges.items():
+        assert (labels[rows] == label).all() and rows.stop - rows.start == (labels == label).sum()

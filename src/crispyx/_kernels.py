@@ -1,8 +1,8 @@
-"""Numba-accelerated kernels for NB-GLM differential expression.
+"""Numba-accelerated kernels for differential expression.
 
-This module contains all Numba JIT-compiled functions used by the GLM module.
-Separating these kernels improves code organization and allows for easier
-maintenance of the performance-critical code paths.
+It holds the Numba JIT-compiled functions of the NB-GLM fits, the Wilcoxon
+rank sums and the t-test's per-group moments, kept apart from the Python
+modules that call them.
 """
 
 from __future__ import annotations
@@ -2277,3 +2277,24 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
         converged[g] = conv
         n_iter[g] = it
     return coef, se, dev_out, converged, n_iter
+
+
+@nb.njit(cache=True, nogil=True)
+def _group_moments_csr(indptr, indices, data, codes, sums, sumsq, expr_counts, counts):
+    """Add each group's per-gene sum and sum of squares (in float64), its
+    stored-entry count and its cell count over CSR rows into the
+    accumulators; row ``i`` is in group ``codes[i]``, ``-1`` rows left out.
+
+    One pass over the stored entries whatever the row order, and each group
+    summed in row order -- the same on a file sorted by group as unsorted."""
+    for row in range(codes.shape[0]):
+        code = codes[row]
+        if code < 0:
+            continue
+        counts[code] += 1
+        for entry in range(indptr[row], indptr[row + 1]):
+            gene = indices[entry]
+            value = np.float64(data[entry])
+            sums[code, gene] += value
+            sumsq[code, gene] += value * value
+            expr_counts[code, gene] += 1

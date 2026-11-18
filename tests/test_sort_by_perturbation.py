@@ -56,3 +56,94 @@ def test_sorted_rows_match_the_reference(tmp_path, monkeypatch, fmt, bands):
     np.testing.assert_array_equal(got, counts[order].toarray())
     assert list(result.obs_names) == [f"c{i}" for i in order]
     assert result.uns["sorting_metadata"]["sorted_by"] == "perturbation"
+
+
+def test_contiguous_ranges_keeps_only_single_runs():
+    from crispyx._grouping import contiguous_ranges
+
+    assert contiguous_ranges(np.array([], dtype=str)) == {}
+    assert contiguous_ranges(np.array(["c", "c", "a", "b", "b"])) == {
+        "c": slice(0, 2), "a": slice(2, 3), "b": slice(3, 5)}
+    # "a" split over two runs is left out; the rest are still ranges.
+    assert contiguous_ranges(np.array(["a", "b", "a", "c"])) == {"b": slice(1, 2), "c": slice(3, 4)}
+
+
+def test_sorted_file_stores_no_per_label_map(tmp_path):
+    """One HDF5 dataset per label in uns made every backed open of a
+    genome-wide sorted file take over a second; the ranges come from obs."""
+    import h5py
+
+    path, _, _ = _screen(tmp_path, "csr")
+    out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad", verbose=False)
+    with h5py.File(out, "r") as handle:
+        assert set(handle["uns/sorting_metadata"]) == {"original_path", "sorted_by", "control_label", "timestamp"}
+
+
+def test_sorted_copy_of_an_older_layout_is_rewritten(tmp_path):
+    import h5py
+
+    path, _, _ = _screen(tmp_path, "csr")
+    out = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "sorted.h5ad", verbose=False)
+    with h5py.File(out, "r+") as handle:  # as a 0.2.6 copy: sorted layout 1
+        handle["uns/crispyx/schema"][()] = 1
+    sort_by_perturbation(path, "perturbation", "ctrl", output_path=out, verbose=False)
+    with h5py.File(out, "r") as handle:
+        assert handle["uns/crispyx/schema"][()] == 2
+
+
+def test_filtering_a_file_sorted_by_an_earlier_release_drops_its_row_map():
+    from crispyx.data import filtered_sorting_metadata
+
+    obs = pd.DataFrame({"perturbation": ["ctrl", "ctrl", "B"]})
+    old = {"sorted_by": "perturbation", "control_label": "ctrl", "original_path": "raw.h5ad", "timestamp": "t",
+           "n_perturbations": 3, "perturbation_boundaries": {"ctrl": [0, 3], "A": [3, 5], "B": [5, 6]},
+           "sort_order": [0, 1, 2, 3, 4, 5]}
+    kept = filtered_sorting_metadata({"sorting_metadata": old}, obs)["sorting_metadata"]
+    assert kept == {"sorted_by": "perturbation", "control_label": "ctrl", "original_path": "raw.h5ad", "timestamp": "t"}
+
+
+def test_chunk_starts_follow_the_selected_runs():
+    from crispyx.data import chunk_starts
+
+    assert chunk_starts(10, 4, selected=np.ones(10, dtype=bool)) == [0, 4, 8]  # all selected: the grid
+    selected = np.zeros(20, dtype=bool)
+    selected[[2, 3, 4, 5, 6, 15, 16]] = True
+    assert chunk_starts(20, 4, selected=selected) == [2, 6, 15]  # gaps skipped, chunks at run starts
+    assert chunk_starts(20, 4, selected=np.zeros(20, dtype=bool)) == []
+    with pytest.raises(ValueError, match="start_chunk"):  # no fixed grid to resume a selection on
+        chunk_starts(20, 4, start_chunk=1, selected=selected)
+
+
+def _log_screen(tmp_path):
+    rng = np.random.default_rng(5)
+    labels = rng.choice(["ctrl"] * 4 + [f"G{i}" for i in range(12)], 600)
+    counts = rng.poisson(3, (labels.size, 15)).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(labels.size)])
+    path = tmp_path / "scattered.h5ad"
+    ad.AnnData(sp.csr_matrix(np.log1p(counts)), obs=obs).write_h5ad(path)
+    return path, labels
+
+
+def test_t_test_on_a_subset_reads_only_its_rows_of_a_sorted_file(tmp_path, monkeypatch):
+    import crispyx as cx
+    import crispyx.de
+
+    path, labels = _log_screen(tmp_path)
+    sorted_path = sort_by_perturbation(path, "perturbation", "ctrl", output_path=tmp_path / "s.h5ad", verbose=False)
+    real = crispyx.de._add_group_moments
+    rows_read = []
+    monkeypatch.setattr(crispyx.de, "_add_group_moments",
+                        lambda block, *args: (rows_read.append(block.shape[0]), real(block, *args))[1])
+    kw = dict(perturbation_column="perturbation", control_label="ctrl", perturbations=["G3", "G7"],
+              cell_chunk_size=32, verbose=False, min_pct_ctrl=0.0, min_pct_pert=0.0, min_mean_ctrl=0.0,
+              min_mean_pert=0.0)
+    on_sorted = cx.t_test(sorted_path, output_path=tmp_path / "t_sorted.h5ad", **kw)
+    wanted = int(np.isin(labels, ["ctrl", "G3", "G7"]).sum())
+    assert wanted <= sum(rows_read) < wanted + 3 * 32  # each range's last chunk may run past it
+    rows_read.clear()
+    on_scattered = cx.t_test(path, output_path=tmp_path / "t_scattered.h5ad", **kw)
+    full = cx.t_test(path, output_path=tmp_path / "t_full.h5ad", **{**kw, "perturbations": None})
+    for label in ("G3", "G7"):
+        for result in (on_scattered, full):
+            np.testing.assert_allclose(on_sorted[label].statistic, result[label].statistic, rtol=1e-10)
+            np.testing.assert_allclose(on_sorted[label].pvalue, result[label].pvalue, rtol=1e-10)

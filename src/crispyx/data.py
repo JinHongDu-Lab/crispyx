@@ -30,6 +30,7 @@ from ._memory import (
     _resolve_n_jobs,
 )
 from ._checkpoint import _create_progress_context, run_fingerprint
+from ._grouping import contiguous_ranges, label_strings
 from ._provenance import KEY as _PROVENANCE_KEY, reusable, reuse_mismatch, stamp, write_stamp
 from ._disk import (
     _free_bytes_at,
@@ -1637,8 +1638,11 @@ def iter_matrix_chunks(
     ``warn_slow_axis=False`` suppresses the one-time logger warning about
     streaming a compressed matrix off its fast axis; callers that already
     resolved that decision through :func:`stream_on_fast_axis` pass it.
-    ``selected``, a boolean mask along ``axis``, skips (without reading) the
-    chunks that hold no selected entry; the chunks yielded are whole.
+    ``selected``, a boolean mask along ``axis``, leaves unselected stretches
+    unread: each chunk starts at the first selected entry the previous one
+    left uncovered (:func:`chunk_starts`), so chunks are off the fixed grid
+    unless every entry is selected, and ``start_chunk`` cannot be combined
+    with it.
     ``read_ahead=True`` reads the next chunk on a background thread while the
     caller works on the current one -- worth it when that work releases the
     GIL (a numba kernel), so reading and computing overlap.
@@ -1695,14 +1699,31 @@ def chunk_starts(
     length: int, chunk_size: int, *, start_chunk: int = 0, selected: np.ndarray | None = None,
 ) -> list[int]:
     """First index of each chunk :func:`iter_matrix_chunks` reads: every
-    ``chunk_size``-th from chunk ``start_chunk`` on, less those holding no
-    ``selected`` entry."""
-    starts = range(start_chunk * chunk_size, length, chunk_size)
+    ``chunk_size``-th from chunk ``start_chunk`` on; with ``selected``, each
+    chunk starts at the first selected entry the previous one left uncovered.
+
+    Unselected stretches are never read, and chunks align with selected runs
+    -- a few perturbations of a file sorted by perturbation are read as
+    their own row ranges, not as the whole fixed-grid chunks they touch.
+    Covering the selected entries greedily this way takes the fewest chunks
+    of ``chunk_size`` possible, so never more than the fixed grid; when every
+    entry is selected it is the grid."""
+    offset = start_chunk * chunk_size
     if selected is None:
-        return list(starts)
+        return list(range(offset, length, chunk_size))
+    if start_chunk:
+        # Chunk k of a selection is not rows k * chunk_size on: no grid to resume on.
+        raise ValueError("start_chunk counts fixed-grid chunks and cannot be combined with selected")
     if len(selected) != length:
         raise ValueError(f"selected has {len(selected)} entries for an axis of {length}")
-    return [start for start in starts if selected[start : start + chunk_size].any()]
+    rows = np.flatnonzero(np.asarray(selected, dtype=bool))
+    starts: list[int] = []
+    position = 0
+    while position < rows.size:
+        start = int(rows[position])
+        starts.append(start)
+        position = int(np.searchsorted(rows, start + chunk_size, side="left"))
+    return starts
 
 
 def _decoded_block_reader(matrix, fmt: str | None, axis: int, n_obs: int, n_vars: int):
@@ -2264,7 +2285,7 @@ def _write_filtered_subset(
                 )
             var[key] = np.asarray(values)
     if row_order is None:
-        uns = filtered_sorting_metadata(meta["uns"], obs, cell_mask)
+        uns = filtered_sorting_metadata(meta["uns"], obs)
     else:  # the caller records the new order
         uns = {k: v for k, v in meta["uns"].items() if k != "sorting_metadata"}
     layer_keys, obsm_keys, varm_keys, obsp_keys, varp_keys = (
@@ -5775,13 +5796,7 @@ def needs_sorting_for_nbglm(
     """
     backed = read_backed(path)
     try:
-        # First check if file is already sorted
-        if "sorting_metadata" in backed.uns:
-            metadata = backed.uns["sorting_metadata"]
-            if metadata.get("sorted_by") == perturbation_column:
-                logger.debug(f"Dataset is already sorted by '{perturbation_column}'")
-                return False
-        
+        # A sorted file passes the contiguity check below.
         n_cells = backed.n_obs
         
         # Check cell count threshold
@@ -5797,6 +5812,9 @@ def needs_sorting_for_nbglm(
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         unique_labels = np.unique(labels)
         n_perts = len(unique_labels)
+        if len(contiguous_ranges(labels)) == n_perts:  # already sorted: one exact pass
+            logger.debug(f"Dataset is already sorted by '{perturbation_column}'")
+            return False
         
         # Check perturbation count threshold
         if n_perts < min_perturbations:
@@ -5841,60 +5859,40 @@ def perturbation_sort_order(labels: np.ndarray, control_label: str) -> np.ndarra
     return np.argsort(keys, kind="stable")
 
 
-def sorting_metadata(
-    sorted_labels: np.ndarray, sort_indices: np.ndarray, *, perturbation_column: str, control_label: str,
-    original_path: Path,
-) -> dict:
+_SORTING_KEYS = ("original_path", "sorted_by", "control_label", "timestamp")
+
+
+def sorting_metadata(*, perturbation_column: str, control_label: str, original_path: Path) -> dict:
     """``uns["sorting_metadata"]`` of a file whose cells are in perturbation
-    order: each label's ``[start, end)`` rows, the column and control, and
-    the order itself for files under 100,000 cells (``sort_indices``, rows
-    of the unsorted cells)."""
+    order (controls first): the column, the control and the source. Where
+    each label's rows are is read off ``obs``
+    (:func:`~crispyx._grouping.contiguous_ranges`), not stored."""
     import datetime
 
-    boundaries = _label_boundaries(sorted_labels)
-    metadata = {
+    return {
         "original_path": str(original_path),
         "sorted_by": perturbation_column,
         "control_label": control_label,
         "timestamp": datetime.datetime.now().isoformat(),
-        "n_perturbations": len(boundaries),
-        "perturbation_boundaries": boundaries,
     }
-    if len(sort_indices) < 100000:
-        metadata["sort_order"] = np.asarray(sort_indices).tolist()
-    return metadata
 
 
-def _label_boundaries(sorted_labels: np.ndarray) -> dict[str, list[int]] | None:
-    """Each label's ``[start, end)`` rows in ``sorted_labels``, or None when
-    a label's rows are not contiguous."""
-    sorted_labels = np.asarray(sorted_labels).astype(str)
-    if not sorted_labels.size:
-        return {}
-    starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
-    stops = np.r_[starts[1:], sorted_labels.size]
-    boundaries = {str(sorted_labels[a]): [int(a), int(b)] for a, b in zip(starts, stops)}
-    return boundaries if len(boundaries) == len(starts) else None
-
-
-def filtered_sorting_metadata(uns: Mapping, obs: pd.DataFrame, cell_mask: np.ndarray) -> dict:
-    """``uns`` of a file whose rows are ``cell_mask``'s rows of a source with
-    ``uns``, in the source's order: a filter keeps a sorted file sorted, so its
-    ``sorting_metadata`` is rebuilt from the kept cells' labels in ``obs``
-    (dropped if they are no longer contiguous)."""
+def filtered_sorting_metadata(uns: Mapping, obs: pd.DataFrame) -> dict:
+    """``uns`` of a file whose rows are a subset of a source with ``uns``,
+    in the source's order: a filter keeps a sorted file sorted, so its
+    ``sorting_metadata`` is kept unless the kept cells' labels in ``obs`` are
+    no longer contiguous (a label dropped from between two runs of another)."""
     uns = dict(uns)
     metadata = uns.pop("sorting_metadata", None)
     if metadata is None:
         return uns
     column = metadata.get("sorted_by")
-    boundaries = _label_boundaries(obs[column].to_numpy()) if column in obs.columns else None
-    if boundaries is not None:
-        metadata = dict(metadata)
-        metadata["perturbation_boundaries"] = boundaries
-        metadata["n_perturbations"] = len(boundaries)
-        if "sort_order" in metadata:
-            metadata["sort_order"] = np.asarray(metadata["sort_order"])[np.asarray(cell_mask, dtype=bool)].tolist()
-        uns["sorting_metadata"] = metadata
+    if column in obs.columns:
+        labels = label_strings(obs[column])
+        if len(contiguous_ranges(labels)) == len(pd.unique(labels)):
+            # Only the stamp's own keys: a source sorted by an earlier release
+            # also has its row map, in the source's row positions.
+            uns["sorting_metadata"] = {key: metadata[key] for key in _SORTING_KEYS if key in metadata}
     return uns
 
 
@@ -5958,12 +5956,10 @@ def sort_by_perturbation(
     
     Notes
     -----
-    The sorted file contains additional metadata in uns['sorting_metadata']:
-    - original_path: Path to the original unsorted file
-    - sort_order: Array mapping new indices to original indices
-    - perturbation_boundaries: Dict mapping perturbation labels to (start, end) indices
-    - sorted_by: The column used for sorting
-    - timestamp: When the sorting was performed
+    The sorted file records in uns['sorting_metadata'] the column it is
+    sorted by (``sorted_by``), the ``control_label``, the
+    ``original_path`` and a ``timestamp``. Each perturbation's rows are not
+    stored: readers find them from ``obs`` in one pass over the labels.
 
     For sparse inputs the output is always written in CSR format, since sorting
     benefits row-wise (per-perturbation) access patterns used by NB-GLM. CSC
@@ -6027,8 +6023,7 @@ def sort_by_perturbation(
         backed.file.close()
     
     uns["sorting_metadata"] = sorting_metadata(
-        labels[sort_indices], sort_indices, perturbation_column=perturbation_column,
-        control_label=control_label, original_path=path,
+        perturbation_column=perturbation_column, control_label=control_label, original_path=path,
     )
     uns[_PROVENANCE_KEY] = stamp("sorted", fingerprint)
     
@@ -6196,56 +6191,6 @@ def _write_sorted_sparse(
         value_dtype=value_dtype, minor_dtype=minor_dtype, fn_name=fn_name, band_kind="row", verbose=verbose,
         label=fn_name,
     )
-
-
-def get_perturbation_slice(
-    adata_or_path: str | Path | ad.AnnData,
-    perturbation_label: str,
-    perturbation_column: str = "perturbation",
-) -> tuple[slice | None, bool]:
-    """Get slice for a perturbation's cells, checking if file is sorted.
-    
-    If the file is sorted by perturbation, returns a contiguous slice.
-    Otherwise, returns None for the slice (caller should use boolean mask).
-    
-    Parameters
-    ----------
-    adata_or_path
-        Path to h5ad file, or an already-opened AnnData object.
-    perturbation_label
-        Label of the perturbation to get slice for.
-    perturbation_column
-        Column containing perturbation labels.
-    
-    Returns
-    -------
-    tuple[slice | None, bool]
-        (slice object or None, is_sorted flag).
-        If is_sorted is True, slice is valid for contiguous access.
-        If is_sorted is False, slice is None and caller should use mask.
-    """
-    # Handle both path and AnnData input
-    if isinstance(adata_or_path, ad.AnnData):
-        adata = adata_or_path
-        should_close = False
-    else:
-        adata = read_backed(adata_or_path)
-        should_close = True
-    
-    try:
-        # Check for sorting metadata
-        if "sorting_metadata" in adata.uns:
-            metadata = adata.uns["sorting_metadata"]
-            if metadata.get("sorted_by") == perturbation_column:
-                boundaries = metadata.get("perturbation_boundaries", {})
-                if perturbation_label in boundaries:
-                    start, end = boundaries[perturbation_label]
-                    return slice(start, end), True
-        
-        return None, False
-    finally:
-        if should_close:
-            adata.file.close()
 
 
 # =============================================================================
