@@ -39,6 +39,7 @@ SCHEMAS = {
     "standardized": 1,
     "concat": 1,
     "residual_effects": 1,
+    "text": 1,  # read_text / read_csv
 }
 
 

@@ -15,6 +15,30 @@ backed AnnData handle alive lazily and automatically closes it when the wrapper
 is garbage collected. Explicitly call ``adata.close()`` to release the file as
 soon as you finish the preview.
 
+From a text table of counts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a screen's counts are published as a CSV or other text table, convert
+it with :func:`crispyx.read_csv` (or :func:`crispyx.read_text` for any
+delimiter). They take the names, defaults and header rules of Scanpy's
+``sc.read_csv`` and ``sc.read_text``, but stream the table into an h5ad file
+instead of reading it into memory, so a table of a million cells converts
+in the memory of one block. For a table with genes as rows, pass
+``transpose=True`` in place of Scanpy's ``.T``:
+
+.. code-block:: python
+
+   counts = cx.read_csv(
+       "data/counts.csv.gz",          # .gz and .bz2 are read as they are
+       output_path="data/counts.h5ad",
+       transpose=True,                # rows are genes, columns cells
+   )
+
+The output records the call that made it, so running the same call again
+reuses it rather than converting again. Rename cells and genes or attach
+metadata afterwards with :func:`crispyx.write_obs` and
+:func:`crispyx.write_var` (below).
+
 Data preparation utilities
 --------------------------
 

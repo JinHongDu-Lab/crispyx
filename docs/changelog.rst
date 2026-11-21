@@ -4,7 +4,11 @@ Changelog
 Version 0.2.8
 -------------
 
-*Released 2026-11-21.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance.
+*Released 2026-11-21.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance, and text count tables convert to h5ad without being read into memory.
+
+**Added**
+
+* ``cx.read_csv`` and ``cx.read_text``: a text table of counts (``.gz`` and ``.bz2`` read as they are) streamed into an h5ad file, with the names, defaults and header rules of Scanpy's ``sc.read_csv`` / ``sc.read_text`` (``anndata.io``), which read the whole table into memory: a 1.2-million-cell table converts in the memory of one block of non-zeros. ``transpose=True`` takes the rows as genes, in place of Scanpy's ``.T``. The output carries crispyx's provenance, so the same call on the same file reuses it.
 
 **Changed**
 

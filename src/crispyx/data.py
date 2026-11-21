@@ -4589,6 +4589,211 @@ def convert_to_csc(
     return AnnData(output_path)
 
 
+_TEXT_BLOCK_NNZ = 1 << 24  # non-zeros gathered from the text before a block is written
+
+
+def _open_text(path: Path):
+    """``path`` opened for reading text, decompressed by its suffix (``.gz``, ``.bz2``)."""
+    if path.suffix == ".gz":
+        import gzip
+        return gzip.open(path, "rt")
+    if path.suffix == ".bz2":
+        import bz2
+        return bz2.open(path, "rt")
+    return open(path)
+
+
+def _is_float(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def read_text(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    delimiter: str | None = None,
+    first_column_names: bool | None = None,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a text table of counts into an h5ad file, never holding it in memory.
+
+    :func:`anndata.io.read_text` (Scanpy's ``sc.read_text``) with its
+    names, defaults and header rules, for tables too large for memory: the
+    table is read one line at a time and written to ``output_path`` as a
+    CSR matrix, so memory holds one block of non-zeros, whatever the size
+    of the table. Lines starting with ``#`` are comments. The first line is
+    the column names when its last field is not a number, else the last
+    comment line, else the columns are numbered. Each line's first field is
+    its row name when ``first_column_names`` is True, or, with None, when
+    the first data line starts with something that is not a number; a
+    header one field longer than the data drops its first name (the
+    corner label). Quotes around names are removed. Every data line must
+    have as many values as the first.
+
+    The file's rows are cells unless ``transpose`` is True, which takes them
+    as genes, the layout of many published count tables (``.T`` after
+    ``sc.read_text``). The genes are then written as columns of a CSC file
+    beside the output and turned into CSR by :func:`convert_to_csr`, which
+    needs about twice the output's size on disk for the time it runs.
+
+    The output carries crispyx's provenance: an existing output written by
+    the same call on the same file is reused, so a pipeline converts its
+    table once (``force=True`` converts again).
+
+    Parameters
+    ----------
+    filename
+        The text file; ``.gz`` and ``.bz2`` are decompressed as read.
+    output_path
+        The h5ad file to write.
+    delimiter
+        The field separator; None splits at any run of whitespace.
+    first_column_names
+        Whether each line starts with its row name; None decides from the
+        first data line.
+    dtype
+        The stored values' type.
+    transpose
+        Rows of the file are genes and columns cells.
+    memory_limit_gb
+        With ``transpose``, the memory :func:`convert_to_csr` may use
+        (``None``: the memory available).
+    verbose
+        Print progress.
+    force
+        Convert even when ``output_path`` holds this call's output.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    name = "read_text"
+    path = Path(filename)
+    output_path = Path(output_path)
+    _refuse_overwriting_input([path], output_path)
+    fingerprint = run_fingerprint(path, params={
+        "delimiter": delimiter, "first_column_names": first_column_names, "dtype": str(np.dtype(dtype)),
+        "transpose": bool(transpose),
+    })
+    if not force and reusable(output_path, "text", fingerprint, verbose):
+        return AnnData(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sep = " " if delimiter is None else delimiter  # numpy: a whitespace separator matches any run of it
+    dtype = np.dtype(dtype)
+
+    with _replace_on_success(output_path) as partial:
+        work = partial.with_name(partial.name + ".csc") if transpose else partial
+        try:
+            with _open_text(path) as handle, h5py.File(work, "w") as h5:
+                h5.attrs["encoding-type"], h5.attrs["encoding-version"] = "anndata", "0.1.0"
+                comments: list[str] = []
+                col_names: list[str] | None = None
+                row_names: list[str] = []
+                n_values = None
+                indptr, indices, values = [0], [], []
+                n_lines = 0
+
+                def flush():
+                    block = sp.csr_matrix(
+                        (np.concatenate(values), np.concatenate(indices), np.asarray(indptr, dtype=np.int64)),
+                        shape=(len(indptr) - 1, n_values),
+                    )
+                    block = block.T.tocsc() if transpose else block  # genes as columns
+                    if "X" in h5:
+                        sparse_dataset(h5["X"]).append(block)
+                    else:
+                        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
+                        write_elem(h5, "X", block)
+                    indptr[:] = [0]
+                    indices.clear()
+                    values.clear()
+
+                for number, line in enumerate(handle, start=1):
+                    line = line.rstrip("\r\n")
+                    if not line.strip():
+                        continue
+                    if n_values is None and col_names is None and line.startswith("#"):
+                        comments.append(line.lstrip("# "))
+                        continue
+                    if n_values is None and col_names is None:
+                        if delimiter is not None and delimiter not in line:
+                            raise ValueError(f"{name}: did not find delimiter {delimiter!r} in the first line of {path}")
+                        fields = line.split(delimiter)
+                        if not _is_float(fields[-1]):
+                            col_names = fields
+                            continue
+                    if first_column_names is None:
+                        first_column_names = not _is_float(line.split(delimiter, 1)[0])
+                    if first_column_names:
+                        row_name, line = line.split(delimiter, 1)
+                        row_names.append(row_name.strip('"'))
+                    row = np.fromstring(line, dtype=dtype, sep=sep)
+                    if n_values is None:
+                        n_values = row.size
+                    elif row.size != n_values:
+                        raise ValueError(f"{name}: line {number} of {path} has {row.size} values; the first had {n_values}")
+                    nonzero = np.flatnonzero(row)
+                    indices.append(nonzero.astype(np.int32))
+                    values.append(row[nonzero])
+                    indptr.append(indptr[-1] + nonzero.size)
+                    n_lines += 1
+                    if indptr[-1] >= _TEXT_BLOCK_NNZ:
+                        flush()
+                if n_values is None:
+                    raise ValueError(f"{name}: {path} has no data lines")
+                if len(indptr) > 1 or "X" not in h5:
+                    flush()
+
+                if col_names is None:
+                    col_names = comments[-1].split() if comments else [str(i) for i in range(n_values)]
+                if len(col_names) == n_values + 1:
+                    col_names = col_names[1:]
+                if len(col_names) != n_values:
+                    raise ValueError(f"{name}: {len(col_names)} column names for {n_values} values per line in {path}")
+                col_index = pd.Index([c.strip('"') for c in col_names], dtype=str)
+                row_index = pd.Index(row_names if row_names else [str(i) for i in range(n_lines)], dtype=str)
+                cells, genes = (col_index, row_index) if transpose else (row_index, col_index)
+                write_elem(h5, "obs", pd.DataFrame(index=cells))
+                write_elem(h5, "var", pd.DataFrame(index=genes))
+                write_elem(h5, "uns", {})
+            if transpose:
+                convert_to_csr(work, output_path=partial, memory_limit_gb=memory_limit_gb, verbose=False)
+        finally:
+            if transpose:
+                work.unlink(missing_ok=True)
+        write_stamp(partial, stamp("text", fingerprint))
+    _messages.vprint(verbose, name, f"{path} -> {output_path}: {len(cells):,} cells x {len(genes):,} genes")
+    return AnnData(output_path)
+
+
+def read_csv(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    delimiter: str | None = ",",
+    first_column_names: bool | None = None,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """:func:`read_text` with the delimiter ``","``, as :func:`anndata.io.read_csv`
+    is to :func:`anndata.io.read_text`."""
+    return read_text(
+        filename, output_path=output_path, delimiter=delimiter, first_column_names=first_column_names, dtype=dtype,
+        transpose=transpose, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
+
+
 def convert_to_csr(
     data: str | Path | "AnnData" | ad.AnnData,
     *,
