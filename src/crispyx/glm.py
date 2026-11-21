@@ -2942,6 +2942,33 @@ def _moment_variance(alpha, mean, n_cells: int, df: int):
     return var * var * (2.0 / df + kurtosis / n_cells) / mean ** 4
 
 
+#: Bins of :func:`local_median_trend`: at least this many genes each, at most this many bins.
+_LOCAL_TREND_MIN_GENES, _LOCAL_TREND_MAX_BINS = 200, 20
+
+
+def local_median_trend(means: ArrayLike, dispersions: ArrayLike) -> np.ndarray:
+    """The running median of ``dispersions`` against ``means``: the median in
+    quantile bins of log mean (at least 200 genes each, at most 20 bins),
+    interpolated on the log scale between the bins' median log means and
+    flat beyond them.
+
+    It is the centre of the log-normal prior of :func:`map_moment_dispersion`:
+    a prior on log alpha belongs at the typical log dispersion, which the
+    median estimates whatever the spread, and unchanged by estimates clipped
+    at a floor while fewer than half of a bin's are. The parametric trend
+    fits the mean dispersion, above the median by the spread's skew; on a
+    genome-wide screen's controls it sat 1.6 times above the median of
+    precise estimates.
+    """
+    log_mean = np.log(np.asarray(means, dtype=np.float64))
+    disp = np.asarray(dispersions, dtype=np.float64)
+    n_bins = int(np.clip(log_mean.size // _LOCAL_TREND_MIN_GENES, 1, _LOCAL_TREND_MAX_BINS))
+    bins = np.array_split(np.argsort(log_mean), n_bins)
+    centre = np.array([np.median(log_mean[b]) for b in bins])
+    level = np.log([np.median(disp[b]) for b in bins])
+    return np.exp(np.interp(log_mean, centre, level))
+
+
 #: The MAP search of :func:`map_moment_dispersion`: DESeq2's dispersion
 #: bounds, grid points over log alpha, and genes per block (a block's grid
 #: arrays take a few MB).
@@ -2955,7 +2982,8 @@ def map_moment_dispersion(
 
     The likelihood is the moment estimate's sampling distribution, normal
     around ``alpha`` with the variance of :func:`_moment_variance`; the prior
-    is DESeq2's, log-normal around the trend, with variance the robust
+    is DESeq2's, log-normal around ``trend`` (from
+    :func:`local_median_trend` in :func:`~crispyx.de.nb_offset_test`), with variance the robust
     variance of the log residuals of genes above 1e-6 less
     their median sampling variance on the log scale at the trend (the
     analogue of DESeq2's ``trigamma((n - p) / 2)``), at least 0.25. A gene

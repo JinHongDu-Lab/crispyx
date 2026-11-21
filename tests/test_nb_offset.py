@@ -482,7 +482,7 @@ def test_the_control_dispersion_is_shrunk_toward_the_trend(tmp_path):
     raw = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", shrink_dispersion=False, **kwargs)
     dispersion = shrunk.layers["dispersion"][0]
     assert dispersion.min() > 0.01
-    assert 0.03 < np.median(dispersion) < 0.1
+    assert 0.04 < np.median(dispersion) < 0.06
     assert 0.25 <= shrunk.uns["dispersion_prior_var"] < 1
     # the gene-wise estimates and the trend are reported either way
     np.testing.assert_allclose(shrunk.layers["dispersion_raw"], raw.layers["dispersion_raw"])
@@ -524,3 +524,24 @@ def test_the_covariate_baseline_honours_shrink_dispersion(tmp_path):
     np.testing.assert_allclose(raw.layers["dispersion"][0][tested], raw.layers["dispersion_raw"][0][tested])
     assert not np.allclose(shrunk.layers["dispersion"][0][tested], shrunk.layers["dispersion_raw"][0][tested])
     assert np.isfinite(shrunk.uns["dispersion_prior_var"]) and np.isnan(raw.uns["dispersion_prior_var"])
+
+
+def test_the_running_median_ignores_clipped_estimates_and_the_spread():
+    """The prior's centre is the typical dispersion at each mean: a third of
+    the estimates clipped at the floor or a long upper tail leave it in
+    place, where a mean would move."""
+    from crispyx.glm import local_median_trend
+
+    rng = np.random.default_rng(5)
+    means = np.exp(rng.uniform(np.log(0.5), np.log(50), 4000))
+    truth = 0.05 + 0.3 / means
+    estimates = truth * np.exp(rng.normal(0, 0.3, means.size))
+    estimates[rng.random(means.size) < 1 / 3] = 1e-8
+    estimates[rng.random(means.size) < 0.05] *= 20
+    centre = local_median_trend(means, estimates)
+    clean = local_median_trend(means, truth * np.exp(rng.normal(0, 0.3, means.size)))
+    assert np.all(centre > 1e-3)
+    # a third clipped low moves the median down a bin's quantile, not to the floor
+    assert 0.5 < np.median(centre / truth) < 1.0
+    np.testing.assert_allclose(np.median(clean / truth), 1.0, atol=0.05)
+    assert local_median_trend(means[:50], estimates[:50]).size == 50  # one bin
