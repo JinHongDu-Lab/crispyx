@@ -305,12 +305,12 @@ def test_the_dispersion_is_unbiased_over_many_small_strata():
         mu = s[:, None] * base[None, :] * np.exp(rng.normal(0, 0.5, (n_strata, n_genes))[strata])
         y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)).astype(np.float64)
         baseline = _offset_baseline(
-            iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, n_strata, n_genes, dispersion=None,
+            iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, n_strata, n_genes, dispersion=None, shrink=True,
         )
         assert 0.2 < np.median(baseline.dispersion_raw) < 0.4, (n_strata, per_stratum)
     # a stratum of one control contributes nothing: alone, no dispersion is estimable
     baseline = _offset_baseline(
-        iter([(np.arange(3), sp.csr_matrix(y[:3]))]), s[:3], np.arange(3), 3, n_genes, dispersion=None,
+        iter([(np.arange(3), sp.csr_matrix(y[:3]))]), s[:3], np.arange(3), 3, n_genes, dispersion=None, shrink=True,
     )
     assert np.isnan(baseline.dispersion_raw).all()
 
@@ -393,12 +393,13 @@ def test_a_stratum_baseline_moves_from_the_pooled_mean_only_as_far_as_its_expect
     counts[0, 0] = 1
     counts[:500, 1] = 2
     strata = np.repeat([0, 1], 500)
-    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1)
+    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1,
+                            shrink=True)
     pooled = base.pooled_mean
     assert 0.5 < base.mean[1, 0] / pooled[0] < 1.0       # one cell of prior put it at pooled / 501
     assert base.mean[1, 1] / pooled[1] < 0.01
     one = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), np.zeros(1000, int), 1, 2,
-                           dispersion=0.1)
+                           dispersion=0.1, shrink=True)
     np.testing.assert_allclose(one.mean[0], one.pooled_mean)
 
 

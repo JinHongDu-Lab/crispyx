@@ -2942,30 +2942,27 @@ def _moment_variance(alpha, mean, n_cells: int, df: int):
     return var * var * (2.0 / df + kurtosis / n_cells) / mean ** 4
 
 
+#: The MAP search of :func:`map_moment_dispersion`: DESeq2's dispersion
+#: bounds, grid points over log alpha, and genes per block (a block's grid
+#: arrays take a few MB).
+_MOMENT_MIN_DISP, _MOMENT_MAX_DISP, _MOMENT_GRID, _MOMENT_BLOCK = 1e-8, 10.0, 400, 512
+
+
 def map_moment_dispersion(
-    estimate: ArrayLike,
-    mean: ArrayLike,
-    trend: ArrayLike,
-    n_cells: int,
-    df: int,
-    *,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-    n_grid: int = 400,
-    block_genes: int = 4096,
+    estimate: ArrayLike, mean: ArrayLike, trend: ArrayLike, n_cells: int, df: int,
 ) -> tuple[np.ndarray, float]:
     """DESeq2's maximum a posteriori dispersions for method-of-moments estimates.
 
     The likelihood is the moment estimate's sampling distribution, normal
     around ``alpha`` with the variance of :func:`_moment_variance`; the prior
     is DESeq2's, log-normal around the trend, with variance the robust
-    variance of the log residuals of genes above ``100 * min_disp`` less
+    variance of the log residuals of genes above 1e-6 less
     their median sampling variance on the log scale at the trend (the
     analogue of DESeq2's ``trigamma((n - p) / 2)``), at least 0.25. A gene
     whose estimate is more than two residual SDs above the trend keeps it,
-    as in DESeq2. The MAP is the minimum over ``n_grid`` points of log
-    alpha in ``[log min_disp, log max(max_disp, n_cells)]``, refined by a
-    parabola through the best point and its neighbours.
+    as in DESeq2. The MAP is the minimum over 400 points of log alpha in
+    ``[log 1e-8, log max(10, n_cells)]``, refined by a parabola through the
+    best point and its neighbours.
 
     Parameters
     ----------
@@ -2983,6 +2980,7 @@ def map_moment_dispersion(
     -------
     The dispersions to test at, and the prior variance.
     """
+    min_disp, n_grid = _MOMENT_MIN_DISP, _MOMENT_GRID
     est = np.asarray(estimate, dtype=np.float64)
     m = np.asarray(mean, dtype=np.float64)
     trend = np.asarray(trend, dtype=np.float64)
@@ -2996,12 +2994,12 @@ def map_moment_dispersion(
     # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
     prior_var = float(np.fmax(squared_logres - expected, 0.25))
 
-    grid = np.linspace(np.log(min_disp), np.log(max(max_disp, float(n_cells))), n_grid)
+    grid = np.linspace(np.log(min_disp), np.log(max(_MOMENT_MAX_DISP, float(n_cells))), n_grid)
     step = grid[1] - grid[0]
     alpha = np.exp(grid)[None, :]
     map_disp = np.empty_like(est)
-    for start in range(0, est.size, block_genes):
-        sl = slice(start, start + block_genes)
+    for start in range(0, est.size, _MOMENT_BLOCK):
+        sl = slice(start, start + _MOMENT_BLOCK)
         var = _moment_variance(alpha, m[sl, None], n_cells, df)
         objective = (0.5 * (est[sl, None] - alpha) ** 2 / var + 0.5 * np.log(var)
                      + 0.5 * (grid[None, :] - np.log(trend[sl, None])) ** 2 / prior_var)

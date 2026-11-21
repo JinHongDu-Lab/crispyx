@@ -2666,7 +2666,7 @@ class _OffsetBaseline:
 
 def _offset_baseline(
     blocks, size_factors: np.ndarray, strata: np.ndarray, n_strata: int, n_genes: int,
-    *, dispersion: "float | np.ndarray | None", shrink: bool = True, min_mean_for_dispersion: float = 0.5,
+    *, dispersion: "float | np.ndarray | None", shrink: bool, min_mean_for_dispersion: float = 0.5,
 ) -> _OffsetBaseline:
     """One pass over the control cells.
 
