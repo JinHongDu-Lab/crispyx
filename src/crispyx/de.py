@@ -67,7 +67,7 @@ from .glm import (
     shrink_lfc_apeglm,
     cauchy_map,
     fit_dispersion_trend,
-    local_median_trend,
+    median_scaled_trend,
     map_moment_dispersion,
     _estimate_apeglm_prior_scale,
     _apeglm_prior_scale_from_blocks,
@@ -2697,10 +2697,11 @@ def _offset_baseline(
     size factors are equal. Subtracting the full Poisson term ``mu S``
     instead would bias ``alpha`` down by ``1/n_b`` per stratum, to the floor
     across hundreds of small strata; a stratum of one control contributes
-    nothing. The trend is the running median of the estimates from
-    ``min_mean_for_dispersion`` up (:func:`~crispyx.glm.local_median_trend`)
-    and the parametric trend below. With ``shrink`` those genes are tested
-    at DESeq2's MAP toward it
+    nothing. The trend is the parametric one fitted from
+    ``min_mean_for_dispersion`` up; genes below that mean are tested at it.
+    Above, it is rescaled to the running median of the estimates around it
+    (:func:`~crispyx.glm.median_scaled_trend`), and with ``shrink`` those
+    genes are tested at DESeq2's MAP toward it
     (:func:`~crispyx.glm.map_moment_dispersion`): near that mean the
     estimate's sampling SD is as large as the dispersion, so without it a
     gene whose controls happen to vary less than Poisson sits at the floor
@@ -2757,7 +2758,7 @@ def _offset_baseline(
         genewise = (pooled >= min_mean_for_dispersion) & np.isfinite(raw)
         trend = fit_dispersion_trend(pooled, np.where(genewise, raw, np.nan))
         if genewise.any():
-            trend[genewise] = local_median_trend(pooled[genewise], raw[genewise])
+            trend[genewise] = median_scaled_trend(pooled, trend, genewise, raw)[genewise]
         final = np.where(genewise, raw, trend)
         prior_var = float("nan")
         if shrink and genewise.any():
@@ -2985,9 +2986,10 @@ def nb_offset_test(
     the dispersion they estimate. Above it, with ``shrink_dispersion`` (the
     default), each gene is tested at DESeq2's maximum a posteriori
     dispersion: the moment estimate's sampling distribution (normal, with
-    the NB variance of a sample variance) times a log-normal prior around
-    the running median of the estimates against log mean (in quantile
-    bins of at least 200 genes), whose variance is the spread of the estimates about the trend
+    the delta-method variance of a moment estimate) times a log-normal
+    prior around the trend rescaled to the running median of the estimates
+    (the parametric fit follows the mean dispersion, above the typical one
+    by the spread's skew), whose variance is the spread of the estimates about the trend
     less their sampling variance, at least 0.25; a gene more than two
     residual SDs above the trend keeps its estimate, as in DESeq2. Near 0.5
     counts the estimate's sampling SD, about ``sqrt(2 / n) / mean``, is as
@@ -3060,8 +3062,8 @@ def nb_offset_test(
         False, at the gene-wise ones, where a gene with less than Poisson
         variance among the controls sits at 1e-8. The layers
         ``dispersion_raw`` and ``dispersion_trend`` hold the gene-wise
-        estimates and the trend (with ``strata``, the running median from
-        0.5 counts up, the parametric trend below) either way, and ``uns["dispersion_prior_var"]``
+        estimates and the trend either way (without ``covariates``, rescaled
+        from 0.5 counts up), and ``uns["dispersion_prior_var"]``
         the prior variance (NaN when not shrunk). Ignored with ``dispersion``.
     min_mu
         Floor on fitted means, as in :func:`nb_glm_test`; None chooses 1e-6

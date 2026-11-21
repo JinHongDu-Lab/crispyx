@@ -526,22 +526,46 @@ def test_the_covariate_baseline_honours_shrink_dispersion(tmp_path):
     assert np.isfinite(shrunk.uns["dispersion_prior_var"]) and np.isnan(raw.uns["dispersion_prior_var"])
 
 
-def test_the_running_median_ignores_clipped_estimates_and_the_spread():
-    """The prior's centre is the typical dispersion at each mean: a third of
-    the estimates clipped at the floor or a long upper tail leave it in
-    place, where a mean would move."""
-    from crispyx.glm import local_median_trend
+def test_the_trend_is_rescaled_to_the_median_of_the_estimates():
+    """The parametric trend rescaled to the typical estimate around it: a
+    third of the estimates clipped at the floor or a long upper tail move
+    the scale little, a panel of a few hundred genes (one bin) keeps the
+    trend's rise toward low means, and bins mostly at the floor are left
+    out rather than pulling the trend to it."""
+    from crispyx.glm import median_scaled_trend
 
     rng = np.random.default_rng(5)
     means = np.exp(rng.uniform(np.log(0.5), np.log(50), 4000))
-    truth = 0.05 + 0.3 / means
-    estimates = truth * np.exp(rng.normal(0, 0.3, means.size))
+    shape = 0.05 + 0.3 / means
+    everyone = np.ones(means.size, dtype=bool)
+    estimates = 0.6 * shape * np.exp(rng.normal(0, 0.3, means.size))
     estimates[rng.random(means.size) < 1 / 3] = 1e-8
     estimates[rng.random(means.size) < 0.05] *= 20
-    centre = local_median_trend(means, estimates)
-    clean = local_median_trend(means, truth * np.exp(rng.normal(0, 0.3, means.size)))
-    assert np.all(centre > 1e-3)
-    # a third clipped low moves the median down a bin's quantile, not to the floor
-    assert 0.5 < np.median(centre / truth) < 1.0
-    np.testing.assert_allclose(np.median(clean / truth), 1.0, atol=0.05)
-    assert local_median_trend(means[:50], estimates[:50]).size == 50  # one bin
+    scaled = median_scaled_trend(means, 2 * shape, everyone, estimates)
+    assert 0.45 < np.median(scaled / shape) < 0.65
+    # one bin: a single scale, the shape kept
+    few = slice(0, 300)
+    small = median_scaled_trend(means[few], 2 * shape[few], everyone[few], 0.6 * shape[few])
+    np.testing.assert_allclose(small / shape[few], 0.6)
+    # the low-mean bins mostly clipped: dropped, the rest set the scale
+    clipped = 0.6 * shape.copy()
+    clipped[means < np.quantile(means, 0.2)] = 1e-8
+    np.testing.assert_allclose(median_scaled_trend(means, 2 * shape, everyone, clipped) / shape, 0.6)
+    # nothing usable: the trend unchanged
+    np.testing.assert_allclose(median_scaled_trend(means, shape, everyone, np.full(means.size, 1e-8)), shape)
+
+
+def test_the_moment_estimate_variance_matches_simulation():
+    """The MAP's likelihood width: the delta-method variance in the sample
+    variance and the sample mean (without the mean's share it was about
+    twice too large near one count per cell)."""
+    from crispyx.glm import _moment_variance
+
+    rng = np.random.default_rng(6)
+    n, n_genes = 500, 4000
+    for alpha, mean in ((0.3, 3.0), (0.2, 1.0)):
+        y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mean), (n, n_genes)).astype(np.float64)
+        base = _offset_baseline(iter([(np.arange(n), sp.csr_matrix(y))]), np.ones(n), np.zeros(n, int), 1, n_genes,
+                                dispersion=None, shrink=False)
+        model = _moment_variance(alpha, mean, n, n - 1)
+        assert 0.85 < base.dispersion_raw.var() / model < 1.15, (alpha, mean)
