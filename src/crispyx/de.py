@@ -67,6 +67,8 @@ from .glm import (
     shrink_lfc_apeglm,
     cauchy_map,
     fit_dispersion_trend,
+    median_scaled_trend,
+    map_moment_dispersion,
     _estimate_apeglm_prior_scale,
     _apeglm_prior_scale_from_blocks,
 )
@@ -2657,6 +2659,7 @@ class _OffsetBaseline:
     dispersion: np.ndarray      # (genes,)
     dispersion_raw: np.ndarray  # (genes,)
     dispersion_trend: np.ndarray  # (genes,)
+    prior_var: float            # the MAP's prior variance (NaN: not shrunk)
     nnz: np.ndarray             # (genes,)
     total: np.ndarray           # (genes,)
     n_cells: int
@@ -2664,7 +2667,7 @@ class _OffsetBaseline:
 
 def _offset_baseline(
     blocks, size_factors: np.ndarray, strata: np.ndarray, n_strata: int, n_genes: int,
-    *, dispersion: "float | np.ndarray | None", min_mean_for_dispersion: float = 0.5,
+    *, dispersion: "float | np.ndarray | None", shrink: bool, min_mean_for_dispersion: float = 0.5,
 ) -> _OffsetBaseline:
     """One pass over the control cells.
 
@@ -2694,7 +2697,15 @@ def _offset_baseline(
     size factors are equal. Subtracting the full Poisson term ``mu S``
     instead would bias ``alpha`` down by ``1/n_b`` per stratum, to the floor
     across hundreds of small strata; a stratum of one control contributes
-    nothing.
+    nothing. The trend is the parametric one fitted from
+    ``min_mean_for_dispersion`` up; genes below that mean are tested at it.
+    Above, it is rescaled to the running median of the estimates around it
+    (:func:`~crispyx.glm.median_scaled_trend`), and with ``shrink`` those
+    genes are tested at DESeq2's MAP toward it
+    (:func:`~crispyx.glm.map_moment_dispersion`): near that mean the
+    estimate's sampling SD is as large as the dispersion, so without it a
+    gene whose controls happen to vary less than Poisson sits at the floor
+    1e-8 and is tested as Poisson.
     """
     s_all = np.asarray(size_factors, dtype=np.float64)
     sy = np.zeros((n_strata, n_genes))
@@ -2732,6 +2743,7 @@ def _offset_baseline(
     if dispersion is not None:
         final = np.broadcast_to(np.asarray(dispersion, dtype=np.float64), (n_genes,)).astype(np.float64)
         raw = trend = np.full(n_genes, np.nan)
+        prior_var = float("nan")
     else:
         # A stratum of one control has no residual about its own mean (both
         # its terms are zero in exact arithmetic) and is left out.
@@ -2741,14 +2753,26 @@ def _offset_baseline(
             mu = sy[usable] / S
             residual_ss = syy[usable] - 2 * mu * ssy[usable] + mu ** 2 * S2
             numerator = (residual_ss - mu * (S - S2 / S)).sum(axis=0)
-            raw = numerator / (mu ** 2 * (S2 - 2 * S3 / S + S2 ** 2 / S ** 2)).sum(axis=0)
-        raw = np.where(np.isfinite(raw), np.clip(raw, 1e-8, None), np.nan)
+            estimate = numerator / (mu ** 2 * (S2 - 2 * S3 / S + S2 ** 2 / S ** 2)).sum(axis=0)
+        raw = np.where(np.isfinite(estimate), np.clip(estimate, 1e-8, None), np.nan)
         genewise = (pooled >= min_mean_for_dispersion) & np.isfinite(raw)
         trend = fit_dispersion_trend(pooled, np.where(genewise, raw, np.nan))
+        if genewise.any():
+            trend[genewise] = median_scaled_trend(pooled, trend, genewise, raw)[genewise]
         final = np.where(genewise, raw, trend)
+        prior_var = float("nan")
+        if shrink and genewise.any():
+            # the cells behind the estimate, their residual degrees of
+            # freedom, and each gene's mean count at their mean size factor
+            n_used = int(n_per_stratum[usable].sum())
+            df = n_used - int(usable.sum())
+            mean_count = pooled[genewise] * s1[usable].sum() / n_used
+            final[genewise], prior_var = map_moment_dispersion(
+                estimate[genewise], mean_count, trend[genewise], n_used, df,
+            )
     return _OffsetBaseline(
         mean=mean, has_controls=has_controls, pooled_mean=pooled, dispersion=final, dispersion_raw=raw,
-        dispersion_trend=trend, nnz=nnz, total=total, n_cells=n_cells,
+        dispersion_trend=trend, prior_var=prior_var, nnz=nnz, total=total, n_cells=n_cells,
     )
 
 
@@ -2762,6 +2786,7 @@ class _DesignBaseline:
     dispersion: np.ndarray
     dispersion_raw: np.ndarray
     dispersion_trend: np.ndarray
+    prior_var: float
     nnz: np.ndarray
     total: np.ndarray
     n_cells: int
@@ -2769,20 +2794,21 @@ class _DesignBaseline:
 
 def _design_baseline(
     control_counts: sp.csc_matrix, size_factors: np.ndarray, design: np.ndarray,
-    *, dispersion: "float | np.ndarray | None", min_mu: float, block_genes: int,
+    *, dispersion: "float | np.ndarray | None", shrink: bool, min_mu: float, block_genes: int,
 ) -> _DesignBaseline:
     """The controls' GLM on ``design`` (intercept first), with DESeq2's
-    dispersion steps on the controls alone unless ``dispersion`` is given:
+    dispersion steps on the controls alone unless ``dispersion`` is given
+    (the MAP step only with ``shrink``):
     :func:`~crispyx.glm.fit_glm_deseq2` with no coefficient under test. Its
     fitted means are the baseline of any cell with the same covariates."""
     fit = fit_glm_deseq2(
-        design, [control_counts], size_factors, 0, dispersion=dispersion, shrink=True, min_mu=min_mu,
+        design, [control_counts], size_factors, 0, dispersion=dispersion, shrink=shrink, min_mu=min_mu,
         block_genes=block_genes,
     )
     coef = np.where(fit.coef_converged[:, None], fit.coef, np.nan)
     return _DesignBaseline(
         coef=coef, dispersion=fit.dispersion, dispersion_raw=fit.genewise_dispersion, dispersion_trend=fit.trend,
-        nnz=np.asarray(control_counts.getnnz(axis=0)).ravel(),
+        prior_var=float(fit.prior_var), nnz=np.asarray(control_counts.getnnz(axis=0)).ravel(),
         total=np.asarray(control_counts.sum(axis=0), dtype=np.float64).ravel(), n_cells=control_counts.shape[0],
     )
 
@@ -2893,6 +2919,7 @@ def nb_offset_test(
     size_factors: ArrayLike | None = None,
     size_factor_method: Literal["libsize", "geomeans", "deseq2"] = "libsize",
     dispersion: float | ArrayLike | None = None,
+    shrink_dispersion: bool = True,
     min_mu: float | None = None,
     max_iter: int = 50,
     tol: float = 1e-6,
@@ -2956,13 +2983,26 @@ def nb_offset_test(
     show no rise toward low means. Below that mean the gene-wise moment
     estimates are too noisy to use: with a few thousand controls about half
     of those under 0.1 counts clip at zero, so their median sits far below
-    the dispersion they estimate. The controls must leave residual degrees
-    of freedom for this estimate (a stratum with two controls; more control
-    units than design columns); otherwise pass ``dispersion``.
+    the dispersion they estimate. Above it, with ``shrink_dispersion`` (the
+    default), each gene is tested at DESeq2's maximum a posteriori
+    dispersion: the moment estimate's sampling distribution (normal, with
+    the delta-method variance of a moment estimate) times a log-normal
+    prior around the trend rescaled to the running median of the estimates
+    (the parametric fit follows the mean dispersion, above the typical one
+    by the spread's skew), whose variance is the spread of the estimates about the trend
+    less their sampling variance, at least 0.25; a gene more than two
+    residual SDs above the trend keeps its estimate, as in DESeq2. Near 0.5
+    counts the estimate's sampling SD, about ``sqrt(2 / n) / mean``, is as
+    large as typical dispersions, so unshrunk a gene whose controls happen
+    to vary less than Poisson is tested at the floor 1e-8, as Poisson. The
+    controls must leave residual degrees of freedom for this estimate (a
+    stratum with two controls; more control units than design columns);
+    otherwise pass ``dispersion``.
     With ``covariates``, any design (one-hot levels and continuous terms
     such as the log cells per pseudo-bulk unit), the controls' GLM on
     ``~ covariates`` is fitted once with DESeq2's dispersion steps on the
-    controls alone (:func:`~crispyx.glm.fit_glm_deseq2`), and each cell's
+    controls alone (:func:`~crispyx.glm.fit_glm_deseq2`, its MAP step with
+    ``shrink_dispersion``), and each cell's
     baseline is its fitted control mean, floored at ``min_mu``. This is the
     pseudo-bulk analogue of the stratum baseline: ``nb_glm_test`` with the
     same covariates refits the whole control set in every fit of
@@ -3016,6 +3056,15 @@ def nb_offset_test(
         The NB dispersion to test at, one value or one per gene (e.g. a
         control-only estimate). None estimates it from the controls as
         described above.
+    shrink_dispersion
+        If True (default), test at the MAP dispersions toward the trend
+        (genes far above it keep their gene-wise one, as in DESeq2); if
+        False, at the gene-wise ones, where a gene with less than Poisson
+        variance among the controls sits at 1e-8. The layers
+        ``dispersion_raw`` and ``dispersion_trend`` hold the gene-wise
+        estimates and the trend either way (without ``covariates``, rescaled
+        from 0.5 counts up), and ``uns["dispersion_prior_var"]``
+        the prior variance (NaN when not shrunk). Ignored with ``dispersion``.
     min_mu
         Floor on fitted means, as in :func:`nb_glm_test`; None chooses 1e-6
         for single cells and 0.5 for pseudo-bulk from the share of zeros.
@@ -3202,6 +3251,7 @@ def nb_offset_test(
 
             baseline = _offset_baseline(
                 control_blocks(), size_factors, stratum_codes, n_strata, n_genes, dispersion=dispersion,
+                shrink=shrink_dispersion,
             )
         finally:
             backed.file.close()
@@ -3217,7 +3267,7 @@ def nb_offset_test(
                                         f"{block_genes} genes at a time")
         baseline = _design_baseline(
             control_counts, size_factors[control_rows], design_all[control_rows], dispersion=dispersion,
-            min_mu=min_mu, block_genes=block_genes,
+            shrink=shrink_dispersion, min_mu=min_mu, block_genes=block_genes,
         )
         del control_counts
         has_baseline_cell = ~unsupported_cell
@@ -3272,6 +3322,7 @@ def nb_offset_test(
             "original_dataset_path": str(path),
             "min_mu": float(min_mu),
             "dispersion_source": "given" if dispersion is not None else "controls",
+            "dispersion_prior_var": baseline.prior_var,
             "de_filter": {
                 "min_cells_expressed": int(min_cells_expressed),
                 "min_pct_ctrl": float(min_pct_ctrl),

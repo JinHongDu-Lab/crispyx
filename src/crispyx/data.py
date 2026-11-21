@@ -27,7 +27,7 @@ import scipy.sparse as sp
 from . import _messages
 from ._memory import (
     _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
-    _resolve_n_jobs,
+    _resolve_memory_limit_bytes, _resolve_n_jobs,
 )
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._grouping import contiguous_ranges, label_strings
@@ -4586,6 +4586,265 @@ def convert_to_csc(
 
     _messages.print_done(verbose, "pp.convert_to_csc", f"{n_obs} cells × {n_vars} genes")
 
+    return AnnData(output_path)
+
+
+_TEXT_BLOCK_LINES = 65536  # lines held before a block is written: each also holds small Python objects
+
+
+def _text_stream(raw):
+    """A text stream over the binary file ``raw``, decompressed by its name's
+    suffix (``.gz``, ``.bz2``); ``raw.tell()`` keeps counting the bytes read
+    from the file itself."""
+    import io
+    suffix = Path(raw.name).suffix
+    if suffix == ".gz":
+        import gzip
+        return io.TextIOWrapper(gzip.GzipFile(fileobj=raw))
+    if suffix == ".bz2":
+        import bz2
+        return io.TextIOWrapper(bz2.BZ2File(raw))
+    return io.TextIOWrapper(raw)
+
+
+def _is_float(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def read_text(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    delimiter: str | None = None,
+    first_column_names: bool | None = None,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a text table of counts into an h5ad file, never holding it in memory.
+
+    :func:`anndata.io.read_text` (Scanpy's ``sc.read_text``) with its
+    names, defaults, header rules and parsing, for tables too large for
+    memory: the table is read one line at a time and written to
+    ``output_path`` as a CSR matrix in blocks sized to ``memory_limit_gb``.
+    As in anndata, lines starting with ``#`` are comments; the first line
+    holds the column names when its last field is not a number, else the
+    last comment line does, else the columns are numbered; each line's
+    first field is its row name when ``first_column_names`` is True, or,
+    with None, when the first data line starts with something that is not
+    a number; a first line one field shorter than the second is integer
+    column names over integer row names; a header one field longer than
+    the data drops its first name (the corner label); quotes around names
+    are removed. Every data line must have as many values as the first,
+    and every value must parse as ``dtype``.
+
+    The file's rows are cells unless ``transpose`` is True, which takes them
+    as genes, the layout of many published count tables (``.T`` after
+    ``sc.read_text``). The genes are then written as columns of a scratch
+    CSC file beside the output and turned into CSR by
+    :func:`convert_to_csr`, which needs about twice the output's size on
+    disk while it runs.
+
+    The output carries crispyx's provenance: an existing output written by
+    the same call on the same file is reused, so a pipeline converts its
+    table once (``force=True`` converts again).
+
+    Parameters
+    ----------
+    filename
+        The text file; ``.gz`` and ``.bz2`` are decompressed as read.
+    output_path
+        The h5ad file to write.
+    delimiter
+        The field separator; None splits at any run of whitespace.
+    first_column_names
+        Whether each line starts with its row name; None decides from the
+        first data line.
+    dtype
+        The stored values' type.
+    transpose
+        Rows of the file are genes and columns cells.
+    memory_limit_gb
+        Bounds the block of non-zeros held before it is written, and with
+        ``transpose`` the memory :func:`convert_to_csr` uses (``None``: the
+        memory available).
+    verbose
+        Print progress.
+    force
+        Convert even when ``output_path`` holds this call's output.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    return _read_table(
+        "read_text", filename, output_path=output_path, delimiter=delimiter, first_column_names=first_column_names,
+        dtype=dtype, transpose=transpose, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
+
+
+def read_csv(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    delimiter: str | None = ",",
+    first_column_names: bool | None = None,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """:func:`read_text` with the delimiter ``","``, as :func:`anndata.io.read_csv`
+    is to :func:`anndata.io.read_text`."""
+    return _read_table(
+        "read_csv", filename, output_path=output_path, delimiter=delimiter, first_column_names=first_column_names,
+        dtype=dtype, transpose=transpose, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
+
+
+def _read_table(
+    name: str, filename, *, output_path, delimiter, first_column_names, dtype, transpose, memory_limit_gb, verbose,
+    force,
+) -> "AnnData":
+    """:func:`read_text` and :func:`read_csv`, reporting as ``name``."""
+    path = Path(filename)
+    output_path = Path(output_path)
+    _refuse_overwriting_input([path], output_path)
+    fingerprint = run_fingerprint(path, params={
+        "delimiter": delimiter, "first_column_names": first_column_names, "dtype": str(np.dtype(dtype)),
+        "transpose": bool(transpose),
+    })
+    if not force and reusable(output_path, "text", fingerprint, verbose):
+        return AnnData(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = np.dtype(dtype)
+    # A block of non-zeros is held about three times over while it is written
+    # (the lines' arrays, their concatenation, the sparse block): a tenth of
+    # the budget for it.
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    block_nnz = int(np.clip(budget * 0.1 / (3 * (dtype.itemsize + 4)), 1e5, 1 << 26))
+    scratch = None
+    if transpose:
+        _sweep_stale_scratch_copies(output_path.parent, fn_name=name, verbose=verbose)
+        scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_",
+                                        dir=output_path.parent))
+
+    with _replace_on_success(output_path) as partial:
+        work = scratch / "genes_as_columns.h5ad" if transpose else partial
+        try:
+            with open(path, "rb") as raw, _text_stream(raw) as handle, h5py.File(work, "w") as h5, \
+                    _create_progress_context(max(1, path.stat().st_size >> 20), name, verbose, unit="MB") as pbar:
+                h5.attrs["encoding-type"], h5.attrs["encoding-version"] = "anndata", "0.1.0"
+                evict = _EvictEvery(work, path)
+                comments: list[str] = []
+                col_names: list[str] | None = None
+                row_names: list[str] = []
+                auto_names = first_column_names is None
+                n_values = None
+                indptr, indices, values = [0], [], []
+                n_lines, read_mb = 0, 0
+
+                def flush():
+                    block = sp.csr_matrix(
+                        (np.concatenate(values), np.concatenate(indices), np.asarray(indptr, dtype=np.int64)),
+                        shape=(len(indptr) - 1, n_values),
+                    )
+                    block = block.T.tocsc() if transpose else block  # genes as columns
+                    if "X" in h5:
+                        sparse_dataset(h5["X"]).append(block)
+                    else:
+                        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
+                        write_elem(h5, "X", block)
+                    evict(block.nnz * (dtype.itemsize + 4))
+                    indptr[:] = [0]
+                    indices.clear()
+                    values.clear()
+
+                def add(row: np.ndarray):
+                    nonzero = np.flatnonzero(row)
+                    indices.append(nonzero.astype(np.int32))
+                    values.append(row[nonzero])
+                    indptr.append(indptr[-1] + nonzero.size)
+
+                for number, line in enumerate(handle, start=1):
+                    line = line.rstrip("\r\n")
+                    if not line.strip():
+                        continue
+                    if n_lines == 0 and col_names is None and line.startswith("#"):
+                        comment = line.lstrip("# ")
+                        if comment:
+                            comments.append(comment)
+                        continue
+                    fields = line.split(delimiter)
+                    if n_lines == 0 and col_names is None:
+                        if delimiter is not None and len(fields) == 1:
+                            raise ValueError(f"{name}: did not find delimiter {delimiter!r} in the first line of {path}")
+                        if not _is_float(fields[-1]):
+                            col_names = fields
+                            continue
+                    if first_column_names is None:
+                        first_column_names = not _is_float(fields[0])
+                    if (n_lines == 1 and auto_names and not first_column_names and not row_names
+                            and col_names is None and len(fields) == n_values + 1):
+                        # anndata: integer column names over integer row names
+                        col_names = [str(int(float(v))) for v in first_row]
+                        indptr[:] = [0]
+                        indices.clear()
+                        values.clear()
+                        n_lines, n_values, first_column_names = 0, None, True
+                    if first_column_names:
+                        row_names.append(fields[0].strip('"'))
+                        fields = fields[1:]
+                    try:
+                        row = np.array(fields, dtype=dtype)
+                    except ValueError as error:
+                        raise ValueError(f"{name}: line {number} of {path}: {error}") from None
+                    if row.size == 0:
+                        raise ValueError(f"{name}: line {number} of {path} has no values")
+                    if n_values is None:
+                        n_values, first_row = row.size, row
+                    elif row.size != n_values:
+                        raise ValueError(f"{name}: line {number} of {path} has {row.size} values; the first had {n_values}")
+                    add(row)
+                    n_lines += 1
+                    if n_lines > 1 and (indptr[-1] >= block_nnz or len(indptr) > _TEXT_BLOCK_LINES):
+                        flush()
+                    done_mb = raw.tell() >> 20
+                    if done_mb > read_mb:
+                        pbar.update(done_mb - read_mb)
+                        evict((done_mb - read_mb) << 20)
+                        read_mb = done_mb
+                if n_values is None:
+                    raise ValueError(f"{name}: {path} has no data lines")
+                if len(indptr) > 1 or "X" not in h5:
+                    flush()
+
+                if col_names is None:
+                    col_names = comments[-1].split() if comments else [str(i) for i in range(n_values)]
+                if len(col_names) == n_values + 1:
+                    col_names = col_names[1:]
+                if len(col_names) != n_values:
+                    raise ValueError(f"{name}: {len(col_names)} column names for {n_values} values per line in {path}")
+                col_index = pd.Index([c.strip('"') for c in col_names], dtype=str)
+                row_index = pd.Index(row_names if row_names else [str(i) for i in range(n_lines)], dtype=str)
+                cells, genes = (col_index, row_index) if transpose else (row_index, col_index)
+                write_elem(h5, "obs", pd.DataFrame(index=cells))
+                write_elem(h5, "var", pd.DataFrame(index=genes))
+                write_elem(h5, "uns", {})
+            if transpose:
+                convert_to_csr(work, output_path=partial, memory_limit_gb=memory_limit_gb, verbose=False)
+        finally:
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+        write_stamp(partial, stamp("text", fingerprint))
+    _messages.vprint(verbose, name, f"{path} -> {output_path}: {len(cells):,} cells x {len(genes):,} genes")
     return AnnData(output_path)
 
 

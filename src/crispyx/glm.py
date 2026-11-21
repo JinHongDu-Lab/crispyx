@@ -2930,6 +2930,144 @@ def _log_residuals(genewise: np.ndarray, trend: np.ndarray, min_disp: float) -> 
     return log_resid, float((np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2)
 
 
+def _moment_variance(alpha, mean, n_cells: int, df: int):
+    """Sampling variance of a method-of-moments dispersion estimate
+    ``(s^2 - m) / m^2`` at ``alpha``, for a gene of mean count ``m`` over
+    ``n_cells`` cells with ``df`` residual degrees of freedom, by the delta
+    method in the sample variance and the sample mean:
+    ``(sigma^4 (2 / df + kappa / n) - (1 + 2 alpha m)^2 sigma^2 / n) / m^4``,
+    with ``sigma^2 = m + alpha m^2`` and the NB excess kurtosis
+    ``kappa = 6 alpha + 1 / (m (1 + alpha m))``. The second term is the
+    sample mean's share: it moves with the sample variance (their
+    covariance is the third central moment ``sigma^2 (1 + 2 alpha m) / n``)
+    and is subtracted from it. Without it the variance is about twice too
+    large near ``m = 1``."""
+    var = mean + alpha * mean * mean
+    kurtosis = 6.0 * alpha + 1.0 / (mean * (1.0 + alpha * mean))
+    skew_term = (1.0 + 2.0 * alpha * mean) ** 2 * var / n_cells
+    return (var * var * (2.0 / df + kurtosis / n_cells) - skew_term) / mean ** 4
+
+
+#: Bins of :func:`median_scaled_trend`: at least this many genes each, at most this many bins.
+_SCALED_TREND_MIN_GENES, _SCALED_TREND_MAX_BINS = 200, 20
+
+
+def median_scaled_trend(means: ArrayLike, trend: ArrayLike, use: ArrayLike, dispersions: ArrayLike) -> np.ndarray:
+    """The parametric ``trend`` rescaled to the median of the gene-wise
+    ``dispersions`` around it.
+
+    Among the genes in ``use``, the median of ``dispersions / trend`` is
+    taken in quantile bins of log mean (at least 200 genes each, at most
+    20 bins), interpolated on the log scale between the bins' median log
+    means, and held flat beyond them; each gene gets ``trend`` times its
+    mean's ratio. A bin whose median dispersion is
+    at most 1e-6, within a hundred times the floor 1e-8 (most of its estimates clipped),
+    is left out; with none left, ``trend`` is returned unchanged.
+
+    It is the centre of the log-normal prior of :func:`map_moment_dispersion`.
+    A prior on log alpha belongs at the typical dispersion, which the median
+    estimates whatever the spread, unchanged by estimates clipped at the
+    floor while fewer than half of a bin's are; the parametric trend fits
+    the mean dispersion, above the median by the spread's skew (1.6 times
+    on a genome-wide screen's controls). Rescaling keeps the trend's shape,
+    so a panel of a few hundred genes (one bin) still rises toward low
+    means. Outside the range of ``use`` the ratio is extrapolated flat, so
+    the rescaled trend inherits the parametric shape there; on that
+    screen's controls it fell 20-35% below the dispersions of genes under
+    0.5 counts, where the unscaled trend was within 25% above them.
+    """
+    log_mean = np.log(np.asarray(means, dtype=np.float64))
+    trend = np.asarray(trend, dtype=np.float64)
+    use = np.asarray(use, dtype=bool)
+    disp = np.asarray(dispersions, dtype=np.float64)[use]
+    log_ratio = np.log(disp / trend[use])
+    n_bins = int(np.clip(use.sum() // _SCALED_TREND_MIN_GENES, 1, _SCALED_TREND_MAX_BINS))
+    bins = [b for b in np.array_split(np.argsort(log_mean[use]), n_bins)
+            if b.size and np.median(disp[b]) > 1e-6]
+    if not bins:
+        return trend.copy()
+    centre = np.array([np.median(log_mean[use][b]) for b in bins])
+    level = np.array([np.median(log_ratio[b]) for b in bins])
+    with np.errstate(invalid="ignore"):
+        return trend * np.exp(np.interp(log_mean, centre, level))
+
+
+#: The MAP search of :func:`map_moment_dispersion`: DESeq2's dispersion
+#: bounds, grid points over log alpha, and genes per block (a block's grid
+#: arrays take a few MB).
+_MOMENT_MIN_DISP, _MOMENT_MAX_DISP, _MOMENT_GRID, _MOMENT_BLOCK = 1e-8, 10.0, 400, 512
+
+
+def map_moment_dispersion(
+    estimate: ArrayLike, mean: ArrayLike, trend: ArrayLike, n_cells: int, df: int,
+) -> tuple[np.ndarray, float]:
+    """DESeq2's maximum a posteriori dispersions for method-of-moments estimates.
+
+    The likelihood is the moment estimate's sampling distribution, normal
+    around ``alpha`` with the delta-method variance of a moment estimate
+    (in the sample variance and the sample mean, with the NB kurtosis); the prior
+    is DESeq2's, log-normal around ``trend`` (from
+    :func:`median_scaled_trend` in :func:`~crispyx.de.nb_offset_test`), with variance the robust
+    variance of the log residuals of genes above 1e-6 less
+    their median sampling variance on the log scale at the trend (the
+    analogue of DESeq2's ``trigamma((n - p) / 2)``), at least 0.25. A gene
+    whose estimate is more than two residual SDs above the trend keeps it,
+    as in DESeq2. The MAP is the minimum over 400 points of log alpha in
+    ``[log 1e-8, log max(10, n_cells)]``, refined by a parabola through the
+    best point and its neighbours.
+
+    Parameters
+    ----------
+    estimate
+        Each gene's moment estimate, unclipped (it is below zero when the
+        sample variance is below the Poisson variance); finite.
+    mean
+        Each gene's mean count per cell (positive).
+    trend
+        The mean-dispersion trend at each gene (positive).
+    n_cells, df
+        Cells behind the estimates and their residual degrees of freedom.
+
+    Returns
+    -------
+    The dispersions to test at, and the prior variance.
+    """
+    min_disp, n_grid = _MOMENT_MIN_DISP, _MOMENT_GRID
+    est = np.asarray(estimate, dtype=np.float64)
+    m = np.asarray(mean, dtype=np.float64)
+    trend = np.asarray(trend, dtype=np.float64)
+    genewise = np.clip(est, min_disp, None)
+    if est.size == 0:
+        return genewise, float("nan")
+    log_resid, squared_logres = _log_residuals(genewise, trend, min_disp)
+    use = genewise >= 100 * min_disp
+    sampling = _moment_variance(trend, m, n_cells, df) / trend ** 2
+    expected = float(np.median(sampling[use])) if use.any() else 0.0
+    # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+    prior_var = float(np.fmax(squared_logres - expected, 0.25))
+
+    grid = np.linspace(np.log(min_disp), np.log(max(_MOMENT_MAX_DISP, float(n_cells))), n_grid)
+    step = grid[1] - grid[0]
+    alpha = np.exp(grid)[None, :]
+    map_disp = np.empty_like(est)
+    for start in range(0, est.size, _MOMENT_BLOCK):
+        sl = slice(start, start + _MOMENT_BLOCK)
+        var = _moment_variance(alpha, m[sl, None], n_cells, df)
+        objective = (0.5 * (est[sl, None] - alpha) ** 2 / var + 0.5 * np.log(var)
+                     + 0.5 * (grid[None, :] - np.log(trend[sl, None])) ** 2 / prior_var)
+        best = np.argmin(objective, axis=1)
+        inner = np.clip(best, 1, n_grid - 2)
+        rows = np.arange(inner.size)
+        f0, f1, f2 = (objective[rows, inner + k] for k in (-1, 0, 1))
+        curvature = f0 - 2.0 * f1 + f2
+        with np.errstate(divide="ignore", invalid="ignore"):
+            shift = np.where(curvature > 0, 0.5 * (f0 - f2) / curvature, 0.0)
+        # at an end of the grid the optimum is the bound itself
+        shift = np.where(best == inner, np.clip(shift, -1.0, 1.0), 0.0)
+        map_disp[sl] = np.exp(grid[best] + shift * step)
+    return np.where(log_resid > 2 * np.sqrt(squared_logres), genewise, map_disp), prior_var
+
+
 def column_parts(counts) -> list:
     """``counts`` -- a matrix, or a list of row blocks -- as a list of blocks
     whose columns slice cheaply: CSC when sparse (a CSC block is not copied)."""

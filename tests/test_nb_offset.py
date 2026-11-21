@@ -305,12 +305,12 @@ def test_the_dispersion_is_unbiased_over_many_small_strata():
         mu = s[:, None] * base[None, :] * np.exp(rng.normal(0, 0.5, (n_strata, n_genes))[strata])
         y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)).astype(np.float64)
         baseline = _offset_baseline(
-            iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, n_strata, n_genes, dispersion=None,
+            iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, n_strata, n_genes, dispersion=None, shrink=True,
         )
         assert 0.2 < np.median(baseline.dispersion_raw) < 0.4, (n_strata, per_stratum)
     # a stratum of one control contributes nothing: alone, no dispersion is estimable
     baseline = _offset_baseline(
-        iter([(np.arange(3), sp.csr_matrix(y[:3]))]), s[:3], np.arange(3), 3, n_genes, dispersion=None,
+        iter([(np.arange(3), sp.csr_matrix(y[:3]))]), s[:3], np.arange(3), 3, n_genes, dispersion=None, shrink=True,
     )
     assert np.isnan(baseline.dispersion_raw).all()
 
@@ -393,12 +393,13 @@ def test_a_stratum_baseline_moves_from_the_pooled_mean_only_as_far_as_its_expect
     counts[0, 0] = 1
     counts[:500, 1] = 2
     strata = np.repeat([0, 1], 500)
-    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1)
+    base = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), strata, 2, 2, dispersion=0.1,
+                            shrink=True)
     pooled = base.pooled_mean
     assert 0.5 < base.mean[1, 0] / pooled[0] < 1.0       # one cell of prior put it at pooled / 501
     assert base.mean[1, 1] / pooled[1] < 0.01
     one = _offset_baseline([(np.arange(1000), counts.tocsr())], np.ones(1000), np.zeros(1000, int), 1, 2,
-                           dispersion=0.1)
+                           dispersion=0.1, shrink=True)
     np.testing.assert_allclose(one.mean[0], one.pooled_mean)
 
 
@@ -456,3 +457,115 @@ def test_controls_without_residual_degrees_of_freedom(tmp_path):
     got = _run(tmp_path / "u.h5ad", tmp_path / "o.h5ad", covariates=["batch"], dispersion=0.05,
                size_factor_method="deseq2", **NO_FILTERS)
     assert np.isfinite(got.X).all()
+
+
+def _near_poisson_screen(path: Path, n_ctrl=400, n_genes=300, alpha=0.05, seed=0):
+    """Every gene at dispersion ``alpha`` with control means just above 0.5,
+    where the moment estimate's sampling SD is about the dispersion itself."""
+    rng = np.random.default_rng(seed)
+    mu = rng.uniform(0.5, 1.5, n_genes)
+    labels = np.array(["control"] * n_ctrl + ["P1"] * 50)
+    s = rng.lognormal(0, 0.2, labels.size)
+    y = rng.poisson(rng.gamma(1 / alpha, alpha * np.outer(s, mu))).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "stratum": np.where(np.arange(labels.size) % 2, "a", "b")},
+                       index=[f"c{i}" for i in range(labels.size)])
+    ad.AnnData(sp.csr_matrix(y), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])).write(path)
+
+
+def test_the_control_dispersion_is_shrunk_toward_the_trend(tmp_path):
+    """Unshrunk, a quarter of these genes have a sample variance below
+    Poisson and are tested at the floor 1e-8; the MAP keeps every gene near
+    the truth."""
+    _near_poisson_screen(tmp_path / "s.h5ad")
+    kwargs = dict(strata="stratum", lfc_base="ln", min_cells_ctrl=0, min_cells_pert=0, **NO_FILTERS)
+    shrunk = _run(tmp_path / "s.h5ad", tmp_path / "on.h5ad", **kwargs)
+    raw = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", shrink_dispersion=False, **kwargs)
+    dispersion = shrunk.layers["dispersion"][0]
+    assert dispersion.min() > 0.01
+    assert 0.04 < np.median(dispersion) < 0.06
+    assert 0.25 <= shrunk.uns["dispersion_prior_var"] < 1
+    # the gene-wise estimates and the trend are reported either way
+    np.testing.assert_allclose(shrunk.layers["dispersion_raw"], raw.layers["dispersion_raw"])
+    np.testing.assert_allclose(shrunk.layers["dispersion_trend"], raw.layers["dispersion_trend"])
+    unshrunk = raw.layers["dispersion"][0]
+    # (the few genes below 0.5 counts per unit size factor are at the trend)
+    assert (np.isclose(unshrunk, raw.layers["dispersion_raw"][0])
+            | np.isclose(unshrunk, raw.layers["dispersion_trend"][0])).all()
+    assert (unshrunk <= 1e-7).sum() > 30
+    assert np.isnan(raw.uns["dispersion_prior_var"])
+    # Poisson standard errors on the floored genes, wider ones once shrunk
+    floored = unshrunk <= 1e-7
+    assert (shrunk.layers["standard_error"][0][floored] > raw.layers["standard_error"][0][floored]).all()
+
+
+def test_the_map_leaves_precise_estimates_and_genes_far_above_the_trend():
+    """With thousands of controls the estimates hardly move; a gene far
+    above the trend keeps its own estimate (DESeq2's outlier rule)."""
+    rng = np.random.default_rng(4)
+    n, n_genes = 4000, 400
+    base = np.exp(rng.uniform(np.log(1), np.log(20), n_genes))
+    alpha = np.full(n_genes, 0.2)
+    alpha[:5] = 5.0
+    s = np.exp(rng.normal(0, 0.3, n))
+    strata = rng.integers(0, 4, n)
+    y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * s[:, None] * base)).astype(np.float64)
+    shrunk, raw = (_offset_baseline(iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, 4, n_genes,
+                                    dispersion=None, shrink=shrink) for shrink in (True, False))
+    np.testing.assert_allclose(shrunk.dispersion[:5], raw.dispersion[:5])
+    np.testing.assert_allclose(shrunk.dispersion[5:], raw.dispersion[5:], rtol=0.15)
+
+
+def test_the_covariate_baseline_honours_shrink_dispersion(tmp_path):
+    _screen(tmp_path / "s.h5ad", n_ctrl=600, n_genes=40, n_pert=2)
+    kwargs = dict(covariates=["stratum"], lfc_base="ln", **NO_FILTERS)
+    shrunk = _run(tmp_path / "s.h5ad", tmp_path / "on.h5ad", **kwargs)
+    raw = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", shrink_dispersion=False, **kwargs)
+    tested = np.isfinite(raw.layers["dispersion"][0])
+    np.testing.assert_allclose(raw.layers["dispersion"][0][tested], raw.layers["dispersion_raw"][0][tested])
+    assert not np.allclose(shrunk.layers["dispersion"][0][tested], shrunk.layers["dispersion_raw"][0][tested])
+    assert np.isfinite(shrunk.uns["dispersion_prior_var"]) and np.isnan(raw.uns["dispersion_prior_var"])
+
+
+def test_the_trend_is_rescaled_to_the_median_of_the_estimates():
+    """The parametric trend rescaled to the typical estimate around it: a
+    third of the estimates clipped at the floor or a long upper tail move
+    the scale little, a panel of a few hundred genes (one bin) keeps the
+    trend's rise toward low means, and bins mostly at the floor are left
+    out rather than pulling the trend to it."""
+    from crispyx.glm import median_scaled_trend
+
+    rng = np.random.default_rng(5)
+    means = np.exp(rng.uniform(np.log(0.5), np.log(50), 4000))
+    shape = 0.05 + 0.3 / means
+    everyone = np.ones(means.size, dtype=bool)
+    estimates = 0.6 * shape * np.exp(rng.normal(0, 0.3, means.size))
+    estimates[rng.random(means.size) < 1 / 3] = 1e-8
+    estimates[rng.random(means.size) < 0.05] *= 20
+    scaled = median_scaled_trend(means, 2 * shape, everyone, estimates)
+    assert 0.45 < np.median(scaled / shape) < 0.65
+    # one bin: a single scale, the shape kept
+    few = slice(0, 300)
+    small = median_scaled_trend(means[few], 2 * shape[few], everyone[few], 0.6 * shape[few])
+    np.testing.assert_allclose(small / shape[few], 0.6)
+    # the low-mean bins mostly clipped: dropped, the rest set the scale
+    clipped = 0.6 * shape.copy()
+    clipped[means < np.quantile(means, 0.2)] = 1e-8
+    np.testing.assert_allclose(median_scaled_trend(means, 2 * shape, everyone, clipped) / shape, 0.6)
+    # nothing usable: the trend unchanged
+    np.testing.assert_allclose(median_scaled_trend(means, shape, everyone, np.full(means.size, 1e-8)), shape)
+
+
+def test_the_moment_estimate_variance_matches_simulation():
+    """The MAP's likelihood width: the delta-method variance in the sample
+    variance and the sample mean (without the mean's share it was about
+    twice too large near one count per cell)."""
+    from crispyx.glm import _moment_variance
+
+    rng = np.random.default_rng(6)
+    n, n_genes = 500, 4000
+    for alpha, mean in ((0.3, 3.0), (0.2, 1.0)):
+        y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mean), (n, n_genes)).astype(np.float64)
+        base = _offset_baseline(iter([(np.arange(n), sp.csr_matrix(y))]), np.ones(n), np.zeros(n, int), 1, n_genes,
+                                dispersion=None, shrink=False)
+        model = _moment_variance(alpha, mean, n, n - 1)
+        assert 0.85 < base.dispersion_raw.var() / model < 1.15, (alpha, mean)

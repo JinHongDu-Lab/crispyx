@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Version 0.2.8
+-------------
+
+*Released 2026-11-21.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance, and text count tables convert to h5ad without being read into memory.
+
+**Added**
+
+* ``cx.read_csv`` and ``cx.read_text``: a text table of counts (``.gz`` and ``.bz2`` read as they are) streamed into an h5ad file, with the names, defaults and header rules of Scanpy's ``sc.read_csv`` / ``sc.read_text`` (``anndata.io``), which read the whole table into memory: a 1.2-million-cell table converts in the memory of one block of non-zeros. ``transpose=True`` takes the rows as genes, in place of Scanpy's ``.T``. The output carries crispyx's provenance, so the same call on the same file reuses it.
+
+**Changed**
+
+* ``cx.tl.nb_offset_test`` without ``covariates`` (with ``strata`` or without, one stratum) tests each gene at DESeq2's maximum a posteriori dispersion toward the mean-dispersion trend by default (new ``shrink_dispersion=True``, the name and default of ``nb_glm_test``), instead of at its method-of-moments estimate. Near 0.5 counts per cell the estimate's sampling SD is as large as typical dispersions, so a gene whose controls happened to vary less than Poisson was tested at the floor 1e-8, as Poisson, with too small a standard error: with 400 controls and every gene at dispersion 0.05, a quarter of the genes sat at the floor (17 of 300 with 3,000 controls), and none does now. The likelihood is the moment estimate's sampling distribution (the delta-method variance in the sample variance and the sample mean), so the controls are still read once. From 0.5 counts up the prior is centred on the parametric trend rescaled to the median of the estimates around it, in quantile bins of log mean (``crispyx.glm.median_scaled_trend``, the ``dispersion_trend`` layer there): the parametric fit follows the mean dispersion, which on a genome-wide screen's controls sat 1.6 times above the median of precise estimates and would have pulled floored genes 1.7 times too high; rescaled, they sit 1.25 times too high and their error is half to three fifths lower. Genes below 0.5 counts keep the unscaled trend, which on those controls was within 25% above their dispersions, where the rescaled one fell 20-35% below. ``dispersion_raw`` keeps the moment estimates, ``uns["dispersion_prior_var"]`` records the prior variance, and ``shrink_dispersion=False`` restores the unshrunk test. With ``covariates`` the parameter switches the MAP step of the controls' DESeq2 fit, which was always on.
+
 Version 0.2.7
 -------------
 
