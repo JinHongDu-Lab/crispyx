@@ -118,14 +118,12 @@ about 45 minutes per fit of 50.
 
 When each stratum holds thousands of control cells against a perturbation's
 handful, the controls dominate the stratum effects and the two fits agree.
-Measured before 0.2.8, when the offset test did not yet shrink its control
-dispersions: on a targeted iPSC-derived screen with every perturbation on the cell
-fallback, genes with a control mean of at least 0.5 counts per cell gave
-``beta`` correlation 0.9992, median \|Δbeta\| 0.0035 and a median standard
-error ratio of 0.99; over all tested genes the offset standard error is
-larger at low counts (median ratio 1.15), where ``nb_glm_test`` shrinks
-each comparison's dispersion toward its trend and the offset test used the
-control estimate, or below 0.5 counts the controls' trend. A stratum's control mean has a prior worth one count at
+On a targeted iPSC-derived cardiomyocyte screen with perturbations on the
+cell fallback (50 perturbations, 21,674 controls in 28 strata), genes with a
+control mean of at least 0.5 counts per cell gave ``beta`` correlation
+0.9992, median \|Δbeta\| 0.0034 and a median standard error ratio of 0.995
+(5th-95th percentile 0.94-1.09); over all tested genes the median ratio is
+0.997 (0.87-1.07). A stratum's control mean has a prior worth one count at
 the pooled control mean, ``m (sum y + 1) / (m sum s + 1)``: a rare gene that
 happens to have no count among a stratum's controls stays near the pooled
 mean, so a single count among the perturbed cells does not send ``beta``
