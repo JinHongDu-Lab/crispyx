@@ -4,7 +4,7 @@ Changelog
 Version 0.2.8
 -------------
 
-*Unreleased.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance.
+*Released 2026-11-21.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance.
 
 **Changed**
 
