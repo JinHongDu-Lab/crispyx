@@ -43,7 +43,7 @@ def _as_dense(path):
 
 @pytest.mark.parametrize("compressed", [False, True])
 def test_read_csv_matches_anndata(tmp_path, compressed, monkeypatch):
-    monkeypatch.setattr(cx_data, "_TEXT_BLOCK_NNZ", 50)  # several blocks
+    monkeypatch.setattr(cx_data, "_TEXT_BLOCK_LINES", 7)  # several blocks
     counts = _table(np.random.default_rng(0))
     source = tmp_path / ("t.csv.gz" if compressed else "t.csv")
     _write(source, counts)
@@ -56,7 +56,7 @@ def test_read_csv_matches_anndata(tmp_path, compressed, monkeypatch):
 
 
 def test_transpose_takes_rows_as_genes(tmp_path, monkeypatch):
-    monkeypatch.setattr(cx_data, "_TEXT_BLOCK_NNZ", 30)
+    monkeypatch.setattr(cx_data, "_TEXT_BLOCK_LINES", 4)
     counts = _table(np.random.default_rng(1), n_rows=30, n_cols=50)  # 30 genes x 50 cells
     _write(tmp_path / "g.csv.gz", counts)
     cx.read_csv(tmp_path / "g.csv.gz", output_path=tmp_path / "g.h5ad", transpose=True, verbose=False)
@@ -95,6 +95,32 @@ def test_ragged_lines_and_missing_delimiter_raise(tmp_path):
     (tmp_path / "tabs.tsv").write_text("a\tb\n1\t2\n")
     with pytest.raises(ValueError, match="delimiter"):
         cx.read_csv(tmp_path / "tabs.tsv", output_path=tmp_path / "t.h5ad", verbose=False)
+    # a value that does not parse, as anndata refuses it (and named for the function called)
+    (tmp_path / "bad.csv").write_text("a,b,c\nr0,1,2,3abc\nr1,4,5,6\n")
+    with pytest.raises(ValueError, match="read_csv: line 2 .*3abc"):
+        cx.read_csv(tmp_path / "bad.csv", output_path=tmp_path / "b.h5ad", verbose=False)
+    with pytest.raises(ValueError):
+        ad.io.read_csv(tmp_path / "bad.csv")
+    # a row name with no values
+    (tmp_path / "short.csv").write_text("a,b\nr0\nr1,1,2\n")
+    with pytest.raises(ValueError, match="line 2"):
+        cx.read_csv(tmp_path / "short.csv", output_path=tmp_path / "s.h5ad", first_column_names=True, verbose=False)
+
+
+def test_header_rules_follow_anndata(tmp_path):
+    cases = {
+        "empty_comment.txt": ("# g0 g1 g2\n#\n1 2 3\n4 5 6\n", None),
+        "integer_names.csv": ("1,2,3\n10,5,6,7\n11,8,9,0\n", ","),
+        "header_and_names.csv": ("x,y\nr0,1,2\nr1,3,4\n", ","),
+    }
+    for file, (text, delimiter) in cases.items():
+        (tmp_path / file).write_text(text)
+        expected = ad.io.read_text(tmp_path / file, delimiter=delimiter)
+        got = ad.read_h5ad(cx.read_text(tmp_path / file, output_path=tmp_path / f"{file}.h5ad", delimiter=delimiter,
+                                        verbose=False).path)
+        np.testing.assert_array_equal(got.X.toarray(), expected.X, err_msg=file)
+        assert list(got.obs_names) == list(expected.obs_names), file
+        assert list(got.var_names) == list(expected.var_names), file
 
 
 def test_the_output_is_reused_until_the_table_or_call_changes(tmp_path, capsys):
