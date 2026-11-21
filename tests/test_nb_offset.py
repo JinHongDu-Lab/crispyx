@@ -456,3 +456,70 @@ def test_controls_without_residual_degrees_of_freedom(tmp_path):
     got = _run(tmp_path / "u.h5ad", tmp_path / "o.h5ad", covariates=["batch"], dispersion=0.05,
                size_factor_method="deseq2", **NO_FILTERS)
     assert np.isfinite(got.X).all()
+
+
+def _near_poisson_screen(path: Path, n_ctrl=400, n_genes=300, alpha=0.05, seed=0):
+    """Every gene at dispersion ``alpha`` with control means just above 0.5,
+    where the moment estimate's sampling SD is about the dispersion itself."""
+    rng = np.random.default_rng(seed)
+    mu = rng.uniform(0.5, 1.5, n_genes)
+    labels = np.array(["control"] * n_ctrl + ["P1"] * 50)
+    s = rng.lognormal(0, 0.2, labels.size)
+    y = rng.poisson(rng.gamma(1 / alpha, alpha * np.outer(s, mu))).astype(np.float32)
+    obs = pd.DataFrame({"perturbation": labels, "stratum": np.where(np.arange(labels.size) % 2, "a", "b")},
+                       index=[f"c{i}" for i in range(labels.size)])
+    ad.AnnData(sp.csr_matrix(y), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])).write(path)
+
+
+def test_the_control_dispersion_is_shrunk_toward_the_trend(tmp_path):
+    """Unshrunk, a quarter of these genes have a sample variance below
+    Poisson and are tested at the floor 1e-8; the MAP keeps every gene near
+    the truth."""
+    _near_poisson_screen(tmp_path / "s.h5ad")
+    kwargs = dict(strata="stratum", lfc_base="ln", min_cells_ctrl=0, min_cells_pert=0, **NO_FILTERS)
+    shrunk = _run(tmp_path / "s.h5ad", tmp_path / "on.h5ad", **kwargs)
+    raw = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", shrink_dispersion=False, **kwargs)
+    dispersion = shrunk.layers["dispersion"][0]
+    assert dispersion.min() > 0.01
+    assert 0.03 < np.median(dispersion) < 0.1
+    assert 0.25 <= shrunk.uns["dispersion_prior_var"] < 1
+    # the gene-wise estimates and the trend are reported either way
+    np.testing.assert_allclose(shrunk.layers["dispersion_raw"], raw.layers["dispersion_raw"])
+    np.testing.assert_allclose(shrunk.layers["dispersion_trend"], raw.layers["dispersion_trend"])
+    unshrunk = raw.layers["dispersion"][0]
+    # (the few genes below 0.5 counts per unit size factor are at the trend)
+    assert (np.isclose(unshrunk, raw.layers["dispersion_raw"][0])
+            | np.isclose(unshrunk, raw.layers["dispersion_trend"][0])).all()
+    assert (unshrunk <= 1e-7).sum() > 30
+    assert np.isnan(raw.uns["dispersion_prior_var"])
+    # Poisson standard errors on the floored genes, wider ones once shrunk
+    floored = unshrunk <= 1e-7
+    assert (shrunk.layers["standard_error"][0][floored] > raw.layers["standard_error"][0][floored]).all()
+
+
+def test_the_map_leaves_precise_estimates_and_genes_far_above_the_trend():
+    """With thousands of controls the estimates hardly move; a gene far
+    above the trend keeps its own estimate (DESeq2's outlier rule)."""
+    rng = np.random.default_rng(4)
+    n, n_genes = 4000, 400
+    base = np.exp(rng.uniform(np.log(1), np.log(20), n_genes))
+    alpha = np.full(n_genes, 0.2)
+    alpha[:5] = 5.0
+    s = np.exp(rng.normal(0, 0.3, n))
+    strata = rng.integers(0, 4, n)
+    y = rng.negative_binomial(1 / alpha, 1 / (1 + alpha * s[:, None] * base)).astype(np.float64)
+    shrunk, raw = (_offset_baseline(iter([(np.arange(n), sp.csr_matrix(y))]), s, strata, 4, n_genes,
+                                    dispersion=None, shrink=shrink) for shrink in (True, False))
+    np.testing.assert_allclose(shrunk.dispersion[:5], raw.dispersion[:5])
+    np.testing.assert_allclose(shrunk.dispersion[5:], raw.dispersion[5:], rtol=0.15)
+
+
+def test_the_covariate_baseline_honours_shrink_dispersion(tmp_path):
+    _screen(tmp_path / "s.h5ad", n_ctrl=600, n_genes=40, n_pert=2)
+    kwargs = dict(covariates=["stratum"], lfc_base="ln", **NO_FILTERS)
+    shrunk = _run(tmp_path / "s.h5ad", tmp_path / "on.h5ad", **kwargs)
+    raw = _run(tmp_path / "s.h5ad", tmp_path / "off.h5ad", shrink_dispersion=False, **kwargs)
+    tested = np.isfinite(raw.layers["dispersion"][0])
+    np.testing.assert_allclose(raw.layers["dispersion"][0][tested], raw.layers["dispersion_raw"][0][tested])
+    assert not np.allclose(shrunk.layers["dispersion"][0][tested], shrunk.layers["dispersion_raw"][0][tested])
+    assert np.isfinite(shrunk.uns["dispersion_prior_var"]) and np.isnan(raw.uns["dispersion_prior_var"])

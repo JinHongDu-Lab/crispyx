@@ -2930,6 +2930,94 @@ def _log_residuals(genewise: np.ndarray, trend: np.ndarray, min_disp: float) -> 
     return log_resid, float((np.median(np.abs(resid - np.median(resid))) / _norm.ppf(0.75)) ** 2)
 
 
+def _moment_variance(alpha, mean, n_cells: int, df: int):
+    """Sampling variance of a method-of-moments dispersion estimate at
+    ``alpha``, for a gene of mean count ``mean`` over ``n_cells`` cells with
+    ``df`` residual degrees of freedom: the variance of a sample variance,
+    ``sigma^4 (2 / df + kappa / n)`` with ``sigma^2 = m + alpha m^2`` and the
+    NB excess kurtosis ``kappa = 6 alpha + 1 / (m (1 + alpha m))``, over
+    ``m^4``."""
+    var = mean + alpha * mean * mean
+    kurtosis = 6.0 * alpha + 1.0 / (mean * (1.0 + alpha * mean))
+    return var * var * (2.0 / df + kurtosis / n_cells) / mean ** 4
+
+
+def map_moment_dispersion(
+    estimate: ArrayLike,
+    mean: ArrayLike,
+    trend: ArrayLike,
+    n_cells: int,
+    df: int,
+    *,
+    min_disp: float = 1e-8,
+    max_disp: float = 10.0,
+    n_grid: int = 400,
+    block_genes: int = 4096,
+) -> tuple[np.ndarray, float]:
+    """DESeq2's maximum a posteriori dispersions for method-of-moments estimates.
+
+    The likelihood is the moment estimate's sampling distribution, normal
+    around ``alpha`` with the variance of :func:`_moment_variance`; the prior
+    is DESeq2's, log-normal around the trend, with variance the robust
+    variance of the log residuals of genes above ``100 * min_disp`` less
+    their median sampling variance on the log scale at the trend (the
+    analogue of DESeq2's ``trigamma((n - p) / 2)``), at least 0.25. A gene
+    whose estimate is more than two residual SDs above the trend keeps it,
+    as in DESeq2. The MAP is the minimum over ``n_grid`` points of log
+    alpha in ``[log min_disp, log max(max_disp, n_cells)]``, refined by a
+    parabola through the best point and its neighbours.
+
+    Parameters
+    ----------
+    estimate
+        Each gene's moment estimate, unclipped (it is below zero when the
+        sample variance is below the Poisson variance); finite.
+    mean
+        Each gene's mean count per cell (positive).
+    trend
+        The mean-dispersion trend at each gene (positive).
+    n_cells, df
+        Cells behind the estimates and their residual degrees of freedom.
+
+    Returns
+    -------
+    The dispersions to test at, and the prior variance.
+    """
+    est = np.asarray(estimate, dtype=np.float64)
+    m = np.asarray(mean, dtype=np.float64)
+    trend = np.asarray(trend, dtype=np.float64)
+    genewise = np.clip(est, min_disp, None)
+    if est.size == 0:
+        return genewise, float("nan")
+    log_resid, squared_logres = _log_residuals(genewise, trend, min_disp)
+    use = genewise >= 100 * min_disp
+    sampling = _moment_variance(trend, m, n_cells, df) / trend ** 2
+    expected = float(np.median(sampling[use])) if use.any() else 0.0
+    # 0.25 when no gene is above 100 * min_disp (fmax drops the NaN)
+    prior_var = float(np.fmax(squared_logres - expected, 0.25))
+
+    grid = np.linspace(np.log(min_disp), np.log(max(max_disp, float(n_cells))), n_grid)
+    step = grid[1] - grid[0]
+    alpha = np.exp(grid)[None, :]
+    map_disp = np.empty_like(est)
+    for start in range(0, est.size, block_genes):
+        sl = slice(start, start + block_genes)
+        var = _moment_variance(alpha, m[sl, None], n_cells, df)
+        objective = (0.5 * (est[sl, None] - alpha) ** 2 / var + 0.5 * np.log(var)
+                     + 0.5 * (grid[None, :] - np.log(trend[sl, None])) ** 2 / prior_var)
+        best = np.argmin(objective, axis=1)
+        inner = np.clip(best, 1, n_grid - 2)
+        rows = np.arange(inner.size)
+        f0, f1, f2 = (objective[rows, inner + k] for k in (-1, 0, 1))
+        curvature = f0 - 2.0 * f1 + f2
+        with np.errstate(divide="ignore", invalid="ignore"):
+            shift = np.where(curvature > 0, 0.5 * (f0 - f2) / curvature, 0.0)
+        # at an end of the grid the optimum is the bound itself
+        shift = np.where(best == inner, np.clip(shift, -1.0, 1.0), 0.0)
+        map_disp[sl] = np.exp(grid[best] + shift * step)
+    return np.where(log_resid > 2 * np.sqrt(squared_logres), genewise, map_disp), prior_var
+
+
 def column_parts(counts) -> list:
     """``counts`` -- a matrix, or a list of row blocks -- as a list of blocks
     whose columns slice cheaply: CSC when sparse (a CSC block is not copied)."""

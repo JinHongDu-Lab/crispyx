@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Version 0.2.8
+-------------
+
+*Unreleased.* The offset test's control dispersion is shrunk toward the trend, so no gene is tested as Poisson by chance.
+
+**Changed**
+
+* ``cx.tl.nb_offset_test`` with ``strata`` tests each gene at DESeq2's maximum a posteriori dispersion toward the mean-dispersion trend by default (new ``shrink_dispersion=True``, the name and default of ``nb_glm_test``), instead of at its method-of-moments estimate. Near 0.5 counts per cell the estimate's sampling SD is as large as typical dispersions, so a gene whose controls happened to vary less than Poisson was tested at the floor 1e-8, as Poisson, with too small a standard error: with 400 controls and every gene at dispersion 0.05, a quarter of the genes sat at the floor (17 of 300 with 3,000 controls), and none does now. The likelihood is the moment estimate's sampling distribution, so the controls are still read once. ``dispersion_raw`` keeps the moment estimates, ``uns["dispersion_prior_var"]`` records the prior variance, and ``shrink_dispersion=False`` restores the unshrunk test. With ``covariates`` the parameter switches the MAP step of the controls' DESeq2 fit, which was always on.
+
 Version 0.2.7
 -------------
 

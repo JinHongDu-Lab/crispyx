@@ -81,7 +81,7 @@ factor) and, unless ``dispersion`` is given, a control-only dispersion per
 gene (method of moments pooled over strata, each stratum's residuals about
 its own mean corrected for the degree of freedom that mean costs, so strata
 of two or three controls do not pull the estimate to the floor; the
-parametric trend ``a0 + a1 / mean`` fitted above 0.5 counts per cell and used below it, flat when the genes above show no rise toward low means: below that mean the gene-wise moment estimates are too noisy, about half clipping at zero with a few thousand controls). Each perturbation is then a one-parameter negative binomial
+parametric trend ``a0 + a1 / mean`` fitted above 0.5 counts per cell and used below it, flat when the genes above show no rise toward low means: below that mean the gene-wise moment estimates are too noisy, about half clipping at zero with a few thousand controls). Above 0.5 counts each gene is tested, by default, at DESeq2's maximum a posteriori dispersion toward the trend, with the moment estimate's sampling distribution as the likelihood: near that mean its sampling SD is as large as the dispersion, so an unshrunk gene whose controls vary less than Poisson would be tested at the floor 1e-8, as Poisson (``shrink_dispersion=False`` does that). Each perturbation is then a one-parameter negative binomial
 fit on its own cells, ``y_i ~ NB(s_i m_bg exp(beta), alpha_g)``, by Fisher
 scoring; the cost is linear in the perturbed cells, however many controls
 there are.
@@ -123,8 +123,8 @@ fallback, genes with a control mean of at least 0.5 counts per cell gave
 ``beta`` correlation 0.9992, median \|Δbeta\| 0.0035 and a median standard
 error ratio of 0.99; over all tested genes the offset standard error is
 larger at low counts (median ratio 1.15), where ``nb_glm_test`` shrinks
-each comparison's dispersion toward its trend and the offset test uses the
-control estimate. A stratum's control mean has a prior worth one count at
+each comparison's dispersion toward its trend and the offset test (before
+0.2.8) used the unshrunk control estimate. A stratum's control mean has a prior worth one count at
 the pooled control mean, ``m (sum y + 1) / (m sum s + 1)``: a rare gene that
 happens to have no count among a stratum's controls stays near the pooled
 mean, so a single count among the perturbed cells does not send ``beta``
