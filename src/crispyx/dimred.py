@@ -43,9 +43,6 @@ PCA_METHODS = ("covariance", "incremental")
 #: Share of the memory budget PCA plans to use: the process holds other
 #: things, and the formulas below are fitted, not exact.
 _PCA_BUDGET_FRACTION = 0.5
-#: ``auto`` takes the covariance method when its g x g matrix fits in this
-#: share of the planned memory, leaving the rest for chunks.
-_COVARIANCE_SHARE = 0.5
 #: Fixed peak above the pre-call size, measured: HDF5 buffers and read blocks.
 _PCA_OVERHEAD_BYTES = 64e6
 
@@ -89,8 +86,9 @@ def _pca_chunk_size(
 ) -> tuple[int, str]:
     """Chunk size and method for :func:`pca` within ``memory_limit_gb``.
 
-    ``auto`` takes the exact covariance method when its g x g float64 matrix
-    fits in a quarter of the budget, IncrementalPCA otherwise. The chunk is
+    ``auto`` takes the exact covariance method whenever its peak at
+    ``min_chunk`` fits in half the budget, and IncrementalPCA (approximate
+    and slower) only when it does not. The chunk is
     ``max_chunk`` unless its peak (:func:`_pca_peak_bytes`) exceeds half the
     budget, then the largest that fits: on any machine with the memory, the
     same file gets the same chunk, and so the same IncrementalPCA result. A forced
@@ -102,15 +100,16 @@ def _pca_chunk_size(
     budget = _resolve_memory_limit_bytes(memory_limit_gb)
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars
-    if method == "auto":
-        method = "covariance" if covariance_bytes <= _COVARIANCE_SHARE * usable else "incremental"
 
-    def peak(chunk: int) -> float:
+    def peak(chunk: int, method: str) -> float:
         return _pca_peak_bytes(method, n_vars, n_comps, chunk, n_obs_in_memory, read_row_bytes)
 
-    if method == "covariance" and peak(min_chunk) > budget:
+    if method == "auto":
+        method = "covariance" if peak(min_chunk, "covariance") <= usable else "incremental"
+
+    if method == "covariance" and peak(min_chunk, method) > budget:
         raise MemoryError(
-            f"PCA with method='covariance' on {n_vars} genes needs {peak(min_chunk) / 1e9:.1f} GB "
+            f"PCA with method='covariance' on {n_vars} genes needs {peak(min_chunk, method) / 1e9:.1f} GB "
             f"(a {covariance_bytes / 1e9:.1f} GB gene x gene matrix), over the "
             f"{budget / 1e9:.1f} GB memory budget. Use method='incremental', or restrict PCA to "
             "highly variable genes (cx.pp.highly_variable_genes, use_highly_variable=True)."
@@ -119,12 +118,12 @@ def _pca_chunk_size(
     lo, hi = min_chunk, max_chunk
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        lo, hi = (mid, hi) if peak(mid) <= usable else (lo, mid - 1)
+        lo, hi = (mid, hi) if peak(mid, method) <= usable else (lo, mid - 1)
     chunk = lo
     if chunk < max_chunk:
         logger.info(f"PCA: chunk lowered to {chunk} to fit the memory budget")
     logger.info(
-        f"PCA: method={method}, chunk={chunk}, peak ~{peak(chunk) / 1e9:.2f} GB "
+        f"PCA: method={method}, chunk={chunk}, peak ~{peak(chunk, method) / 1e9:.2f} GB "
         f"of a {budget / 1e9:.1f} GB budget ({n_vars} genes, {n_comps} components)"
     )
     return chunk, method
@@ -319,9 +318,9 @@ def pca(
     n_comps
         Number of principal components to compute. Default 50.
     method
-        - ``'auto'``: ``'covariance'`` when its gene x gene matrix fits in a
-          quarter of the memory budget, else ``'incremental'``. The choice
-          depends on the budget; pass the method to fix it across machines.
+        - ``'auto'``: ``'covariance'`` whenever it fits in half the memory
+          budget, ``'incremental'`` only when it does not. The choice depends
+          on the budget; pass the method to fix it across machines.
         - ``'covariance'``: exact PCA from the gene x gene covariance (one
           ``8 g²``-byte matrix, g = genes entering PCA). Raises
           :class:`MemoryError` up front when that does not fit.

@@ -261,9 +261,9 @@ PCA streams the cells twice (fit, then project) with one of two methods:
   components matched an exact PCA (largest subspace angle 0.4°); later
   components, in the noise where eigenvalues differ by a few percent, did
   not, and change with ``chunk_size``.
-* **Automatic selection** (``method='auto'``, default): covariance when its
-  matrix fits in a quarter of ``memory_limit_gb`` (detected when not given),
-  incremental otherwise. The chunk is 4,096 cells unless that does not fit
+* **Automatic selection** (``method='auto'``, default): covariance whenever
+  its peak fits in half of ``memory_limit_gb`` (detected when not given), and
+  incremental only when it does not. The chunk is 4,096 cells unless that does not fit
   in half the budget; ``uns['pca']`` records the method and chunk used.
 
 Neither method is randomized: the same file, method and chunk give the same

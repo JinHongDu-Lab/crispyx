@@ -68,9 +68,10 @@ def backed(tmp_path):
     [
         (5_000, dict(memory_limit_gb=32), "covariance"),     # 0.2 GB matrix
         (50_000, dict(memory_limit_gb=16), "incremental"),   # 20 GB matrix
+        (16_000, dict(memory_limit_gb=8), "covariance"),     # 2 GB matrix: fits, so the exact method
         (5_000, dict(memory_limit_gb=32, method="incremental"), "incremental"),
     ],
-    ids=["auto-small", "auto-large", "explicit"],
+    ids=["auto-small", "auto-large", "auto-fits", "explicit"],
 )
 def test_pca_chunk_size_selects_method(n_vars, kwargs, expected_method):
     chunk_size, method = _pca_chunk_size(n_vars, 50, **kwargs)
