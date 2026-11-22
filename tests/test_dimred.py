@@ -97,9 +97,47 @@ def test_covariance_pca_matches_sklearn(dense):
     cx.pp.pca(adata, n_comps=10, method="covariance", chunk_size=64, show_progress=False)
     ref = PCA(10, svd_solver="full").fit(X)
     np.testing.assert_allclose(adata.uns["pca"]["variance_ratio"], ref.explained_variance_ratio_, atol=1e-12)
+    np.testing.assert_allclose(adata.uns["pca"]["variance"], ref.explained_variance_, rtol=1e-10)  # n - 1
     _assert_same_up_to_sign(adata.varm["PCs"], ref.components_.T, atol=1e-6)  # stored as float32
     _assert_same_up_to_sign(adata.obsm["X_pca"], ref.transform(X), rtol=1e-5, atol=1e-5)
     assert adata.uns["pca"]["method"] == "covariance"
+    assert adata.uns["pca"]["chunk_size"] == 64
+
+
+@pytest.mark.parametrize("method", ["covariance", "incremental"])
+def test_components_have_a_canonical_sign(method):
+    """scikit-learn's convention: each component's largest loading is
+    positive, whatever sign LAPACK returned, so X_pca is the same on any
+    BLAS."""
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=10, method=method, chunk_size=64, use_highly_variable=False, show_progress=False)
+    pcs = adata.varm["PCs"]
+    assert np.all(pcs[np.argmax(np.abs(pcs), axis=0), np.arange(pcs.shape[1])] > 0)
+
+
+def test_covariance_pca_is_exact_for_genes_with_large_means():
+    """E[x²] - E[x]² cancels for a gene whose mean dwarfs its spread; the
+    accumulation shifts by the first chunk's means first."""
+    X = _counts().astype(np.float64)
+    X[:, :5] += 1e7
+    fit = _fit_pca(sparse.csr_matrix(X), "covariance", 10, 64, None, show_progress=False)
+    ref = PCA(10, svd_solver="full").fit(X)
+    np.testing.assert_allclose(fit["variance_ratio"], ref.explained_variance_ratio_, rtol=1e-8)
+    _assert_same_up_to_sign(fit["components"].T, ref.components_.T, atol=1e-7)
+
+
+def test_covariance_pca_does_not_depend_on_the_chunk():
+    matrix = sparse.csr_matrix(_counts())
+    a, b = (_fit_pca(matrix, "covariance", 10, chunk, None, show_progress=False) for chunk in (64, 400))
+    np.testing.assert_allclose(a["components"], b["components"], atol=1e-12)
+    np.testing.assert_allclose(a["variance"], b["variance"], rtol=1e-12)
+
+
+def test_default_chunk_does_not_depend_on_free_memory():
+    """With the memory to spare, the chunk (which IncrementalPCA's result
+    depends on) is the same on every machine."""
+    chunks = {_pca_chunk_size(2_000, 50, memory_limit_gb=gb, method="incremental")[0] for gb in (4, 16, 256)}
+    assert chunks == {4096}
 
 
 def test_incremental_pca_matches_sklearn_on_leading_components(backed):

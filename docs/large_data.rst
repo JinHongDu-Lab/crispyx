@@ -248,82 +248,82 @@ incremental, each plus 64 MB of fixed overhead; k = 50):
    * - 2,000
      - covariance
      - 512
-     - 94 MB
-     - 75 MB
+     - 91 MB
+     - 96 MB
      - 112 MB
    * - 2,000
      - covariance
      - 2,048
-     - 162 MB
-     - 161 MB
+     - 146 MB
+     - 157 MB
      - 162 MB
    * - 2,000
      - incremental
      - 512
-     - 88 MB
-     - 101 MB
+     - 90 MB
+     - 105 MB
      - 130 MB
    * - 2,000
      - incremental
      - 2,048
-     - 358 MB
-     - 360 MB
+     - 403 MB
+     - 439 MB
      - 415 MB
    * - 5,000
      - covariance
      - 512
-     - 267 MB
-     - 292 MB
+     - 289 MB
+     - 298 MB
      - 305 MB
    * - 5,000
      - covariance
      - 2,048
-     - 366 MB
-     - 371 MB
+     - 372 MB
+     - 395 MB
      - 428 MB
    * - 5,000
      - incremental
      - 512
-     - 211 MB
-     - 217 MB
+     - 197 MB
+     - 215 MB
      - 215 MB
    * - 5,000
      - incremental
      - 2,048
-     - 630 MB
-     - 633 MB
+     - 664 MB
+     - 676 MB
      - 729 MB
    * - 10,000
      - covariance
      - 512
-     - 898 MB
-     - 901 MB
+     - 891 MB
+     - 921 MB
      - 946 MB
    * - 10,000
      - covariance
      - 2,048
-     - 946 MB
-     - 991 MB
+     - 969 MB
+     - 1,053 MB
      - 1,192 MB
    * - 10,000
      - incremental
      - 512
-     - 327 MB
-     - 329 MB
+     - 323 MB
+     - 343 MB
      - 355 MB
    * - 10,000
      - incremental
      - 2,048
-     - 1,128 MB
-     - 1,142 MB
+     - 1,165 MB
+     - 1,197 MB
      - 1,254 MB
 
 The peak does not grow with the cells: 50,000 and 200,000 cells agree within
-a few percent. The formula is never more than 1% below a measurement and at
-most 26% above it, except at 2,000 genes with 512-cell chunks (up to 50%
-above), where the fixed overhead dominates.
-``neighbors`` measured 0.43 GB at 50,000 cells and 1.35 GB at 200,000;
-``umap`` 0.27 GB and 1.18 GB.
+a few percent. The formula is at most 6% below a measurement and up to 45%
+above it, most at 2,000 genes with 512-cell chunks, where the fixed overhead
+dominates.
+``neighbors`` measured 0.41 GB at 50,000 cells and 1.26 GB at 200,000;
+``umap`` 0.27 GB and 1.17 GB.
 
 .. _disk-space:
 

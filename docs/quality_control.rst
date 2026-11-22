@@ -256,10 +256,22 @@ PCA streams the cells twice (fit, then project) with one of two methods:
   it suits HVGs. Forced on a gene set whose matrix exceeds the memory budget,
   it raises ``MemoryError`` before reading the data.
 * **IncrementalPCA** (``method='incremental'``): scikit-learn's approximate
-  streaming PCA, memory linear in the genes.
+  streaming PCA, memory linear in the genes, and 5-7 times slower than
+  covariance. On 200,000 simulated cells with 30 programs its first 30
+  components matched an exact PCA (largest subspace angle 0.4°); later
+  components, in the noise where eigenvalues differ by a few percent, did
+  not, and change with ``chunk_size``.
 * **Automatic selection** (``method='auto'``, default): covariance when its
   matrix fits in a quarter of ``memory_limit_gb`` (detected when not given),
-  incremental otherwise. The chunk is the largest whose peak fits in half.
+  incremental otherwise. The chunk is 4,096 cells unless that does not fit
+  in half the budget; ``uns['pca']`` records the method and chunk used.
+
+Neither method is randomized: the same file, method and chunk give the same
+result on every run. Covariance gives the same result at any chunk size and
+thread count (scores within 1e-7), and matches an exact PCA to float32
+precision. Components follow scikit-learn's sign convention (each one's
+largest loading positive), and ``uns['pca']['variance']`` is the sample
+variance, as in Scanpy.
 
 Restrict PCA to highly variable genes (``cx.pp.highly_variable_genes`` first,
 ``use_highly_variable=True``, the default): without a ``highly_variable``
