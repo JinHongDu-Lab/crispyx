@@ -1,6 +1,30 @@
 Changelog
 =========
 
+Version 0.2.9
+-------------
+
+*Unreleased.* PCA holds one gene x gene matrix instead of about four, sizes itself from ``memory_limit_gb``, and writes its scores to the file as it goes; the docs gain a memory model for every streaming function.
+
+**Changed**
+
+* ``cx.pp.pca(method="covariance")``, renamed from ``"sparse_cov"`` (it densified each chunk; nothing about it was sparse), accumulates ``XᵀX`` in place with BLAS ``syrk`` in float64, centres it in column blocks and hands it to ``eigh`` to overwrite, so it holds one ``8 × genes²``-byte matrix where the old code held about 3.4 (the matrix, ``XᵀX / n``, the mean outer product and ``eigh``'s copy): on 20,000 cells x 4,000 genes the peak falls from 429 MB to 292 MB, and at 33,000 genes from about 30 GB to 8.7 GB. The covariance was summed in the input's float32 before; it is float64 throughout now.
+* ``cx.pp.pca`` takes ``memory_limit_gb`` like the rest of crispyx and picks its method and chunk size from a stated peak (``8 g² + 16 c g`` bytes plus 64 MB for covariance, ``50 (c + k) g + 32 (c + k)²`` plus 64 MB for incremental, never more than 1% below the peaks measured on a Linux server, and at most 26% above them beyond the smallest runs): covariance when its matrix fits in a quarter of the budget, and the largest chunk whose peak fits in half. Forcing ``method="covariance"`` on a gene set whose matrix exceeds the budget raises ``MemoryError`` before any data is read, naming the size and the alternatives, instead of the job being killed partway.
+* On a crispyx backed file ``cx.pp.pca`` writes ``obsm["X_pca"]`` a chunk at a time (to a temporary key, renamed when complete), so its memory no longer grows with the number of cells; it reads ``.X`` through h5py rather than opening the file with anndata, which reads every layer into memory.
+* ``cx.pp.pca(method="incremental")`` joins a final chunk shorter than ``n_comps`` to the one before it; it was left out of the fit.
+
+**Fixed**
+
+* ``cx.pp.pca``, ``cx.pp.neighbors`` and ``cx.tl.umap`` given a path opened it as anndata's backed object and stored their results in its memory, where they were lost: they now open it as a crispyx backed file and write the results into it.
+
+**Removed**
+
+* ``crispyx.data.calculate_pca_chunk_size``; PCA's sizing lives in ``crispyx.dimred``.
+
+**Documentation**
+
+* :ref:`memory-model` lists, for each streaming function, what its peak memory grows with and whether ``memory_limit_gb`` bounds it, including the terms that still grow with the screen. The installation, NB-GLM, QC and README pages no longer claim memory independent of the dataset where the code does not bound it.
+
 Version 0.2.8
 -------------
 

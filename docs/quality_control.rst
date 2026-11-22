@@ -183,9 +183,9 @@ Two flavors are available via ``flavor=``:
   data**; needs no extra dependency (``scikit-misc``, used only by
   ``"seurat_v3"``'s LOESS fit).
 
-Both flavors stream the data in ``O(n_genes)`` memory, dispatching on
-storage format the same way the QC functions do (row-chunked for
-CSR/dense, column-chunked for CSC), and write ``var["highly_variable"]``,
+Both flavors stream the data a chunk at a time (rows × genes for CSR/dense,
+cells × a few genes for CSC), dispatching on storage format the same way
+the QC functions do, and write ``var["highly_variable"]``,
 ``var["means"]``, ``var["variances"]``, and ``var["variances_norm"]`` back
 to the file.
 
@@ -248,14 +248,23 @@ Plot the embedding:
    # Gene loadings for top components
    cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
 
-The PCA implementation uses a hybrid approach:
+PCA streams the cells twice (fit, then project) with one of two methods:
 
-* **Sparse covariance** (``method='sparse_cov'``): ~5× faster for datasets with
-  ≤15K genes. Exploits sparsity in the Xᵀ @ X computation.
-* **IncrementalPCA** (``method='incremental'``): Lower memory for datasets with
-  >15K genes. Uses sklearn's streaming PCA with partial_fit().
-* **Automatic selection** (``method='auto'``, default): Chooses the optimal method
-  based on gene count and available memory.
+* **Covariance** (``method='covariance'``): exact PCA from the gene × gene
+  covariance, accumulated in place with BLAS. It holds one ``8 × genes²``-byte
+  matrix (32 MB for 2,000 HVGs, 2 GB for 16,000 genes, 8.7 GB for 33,000), so
+  it suits HVGs. Forced on a gene set whose matrix exceeds the memory budget,
+  it raises ``MemoryError`` before reading the data.
+* **IncrementalPCA** (``method='incremental'``): scikit-learn's approximate
+  streaming PCA, memory linear in the genes.
+* **Automatic selection** (``method='auto'``, default): covariance when its
+  matrix fits in a quarter of ``memory_limit_gb`` (detected when not given),
+  incremental otherwise. The chunk is the largest whose peak fits in half.
+
+Restrict PCA to highly variable genes (``cx.pp.highly_variable_genes`` first,
+``use_highly_variable=True``, the default): without a ``highly_variable``
+column it runs on every gene. The peak memory of each step is in
+:ref:`memory-model`.
 
 PCA results are stored in:
 
@@ -269,7 +278,8 @@ KNN results are stored in:
 * ``adata.obsp['connectivities']``: Sparse connectivity matrix (UMAP-style)
 * ``adata.uns['neighbors']``: Parameters dict
 
-**Close-Write-Reopen Pattern**: When using ``cx.read_h5ad_ondisk()`` to load
-backed data, PCA and neighbors results are written directly to the h5ad file.
-This keeps ``.X`` on disk while persisting embeddings, loadings, and neighbor
-graphs for later use. No ``copy=True`` is needed in typical workflows.
+**Results go to the file**: on a file opened with ``cx.read_h5ad_ondisk()``,
+or given as a path, PCA, neighbors and UMAP write their results into the h5ad
+file. PCA writes ``X_pca`` a chunk at a time, so its memory does not grow with
+the number of cells. ``copy=True`` instead loads the whole file into memory
+and returns it, as Scanpy's ``copy`` does.

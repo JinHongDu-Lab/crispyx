@@ -114,7 +114,8 @@ NB-GLM then streams the CSR file:
 * Without covariates, the control cells are summarised in one pass, 4,096 at
   a time (each gene's count histogram and size-factor-binned moments), and
   every comparison is fitted against that summary. Peak memory is
-  O(chunk_size × n_genes), not O(n_control × n_genes).
+  O(chunk_size × n_genes) plus the largest perturbation's cells, not
+  O(n_control × n_genes).
 * With covariates, the control cells are held in memory.
 
 After each streaming phase,
@@ -133,6 +134,196 @@ still reads from memory.
    If ``nb_glm_test()`` detects CSC storage, it emits a ``UserWarning``
    advising conversion to CSR. In the benchmark pipeline, CSR conversion
    is handled automatically via the ``crispyx_standardize_csr`` step.
+
+.. _memory-model:
+
+Memory model
+------------
+
+crispyx aims for memory you can predict before a run: each step holds a chunk
+of cells or genes rather than the matrix, and where it takes
+``memory_limit_gb`` (detected from the machine or the job when not given; on
+a Slurm job set it to ``--mem``) it sizes that chunk from it. Some terms still
+grow with the screen. The table says, for each streaming function, what its
+peak grows with beyond the chunk, so a run can be sized from the file's shape.
+
+Notation: n cells, g genes, c cells (or genes) per chunk, P perturbations,
+B batches or strata, k principal components.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 46 32
+
+   * - Function
+     - Peak beyond the chunk
+     - Sized from ``memory_limit_gb``
+   * - ``qc_summary``
+     - Reads the whole file into memory when its estimate is below
+       ``min(0.6 × budget, 50 GB)``; streams otherwise. On CSC, chunks are
+       n × c.
+     - In-memory switch, chunk size
+   * - ``filter_cells`` / ``filter_genes``, ``downsample_counts``
+     - O(n) per-cell arrays. A CSC file is re-read whole for every row
+       chunk; convert it to CSR first.
+     - No
+   * - ``normalize_total_log1p``, ``collapse_genes``
+     - O(n) per-cell arrays.
+     - No (a CSC conversion uses half the detected memory)
+   * - ``highly_variable_genes``
+     - Two g-length accumulators; on CSC, chunks are n × c.
+     - No
+   * - ``sort_by_perturbation``, ``convert_to_csc`` / ``convert_to_csr``
+     - Output bands of at most half the budget; O(n) indices.
+     - Band size
+   * - ``read_csv`` / ``read_text``
+     - One parsed block; O(n) row names.
+     - Block size
+   * - ``aggregate_pseudobulk``
+     - P × g sums in a memory-mapped file on disk.
+     - Chunk size
+   * - ``compute_normalized_effects``
+     - Up to five P × g float64 result arrays in memory, written at the end.
+     - Chunk size, pair sums in memory or on disk
+   * - ``t_test``
+     - P × g sums, sums of squares and counts (20 bytes per entry:
+       12.6 GB at 18,000 perturbations × 35,000 genes).
+     - Cell chunk size
+   * - ``wilcoxon_test``
+     - A dense n × c block of genes and two copies; c is at least 32, so at
+       least 32 × n × 12 bytes whatever the budget.
+     - Gene chunk width
+   * - ``nb_glm_test``
+     - Without covariates: a summary of the controls plus the largest
+       perturbation's cells. With covariates, apeGLM or
+       ``targets_per_fit > 1``: the control cells, sparse, and a dense
+       block of at least 64 genes per fit.
+     - Worker count, gene block
+   * - ``nb_offset_test``
+     - Without covariates: B × g baselines. With covariates: the control
+       cells, sparse, and an n × covariates design.
+     - Gene and cell blocks
+   * - ``residual_effects``
+     - Three P × g float64 arrays; raises ``MemoryError`` up front when they
+       do not fit.
+     - Chunk size, the check
+   * - ``shrink_lfc``
+     - ``method="stats"``: P × g estimates, cached when they fit in a
+       quarter of the budget. ``method="full"``: every control cell, dense
+       (controls × g).
+     - ``"stats"``: the cache; ``"full"``: worker count only
+   * - ``batch_process``
+     - One reducer state per (group, batch) pair for a c-gene chunk.
+     - Gene chunk width (pair states not counted)
+   * - ``pca``
+     - ``method="covariance"``: one g × g float64 matrix, ``8 g²`` bytes
+       (32 MB at 2,000 genes, 8.7 GB at 33,000). ``"incremental"``: none.
+       The scores go to the file a chunk at a time; returned in memory
+       (``4 n k`` bytes) only for an in-memory AnnData.
+     - Method and chunk size; ``"covariance"`` raises ``MemoryError`` when
+       its matrix cannot fit
+   * - ``neighbors``, ``umap``
+     - The embedding and the k-NN graph, in memory: about 7-9 KB per cell
+       for ``neighbors`` and 6 KB for ``umap`` (50 components, 15
+       neighbors; measured).
+     - No
+   * - Any function with ``copy=True``
+     - The whole file, as Scanpy's ``copy`` does.
+     - No
+
+PCA's peak, measured on a Linux server (synthetic log-normalised data,
+10% non-zero, peak resident memory above the process's size before the call,
+16 BLAS threads), against the formula ``pca`` sizes itself with
+(``8 g² + 16 c g`` bytes for covariance, ``50 (c + k) g + 32 (c + k)²`` for
+incremental, each plus 64 MB of fixed overhead; k = 50):
+
+.. list-table::
+   :header-rows: 1
+
+   * - Genes
+     - Method
+     - Chunk
+     - 50,000 cells
+     - 200,000 cells
+     - Formula
+   * - 2,000
+     - covariance
+     - 512
+     - 94 MB
+     - 75 MB
+     - 112 MB
+   * - 2,000
+     - covariance
+     - 2,048
+     - 162 MB
+     - 161 MB
+     - 162 MB
+   * - 2,000
+     - incremental
+     - 512
+     - 88 MB
+     - 101 MB
+     - 130 MB
+   * - 2,000
+     - incremental
+     - 2,048
+     - 358 MB
+     - 360 MB
+     - 415 MB
+   * - 5,000
+     - covariance
+     - 512
+     - 267 MB
+     - 292 MB
+     - 305 MB
+   * - 5,000
+     - covariance
+     - 2,048
+     - 366 MB
+     - 371 MB
+     - 428 MB
+   * - 5,000
+     - incremental
+     - 512
+     - 211 MB
+     - 217 MB
+     - 215 MB
+   * - 5,000
+     - incremental
+     - 2,048
+     - 630 MB
+     - 633 MB
+     - 729 MB
+   * - 10,000
+     - covariance
+     - 512
+     - 898 MB
+     - 901 MB
+     - 946 MB
+   * - 10,000
+     - covariance
+     - 2,048
+     - 946 MB
+     - 991 MB
+     - 1,192 MB
+   * - 10,000
+     - incremental
+     - 512
+     - 327 MB
+     - 329 MB
+     - 355 MB
+   * - 10,000
+     - incremental
+     - 2,048
+     - 1,128 MB
+     - 1,142 MB
+     - 1,254 MB
+
+The peak does not grow with the cells: 50,000 and 200,000 cells agree within
+a few percent. The formula is never more than 1% below a measurement and at
+most 26% above it, except at 2,000 genes with 512-cell chunks (up to 50%
+above), where the fixed overhead dominates.
+``neighbors`` measured 0.43 GB at 50,000 cells and 1.35 GB at 200,000;
+``umap`` 0.27 GB and 1.18 GB.
 
 .. _disk-space:
 
