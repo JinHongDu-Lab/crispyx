@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import tracemalloc
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from crispyx.data import (
     write_uns_dict_to_h5ad,
     write_varm_to_h5ad,
 )
-from crispyx.dimred import _fit_pca, _pca_chunk_size, _pca_peak_bytes, neighbors, umap
+from crispyx.dimred import _fit_pca, _pca_chunk_size, _pca_peak_bytes, _pca_scratch_path, neighbors, umap
 
 
 def _counts(n_obs: int = 400, n_vars: int = 60, seed: int = 0) -> np.ndarray:
@@ -150,7 +151,8 @@ def test_backed_pca_memory_does_not_grow_with_the_cells(tmp_path):
         )
         with h5py.File(path, "r") as f:
             assert f["obsm/X_pca"].shape == (n_obs, n_comps)
-            assert list(f["obsm"]) == ["X_pca"]  # no partial dataset left behind
+            assert list(f["obsm"]) == ["X_pca"]
+        assert not _pca_scratch_path(path).exists()
     assert peaks[80_000] - peaks[20_000] < 0.5 * 60_000 * n_comps * 4
 
 
@@ -179,6 +181,53 @@ def test_pca_writes_results_to_the_backed_file(tmp_path, use_highly_variable):
     assert info["n_comps"] == 8
     assert bool(info["use_highly_variable"]) is use_highly_variable
     np.testing.assert_allclose(info["variance_ratio"], ref.explained_variance_ratio_, rtol=1e-4)
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_pca_leaves_an_in_memory_matrix_untouched(order):
+    """Rows of a dense float64 X can reach the projection as views (a one-row
+    tail chunk, or a Fortran-ordered X in one chunk); centring must not write
+    through them."""
+    X = np.asarray(np.random.default_rng(0).random((257, 50)), order=order)
+    adata = ad.AnnData(X.copy(order=order))
+    cx.pp.pca(adata, n_comps=5, chunk_size=256 if order == "C" else 512, use_highly_variable=False, show_progress=False)
+    np.testing.assert_array_equal(adata.X, X)
+
+
+def test_pca_on_a_linked_file_with_a_read_only_source(tmp_path):
+    """A standardized file's X is an external link: PCA writes to the linked
+    file and only reads the source, which may be read-only."""
+    from crispyx.data import _write_linked_h5ad
+
+    source, linked = tmp_path / "source.h5ad", tmp_path / "linked.h5ad"
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    adata.write(source)
+    _write_linked_h5ad(source, linked, obs=adata.obs, var=adata.var, uns={})
+    source.chmod(0o444)
+    try:
+        if os.access(source, os.W_OK):
+            pytest.skip("running as a user who can write a read-only file")
+        cx.pp.pca(cx.AnnData(linked), n_comps=5, show_progress=False)
+    finally:
+        source.chmod(0o644)
+    assert ad.read_h5ad(linked).obsm["X_pca"].shape == (400, 5)
+
+
+def test_interrupted_pca_leaves_the_file_as_it_was(tmp_path, monkeypatch):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    before = ad.read_h5ad(path).obsm["X_pca"]
+
+    def fail(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("crispyx.dimred._project", fail)
+    with pytest.raises(KeyboardInterrupt):
+        cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    with h5py.File(path, "r") as f:
+        assert list(f["obsm"]) == ["X_pca"]
+    assert not _pca_scratch_path(path).exists()
+    np.testing.assert_array_equal(ad.read_h5ad(path).obsm["X_pca"], before)
 
 
 def test_pca_on_a_path_writes_to_the_file(tmp_path):

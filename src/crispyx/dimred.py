@@ -3,27 +3,15 @@
 Streaming PCA, and neighbor and UMAP computation on the PCA embedding,
 following Scanpy-style API patterns.
 
-Memory
-------
-With g genes entering PCA, k components, c cells per chunk and n cells:
-
-* ``pca(method="covariance")`` holds one g x g float64 matrix plus a chunk:
-  about ``8 g² + 16 c g`` bytes plus 64 MB (:func:`_pca_peak_bytes`).
-* ``pca(method="incremental")`` holds a chunk and scikit-learn's
-  ``IncrementalPCA`` state, about ``50 (c + k) g + 32 (c + k)²`` bytes plus
-  64 MB.
-* On a crispyx backed file the scores are written to ``obsm['X_pca']`` a chunk
-  at a time; otherwise the returned ``X_pca`` adds ``4 n k`` bytes.
-* ``neighbors`` and ``umap`` hold the embedding and the k-NN graph in memory:
-  O(n (k + n_neighbors)), never cells x genes; measured, about 7-9 KB per
-  cell for ``neighbors`` and 6 KB for ``umap`` at 50 components.
-* ``copy=True`` loads the whole file into memory, as Scanpy's ``copy`` does.
+PCA's peak memory is :func:`_pca_peak_bytes`; every step's is in the docs'
+memory model (docs/large_data.rst, ``memory-model``).
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import h5py
@@ -163,9 +151,12 @@ def _dense_blocks(
         for slc, block in iter_matrix_chunks(None, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False):
             if gene_indices is not None:
                 block = block[:, gene_indices]
+            # Always a fresh array: callers centre it in place, and a dense
+            # input's rows may otherwise be returned as a view of adata.X.
             if sparse.issparse(block):
-                block = block.toarray(order="F")
-            block = np.asarray(block, dtype=np.float64, order="F")
+                block = np.asarray(block.toarray(order="F"), dtype=np.float64, order="F")
+            else:
+                block = np.array(block, dtype=np.float64, order="F", copy=True)
             bar.update(slc.stop - slc.start)
             if slc.start == hold_start:
                 held = (slc, block)
@@ -247,9 +238,22 @@ def _project(matrix, fit: dict, chunk_size: int, gene_indices: np.ndarray | None
         out[slc] = (block @ components_t).astype(np.float32)
 
 
+def _pca_scratch_path(path) -> Path:
+    path = Path(path)
+    return path.with_name(f".{path.name}.X_pca.partial")
+
+
 def _open_x(f: h5py.File):
-    elem = f["X"]
-    return sparse_dataset(elem) if isinstance(elem, h5py.Group) else elem
+    """``X`` of a file open for writing, read-only through an external link
+    (a standardized file's ``X`` is one): HDF5 would otherwise open the link's
+    source with the parent's write access, which fails on a read-only source
+    or one already open for reading."""
+    lapl = h5py.h5p.create(h5py.h5p.LINK_ACCESS)
+    lapl.set_elink_acc_flags(h5py.h5f.ACC_RDONLY)
+    oid = h5py.h5o.open(f.id, b"X", lapl=lapl)
+    if isinstance(oid, h5py.h5g.GroupID):
+        return sparse_dataset(h5py.Group(oid))
+    return h5py.Dataset(oid)
 
 
 def pca(
@@ -355,20 +359,26 @@ def pca(
         fit =_fit_pca(matrix, selected_method, n_comps, chunk_size, gene_indices, show_progress)
 
         if stream:
-            obsm = f.require_group("obsm")
-            partial = ".X_pca.partial"
-            if partial in obsm:
-                del obsm[partial]
-            out = obsm.create_dataset(
-                partial, shape=(n_obs, n_comps), dtype=np.float32,
-                chunks=(min(chunk_size, n_obs), n_comps), compression="gzip", compression_opts=4,
-            )
-            _project(matrix, fit, chunk_size, gene_indices, out, show_progress)
-            out.attrs["encoding-type"] = "array"
-            out.attrs["encoding-version"] = "0.2.0"
-            if "X_pca" in obsm:
-                del obsm["X_pca"]
-            obsm.move(partial, "X_pca")
+            # Scores go to a scratch file beside the output (n x k, small) and
+            # are copied in, compressed chunks as they are, once complete: a
+            # run killed partway leaves the output as it was.
+            scratch = _pca_scratch_path(path)
+            scratch.unlink(missing_ok=True)
+            try:
+                with h5py.File(scratch, "w") as tmp:
+                    out = tmp.create_dataset(
+                        "X_pca", shape=(n_obs, n_comps), dtype=np.float32,
+                        chunks=(min(chunk_size, n_obs), n_comps), compression="gzip", compression_opts=4,
+                    )
+                    _project(matrix, fit, chunk_size, gene_indices, out, show_progress)
+                    out.attrs["encoding-type"] = "array"
+                    out.attrs["encoding-version"] = "0.2.0"
+                    obsm = f.require_group("obsm")
+                    if "X_pca" in obsm:
+                        del obsm["X_pca"]
+                    obsm.copy(out, "X_pca")
+            finally:
+                scratch.unlink(missing_ok=True)
         else:
             X_pca = np.empty((n_obs, n_comps), dtype=np.float32)
             _project(matrix, fit, chunk_size, gene_indices, X_pca, show_progress)
