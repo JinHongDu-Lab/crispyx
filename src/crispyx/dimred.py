@@ -1,26 +1,46 @@
 """Dimension reduction module for crispyx.
 
-Provides streaming/on-disk PCA and neighbor computation to avoid memory issues
-with large datasets. Follows Scanpy-style API patterns.
+Streaming PCA, and neighbor and UMAP computation on the PCA embedding,
+following Scanpy-style API patterns.
+
+Memory
+------
+With g genes entering PCA, k components, c cells per chunk and n cells:
+
+* ``pca(method="covariance")`` holds one g x g float64 matrix plus a chunk:
+  about ``8 g² + 16 c g`` bytes plus 64 MB (:func:`_pca_peak_bytes`).
+* ``pca(method="incremental")`` holds a chunk and scikit-learn's
+  ``IncrementalPCA`` state, about ``50 (c + k) g + 32 (c + k)²`` bytes plus
+  64 MB.
+* On a crispyx backed file the scores are written to ``obsm['X_pca']`` a chunk
+  at a time; otherwise the returned ``X_pca`` adds ``4 n k`` bytes.
+* ``neighbors`` and ``umap`` hold the embedding and the k-NN graph in memory:
+  O(n (k + n_neighbors)), never cells x genes; measured, about 7-9 KB per
+  cell for ``neighbors`` and 6 KB for ``umap`` at 50 components.
+* ``copy=True`` loads the whole file into memory, as Scanpy's ``copy`` does.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
+import h5py
 import numpy as np
+from anndata.io import sparse_dataset
 from scipy import sparse
 from scipy.linalg import eigh
+from scipy.linalg.blas import dsyrk
 from sklearn.decomposition import IncrementalPCA
 from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     import anndata as AnnData
 
+from ._memory import _resolve_memory_limit_bytes
 from .data import (
-    calculate_pca_chunk_size,
-    _to_dense,
+    iter_matrix_chunks,
     write_obsm_to_h5ad,
     write_varm_to_h5ad,
     write_uns_dict_to_h5ad,
@@ -30,265 +50,206 @@ from .data import (
 
 logger = logging.getLogger(__name__)
 
+PCA_METHODS = ("covariance", "incremental")
 
-def _streaming_pca_sparse_cov(
-    adata: "AnnData",
-    n_comps: int = 50,
-    chunk_size: int = 2048,
-    use_highly_variable: bool = True,
-    return_info: bool = False,
-    show_progress: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict | None]:
-    """Compute PCA using sparse covariance method.
-    
-    Efficient for datasets with moderate gene counts (< ~15K genes).
-    Computes X^T @ X in a streaming fashion, exploiting sparsity.
-    
-    Parameters
-    ----------
-    adata
-        AnnData object with expression data.
-    n_comps
-        Number of principal components to compute.
-    chunk_size
-        Number of cells per chunk.
-    use_highly_variable
-        If True and 'highly_variable' exists in var, use only HVGs.
-    return_info
-        If True, return additional info dict.
-    show_progress
-        Show progress bar.
-    
-    Returns
-    -------
-    X_pca
-        PCA-transformed data (n_obs × n_comps).
-    components
-        Principal components (n_comps × n_vars).
-    variance_ratio
-        Variance explained ratio for each component.
-    info
-        Optional dict with mean, variance, etc. if return_info=True.
+#: Share of the memory budget PCA plans to use: the process holds other
+#: things, and the formulas below are fitted, not exact.
+_PCA_BUDGET_FRACTION = 0.5
+#: ``auto`` takes the covariance method when its g x g matrix fits in this
+#: share of the planned memory, leaving the rest for chunks.
+_COVARIANCE_SHARE = 0.5
+#: Fixed peak above the pre-call size, measured: HDF5 buffers and read blocks.
+_PCA_OVERHEAD_BYTES = 64e6
+
+
+def _pca_peak_bytes(
+    method: str, n_vars: int, n_comps: int, chunk_size: int, n_obs_in_memory: int = 0,
+) -> float:
+    """Peak bytes PCA holds above the process's size before the call: the
+    method's fixed state, one chunk's working set, a fixed overhead (HDF5
+    buffers, read blocks) and, when they are returned rather than written to
+    the file, the scores.
+
+    Fitted to peak resident memory measured on a Linux server, 50,000 and
+    200,000 cells x 2,000-10,000 genes, chunks of 512 and 2,048: the formula
+    is never more than 1% below a measurement and at most 26% above, except
+    for the smallest runs (2,000 genes, 512-cell chunks: up to 50% above,
+    where the fixed overhead dominates); docs/large_data.rst, ``memory-model``. The covariance working set is the read block, its
+    float64 copy and the next block read beside it; the incremental one is
+    IncrementalPCA's centred copy, stacked matrix and SVD.
     """
-    X = adata.X
-    n_obs, n_vars_total = adata.shape
-    
-    # Determine which genes to use
-    if use_highly_variable and "highly_variable" in adata.var.columns:
-        gene_mask = adata.var["highly_variable"].values
-        gene_indices = np.where(gene_mask)[0]
-        n_vars = len(gene_indices)
-        logger.info(f"Using {n_vars} highly variable genes for PCA")
-    else:
-        gene_indices = None
-        n_vars = n_vars_total
-        logger.info(f"Using all {n_vars} genes for PCA")
-    
-    n_comps = min(n_comps, n_vars, n_obs)
-    
-    # Streaming: compute sums and X^T @ X
-    gene_sums = np.zeros(n_vars, dtype=np.float64)
-    XTX = np.zeros((n_vars, n_vars), dtype=np.float64)
-    
-    n_chunks = (n_obs + chunk_size - 1) // chunk_size
-    pbar_desc = "Computing covariance"
-    
-    for chunk_start in tqdm(
-        range(0, n_obs, chunk_size),
-        total=n_chunks,
-        desc=pbar_desc,
-        disable=not show_progress,
-    ):
-        chunk_end = min(chunk_start + chunk_size, n_obs)
-        chunk = X[chunk_start:chunk_end, :]
-        
-        # Subset to selected genes
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        
-        # Convert to dense if sparse
-        chunk_dense = _to_dense(chunk)
-        
-        # Accumulate sums
-        gene_sums += chunk_dense.sum(axis=0)
-        
-        # Accumulate X^T @ X (exploits sparsity if input was sparse)
-        XTX += chunk_dense.T @ chunk_dense
-    
-    # Compute mean
-    mean = gene_sums / n_obs
-    
-    # Compute covariance: (X^T @ X) / n - mean @ mean^T
-    cov = XTX / n_obs - np.outer(mean, mean)
-    
-    # Eigendecomposition (get top n_comps)
-    # eigh returns eigenvalues in ascending order
+    scores = 4.0 * n_obs_in_memory * n_comps
+    if method == "covariance":
+        return 8.0 * n_vars * n_vars + 16.0 * chunk_size * n_vars + _PCA_OVERHEAD_BYTES + scores
+    rows = chunk_size + n_comps
+    return 50.0 * rows * n_vars + 32.0 * rows * rows + _PCA_OVERHEAD_BYTES + scores
+
+
+def _pca_chunk_size(
+    n_vars: int,
+    n_comps: int = 50,
+    *,
+    n_obs_in_memory: int = 0,
+    method: str = "auto",
+    memory_limit_gb: float | None = None,
+    min_chunk: int = 256,
+    max_chunk: int = 4096,
+) -> tuple[int, str]:
+    """Chunk size and method for :func:`pca` within ``memory_limit_gb``.
+
+    ``auto`` takes the exact covariance method when its g x g float64 matrix
+    fits in a quarter of the budget, IncrementalPCA otherwise. The chunk is
+    the largest in ``[min_chunk, max_chunk]`` whose peak
+    (:func:`_pca_peak_bytes`) fits in half the budget. A forced
+    ``method="covariance"`` whose matrix does not fit the whole budget raises
+    :class:`MemoryError` rather than being killed partway.
+    """
+    if method not in ("auto", *PCA_METHODS):
+        raise ValueError(f"method must be 'auto', 'covariance' or 'incremental', got {method!r}")
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    usable = _PCA_BUDGET_FRACTION * budget
+    covariance_bytes = 8.0 * n_vars * n_vars
+    if method == "auto":
+        method = "covariance" if covariance_bytes <= _COVARIANCE_SHARE * usable else "incremental"
+
+    def peak(chunk: int) -> float:
+        return _pca_peak_bytes(method, n_vars, n_comps, chunk, n_obs_in_memory)
+
+    if method == "covariance" and peak(min_chunk) > budget:
+        raise MemoryError(
+            f"PCA with method='covariance' on {n_vars} genes needs {peak(min_chunk) / 1e9:.1f} GB "
+            f"(a {covariance_bytes / 1e9:.1f} GB gene x gene matrix), over the "
+            f"{budget / 1e9:.1f} GB memory budget. Use method='incremental', or restrict PCA to "
+            "highly variable genes (cx.pp.highly_variable_genes, use_highly_variable=True)."
+        )
+    # The peak grows monotonically with the chunk: bisect for the largest that fits.
+    lo, hi = min_chunk, max_chunk
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if peak(mid) <= usable else (lo, mid - 1)
+    chunk = lo
+    logger.info(
+        f"PCA: method={method}, chunk={chunk}, peak ~{peak(chunk) / 1e9:.2f} GB "
+        f"of a {budget / 1e9:.1f} GB budget ({n_vars} genes, {n_comps} components)"
+    )
+    return chunk, method
+
+
+def _pca_gene_indices(var, use_highly_variable: bool) -> np.ndarray | None:
+    """Columns entering PCA: the highly variable genes when asked and marked,
+    else all (``None``)."""
+    if use_highly_variable and "highly_variable" in var.columns:
+        gene_indices = np.flatnonzero(np.asarray(var["highly_variable"], dtype=bool))
+        logger.info(f"Using {gene_indices.size} highly variable genes for PCA")
+        return gene_indices
+    logger.info(f"Using all {len(var)} genes for PCA")
+    return None
+
+
+def _dense_blocks(
+    matrix, chunk_size: int, gene_indices: np.ndarray | None, *, min_rows: int = 1,
+    desc: str = "", show_progress: bool = True,
+) -> Iterator[tuple[slice, np.ndarray]]:
+    """Row chunks of ``matrix`` restricted to ``gene_indices``, as Fortran-
+    ordered float64 arrays (what BLAS ``dsyrk`` and LAPACK take without a
+    copy). A final chunk shorter than ``min_rows`` is merged into the one
+    before it, so IncrementalPCA sees every cell."""
+    n_obs = matrix.shape[0]
+    tail = n_obs % chunk_size
+    # Only a short tail is held back for: the chunk before it waits to be joined.
+    hold_start = n_obs - tail - chunk_size if 0 < tail < min_rows and n_obs > chunk_size else -1
+    held: tuple[slice, np.ndarray] | None = None
+    with tqdm(total=n_obs, desc=desc, disable=not show_progress, unit="cells") as bar:
+        for slc, block in iter_matrix_chunks(None, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False):
+            if gene_indices is not None:
+                block = block[:, gene_indices]
+            if sparse.issparse(block):
+                block = block.toarray(order="F")
+            block = np.asarray(block, dtype=np.float64, order="F")
+            bar.update(slc.stop - slc.start)
+            if slc.start == hold_start:
+                held = (slc, block)
+            elif held is not None:
+                yield slice(held[0].start, slc.stop), np.asfortranarray(np.vstack([held[1], block]))
+                held = None
+            else:
+                yield slc, block
+
+
+def _fit_covariance(blocks, n_obs: int, n_vars: int, n_comps: int) -> dict:
+    """Exact PCA from the gene x gene covariance, accumulated in place.
+
+    ``dsyrk`` adds each chunk's ``Xᵀ X`` into the upper triangle of one
+    Fortran-ordered float64 matrix, which is then centred in column blocks and
+    handed to ``eigh`` with ``overwrite_a``: one g x g array in all.
+    """
+    xtx = np.zeros((n_vars, n_vars), dtype=np.float64, order="F")
+    sums = np.zeros(n_vars, dtype=np.float64)
+    for _, block in blocks:
+        sums += block.sum(axis=0)
+        xtx = dsyrk(1.0, block, beta=1.0, c=xtx, trans=1, lower=0, overwrite_c=1)
+    mean = sums / n_obs
+    xtx /= n_obs
+    step = max(1, (1 << 21) // max(n_vars, 1))  # 16 MB of outer product at a time
+    for j in range(0, n_vars, step):
+        xtx[:, j:j + step] -= np.outer(mean, mean[j:j + step])
+    total_variance = float(np.trace(xtx))
     eigenvalues, eigenvectors = eigh(
-        cov,
+        xtx, lower=False, overwrite_a=True, check_finite=False,
         subset_by_index=[n_vars - n_comps, n_vars - 1],
     )
-    
-    # Reverse to get descending order
+    del xtx
     eigenvalues = eigenvalues[::-1]
-    components = eigenvectors[:, ::-1].T  # (n_comps, n_vars)
-    
-    # Variance explained ratio
-    total_variance = np.trace(cov)
-    variance_ratio = eigenvalues / total_variance
-    
-    # Transform data: second pass through data
-    X_pca = np.zeros((n_obs, n_comps), dtype=np.float32)
-    
-    for chunk_start in tqdm(
-        range(0, n_obs, chunk_size),
-        total=n_chunks,
-        desc="Transforming data",
-        disable=not show_progress,
-    ):
-        chunk_end = min(chunk_start + chunk_size, n_obs)
-        chunk = X[chunk_start:chunk_end, :]
-        
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        
-        chunk_dense = _to_dense(chunk)
-        
-        # Center and project
-        chunk_centered = chunk_dense - mean
-        X_pca[chunk_start:chunk_end] = (chunk_centered @ components.T).astype(np.float32)
-    
-    info = None
-    if return_info:
-        info = {
-            "mean": mean,
-            "variance": eigenvalues,
-            "variance_ratio": variance_ratio,
-            "gene_indices": gene_indices,
-        }
-    
-    return X_pca, components, variance_ratio, info
+    return {
+        "mean": mean,
+        "components": np.ascontiguousarray(eigenvectors[:, ::-1].T),
+        "variance": eigenvalues,
+        "variance_ratio": eigenvalues / total_variance,
+    }
 
 
-def _streaming_pca_incremental(
-    adata: "AnnData",
-    n_comps: int = 50,
-    chunk_size: int = 1024,
-    use_highly_variable: bool = True,
-    return_info: bool = False,
-    show_progress: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict | None]:
-    """Compute PCA using IncrementalPCA from sklearn.
-    
-    Memory-efficient for datasets with many genes (> ~15K genes).
-    Streams through data without loading all into memory.
-    
-    Parameters
-    ----------
-    adata
-        AnnData object with expression data.
-    n_comps
-        Number of principal components to compute.
-    chunk_size
-        Number of cells per chunk. Must be >= n_comps.
-    use_highly_variable
-        If True and 'highly_variable' exists in var, use only HVGs.
-    return_info
-        If True, return additional info dict.
-    show_progress
-        Show progress bar.
-    
-    Returns
-    -------
-    X_pca
-        PCA-transformed data (n_obs × n_comps).
-    components
-        Principal components (n_comps × n_vars).
-    variance_ratio
-        Variance explained ratio for each component.
-    info
-        Optional dict with mean, noise_variance, etc. if return_info=True.
-    """
-    X = adata.X
-    n_obs, n_vars_total = adata.shape
-    
-    # Determine which genes to use
-    if use_highly_variable and "highly_variable" in adata.var.columns:
-        gene_mask = adata.var["highly_variable"].values
-        gene_indices = np.where(gene_mask)[0]
-        n_vars = len(gene_indices)
-        logger.info(f"Using {n_vars} highly variable genes for PCA")
-    else:
-        gene_indices = None
-        n_vars = n_vars_total
-        logger.info(f"Using all {n_vars} genes for PCA")
-    
-    n_comps = min(n_comps, n_vars, n_obs)
-    
-    # Ensure chunk_size >= n_comps for IncrementalPCA
-    actual_chunk_size = max(chunk_size, n_comps)
-    if actual_chunk_size != chunk_size:
-        logger.info(f"Adjusted chunk size from {chunk_size} to {actual_chunk_size} (>= n_comps)")
-    
-    # Initialize IncrementalPCA
+def _fit_incremental(blocks, n_comps: int) -> dict:
+    """Approximate PCA with scikit-learn's IncrementalPCA, a chunk at a time."""
     ipca = IncrementalPCA(n_components=n_comps)
-    
-    n_chunks = (n_obs + actual_chunk_size - 1) // actual_chunk_size
-    
-    # First pass: partial_fit to learn components
-    for chunk_start in tqdm(
-        range(0, n_obs, actual_chunk_size),
-        total=n_chunks,
-        desc="Learning PCA",
-        disable=not show_progress,
-    ):
-        chunk_end = min(chunk_start + actual_chunk_size, n_obs)
-        chunk = X[chunk_start:chunk_end, :]
-        
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        
-        chunk_dense = _to_dense(chunk)
-        
-        # Skip if chunk smaller than n_comps (last chunk edge case)
-        if chunk_dense.shape[0] < n_comps:
-            logger.debug(f"Skipping small final chunk of size {chunk_dense.shape[0]}")
-            continue
-        
-        ipca.partial_fit(chunk_dense)
-    
-    # Extract components
-    components = ipca.components_  # (n_comps, n_vars)
-    variance_ratio = ipca.explained_variance_ratio_
-    
-    # Second pass: transform data
-    X_pca = np.zeros((n_obs, n_comps), dtype=np.float32)
-    
-    for chunk_start in tqdm(
-        range(0, n_obs, actual_chunk_size),
-        total=n_chunks,
-        desc="Transforming data",
-        disable=not show_progress,
-    ):
-        chunk_end = min(chunk_start + actual_chunk_size, n_obs)
-        chunk = X[chunk_start:chunk_end, :]
-        
-        if gene_indices is not None:
-            chunk = chunk[:, gene_indices]
-        
-        chunk_dense = _to_dense(chunk)
-        X_pca[chunk_start:chunk_end] = ipca.transform(chunk_dense).astype(np.float32)
-    
-    info = None
-    if return_info:
-        info = {
-            "mean": ipca.mean_,
-            "variance": ipca.explained_variance_,
-            "variance_ratio": variance_ratio,
-            "gene_indices": gene_indices,
-            "noise_variance": ipca.noise_variance_,
-        }
-    
-    return X_pca, components, variance_ratio, info
+    for _, block in blocks:
+        ipca.partial_fit(block)
+    return {
+        "mean": ipca.mean_,
+        "components": ipca.components_,
+        "variance": ipca.explained_variance_,
+        "variance_ratio": ipca.explained_variance_ratio_,
+        "noise_variance": ipca.noise_variance_,
+    }
+
+
+def _fit_pca(
+    matrix, method: str, n_comps: int, chunk_size: int, gene_indices: np.ndarray | None,
+    show_progress: bool,
+) -> dict:
+    n_obs = matrix.shape[0]
+    n_vars = matrix.shape[1] if gene_indices is None else gene_indices.size
+    if method == "covariance":
+        blocks = _dense_blocks(matrix, chunk_size, gene_indices, desc="Computing covariance", show_progress=show_progress)
+        return _fit_covariance(blocks, n_obs, n_vars, n_comps)
+    blocks = _dense_blocks(
+        matrix, max(chunk_size, n_comps), gene_indices, min_rows=n_comps,
+        desc="Learning PCA", show_progress=show_progress,
+    )
+    return _fit_incremental(blocks, n_comps)
+
+
+def _project(matrix, fit: dict, chunk_size: int, gene_indices: np.ndarray | None, out, show_progress: bool) -> None:
+    """Write each chunk's scores ``(x - mean) @ componentsᵀ`` into ``out``, an
+    array or an HDF5 dataset of shape (n_obs, n_comps)."""
+    components_t = fit["components"].T
+    for slc, block in _dense_blocks(matrix, chunk_size, gene_indices, desc="Transforming data", show_progress=show_progress):
+        block -= fit["mean"]
+        out[slc] = (block @ components_t).astype(np.float32)
+
+
+def _open_x(f: h5py.File):
+    elem = f["X"]
+    return sparse_dataset(elem) if isinstance(elem, h5py.Group) else elem
 
 
 def pca(
@@ -297,18 +258,18 @@ def pca(
     method: str = "auto",
     use_highly_variable: bool = True,
     chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
     random_state: int = 0,
     copy: bool = False,
     show_progress: bool = True,
 ) -> "AnnData" | None:
-    """Compute Principal Component Analysis (PCA) on backed AnnData.
-    
-    Streaming implementation that works with on-disk data to avoid memory issues.
-    Automatically selects the optimal method based on dataset characteristics.
-    
-    For backed data (crispyx.AnnData wrapper), results are written directly to
-    the h5ad file using a close-write-reopen pattern, keeping .X on disk.
-    
+    """Compute Principal Component Analysis (PCA), streaming the cells from disk.
+
+    On a crispyx backed file (:class:`crispyx.AnnData`, from
+    ``cx.read_h5ad_ondisk`` or a path through ``cx.pp.pca``) the scores are
+    written to ``obsm['X_pca']`` a chunk at a time, so memory does not grow
+    with the number of cells. See the module docstring for each method's peak.
+
     Parameters
     ----------
     adata
@@ -316,156 +277,126 @@ def pca(
     n_comps
         Number of principal components to compute. Default 50.
     method
-        PCA method to use:
-        - 'auto': Automatically select based on gene count and memory
-        - 'sparse_cov': Use sparse covariance method (fast for ≤15K genes)
-        - 'incremental': Use IncrementalPCA (memory-efficient for >15K genes)
+        - ``'auto'``: ``'covariance'`` when its gene x gene matrix fits in a
+          quarter of the memory budget, else ``'incremental'``.
+        - ``'covariance'``: exact PCA from the gene x gene covariance (one
+          ``8 g²``-byte matrix, g = genes entering PCA). Raises
+          :class:`MemoryError` up front when that does not fit.
+        - ``'incremental'``: scikit-learn's IncrementalPCA, approximate,
+          memory linear in the genes.
     use_highly_variable
         If True and 'highly_variable' exists in var, restrict to HVGs.
-        Default True.
+        Default True. Without HVGs, PCA runs on every gene.
     chunk_size
-        Number of cells to process per chunk. If None, automatically
-        calculated based on available memory.
+        Number of cells to process per chunk. If None, the largest chunk
+        whose peak fits in half the memory budget (256 to 4096).
+    memory_limit_gb
+        Memory budget in GB. ``None`` detects the memory available, capped
+        by the job's allocation when known (pass the job's ``--mem`` on a
+        cluster that does not expose it).
     random_state
-        Random seed (not currently used, for API compatibility).
+        Not used: both methods are deterministic. Kept for Scanpy's signature.
     copy
-        If True, return a copy of adata with PCA results.
-        If False, modify adata in place and return None.
+        If True, load the data into memory and return a copy with the PCA
+        results; otherwise modify ``adata`` (or its file) in place.
     show_progress
         Show progress bars during computation. Default True.
-    
+
     Returns
     -------
     adata : AnnData | None
         If copy=True, returns modified AnnData. Otherwise modifies in place.
-    
+
     Modifies adata
     --------------
     obsm['X_pca']
         PCA-transformed data (n_obs × n_comps).
     varm['PCs']
-        Principal components (n_vars × n_comps). Only includes selected genes.
+        Principal components (n_vars × n_comps); zero outside the genes used.
     uns['pca']
-        Dict with 'variance', 'variance_ratio', 'use_highly_variable'.
-    
+        Dict with 'variance', 'variance_ratio', 'use_highly_variable',
+        'method' and 'n_comps'.
+
     Examples
     --------
     >>> import crispyx as cx
-    >>> adata = cx.read_backed("data.h5ad")
+    >>> adata = cx.read_h5ad_ondisk("data.h5ad")
     >>> cx.pp.pca(adata, n_comps=50)
-    >>> adata.obsm['X_pca'].shape
-    (n_obs, 50)
     """
-    import anndata
-    
-    # Detect if this is a crispyx.AnnData wrapper (backed, with .path)
-    is_crispyx_wrapper = isinstance(adata, CrispyxAnnData)
-    
+    stream = isinstance(adata, CrispyxAnnData) and not copy
     if copy:
-        # For copy mode, load into memory
-        if is_crispyx_wrapper:
-            adata = adata.to_memory()
-        elif hasattr(adata, 'file') and adata.file is not None:
-            adata = adata.to_memory()
-        else:
-            adata = adata.copy()
-    
-    n_obs, n_vars = adata.shape
-    
-    # Determine gene count for PCA (after HVG filtering)
-    if use_highly_variable and "highly_variable" in adata.var.columns:
-        n_vars_pca = adata.var["highly_variable"].sum()
+        is_backed = isinstance(adata, CrispyxAnnData) or getattr(adata, "isbacked", False)
+        adata = adata.to_memory() if is_backed else adata.copy()
+
+    var = adata.var
+    gene_indices = _pca_gene_indices(var, use_highly_variable)
+    n_vars_total = len(var)
+    n_vars = n_vars_total if gene_indices is None else gene_indices.size
+
+    if stream:
+        path = adata.path
+        adata.close()
+        f = h5py.File(path, "r+")
+        matrix = _open_x(f)
     else:
-        n_vars_pca = n_vars
-    
-    # Calculate chunk size and method if not provided
-    if chunk_size is None:
-        chunk_size, selected_method = calculate_pca_chunk_size(
-            n_obs=n_obs,
-            n_vars=n_vars_pca,
-            n_comps=n_comps,
-            method=method,
+        f = None
+        matrix = adata.X
+    try:
+        n_obs = matrix.shape[0]
+        n_comps = min(n_comps, n_vars, n_obs)
+        planned_chunk, selected_method = _pca_chunk_size(
+            n_vars, n_comps, n_obs_in_memory=0 if stream else n_obs,
+            method=method, memory_limit_gb=memory_limit_gb,
         )
-    else:
-        # Still need to select method
-        if method == "auto":
-            _, selected_method = calculate_pca_chunk_size(
-                n_obs=n_obs,
-                n_vars=n_vars_pca,
-                n_comps=n_comps,
-                method=method,
+        if chunk_size is None:
+            chunk_size = planned_chunk
+        else:
+            logger.info(f"PCA: chunk_size={chunk_size} as given")
+        fit =_fit_pca(matrix, selected_method, n_comps, chunk_size, gene_indices, show_progress)
+
+        if stream:
+            obsm = f.require_group("obsm")
+            partial = ".X_pca.partial"
+            if partial in obsm:
+                del obsm[partial]
+            out = obsm.create_dataset(
+                partial, shape=(n_obs, n_comps), dtype=np.float32,
+                chunks=(min(chunk_size, n_obs), n_comps), compression="gzip", compression_opts=4,
             )
+            _project(matrix, fit, chunk_size, gene_indices, out, show_progress)
+            out.attrs["encoding-type"] = "array"
+            out.attrs["encoding-version"] = "0.2.0"
+            if "X_pca" in obsm:
+                del obsm["X_pca"]
+            obsm.move(partial, "X_pca")
         else:
-            selected_method = method
-    
-    logger.info(f"Running PCA with method='{selected_method}', chunk_size={chunk_size}")
-    
-    # Run PCA
-    if selected_method == "sparse_cov":
-        X_pca, components, variance_ratio, info = _streaming_pca_sparse_cov(
-            adata,
-            n_comps=n_comps,
-            chunk_size=chunk_size,
-            use_highly_variable=use_highly_variable,
-            return_info=True,
-            show_progress=show_progress,
-        )
-    else:
-        X_pca, components, variance_ratio, info = _streaming_pca_incremental(
-            adata,
-            n_comps=n_comps,
-            chunk_size=chunk_size,
-            use_highly_variable=use_highly_variable,
-            return_info=True,
-            show_progress=show_progress,
-        )
-    
-    # Prepare PCs array
-    if use_highly_variable and "highly_variable" in adata.var.columns:
-        pcs_full = np.zeros((n_vars, n_comps), dtype=np.float32)
-        pcs_full[info["gene_indices"], :] = components.T
-    else:
-        pcs_full = components.T.astype(np.float32)
-    
-    # Prepare uns dict
+            X_pca = np.empty((n_obs, n_comps), dtype=np.float32)
+            _project(matrix, fit, chunk_size, gene_indices, X_pca, show_progress)
+    finally:
+        if f is not None:
+            f.close()
+
+    pcs_full = np.zeros((n_vars_total, n_comps), dtype=np.float32)
+    rows = slice(None) if gene_indices is None else gene_indices
+    pcs_full[rows, :] = fit["components"].T
     pca_uns = {
-        "variance": info["variance"],
-        "variance_ratio": variance_ratio,
+        "variance": fit["variance"],
+        "variance_ratio": fit["variance_ratio"],
         "use_highly_variable": use_highly_variable,
         "method": selected_method,
         "n_comps": n_comps,
     }
-    
-    # Store results: use close-write-reopen for crispyx wrapper, direct for in-memory
-    if is_crispyx_wrapper and not copy:
-        # Close file handle
-        path = adata.path
-        adata.close()
-        
-        # Write results to h5ad file
-        write_obsm_to_h5ad(path, "X_pca", X_pca)
+    explained = f"{fit['variance_ratio'].sum():.2%}"
+    if stream:
         write_varm_to_h5ad(path, "PCs", pcs_full)
         write_uns_dict_to_h5ad(path, "pca", pca_uns)
-        
-        # File will be reopened lazily on next access
-        logger.info(
-            f"PCA complete: {n_comps} components, "
-            f"variance explained: {variance_ratio.sum():.2%} (written to {path})"
-        )
-    else:
-        # In-memory AnnData: store directly
-        adata.obsm["X_pca"] = X_pca
-        adata.varm["PCs"] = pcs_full
-        adata.uns["pca"] = pca_uns
-        
-        logger.info(
-            f"PCA complete: {n_comps} components, "
-            f"variance explained: {variance_ratio.sum():.2%}"
-        )
-    
-    if copy:
-        return adata
-    return None
+        logger.info(f"PCA complete: {n_comps} components, variance explained: {explained} (written to {path})")
+        return None
+    adata.obsm["X_pca"] = X_pca
+    adata.varm["PCs"] = pcs_full
+    adata.uns["pca"] = pca_uns
+    logger.info(f"PCA complete: {n_comps} components, variance explained: {explained}")
+    return adata if copy else None
 
 
 def _compute_connectivities_umap(

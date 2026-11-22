@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import tracemalloc
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pytest
 from scipy import sparse
@@ -16,13 +18,12 @@ from sklearn.neighbors import NearestNeighbors
 
 import crispyx as cx
 from crispyx.data import (
-    calculate_pca_chunk_size,
     write_obsm_to_h5ad,
     write_obsp_to_h5ad,
     write_uns_dict_to_h5ad,
     write_varm_to_h5ad,
 )
-from crispyx.dimred import _streaming_pca_incremental, _streaming_pca_sparse_cov, neighbors, umap
+from crispyx.dimred import _fit_pca, _pca_chunk_size, _pca_peak_bytes, neighbors, umap
 
 
 def _counts(n_obs: int = 400, n_vars: int = 60, seed: int = 0) -> np.ndarray:
@@ -62,47 +63,95 @@ def backed(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "n_obs, n_vars, kwargs, expected_method",
+    "n_vars, kwargs, expected_method",
     [
-        (100_000, 5_000, dict(available_memory_gb=32, method="auto"), "sparse_cov"),   # ~200 MB covariance
-        (100_000, 50_000, dict(available_memory_gb=16, method="auto"), "incremental"),  # ~20 GB covariance
-        (100_000, 5_000, dict(method="incremental"), "incremental"),
+        (5_000, dict(memory_limit_gb=32), "covariance"),     # 0.2 GB matrix
+        (50_000, dict(memory_limit_gb=16), "incremental"),   # 20 GB matrix
+        (5_000, dict(memory_limit_gb=32, method="incremental"), "incremental"),
     ],
     ids=["auto-small", "auto-large", "explicit"],
 )
-def test_pca_chunk_size_selects_method(n_obs, n_vars, kwargs, expected_method):
-    chunk_size, method = calculate_pca_chunk_size(n_obs, n_vars, **kwargs)
+def test_pca_chunk_size_selects_method(n_vars, kwargs, expected_method):
+    chunk_size, method = _pca_chunk_size(n_vars, 50, **kwargs)
     assert isinstance(chunk_size, int) and chunk_size > 0
     assert method == expected_method
 
 
-def test_pca_chunk_size_respects_bounds():
-    chunk_size, _ = calculate_pca_chunk_size(100_000, 1_000, available_memory_gb=1, min_chunk=128, max_chunk=256)
-    assert 128 <= chunk_size <= 256
+def test_pca_chunk_size_fits_the_budget():
+    chunk_size, method = _pca_chunk_size(20_000, 50, memory_limit_gb=1, method="incremental")
+    assert 256 <= chunk_size <= 4096
+    assert _pca_peak_bytes(method, 20_000, 50, chunk_size) <= 0.5e9 or chunk_size == 256
+    assert _pca_chunk_size(1_000, 50, memory_limit_gb=1, min_chunk=128, max_chunk=256)[0] <= 256
 
 
-def test_sparse_covariance_pca_matches_sklearn(backed):
-    adata, X = backed
-    scores, components, variance_ratio, info = _streaming_pca_sparse_cov(
-        adata, n_comps=10, show_progress=False, return_info=True,
-    )
+def test_forced_covariance_over_the_budget_raises():
+    with pytest.raises(MemoryError, match="method='incremental'"):
+        _pca_chunk_size(30_000, 50, memory_limit_gb=4, method="covariance")  # 7.2 GB matrix
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_covariance_pca_matches_sklearn(dense):
+    X = _counts().astype(np.float64)
+    adata = ad.AnnData(X if dense else sparse.csr_matrix(X))
+    cx.pp.pca(adata, n_comps=10, method="covariance", chunk_size=64, show_progress=False)
     ref = PCA(10, svd_solver="full").fit(X)
-    np.testing.assert_allclose(variance_ratio, ref.explained_variance_ratio_, atol=1e-12)
-    _assert_same_up_to_sign(components.T, ref.components_.T, atol=1e-10)
-    _assert_same_up_to_sign(scores, ref.transform(X), atol=1e-8)
-    assert info is not None
+    np.testing.assert_allclose(adata.uns["pca"]["variance_ratio"], ref.explained_variance_ratio_, atol=1e-12)
+    _assert_same_up_to_sign(adata.varm["PCs"], ref.components_.T, atol=1e-6)  # stored as float32
+    _assert_same_up_to_sign(adata.obsm["X_pca"], ref.transform(X), rtol=1e-5, atol=1e-5)
+    assert adata.uns["pca"]["method"] == "covariance"
 
 
 def test_incremental_pca_matches_sklearn_on_leading_components(backed):
     """Incremental PCA is approximate; the well-separated leading components agree."""
     adata, X = backed
-    scores, components, variance_ratio, _ = _streaming_pca_incremental(
-        adata, n_comps=10, chunk_size=64, show_progress=False,
-    )
+    fit = _fit_pca(adata.X, "incremental", 10, 64, None, show_progress=False)
     ref = PCA(10, svd_solver="full").fit(X)
-    assert components.shape == (10, X.shape[1])
-    np.testing.assert_allclose(variance_ratio, ref.explained_variance_ratio_, atol=0.01)
+    assert fit["components"].shape == (10, X.shape[1])
+    np.testing.assert_allclose(fit["variance_ratio"], ref.explained_variance_ratio_, atol=0.01)
+    scores = (X - fit["mean"]) @ fit["components"].T
     _assert_same_up_to_sign(scores[:, :5], ref.transform(X)[:, :5], rtol=0.01, atol=0.05)
+
+
+def test_incremental_pca_fits_a_short_final_chunk():
+    """400 cells in chunks of 98 leave 8 < n_comps: they join the chunk before
+    rather than being left out of the fit."""
+    X = _counts()
+    fit = _fit_pca(sparse.csr_matrix(X), "incremental", 10, 98, None, show_progress=False)
+    np.testing.assert_allclose(fit["mean"], X.astype(np.float64).mean(axis=0), rtol=1e-12)
+
+
+def _traced_peak(fn) -> int:
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_covariance_fit_holds_one_gene_by_gene_matrix():
+    n_vars, chunk = 3_000, 512
+    matrix = sparse.random(2_048, n_vars, density=0.05, format="csr", random_state=0, dtype=np.float32)
+    peak =_traced_peak(lambda: _fit_pca(matrix, "covariance", 20, chunk, None, show_progress=False))
+    assert peak < 1.25 * 8 * n_vars**2 + 16 * chunk * n_vars
+
+
+def test_backed_pca_memory_does_not_grow_with_the_cells(tmp_path):
+    """Scores are written to the file a chunk at a time: 4x the cells adds far
+    less than the n x k float32 score matrix."""
+    n_comps, peaks = 20, {}
+    for n_obs in (20_000, 80_000):
+        X = sparse.random(n_obs, 40, density=0.3, format="csr", random_state=0, dtype=np.float32)
+        path = tmp_path / f"cells_{n_obs}.h5ad"
+        ad.AnnData(X).write(path)
+        backed = cx.AnnData(path)
+        peaks[n_obs] = _traced_peak(
+            lambda: cx.pp.pca(backed, n_comps=n_comps, chunk_size=2_048, show_progress=False)
+        )
+        with h5py.File(path, "r") as f:
+            assert f["obsm/X_pca"].shape == (n_obs, n_comps)
+            assert list(f["obsm"]) == ["X_pca"]  # no partial dataset left behind
+    assert peaks[80_000] - peaks[20_000] < 0.5 * 60_000 * n_comps * 4
 
 
 @pytest.mark.parametrize("use_highly_variable", [False, True])
@@ -132,10 +181,17 @@ def test_pca_writes_results_to_the_backed_file(tmp_path, use_highly_variable):
     np.testing.assert_allclose(info["variance_ratio"], ref.explained_variance_ratio_, rtol=1e-4)
 
 
+def test_pca_on_a_path_writes_to_the_file(tmp_path):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    assert cx.pp.pca(str(path), n_comps=8, show_progress=False) is None
+    assert ad.read_h5ad(path).obsm["X_pca"].shape == (400, 8)
+
+
 def test_pca_copy_from_a_path_returns_the_same_embedding(tmp_path):
     path = _write(tmp_path / "pca.h5ad", _counts())
     copied = cx.pp.pca(path, n_comps=8, copy=True, show_progress=False)
     assert isinstance(copied, ad.AnnData)
+    assert "X_pca" not in ad.read_h5ad(path).obsm  # copy leaves the file alone
     backed = cx.read_h5ad_ondisk(path)
     cx.pp.pca(backed, n_comps=8, show_progress=False)
     np.testing.assert_allclose(copied.obsm["X_pca"], np.asarray(cx.read_h5ad_ondisk(path).obsm["X_pca"]))
@@ -256,8 +312,8 @@ def test_write_helpers_round_trip(tmp_path, slot):
         write_obsp_to_h5ad(path, "connectivities", value)
         np.testing.assert_array_equal(ad.read_h5ad(path).obsp["connectivities"].toarray(), value.toarray())
     else:
-        value = {"variance_ratio": np.array([0.5, 0.3, 0.1]), "n_comps": 10, "method": "sparse_cov"}
+        value = {"variance_ratio": np.array([0.5, 0.3, 0.1]), "n_comps": 10, "method": "covariance"}
         write_uns_dict_to_h5ad(path, "pca", value)
         stored = ad.read_h5ad(path).uns["pca"]
         np.testing.assert_array_equal(stored["variance_ratio"], value["variance_ratio"])
-        assert stored["n_comps"] == 10 and stored["method"] == "sparse_cov"
+        assert stored["n_comps"] == 10 and stored["method"] == "covariance"
