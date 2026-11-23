@@ -220,10 +220,10 @@ B batches or strata, k principal components.
        The scores go to the file a chunk at a time on a crispyx backed file;
        for any other object they are held in memory (``4 n k`` bytes). With
        a gene subset (HVGs), about three full-width input rows per cell of
-       the chunk. A CSC file is re-read whole for every row chunk; convert
-       it to CSR first.
+       the chunk. A CSR file's row index, 8 bytes per cell. A CSC file is
+       re-read whole for every row chunk; convert it to CSR first.
      - Method and chunk size; ``"covariance"`` raises ``MemoryError`` when
-       its matrix cannot fit
+       its peak at the smallest chunk cannot fit
    * - ``neighbors``, ``umap``
      - The embedding and the k-NN graph, in memory: about 6-8 KB per cell
        for ``neighbors`` and 6 KB for ``umap`` (50 components, 15

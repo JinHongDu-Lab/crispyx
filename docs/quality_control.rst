@@ -255,8 +255,8 @@ PCA streams the cells twice (fit, then project) with one of two methods:
 * **Covariance** (``method='covariance'``): exact PCA from the gene × gene
   covariance, accumulated in place with BLAS. It holds one ``8 × genes²``-byte
   matrix (32 MB for 2,000 HVGs, 2 GB for 16,000 genes, 8.7 GB for 33,000), so
-  it suits HVGs. Forced on a gene set whose matrix exceeds the memory budget,
-  it raises ``MemoryError`` before reading the data.
+  it suits HVGs. Forced when its peak (chiefly the matrix) exceeds the memory
+  budget, it raises ``MemoryError`` before the passes.
 * **IncrementalPCA** (``method='incremental'``): scikit-learn's approximate
   streaming PCA, memory linear in the genes, for gene sets whose covariance
   matrix does not fit. It is 2.5-7 times slower than covariance, and only its
@@ -319,6 +319,6 @@ KNN results are stored in:
 
 **Results go to the file**: on a file opened with ``cx.read_h5ad_ondisk()``,
 or given as a path, PCA, neighbors and UMAP write their results into the h5ad
-file. PCA writes ``X_pca`` a chunk at a time, so its memory does not grow with
-the number of cells. ``copy=True`` instead loads the whole file into memory
+file. PCA writes ``X_pca`` a chunk at a time, so its memory grows with the
+number of cells only by a CSR file's 8-byte row index. ``copy=True`` instead loads the whole file into memory
 and returns it, as Scanpy's ``copy`` does.

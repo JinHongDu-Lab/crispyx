@@ -28,7 +28,7 @@ from tqdm.auto import tqdm
 if TYPE_CHECKING:
     import anndata as AnnData
 
-from ._memory import _resolve_memory_limit_bytes
+from ._memory import _detected_available_bytes, _granted_bytes, _resolve_memory_limit_bytes
 from .data import (
     iter_matrix_chunks,
     write_obsm_to_h5ad,
@@ -77,6 +77,25 @@ def _pca_peak_bytes(
     return 50.0 * rows * n_vars + 32.0 * rows * rows + _PCA_OVERHEAD_BYTES + scores
 
 
+def _pca_budget(memory_limit_gb: float | None) -> float:
+    """``memory_limit_gb`` in bytes, or the memory detected. Without psutil
+    nothing is detected: assume 16 GB (capped by the job's grant when known)
+    and say so, rather than the shared resolver's 64 GB, which could send a
+    small machine into a covariance fit it cannot hold."""
+    if memory_limit_gb is not None:
+        return _resolve_memory_limit_bytes(memory_limit_gb)
+    try:
+        return _detected_available_bytes()
+    except ImportError:
+        granted = _granted_bytes()
+        budget = 16e9 if granted is None else min(16e9, granted)
+        logger.warning(
+            f"psutil is not installed, so PCA cannot detect the free memory and assumes "
+            f"{budget / 1e9:.0f} GB; pass memory_limit_gb, or install psutil."
+        )
+        return budget
+
+
 def _pca_chunk_size(
     n_vars: int,
     n_comps: int = 50,
@@ -96,12 +115,13 @@ def _pca_chunk_size(
     ``max_chunk`` unless its peak (:func:`_pca_peak_bytes`) exceeds half the
     budget, then the largest that fits: on any machine with the memory, the
     same file gets the same chunk, and so the same IncrementalPCA result. A forced
-    ``method="covariance"`` whose matrix does not fit the whole budget raises
-    :class:`MemoryError` rather than being killed partway.
+    ``method="covariance"`` whose peak at ``min_chunk`` (chiefly the matrix)
+    exceeds the whole budget raises :class:`MemoryError` rather than being
+    killed partway.
     """
     if method not in ("auto", *PCA_METHODS):
         raise ValueError(f"method must be 'auto', 'covariance' or 'incremental', got {method!r}")
-    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    budget = _pca_budget(memory_limit_gb)
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars
 
@@ -298,14 +318,16 @@ def _pca_uns(fit: dict, use_highly_variable: bool, method: str, chunk: int) -> d
 
 
 def _pca_scratch_path(path) -> Path:
+    """Hidden, and named per process: with HDF5 file locking off (common on
+    network filesystems), two runs on one file must not share it."""
     path = Path(path)
-    return path.with_name(f".{path.name}.X_pca.partial")
+    return path.with_name(f".{path.name}.X_pca.{os.getpid()}.partial")
 
 
 def _check_writable(path) -> None:
     """Fail before the passes, not after them, when the results could not be
-    written: HDF5 opens a file for writing only if no other handle -- in this
-    process or another -- has it open."""
+    written: HDF5 opens a file for writing only if no other handle has it open
+    -- in this process, or, with file locking on (HDF5's default), another."""
     if not os.access(path, os.W_OK):
         raise PermissionError(f"{path} is not writable, so PCA could not store its results; pass copy=True to get them in memory.")
     try:
@@ -363,8 +385,9 @@ def pca(
 
     On a crispyx backed file (:class:`crispyx.AnnData`, from
     ``cx.read_h5ad_ondisk`` or a path through ``cx.pp.pca``) the scores are
-    written to ``obsm['X_pca']`` a chunk at a time, so memory does not grow
-    with the number of cells. See the module docstring for each method's peak.
+    written to ``obsm['X_pca']`` a chunk at a time, so memory grows with the
+    number of cells only by the 8-byte row index of a CSR file. Each method's
+    peak is in the docs' memory model (Working with large data).
 
     Parameters
     ----------
@@ -378,7 +401,8 @@ def pca(
           on the budget; pass the method to fix it across machines.
         - ``'covariance'``: exact PCA from the gene x gene covariance (one
           ``8 g²``-byte matrix, g = genes entering PCA). Raises
-          :class:`MemoryError` up front when that does not fit.
+          :class:`MemoryError` before the passes when its peak at the
+          smallest chunk exceeds the budget.
         - ``'incremental'``: scikit-learn's IncrementalPCA, approximate,
           memory linear in the genes.
     use_highly_variable
