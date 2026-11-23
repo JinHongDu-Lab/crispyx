@@ -218,7 +218,10 @@ B batches or strata, k principal components.
      - ``method="covariance"``: one g × g float64 matrix, ``8 g²`` bytes
        (32 MB at 2,000 genes, 8.7 GB at 33,000). ``"incremental"``: none.
        The scores go to the file a chunk at a time on a crispyx backed file;
-       for any other object they are held in memory (``4 n k`` bytes).
+       for any other object they are held in memory (``4 n k`` bytes). With
+       a gene subset (HVGs), about three full-width input rows per cell of
+       the chunk. A CSC file is re-read whole for every row chunk; convert
+       it to CSR first.
      - Method and chunk size; ``"covariance"`` raises ``MemoryError`` when
        its matrix cannot fit
    * - ``neighbors``, ``umap``
@@ -321,7 +324,10 @@ incremental, each plus 64 MB of fixed overhead; k = 50):
 The peak does not grow with the cells: 50,000 and 200,000 cells agree within
 a few percent. The formula is at most 6% below a measurement and up to 45%
 above it, most at 2,000 genes with 512-cell chunks, where the fixed overhead
-dominates.
+dominates. These runs use every gene; with HVGs, the full-width rows read
+before the subset add the term above, which predicts 0.69 GB for the
+2-million-cell screen in :ref:`the QC page <quality-control-pca>`
+(measured 0.71 GB).
 ``neighbors`` measured 0.41 GB at 50,000 cells and 1.26 GB at 200,000;
 ``umap`` 0.27 GB and 1.17 GB.
 

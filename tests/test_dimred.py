@@ -477,3 +477,20 @@ def test_returned_scores_do_not_steer_the_method():
     """Both methods hold the same scores, so they must not tip auto to the
     slower, approximate one."""
     assert _pca_chunk_size(2_000, 50, n_obs_in_memory=2_000_000, memory_limit_gb=1)[1] == "covariance"
+
+
+def test_pca_checks_the_scratch_directory_before_the_passes(tmp_path, monkeypatch):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+
+    def never(*args, **kwargs):
+        raise AssertionError("fit ran although the scratch file could not be created")
+
+    monkeypatch.setattr("crispyx.dimred._fit_pca", never)
+    tmp_path.chmod(0o555)
+    try:
+        if os.access(tmp_path, os.W_OK):
+            pytest.skip("running as a user who can write a read-only directory")
+        with pytest.raises(PermissionError, match="scratch file"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        tmp_path.chmod(0o755)

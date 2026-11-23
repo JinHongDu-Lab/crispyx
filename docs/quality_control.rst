@@ -221,6 +221,8 @@ explicitly, or set ``cell_mask=None`` to use all cells without perturbation
 metadata. If the resolved control label matches zero cells, the call raises
 rather than silently proceeding with a degenerate (``n=0``) statistic.
 
+.. _quality-control-pca:
+
 Dimension reduction
 -------------------
 

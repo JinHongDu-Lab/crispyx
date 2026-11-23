@@ -6485,15 +6485,12 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
 
 
 def _close_backed(data: Any) -> None:
-    """Close the read handle of the object a caller passed -- a crispyx
-    :class:`AnnData` wrapper (it reopens on its next access) or a backed
-    anndata object -- before its file is rewritten in place: HDF5 will not
-    open a file for writing that this process holds open for reading. Other
-    handles to the file are the caller's to close."""
+    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
+    is rewritten in place: HDF5 will not open a file for writing that this
+    process holds open for reading. The wrapper reopens on its next access.
+    Other handles to the file are the caller's to close."""
     if isinstance(data, AnnData):
         data.close()
-    elif getattr(data, "isbacked", False) and getattr(data, "file", None) is not None:
-        data.file.close()
 
 
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
