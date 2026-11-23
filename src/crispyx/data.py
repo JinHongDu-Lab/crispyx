@@ -6484,6 +6484,14 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     _replace_dataframe(Path(path), "var", df, unit="genes")
 
 
+def _close_backed(data: Any) -> None:
+    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
+    is rewritten in place: HDF5 will not open a file for writing that this
+    process holds open for reading. The wrapper reopens on its next access."""
+    if isinstance(data, AnnData):
+        data.close()
+
+
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
     """Replace the ``obs`` or ``var`` table of the h5ad at ``path`` in place.
 
@@ -6614,6 +6622,7 @@ def standardise_gene_names(
     pd.Series or None
         Normalised gene names when ``inplace=False``, else ``None``.
     """
+    _close_backed(path)
     path = Path(path)
     df = load_var(path)
 
@@ -6765,6 +6774,7 @@ def normalise_perturbation_labels(
     pd.Series or None
         Normalised labels when ``inplace=False``, else ``None``.
     """
+    _close_backed(path)
     path = Path(path)
     df = load_obs(path)
 

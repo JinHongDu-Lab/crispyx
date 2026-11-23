@@ -475,3 +475,17 @@ class TestDimredIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_hvg_writes_to_a_file_its_wrapper_holds_open(tmp_path):
+    """A crispyx wrapper whose handle is open (any .shape or .obs access opens
+    it) must not block the in-place var write, and sees the new column."""
+    from crispyx.data import AnnData as CrispyxAnnData
+
+    import crispyx as cx
+
+    for call in (highly_variable_genes, cx.pp.highly_variable_genes):
+        wrapper = CrispyxAnnData(_make_hvg_dataset(tmp_path, "csr", name=call.__qualname__))
+        assert wrapper.shape == (300, 50)  # opens the read handle
+        call(wrapper, flavor="mean_dispersion", n_top_genes=10, cell_mask=None)
+        assert int(wrapper.var["highly_variable"].sum()) >= 10  # ties at the cutoff are kept, as in Scanpy

@@ -523,9 +523,8 @@ class _PreprocessingNamespace:
         See :func:`crispyx.hvg.highly_variable_genes` for the full parameter
         documentation, including the ``cell_mask="control"`` default.
         """
-        path = resolve_data_path(data)
         return highly_variable_genes(
-            path,
+            data,  # not its path: an open crispyx wrapper is closed before the var write
             flavor=flavor,
             n_top_genes=n_top_genes,
             min_mean=min_mean,

@@ -34,6 +34,7 @@ from .data import (
     read_backed,
     resolve_control_label,
     resolve_data_path,
+    _close_backed,
     write_var,
 )
 
@@ -628,6 +629,7 @@ def highly_variable_genes(
         var_df["variances"] = var
         var_df["variances_norm"] = variances_norm
         var_df["highly_variable"] = highly_variable
+        _close_backed(data)
         write_var(path, var_df)
         return None
 
