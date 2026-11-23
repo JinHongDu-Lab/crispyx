@@ -433,3 +433,47 @@ def test_pca_records_the_chunk_the_fit_used():
     adata = ad.AnnData(sparse.csr_matrix(_counts()))
     cx.pp.pca(adata, n_comps=20, method="incremental", chunk_size=8, use_highly_variable=False, show_progress=False)
     assert adata.uns["pca"]["chunk_size"] == 20
+
+
+def test_a_handle_opened_during_the_passes_gives_the_clear_error(tmp_path, monkeypatch):
+    from crispyx import dimred
+
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    project, held = dimred._project, []
+
+    def project_then_open(*args, **kwargs):
+        project(*args, **kwargs)
+        held.append(h5py.File(path, "r"))  # a reader arriving mid-run
+
+    monkeypatch.setattr(dimred, "_project", project_then_open)
+    try:
+        with pytest.raises(OSError, match="open elsewhere"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        for f in held:
+            f.close()
+    assert not _pca_scratch_path(path).exists()
+
+
+def test_pca_on_a_read_only_file_says_so(tmp_path):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    path.chmod(0o444)
+    try:
+        if os.access(path, os.W_OK):
+            pytest.skip("running as a user who can write a read-only file")
+        with pytest.raises(PermissionError, match="not writable"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        path.chmod(0o644)
+
+
+def test_recorded_chunk_is_capped_by_the_cells():
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=5, method="covariance", use_highly_variable=False, show_progress=False)
+    assert adata.uns["pca"]["chunk_size"] == adata.n_obs
+
+
+def test_returned_scores_do_not_steer_the_method():
+    """Both methods hold the same scores, so they must not tip auto to the
+    slower, approximate one."""
+    assert _pca_chunk_size(2_000, 50, n_obs_in_memory=2_000_000, memory_limit_gb=1)[1] == "covariance"

@@ -10,6 +10,7 @@ memory model (docs/large_data.rst, ``memory-model``).
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,7 @@ from scipy import sparse
 from scipy.linalg import eigh
 from scipy.linalg.blas import dsyrk
 from sklearn.decomposition import IncrementalPCA
+from sklearn.utils.extmath import svd_flip
 from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
@@ -101,15 +103,16 @@ def _pca_chunk_size(
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars
 
-    def peak(chunk: int, method: str) -> float:
-        return _pca_peak_bytes(method, n_vars, n_comps, chunk, n_obs_in_memory, read_row_bytes)
+    def peak(chunk: int, method: str, scores: int = n_obs_in_memory) -> float:
+        return _pca_peak_bytes(method, n_vars, n_comps, chunk, scores, read_row_bytes)
 
+    # Returned scores cost both methods the same, so they choose neither.
     if method == "auto":
-        method = "covariance" if peak(min_chunk, "covariance") <= usable else "incremental"
+        method = "covariance" if peak(min_chunk, "covariance", 0) <= usable else "incremental"
 
-    if method == "covariance" and peak(min_chunk, method) > budget:
+    if method == "covariance" and peak(min_chunk, method, 0) > budget:
         raise MemoryError(
-            f"PCA with method='covariance' on {n_vars} genes needs {peak(min_chunk, method) / 1e9:.1f} GB "
+            f"PCA with method='covariance' on {n_vars} genes needs {peak(min_chunk, method, 0) / 1e9:.1f} GB "
             f"(a {covariance_bytes / 1e9:.1f} GB gene x gene matrix), over the "
             f"{budget / 1e9:.1f} GB memory budget. Use method='incremental', or restrict PCA to "
             "highly variable genes (cx.pp.highly_variable_genes, use_highly_variable=True)."
@@ -253,12 +256,11 @@ def _fit_pca(
             desc="Learning PCA", show_progress=show_progress,
         )
         fit = _fit_incremental(blocks, n_comps)
-    # scikit-learn's sign convention (svd_flip on the components): each
-    # component's largest loading is positive, whatever sign LAPACK returned.
-    components = fit["components"]
-    signs = np.sign(components[np.arange(components.shape[0]), np.argmax(np.abs(components), axis=1)])
-    signs[signs == 0] = 1.0
-    fit["components"] = components * signs[:, None]
+    # scikit-learn's sign convention: each component's largest loading is
+    # positive, whatever sign LAPACK returned. An empty u, as u=None needs
+    # scikit-learn 1.5 and crispyx supports 1.0.
+    components = np.array(fit["components"], dtype=np.float64)
+    _, fit["components"] = svd_flip(np.empty((0, components.shape[0])), components, u_based_decision=False)
     return fit
 
 
@@ -302,13 +304,19 @@ def _check_writable(path) -> None:
     """Fail before the passes, not after them, when the results could not be
     written: HDF5 opens a file for writing only if no other handle -- in this
     process or another -- has it open."""
+    if not os.access(path, os.W_OK):
+        raise PermissionError(f"{path} is not writable, so PCA could not store its results; pass copy=True to get them in memory.")
     try:
         h5py.File(path, "r+").close()
     except OSError as err:
-        raise OSError(
-            f"{path} is open elsewhere (another AnnData object or process holds it), so PCA "
-            "could not write its results; close it, or pass copy=True to get them in memory."
-        ) from err
+        raise _open_elsewhere(path, err) from err
+
+
+def _open_elsewhere(path, err: OSError) -> OSError:
+    return OSError(
+        f"{path} is open elsewhere (another AnnData object or process holds it), so PCA could not "
+        f"write its results ({err}); close it and rerun, or pass copy=True to get them in memory."
+    )
 
 
 def _open_x(f: h5py.File):
@@ -441,7 +449,7 @@ def pca(
         else:
             logger.info(f"PCA: chunk_size={chunk_size} as given")
         fit = _fit_pca(matrix, selected_method, n_comps, chunk_size, gene_indices, show_progress)
-        fit_chunk = max(chunk_size, n_comps) if selected_method == "incremental" else chunk_size
+        fit_chunk = min(max(chunk_size, n_comps) if selected_method == "incremental" else chunk_size, n_obs)
 
         if stream:
             # Scores go to a scratch file beside the output (n x k, small) and
@@ -460,7 +468,11 @@ def pca(
                     out.attrs["encoding-version"] = "0.2.0"
                 f.close()
                 # One write session, after every pass: X_pca, PCs and uns together.
-                with h5py.File(path, "r+") as dst, h5py.File(scratch, "r") as tmp:
+                try:
+                    dst = h5py.File(path, "r+")
+                except OSError as err:
+                    raise _open_elsewhere(path, err) from err
+                with dst, h5py.File(scratch, "r") as tmp:
                     obsm = dst.require_group("obsm")
                     if "X_pca" in obsm:
                         del obsm["X_pca"]
@@ -600,7 +612,7 @@ def neighbors(
     Examples
     --------
     >>> import crispyx as cx
-    >>> adata = cx.read_backed("data.h5ad")
+    >>> adata = cx.read_h5ad_ondisk("data.h5ad")
     >>> cx.pp.pca(adata, n_comps=50)
     >>> cx.pp.neighbors(adata, n_neighbors=15)
     >>> adata.obsp['connectivities']
@@ -779,7 +791,7 @@ def umap(
     Examples
     --------
     >>> import crispyx as cx
-    >>> adata = cx.read_backed("data.h5ad")
+    >>> adata = cx.read_h5ad_ondisk("data.h5ad")
     >>> cx.pp.pca(adata, n_comps=50)
     >>> cx.pp.neighbors(adata, n_neighbors=15)
     >>> cx.tl.umap(adata)

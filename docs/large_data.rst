@@ -217,8 +217,8 @@ B batches or strata, k principal components.
    * - ``pca``
      - ``method="covariance"``: one g × g float64 matrix, ``8 g²`` bytes
        (32 MB at 2,000 genes, 8.7 GB at 33,000). ``"incremental"``: none.
-       The scores go to the file a chunk at a time; returned in memory
-       (``4 n k`` bytes) only for an in-memory AnnData.
+       The scores go to the file a chunk at a time on a crispyx backed file;
+       for any other object they are held in memory (``4 n k`` bytes).
      - Method and chunk size; ``"covariance"`` raises ``MemoryError`` when
        its matrix cannot fit
    * - ``neighbors``, ``umap``

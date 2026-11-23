@@ -631,6 +631,9 @@ def highly_variable_genes(
         var_df["highly_variable"] = highly_variable
         _close_backed(data)
         write_var(path, var_df)
+        if isinstance(data, ad.AnnData) and data.isbacked:  # anndata does not reload var on reopening
+            for column in var_df.columns:
+                data.var[column] = var_df[column].to_numpy()
         return None
 
     return pd.DataFrame(
