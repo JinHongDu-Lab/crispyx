@@ -22,7 +22,6 @@ from .data import (
     recover_counts,
     collapse_genes,
     normalize_total_log1p,
-    read_backed,
     resolve_data_path,
 )
 from .de import (
@@ -524,9 +523,8 @@ class _PreprocessingNamespace:
         See :func:`crispyx.hvg.highly_variable_genes` for the full parameter
         documentation, including the ``cell_mask="control"`` default.
         """
-        path = resolve_data_path(data)
         return highly_variable_genes(
-            path,
+            data,  # not its path: an open crispyx wrapper is closed before the var write
             flavor=flavor,
             n_top_genes=n_top_genes,
             min_mean=min_mean,
@@ -551,6 +549,7 @@ class _PreprocessingNamespace:
         method: str = "auto",
         use_highly_variable: bool = True,
         chunk_size: int | None = None,
+        memory_limit_gb: float | None = None,
         random_state: int = 0,
         copy: bool = False,
         show_progress: bool = True,
@@ -564,15 +563,19 @@ class _PreprocessingNamespace:
         n_comps
             Number of principal components. Default 50.
         method
-            'auto', 'sparse_cov', or 'incremental'. Default 'auto'.
+            'auto', 'covariance' (exact, one gene x gene matrix) or
+            'incremental' (IncrementalPCA). Default 'auto'.
         use_highly_variable
             Use only HVGs if available. Default True.
         chunk_size
             Cells per chunk. Auto-calculated if None.
+        memory_limit_gb
+            Memory budget in GB; detected when None.
         random_state
-            Random seed.
+            Not used (both methods are deterministic).
         copy
-            If True, return copy with results instead of in-place.
+            If True, load the data into memory and return a copy with the
+            results instead of writing them to the file.
         show_progress
             Show progress bars.
 
@@ -584,7 +587,7 @@ class _PreprocessingNamespace:
         from .dimred import pca as _pca
 
         if isinstance(data, (str, Path)):
-            adata = read_backed(data)
+            adata = AnnData(data)  # crispyx backed file: results are written to it
         else:
             adata = data
 
@@ -594,6 +597,7 @@ class _PreprocessingNamespace:
             method=method,
             use_highly_variable=use_highly_variable,
             chunk_size=chunk_size,
+            memory_limit_gb=memory_limit_gb,
             random_state=random_state,
             copy=copy,
             show_progress=show_progress,
@@ -642,7 +646,7 @@ class _PreprocessingNamespace:
         from .dimred import neighbors as _neighbors
 
         if isinstance(data, (str, Path)):
-            adata = read_backed(data)
+            adata = AnnData(data)  # crispyx backed file: results are written to it
         else:
             adata = data
 
@@ -842,7 +846,7 @@ class _ToolsNamespace:
         from .dimred import umap as _umap
 
         if isinstance(data, (str, Path)):
-            adata = read_backed(data)
+            adata = AnnData(data)  # crispyx backed file: results are written to it
         else:
             adata = data
 

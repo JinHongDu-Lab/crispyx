@@ -34,6 +34,7 @@ from .data import (
     read_backed,
     resolve_control_label,
     resolve_data_path,
+    _close_backed,
     write_var,
 )
 
@@ -557,6 +558,12 @@ def highly_variable_genes(
     if flavor == "seurat_v3" and n_top_genes is None:
         raise ValueError("n_top_genes is required for flavor='seurat_v3'.")
 
+    if inplace and isinstance(data, ad.AnnData) and data.isbacked:
+        # Closing it would leave its layers on dead handles and its var stale.
+        raise ValueError(
+            "A backed anndata object holds its file open, so its var cannot be rewritten in place: "
+            "pass the path or cx.read_h5ad_ondisk(path) instead, or inplace=False."
+        )
     path = resolve_data_path(data)
     _messages.print_reading(verbose, "pp.highly_variable_genes", path)
 
@@ -628,6 +635,7 @@ def highly_variable_genes(
         var_df["variances"] = var
         var_df["variances_norm"] = variances_norm
         var_df["highly_variable"] = highly_variable
+        _close_backed(data)
         write_var(path, var_df)
         return None
 

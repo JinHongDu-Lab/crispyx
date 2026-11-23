@@ -553,7 +553,7 @@ def write_varm_to_h5ad(path: "str | Path | h5py.File", key: str, data: np.ndarra
         ds.attrs["encoding-version"] = "0.2.0"
 
 
-def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
+def write_uns_dict_to_h5ad(path: "str | Path | h5py.File", key: str, data: dict) -> None:
     """Write a dict to uns/{key} in an h5ad file.
     
     Handles scalar values, numpy arrays, and nested dicts.
@@ -562,7 +562,7 @@ def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file.
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
     key
         Key under uns (e.g., 'pca').
     data
@@ -606,7 +606,7 @@ def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
             ds.attrs["encoding-type"] = "string"
             ds.attrs["encoding-version"] = "0.2.0"
     
-    with h5py.File(path, "r+") as f:
+    with _h5ad_write_handle(path) as f:
         if "uns" not in f:
             f.create_group("uns")
         uns = f["uns"]
@@ -5488,106 +5488,6 @@ def calculate_wilcoxon_chunk_size(
     return chunk_size
 
 
-def calculate_pca_chunk_size(
-    n_obs: int,
-    n_vars: int,
-    n_comps: int = 50,
-    available_memory_gb: float | None = None,
-    method: str = "auto",
-    memory_fraction: float = 0.5,
-    min_chunk: int = 256,
-    max_chunk: int = 4096,
-) -> tuple[int, str]:
-    """Calculate optimal chunk size for streaming PCA.
-    
-    PCA memory usage depends on the method:
-    - sparse_cov: O(genes²) for covariance matrix, fast for small gene counts
-    - incremental: O(chunk × genes) for data chunks, better for large gene counts
-    
-    Parameters
-    ----------
-    n_obs
-        Number of observations (cells) in the dataset.
-    n_vars
-        Number of variables (genes) in the dataset.
-    n_comps
-        Number of principal components to compute. Default 50.
-    available_memory_gb
-        Available memory in gigabytes. If None, auto-detects using psutil.
-    method
-        PCA method: 'auto', 'sparse_cov', or 'incremental'.
-        'auto' selects based on gene count and available memory.
-    memory_fraction
-        Fraction of available memory to use (default 0.5).
-    min_chunk
-        Minimum chunk size to return (default 256).
-    max_chunk
-        Maximum chunk size to return (default 4096).
-    
-    Returns
-    -------
-    tuple[int, str]
-        (chunk_size, selected_method) where selected_method is 'sparse_cov'
-        or 'incremental'.
-    
-    Examples
-    --------
-    >>> calculate_pca_chunk_size(100000, 8000, available_memory_gb=32)
-    (2048, 'sparse_cov')
-    >>> calculate_pca_chunk_size(100000, 50000, available_memory_gb=32)
-    (1024, 'incremental')
-    """
-    if available_memory_gb is None:
-        try:
-            available_memory_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for PCA chunk size calculation."
-            )
-            available_memory_gb = 16.0
-    
-    usable_memory_gb = available_memory_gb * memory_fraction
-    
-    # Estimate covariance matrix memory (genes × genes × 8 bytes)
-    cov_memory_gb = n_vars * n_vars * 8 / 1e9
-    
-    # Select method if auto
-    if method == "auto":
-        # Use sparse_cov if covariance fits in 30% of usable memory
-        if cov_memory_gb < usable_memory_gb * 0.3:
-            selected_method = "sparse_cov"
-        else:
-            selected_method = "incremental"
-    else:
-        selected_method = method
-    
-    # Calculate chunk size based on method
-    if selected_method == "sparse_cov":
-        # Need: XTX (genes² × 8), sums (genes × 8), chunk (chunk × genes × 8)
-        reserved_gb = cov_memory_gb + n_vars * 8 / 1e9
-        remaining_gb = max(0.1, usable_memory_gb - reserved_gb)
-    else:
-        # Need: mean (genes × 8), IPCA internals (~2 × comps × genes × 8), chunk
-        ipca_internal_gb = 2 * n_comps * n_vars * 8 / 1e9
-        reserved_gb = n_vars * 8 / 1e9 + ipca_internal_gb
-        remaining_gb = max(0.1, usable_memory_gb - reserved_gb)
-    
-    # Chunk memory: chunk_size × n_vars × 8 bytes (float64 during computation)
-    bytes_per_row = n_vars * 8
-    max_chunk_from_memory = int(remaining_gb * 0.5 * 1e9 / bytes_per_row)
-    
-    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
-    
-    logger.info(
-        f"PCA chunk size: {chunk_size}, method: {selected_method} "
-        f"(dataset: {n_obs} cells × {n_vars} genes, "
-        f"cov matrix: {cov_memory_gb:.2f} GB, "
-        f"available: {available_memory_gb:.1f} GB)"
-    )
-    
-    return chunk_size, selected_method
-
-
 def calculate_adaptive_qc_thresholds(
     adata: ad.AnnData,
     perturbation_column: str,
@@ -6584,6 +6484,15 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     _replace_dataframe(Path(path), "var", df, unit="genes")
 
 
+def _close_backed(data: Any) -> None:
+    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
+    is rewritten in place: HDF5 will not open a file for writing that this
+    process holds open for reading. The wrapper reopens on its next access.
+    Other handles to the file are the caller's to close."""
+    if isinstance(data, AnnData):
+        data.close()
+
+
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
     """Replace the ``obs`` or ``var`` table of the h5ad at ``path`` in place.
 
@@ -6714,7 +6623,7 @@ def standardise_gene_names(
     pd.Series or None
         Normalised gene names when ``inplace=False``, else ``None``.
     """
-    path = Path(path)
+    source, path = path, Path(path)
     df = load_var(path)
 
     if column is None:
@@ -6786,6 +6695,7 @@ def standardise_gene_names(
     else:
         df[column] = names.to_numpy()
 
+    _close_backed(source)
     write_var(path, df)
     return None
 
@@ -6865,7 +6775,7 @@ def normalise_perturbation_labels(
     pd.Series or None
         Normalised labels when ``inplace=False``, else ``None``.
     """
-    path = Path(path)
+    source, path = path, Path(path)
     df = load_obs(path)
 
     if column not in df.columns:
@@ -6915,6 +6825,7 @@ def normalise_perturbation_labels(
     else:
         df[column] = labels.to_numpy()
 
+    _close_backed(source)
     write_obs(path, df)
     return None
 

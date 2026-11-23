@@ -6,10 +6,12 @@ Requirements
 
 * **Python ≥ 3.10**
 * A working C compiler for Numba JIT (usually ships with your OS)
-* Memory is set by ``memory_limit_gb``, not by the dataset: the streaming
-  steps run within a few GB on any screen. The exception is a cell-level
-  NB-GLM with covariates, whose fit holds the control cells sparse in
-  memory (about 50 GB for 535,000 controls).
+* Memory: the streaming steps hold a chunk of cells or genes, sized from
+  ``memory_limit_gb`` where the function takes it, rather than the whole
+  matrix. Some terms still grow with the screen (per-perturbation results
+  or accumulators, the control cells of a cell-level NB-GLM with covariates,
+  about 50 GB for 535,000 controls); :ref:`memory-model` lists each
+  function's peak.
 
 Install from PyPI
 -----------------

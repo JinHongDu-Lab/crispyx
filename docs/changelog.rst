@@ -1,6 +1,33 @@
 Changelog
 =========
 
+Version 0.2.9
+-------------
+
+*Released 2026-11-23.* PCA holds one gene x gene matrix instead of about 3.4, sizes itself from ``memory_limit_gb``, and writes its scores to the file as it goes; the docs gain a memory model for every streaming function.
+
+**Changed**
+
+* ``cx.pp.pca(method="covariance")``, renamed from ``"sparse_cov"`` (it densified each chunk; nothing about it was sparse), accumulates ``XᵀX`` in place with BLAS ``syrk`` in float64, centres it in column blocks and hands it to ``eigh`` to overwrite, so it holds one ``8 × genes²``-byte matrix where the old code held about 3.4 (the matrix, ``XᵀX / n``, the mean outer product and ``eigh``'s copy): on 20,000 cells x 4,000 genes the peak falls from 429 MB to 292 MB, and at 33,000 genes the gene x gene matrices it holds fall from about 30 GB to 8.7 GB. The covariance was summed in the input's float32 as ``E[x²] - E[x]²`` before, which loses precision for a gene whose mean dwarfs its spread (0.5% in the explained variance with five genes shifted by 1e7); it is summed in float64 around the first chunk's means now, and matches an exact PCA within 2e-14 in the explained variance on 200,000 cells.
+* ``cx.pp.pca`` takes ``memory_limit_gb`` like the rest of crispyx and picks its method and chunk size from a stated peak (``8 g² + 16 c g`` bytes plus 64 MB for covariance, ``50 (c + k) g + 32 (c + k)²`` plus 64 MB for incremental, at most 6% below the peaks measured on a Linux server at 512- and 2,048-cell chunks, plus three full-width input rows per cell of the chunk when PCA uses a gene subset, fitted to a 2-million-cell screen): covariance whenever its peak fits in half the budget, IncrementalPCA (approximate beyond its leading components, and 2.5-7 times slower) only when it does not, and a chunk of 4,096 cells unless that does not fit in half, so the same file gets the same chunk, and so the same IncrementalPCA result, on any machine with the memory. ``uns['pca']`` records the method and the chunk. Forcing ``method="covariance"`` when its peak at the smallest chunk (chiefly the matrix) exceeds the budget raises ``MemoryError`` before the passes (with ``copy=True``, after loading the file), naming the size and the alternatives, instead of the job being killed partway. Without psutil, PCA assumes 16 GB (capped by the job's grant) and warns, where the shared fallback is 64 GB.
+* On a crispyx backed file ``cx.pp.pca`` writes the scores a chunk at a time, to a hidden scratch file beside the output that is copied into ``obsm["X_pca"]`` once complete, so its memory grows with the number of cells only by a CSR file's 8-byte row index, and a run killed during its passes leaves the file as it was (a kill can leave a hidden ``.<name>.X_pca.<pid>.partial`` beside it to delete); ``X_pca``, ``varm['PCs']`` and ``uns['pca']`` are then written together in one session. It reads ``.X`` through h5py rather than opening the file as a backed AnnData, which loads ``obsm``, ``obsp``, ``varm`` and ``uns`` (a previous embedding or neighbour graph) into memory, and so reads a standardized file's linked ``X`` read-only. On a CSC file each row chunk still reads the whole matrix; convert it to CSR first.
+* ``cx.pp.pca(method="incremental")`` joins a final chunk shorter than ``n_comps`` to the one before it; it was left out of the fit.
+* ``cx.pp.pca`` components follow scikit-learn's sign convention (each one's largest loading is positive), so ``X_pca`` no longer flips with the BLAS library or thread count; ``uns['pca']['variance']`` of the covariance method is the sample variance (divided by n - 1), as IncrementalPCA, scikit-learn and Scanpy report, where it was divided by n.
+* ``cx.pp.pca`` projects a sparse chunk without densifying it (``x @ Vᵀ - mean @ Vᵀ``), densifies only the non-zeros' cast for the fit, and passes each chunk to IncrementalPCA without a further copy. It opens the file read-only for its passes and for writing only to store the results; it checks first that it can, and stops before the passes with a clear error when another handle holds the file (another process's, with HDF5 file locking on), the file is not writable, or its directory does not take the scratch file. A handle opened on the file during the passes makes the final write fail with the same error.
+
+**Fixed**
+
+* ``cx.pp.pca``, ``cx.pp.neighbors`` and ``cx.tl.umap`` given a path opened it as anndata's backed object and stored their results in its memory, where they were lost: they now open it as a crispyx backed file and write the results into it.
+* ``cx.pp.highly_variable_genes``, ``standardise_gene_names`` and ``normalise_perturbation_labels`` given a crispyx backed file whose read handle was open (any ``.shape`` or ``.obs`` access opens it) failed to write in place with ``OSError: file is already open for read-only``: they close the object's handle just before writing, and it reopens on its next access. Given a backed anndata object, ``cx.pp.highly_variable_genes`` with ``inplace=True`` says to pass the path instead, before computing. ``cx.pp.highly_variable_genes`` passes the object, not its path, so the namespace call gets the fix too.
+
+**Removed**
+
+* ``crispyx.data.calculate_pca_chunk_size``; PCA's sizing lives in ``crispyx.dimred``.
+
+**Documentation**
+
+* :ref:`memory-model` lists, for each streaming function, what its peak memory grows with and whether ``memory_limit_gb`` bounds it, including the terms that still grow with the screen. The installation, NB-GLM, QC and README pages no longer claim memory independent of the dataset where the code does not bound it.
+
 Version 0.2.8
 -------------
 

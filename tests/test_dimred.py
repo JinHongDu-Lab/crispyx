@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import os
+import tracemalloc
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pytest
 from scipy import sparse
@@ -16,13 +19,12 @@ from sklearn.neighbors import NearestNeighbors
 
 import crispyx as cx
 from crispyx.data import (
-    calculate_pca_chunk_size,
     write_obsm_to_h5ad,
     write_obsp_to_h5ad,
     write_uns_dict_to_h5ad,
     write_varm_to_h5ad,
 )
-from crispyx.dimred import _streaming_pca_incremental, _streaming_pca_sparse_cov, neighbors, umap
+from crispyx.dimred import _fit_pca, _pca_chunk_size, _pca_peak_bytes, _pca_scratch_path, neighbors, umap
 
 
 def _counts(n_obs: int = 400, n_vars: int = 60, seed: int = 0) -> np.ndarray:
@@ -62,47 +64,135 @@ def backed(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "n_obs, n_vars, kwargs, expected_method",
+    "n_vars, kwargs, expected_method",
     [
-        (100_000, 5_000, dict(available_memory_gb=32, method="auto"), "sparse_cov"),   # ~200 MB covariance
-        (100_000, 50_000, dict(available_memory_gb=16, method="auto"), "incremental"),  # ~20 GB covariance
-        (100_000, 5_000, dict(method="incremental"), "incremental"),
+        (5_000, dict(memory_limit_gb=32), "covariance"),     # 0.2 GB matrix
+        (50_000, dict(memory_limit_gb=16), "incremental"),   # 20 GB matrix
+        (16_000, dict(memory_limit_gb=8), "covariance"),     # 2 GB matrix: fits, so the exact method
+        (5_000, dict(memory_limit_gb=32, method="incremental"), "incremental"),
     ],
-    ids=["auto-small", "auto-large", "explicit"],
+    ids=["auto-small", "auto-large", "auto-fits", "explicit"],
 )
-def test_pca_chunk_size_selects_method(n_obs, n_vars, kwargs, expected_method):
-    chunk_size, method = calculate_pca_chunk_size(n_obs, n_vars, **kwargs)
+def test_pca_chunk_size_selects_method(n_vars, kwargs, expected_method):
+    chunk_size, method = _pca_chunk_size(n_vars, 50, **kwargs)
     assert isinstance(chunk_size, int) and chunk_size > 0
     assert method == expected_method
 
 
-def test_pca_chunk_size_respects_bounds():
-    chunk_size, _ = calculate_pca_chunk_size(100_000, 1_000, available_memory_gb=1, min_chunk=128, max_chunk=256)
-    assert 128 <= chunk_size <= 256
+def test_pca_chunk_size_fits_the_budget():
+    chunk_size, method = _pca_chunk_size(20_000, 50, memory_limit_gb=1, method="incremental")
+    assert 256 <= chunk_size <= 4096
+    assert _pca_peak_bytes(method, 20_000, 50, chunk_size) <= 0.5e9 or chunk_size == 256
+    assert _pca_chunk_size(1_000, 50, memory_limit_gb=1, min_chunk=128, max_chunk=256)[0] <= 256
 
 
-def test_sparse_covariance_pca_matches_sklearn(backed):
-    adata, X = backed
-    scores, components, variance_ratio, info = _streaming_pca_sparse_cov(
-        adata, n_comps=10, show_progress=False, return_info=True,
-    )
+def test_forced_covariance_over_the_budget_raises():
+    with pytest.raises(MemoryError, match="method='incremental'"):
+        _pca_chunk_size(30_000, 50, memory_limit_gb=4, method="covariance")  # 7.2 GB matrix
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_covariance_pca_matches_sklearn(dense):
+    X = _counts().astype(np.float64)
+    adata = ad.AnnData(X if dense else sparse.csr_matrix(X))
+    cx.pp.pca(adata, n_comps=10, method="covariance", chunk_size=64, show_progress=False)
     ref = PCA(10, svd_solver="full").fit(X)
-    np.testing.assert_allclose(variance_ratio, ref.explained_variance_ratio_, atol=1e-12)
-    _assert_same_up_to_sign(components.T, ref.components_.T, atol=1e-10)
-    _assert_same_up_to_sign(scores, ref.transform(X), atol=1e-8)
-    assert info is not None
+    np.testing.assert_allclose(adata.uns["pca"]["variance_ratio"], ref.explained_variance_ratio_, atol=1e-12)
+    np.testing.assert_allclose(adata.uns["pca"]["variance"], ref.explained_variance_, rtol=1e-10)  # n - 1
+    _assert_same_up_to_sign(adata.varm["PCs"], ref.components_.T, atol=1e-6)  # stored as float32
+    _assert_same_up_to_sign(adata.obsm["X_pca"], ref.transform(X), rtol=1e-5, atol=1e-5)
+    assert adata.uns["pca"]["method"] == "covariance"
+    assert adata.uns["pca"]["chunk_size"] == 64
+
+
+@pytest.mark.parametrize("method", ["covariance", "incremental"])
+def test_components_have_a_canonical_sign(method):
+    """scikit-learn's convention: each component's largest loading is
+    positive, whatever sign LAPACK returned, so X_pca is the same on any
+    BLAS."""
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=10, method=method, chunk_size=64, use_highly_variable=False, show_progress=False)
+    pcs = adata.varm["PCs"]
+    assert np.all(pcs[np.argmax(np.abs(pcs), axis=0), np.arange(pcs.shape[1])] > 0)
+
+
+def test_covariance_pca_is_exact_for_genes_with_large_means():
+    """E[x²] - E[x]² cancels for a gene whose mean dwarfs its spread; the
+    accumulation shifts by the first chunk's means first."""
+    X = _counts().astype(np.float64)
+    X[:, :5] += 1e7
+    fit = _fit_pca(sparse.csr_matrix(X), "covariance", 10, 64, None, show_progress=False)
+    ref = PCA(10, svd_solver="full").fit(X)
+    np.testing.assert_allclose(fit["variance_ratio"], ref.explained_variance_ratio_, rtol=1e-8)
+    _assert_same_up_to_sign(fit["components"].T, ref.components_.T, atol=1e-7)
+
+
+def test_covariance_pca_does_not_depend_on_the_chunk():
+    matrix = sparse.csr_matrix(_counts())
+    a, b = (_fit_pca(matrix, "covariance", 10, chunk, None, show_progress=False) for chunk in (64, 400))
+    np.testing.assert_allclose(a["components"], b["components"], atol=1e-12)
+    np.testing.assert_allclose(a["variance"], b["variance"], rtol=1e-12)
+
+
+def test_default_chunk_does_not_depend_on_free_memory():
+    """With the memory to spare, the chunk (which IncrementalPCA's result
+    depends on) is the same on every machine."""
+    chunks = {_pca_chunk_size(2_000, 50, memory_limit_gb=gb, method="incremental")[0] for gb in (4, 16, 256)}
+    assert chunks == {4096}
 
 
 def test_incremental_pca_matches_sklearn_on_leading_components(backed):
     """Incremental PCA is approximate; the well-separated leading components agree."""
     adata, X = backed
-    scores, components, variance_ratio, _ = _streaming_pca_incremental(
-        adata, n_comps=10, chunk_size=64, show_progress=False,
-    )
+    fit = _fit_pca(adata.X, "incremental", 10, 64, None, show_progress=False)
     ref = PCA(10, svd_solver="full").fit(X)
-    assert components.shape == (10, X.shape[1])
-    np.testing.assert_allclose(variance_ratio, ref.explained_variance_ratio_, atol=0.01)
+    assert fit["components"].shape == (10, X.shape[1])
+    np.testing.assert_allclose(fit["variance_ratio"], ref.explained_variance_ratio_, atol=0.01)
+    scores = (X - fit["mean"]) @ fit["components"].T
     _assert_same_up_to_sign(scores[:, :5], ref.transform(X)[:, :5], rtol=0.01, atol=0.05)
+
+
+def test_incremental_pca_fits_a_short_final_chunk():
+    """400 cells in chunks of 98 leave 8 < n_comps: they join the chunk before
+    rather than being left out of the fit."""
+    X = _counts()
+    fit = _fit_pca(sparse.csr_matrix(X), "incremental", 10, 98, None, show_progress=False)
+    np.testing.assert_allclose(fit["mean"], X.astype(np.float64).mean(axis=0), rtol=1e-12)
+
+
+def _traced_peak(fn) -> int:
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_covariance_fit_holds_one_gene_by_gene_matrix():
+    n_vars, chunk = 3_000, 512
+    matrix = sparse.random(2_048, n_vars, density=0.05, format="csr", random_state=0, dtype=np.float32)
+    peak =_traced_peak(lambda: _fit_pca(matrix, "covariance", 20, chunk, None, show_progress=False))
+    assert peak < 1.25 * 8 * n_vars**2 + 16 * chunk * n_vars
+
+
+def test_backed_pca_memory_does_not_grow_with_the_cells(tmp_path):
+    """Scores are written to the file a chunk at a time: 4x the cells adds far
+    less than the n x k float32 score matrix."""
+    n_comps, peaks = 20, {}
+    for n_obs in (20_000, 80_000):
+        X = sparse.random(n_obs, 40, density=0.3, format="csr", random_state=0, dtype=np.float32)
+        path = tmp_path / f"cells_{n_obs}.h5ad"
+        ad.AnnData(X).write(path)
+        backed = cx.AnnData(path)
+        peaks[n_obs] = _traced_peak(
+            lambda: cx.pp.pca(backed, n_comps=n_comps, chunk_size=2_048, show_progress=False)
+        )
+        with h5py.File(path, "r") as f:
+            assert f["obsm/X_pca"].shape == (n_obs, n_comps)
+            assert list(f["obsm"]) == ["X_pca"]
+        assert not _pca_scratch_path(path).exists()
+    assert peaks[80_000] - peaks[20_000] < 0.5 * 60_000 * n_comps * 4
 
 
 @pytest.mark.parametrize("use_highly_variable", [False, True])
@@ -132,10 +222,64 @@ def test_pca_writes_results_to_the_backed_file(tmp_path, use_highly_variable):
     np.testing.assert_allclose(info["variance_ratio"], ref.explained_variance_ratio_, rtol=1e-4)
 
 
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_pca_leaves_an_in_memory_matrix_untouched(order):
+    """Rows of a dense float64 X can reach the projection as views (a one-row
+    tail chunk, or a Fortran-ordered X in one chunk); centring must not write
+    through them."""
+    X = np.asarray(np.random.default_rng(0).random((257, 50)), order=order)
+    adata = ad.AnnData(X.copy(order=order))
+    cx.pp.pca(adata, n_comps=5, chunk_size=256 if order == "C" else 512, use_highly_variable=False, show_progress=False)
+    np.testing.assert_array_equal(adata.X, X)
+
+
+def test_pca_on_a_linked_file_with_a_read_only_source(tmp_path):
+    """A standardized file's X is an external link: PCA writes to the linked
+    file and only reads the source, which may be read-only."""
+    from crispyx.data import _write_linked_h5ad
+
+    source, linked = tmp_path / "source.h5ad", tmp_path / "linked.h5ad"
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    adata.write(source)
+    _write_linked_h5ad(source, linked, obs=adata.obs, var=adata.var, uns={})
+    source.chmod(0o444)
+    try:
+        if os.access(source, os.W_OK):
+            pytest.skip("running as a user who can write a read-only file")
+        cx.pp.pca(cx.AnnData(linked), n_comps=5, show_progress=False)
+    finally:
+        source.chmod(0o644)
+    assert ad.read_h5ad(linked).obsm["X_pca"].shape == (400, 5)
+
+
+def test_interrupted_pca_leaves_the_file_as_it_was(tmp_path, monkeypatch):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    before = ad.read_h5ad(path).obsm["X_pca"]
+
+    def fail(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("crispyx.dimred._project", fail)
+    with pytest.raises(KeyboardInterrupt):
+        cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    with h5py.File(path, "r") as f:
+        assert list(f["obsm"]) == ["X_pca"]
+    assert not _pca_scratch_path(path).exists()
+    np.testing.assert_array_equal(ad.read_h5ad(path).obsm["X_pca"], before)
+
+
+def test_pca_on_a_path_writes_to_the_file(tmp_path):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    assert cx.pp.pca(str(path), n_comps=8, show_progress=False) is None
+    assert ad.read_h5ad(path).obsm["X_pca"].shape == (400, 8)
+
+
 def test_pca_copy_from_a_path_returns_the_same_embedding(tmp_path):
     path = _write(tmp_path / "pca.h5ad", _counts())
     copied = cx.pp.pca(path, n_comps=8, copy=True, show_progress=False)
     assert isinstance(copied, ad.AnnData)
+    assert "X_pca" not in ad.read_h5ad(path).obsm  # copy leaves the file alone
     backed = cx.read_h5ad_ondisk(path)
     cx.pp.pca(backed, n_comps=8, show_progress=False)
     np.testing.assert_allclose(copied.obsm["X_pca"], np.asarray(cx.read_h5ad_ondisk(path).obsm["X_pca"]))
@@ -256,8 +400,112 @@ def test_write_helpers_round_trip(tmp_path, slot):
         write_obsp_to_h5ad(path, "connectivities", value)
         np.testing.assert_array_equal(ad.read_h5ad(path).obsp["connectivities"].toarray(), value.toarray())
     else:
-        value = {"variance_ratio": np.array([0.5, 0.3, 0.1]), "n_comps": 10, "method": "sparse_cov"}
+        value = {"variance_ratio": np.array([0.5, 0.3, 0.1]), "n_comps": 10, "method": "covariance"}
         write_uns_dict_to_h5ad(path, "pca", value)
         stored = ad.read_h5ad(path).uns["pca"]
         np.testing.assert_array_equal(stored["variance_ratio"], value["variance_ratio"])
-        assert stored["n_comps"] == 10 and stored["method"] == "sparse_cov"
+        assert stored["n_comps"] == 10 and stored["method"] == "covariance"
+
+
+def test_pca_fails_before_the_passes_when_the_file_is_open_elsewhere(tmp_path, monkeypatch):
+    """The results could not be written while another handle holds the file:
+    say so before computing anything, not after."""
+    path = _write(tmp_path / "pca.h5ad", _counts())
+
+    def never(*args, **kwargs):
+        raise AssertionError("fit ran although the results could not be written")
+
+    monkeypatch.setattr("crispyx.dimred._fit_pca", never)
+    with h5py.File(path, "r"):
+        with pytest.raises(OSError, match="open elsewhere"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+
+
+def test_pca_without_any_highly_variable_gene_raises():
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    adata.var["highly_variable"] = False
+    with pytest.raises(ValueError, match="marks no genes"):
+        cx.pp.pca(adata, n_comps=5, show_progress=False)
+
+
+def test_pca_records_the_chunk_the_fit_used():
+    """IncrementalPCA needs at least n_comps rows per chunk."""
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=20, method="incremental", chunk_size=8, use_highly_variable=False, show_progress=False)
+    assert adata.uns["pca"]["chunk_size"] == 20
+
+
+def test_a_handle_opened_during_the_passes_gives_the_clear_error(tmp_path, monkeypatch):
+    from crispyx import dimred
+
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    project, held = dimred._project, []
+
+    def project_then_open(*args, **kwargs):
+        project(*args, **kwargs)
+        held.append(h5py.File(path, "r"))  # a reader arriving mid-run
+
+    monkeypatch.setattr(dimred, "_project", project_then_open)
+    try:
+        with pytest.raises(OSError, match="open elsewhere"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        for f in held:
+            f.close()
+    assert not _pca_scratch_path(path).exists()
+
+
+def test_pca_on_a_read_only_file_says_so(tmp_path):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+    path.chmod(0o444)
+    try:
+        if os.access(path, os.W_OK):
+            pytest.skip("running as a user who can write a read-only file")
+        with pytest.raises(PermissionError, match="not writable"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        path.chmod(0o644)
+
+
+def test_recorded_chunk_is_capped_by_the_cells():
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=5, method="covariance", use_highly_variable=False, show_progress=False)
+    assert adata.uns["pca"]["chunk_size"] == adata.n_obs
+
+
+def test_returned_scores_do_not_steer_the_method():
+    """Both methods hold the same scores, so they must not tip auto to the
+    slower, approximate one."""
+    assert _pca_chunk_size(2_000, 50, n_obs_in_memory=2_000_000, memory_limit_gb=1)[1] == "covariance"
+
+
+def test_pca_checks_the_scratch_directory_before_the_passes(tmp_path, monkeypatch):
+    path = _write(tmp_path / "pca.h5ad", _counts())
+
+    def never(*args, **kwargs):
+        raise AssertionError("fit ran although the scratch file could not be created")
+
+    monkeypatch.setattr("crispyx.dimred._fit_pca", never)
+    tmp_path.chmod(0o555)
+    try:
+        if os.access(tmp_path, os.W_OK):
+            pytest.skip("running as a user who can write a read-only directory")
+        with pytest.raises(PermissionError, match="scratch file"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+    finally:
+        tmp_path.chmod(0o755)
+
+
+def test_without_psutil_pca_assumes_16_gb_and_warns(monkeypatch, caplog):
+    """The shared resolver falls back to 64 GB, which would send a 33,000-gene
+    covariance fit onto a small machine; PCA keeps its own, smaller default."""
+    from crispyx import dimred
+
+    def no_psutil():
+        raise ImportError("psutil")
+
+    monkeypatch.setattr(dimred, "_detected_available_bytes", no_psutil)
+    monkeypatch.setattr(dimred, "_granted_bytes", lambda: None)
+    with caplog.at_level("WARNING", logger="crispyx.dimred"):
+        assert _pca_chunk_size(33_000, 50)[1] == "incremental"
+    assert "psutil is not installed" in caplog.text

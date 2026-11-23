@@ -13,6 +13,12 @@ default ``distribution="normal"``), but uses substantially
 less time and memory by streaming from disk instead of loading the full count
 matrix into RAM. This assumes adequate scratch disk; see :ref:`disk-space`.
 
+Scanpy can process large data too: backed AnnData, ``sc.pp.pca(chunked=True)``
+(the same IncrementalPCA crispyx uses) and Dask arrays. crispyx's difference is
+narrower: a CRISPR-screen pipeline in which each step's peak memory is stated
+in advance (:ref:`memory-model`) and, for most steps, sized from
+``memory_limit_gb``, so a job's memory request can be set before it runs.
+
 When to use crispyx instead of Scanpy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

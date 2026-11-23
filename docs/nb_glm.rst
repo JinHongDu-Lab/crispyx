@@ -141,9 +141,10 @@ Other options
   job's cgroup still grants. On a Slurm job, set it to your ``--mem`` value.
   It sets the worker count for ``nb_glm_test`` and ``shrink_lfc``
   (``method="full"``), the gene chunk width for ``wilcoxon_test``, and the
-  cell chunk size for ``t_test``. Results are never held in memory: each
-  perturbation's (or gene chunk's) values are written to the output file as
-  they are computed.
+  cell chunk size for ``t_test``. Each perturbation's (or gene chunk's)
+  results are written to the output file as they are computed, but
+  ``t_test`` keeps its perturbations x genes sums in memory while it reads
+  (:ref:`memory-model`).
 * ``scanpy_format=True`` (``t_test``, ``wilcoxon_test``, ``nb_glm_test``)
   also writes the Scanpy ``uns["rank_genes_groups"]`` structure, for
   ``sc.get.rank_genes_groups_df()`` and similar utilities. Default ``False``.
@@ -226,10 +227,10 @@ screens. Null pairs are expected at \|z\| > 3 in 0.27 % and at p < 0.05 in
   perturbation (2 guides x 2 batches), it found 118 genes for SPAST against 19
   for pseudo-bulk, with the same fold changes (r 0.97-0.99): few units widen
   the standard errors.
-* With covariates, a cell-level fit holds every control cell in memory, dense.
-  A hundred thousand control cells or more need hundreds of gigabytes, so
-  ``nb_glm_test`` raises ``MemoryError``; use pseudo-bulk there, or, where no
-  pseudo-bulk unit can be formed, :ref:`nb_offset_test <nb-offset>`.
+* With covariates, a cell-level fit holds every control cell in memory,
+  sparse (about 50 GB for 535,000 controls), and densifies a block of genes
+  at a time; use pseudo-bulk there, or, where no pseudo-bulk unit can be
+  formed, :ref:`nb_offset_test <nb-offset>`.
 
 .. _size-factors:
 

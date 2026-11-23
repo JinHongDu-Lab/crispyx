@@ -31,8 +31,8 @@ for an end-to-end walkthrough.
 Key features
 ------------
 
-- **Streaming QC & preprocessing** — filter and normalise without loading
-  the full matrix
+- **Streaming QC & preprocessing** — filter and normalise by streaming
+  from disk (``qc_summary`` reads a small file into memory)
 - **Data preparation** — normalise labels and take targets out of guide
   names, assign guides, recover counts from log1p data, collapse genes split
   over several rows, concatenate multi-file screens, and check a file before
@@ -44,7 +44,8 @@ Key features
   small perturbations against a stratified control set
 - **Control checks** — do the control guides agree, and may cells without a
   detected guide join them?
-- **Dimension reduction** — memory-efficient PCA and KNN on backed data
+- **Dimension reduction** — streaming PCA sized from ``memory_limit_gb``;
+  KNN and UMAP on the embedding
 - **Scanpy-compatible API** — familiar namespaces and plotting helpers
 - **HPC-ready** — resume/checkpoint, configurable memory limits, Docker
   and Singularity
