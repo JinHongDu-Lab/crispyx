@@ -4,7 +4,7 @@ Changelog
 Version 0.2.9
 -------------
 
-*Unreleased.* PCA holds one gene x gene matrix instead of about four, sizes itself from ``memory_limit_gb``, and writes its scores to the file as it goes; the docs gain a memory model for every streaming function.
+*Released 2026-11-23.* PCA holds one gene x gene matrix instead of about four, sizes itself from ``memory_limit_gb``, and writes its scores to the file as it goes; the docs gain a memory model for every streaming function.
 
 **Changed**
 
@@ -18,6 +18,7 @@ Version 0.2.9
 **Fixed**
 
 * ``cx.pp.pca``, ``cx.pp.neighbors`` and ``cx.tl.umap`` given a path opened it as anndata's backed object and stored their results in its memory, where they were lost: they now open it as a crispyx backed file and write the results into it.
+* ``cx.pp.highly_variable_genes``, ``standardise_gene_names`` and ``normalise_perturbation_labels`` given a crispyx backed file whose read handle was open (any ``.shape`` or ``.obs`` access opens it) failed to write in place with ``OSError: file is already open for read-only``: they close the handle first, and the object reopens on its next access. ``cx.pp.highly_variable_genes`` passes the object, not its path, so the namespace call gets the fix too.
 
 **Removed**
 
