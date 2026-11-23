@@ -134,6 +134,11 @@ def _pca_gene_indices(var, use_highly_variable: bool) -> np.ndarray | None:
     else all (``None``)."""
     if use_highly_variable and "highly_variable" in var.columns:
         gene_indices = np.flatnonzero(np.asarray(var["highly_variable"], dtype=bool))
+        if gene_indices.size == 0:
+            raise ValueError(
+                "var['highly_variable'] marks no genes: rerun cx.pp.highly_variable_genes, "
+                "or pass use_highly_variable=False to use every gene."
+            )
         logger.info(f"Using {gene_indices.size} highly variable genes for PCA")
         return gene_indices
     logger.info(f"Using all {len(var)} genes for PCA")
@@ -270,9 +275,40 @@ def _project(matrix, fit: dict, chunk_size: int, gene_indices: np.ndarray | None
         out[slc] = scores.astype(np.float32)
 
 
+def _full_pcs(fit: dict, gene_indices: np.ndarray | None, n_vars_total: int) -> np.ndarray:
+    """``varm['PCs']``: the components over every gene, zero outside those used."""
+    pcs = np.zeros((n_vars_total, fit["components"].shape[0]), dtype=np.float32)
+    pcs[slice(None) if gene_indices is None else gene_indices, :] = fit["components"].T
+    return pcs
+
+
+def _pca_uns(fit: dict, use_highly_variable: bool, method: str, chunk: int) -> dict:
+    return {
+        "variance": fit["variance"],
+        "variance_ratio": fit["variance_ratio"],
+        "use_highly_variable": use_highly_variable,
+        "method": method,
+        "n_comps": int(fit["components"].shape[0]),
+        "chunk_size": int(chunk),
+    }
+
+
 def _pca_scratch_path(path) -> Path:
     path = Path(path)
     return path.with_name(f".{path.name}.X_pca.partial")
+
+
+def _check_writable(path) -> None:
+    """Fail before the passes, not after them, when the results could not be
+    written: HDF5 opens a file for writing only if no other handle -- in this
+    process or another -- has it open."""
+    try:
+        h5py.File(path, "r+").close()
+    except OSError as err:
+        raise OSError(
+            f"{path} is open elsewhere (another AnnData object or process holds it), so PCA "
+            "could not write its results; close it, or pass copy=True to get them in memory."
+        ) from err
 
 
 def _open_x(f: h5py.File):
@@ -332,7 +368,8 @@ def pca(
     chunk_size
         Number of cells to process per chunk. If None, 4096, or the largest
         chunk whose peak fits in half the memory budget when that is smaller
-        (logged, and stored in ``uns['pca']['chunk_size']``). The covariance
+        (logged; the chunk the fit used, at least ``n_comps`` for
+        IncrementalPCA, is stored in ``uns['pca']['chunk_size']``). The covariance
         result does not depend on it; IncrementalPCA's does, slightly.
     memory_limit_gb
         Memory budget in GB. ``None`` detects the memory available, capped
@@ -385,6 +422,7 @@ def pca(
         # for writing only to store the results.
         path = adata.path
         adata.close()
+        _check_writable(path)
         f = h5py.File(path, "r")
         matrix = _open_x(f)
     else:
@@ -402,7 +440,8 @@ def pca(
             chunk_size = planned_chunk
         else:
             logger.info(f"PCA: chunk_size={chunk_size} as given")
-        fit =_fit_pca(matrix, selected_method, n_comps, chunk_size, gene_indices, show_progress)
+        fit = _fit_pca(matrix, selected_method, n_comps, chunk_size, gene_indices, show_progress)
+        fit_chunk = max(chunk_size, n_comps) if selected_method == "incremental" else chunk_size
 
         if stream:
             # Scores go to a scratch file beside the output (n x k, small) and
@@ -420,11 +459,14 @@ def pca(
                     out.attrs["encoding-type"] = "array"
                     out.attrs["encoding-version"] = "0.2.0"
                 f.close()
+                # One write session, after every pass: X_pca, PCs and uns together.
                 with h5py.File(path, "r+") as dst, h5py.File(scratch, "r") as tmp:
                     obsm = dst.require_group("obsm")
                     if "X_pca" in obsm:
                         del obsm["X_pca"]
                     obsm.copy(tmp["X_pca"], "X_pca")
+                    write_varm_to_h5ad(dst, "PCs", _full_pcs(fit, gene_indices, n_vars_total))
+                    write_uns_dict_to_h5ad(dst, "pca", _pca_uns(fit, use_highly_variable, selected_method, fit_chunk))
             finally:
                 scratch.unlink(missing_ok=True)
         else:
@@ -434,26 +476,13 @@ def pca(
         if f is not None and f.id.valid:
             f.close()
 
-    pcs_full = np.zeros((n_vars_total, n_comps), dtype=np.float32)
-    rows = slice(None) if gene_indices is None else gene_indices
-    pcs_full[rows, :] = fit["components"].T
-    pca_uns = {
-        "variance": fit["variance"],
-        "variance_ratio": fit["variance_ratio"],
-        "use_highly_variable": use_highly_variable,
-        "method": selected_method,
-        "n_comps": n_comps,
-        "chunk_size": chunk_size,
-    }
     explained = f"{fit['variance_ratio'].sum():.2%}"
     if stream:
-        write_varm_to_h5ad(path, "PCs", pcs_full)
-        write_uns_dict_to_h5ad(path, "pca", pca_uns)
         logger.info(f"PCA complete: {n_comps} components, variance explained: {explained} (written to {path})")
         return None
     adata.obsm["X_pca"] = X_pca
-    adata.varm["PCs"] = pcs_full
-    adata.uns["pca"] = pca_uns
+    adata.varm["PCs"] = _full_pcs(fit, gene_indices, n_vars_total)
+    adata.uns["pca"] = _pca_uns(fit, use_highly_variable, selected_method, fit_chunk)
     logger.info(f"PCA complete: {n_comps} components, variance explained: {explained}")
     return adata if copy else None
 

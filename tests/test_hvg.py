@@ -489,3 +489,9 @@ def test_hvg_writes_to_a_file_its_wrapper_holds_open(tmp_path):
         assert wrapper.shape == (300, 50)  # opens the read handle
         call(wrapper, flavor="mean_dispersion", n_top_genes=10, cell_mask=None)
         assert int(wrapper.var["highly_variable"].sum()) >= 10  # ties at the cutoff are kept, as in Scanpy
+
+
+def test_hvg_writes_through_a_backed_anndata_object(tmp_path):
+    a = ad.read_h5ad(_make_hvg_dataset(tmp_path, "csr"), backed="r")
+    highly_variable_genes(a, flavor="mean_dispersion", n_top_genes=10, cell_mask=None)
+    assert "highly_variable" in load_var(a.filename).columns

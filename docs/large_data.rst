@@ -222,7 +222,7 @@ B batches or strata, k principal components.
      - Method and chunk size; ``"covariance"`` raises ``MemoryError`` when
        its matrix cannot fit
    * - ``neighbors``, ``umap``
-     - The embedding and the k-NN graph, in memory: about 7-9 KB per cell
+     - The embedding and the k-NN graph, in memory: about 6-8 KB per cell
        for ``neighbors`` and 6 KB for ``umap`` (50 components, 15
        neighbors; measured).
      - No

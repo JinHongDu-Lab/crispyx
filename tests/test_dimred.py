@@ -405,3 +405,31 @@ def test_write_helpers_round_trip(tmp_path, slot):
         stored = ad.read_h5ad(path).uns["pca"]
         np.testing.assert_array_equal(stored["variance_ratio"], value["variance_ratio"])
         assert stored["n_comps"] == 10 and stored["method"] == "covariance"
+
+
+def test_pca_fails_before_the_passes_when_the_file_is_open_elsewhere(tmp_path, monkeypatch):
+    """The results could not be written while another handle holds the file:
+    say so before computing anything, not after."""
+    path = _write(tmp_path / "pca.h5ad", _counts())
+
+    def never(*args, **kwargs):
+        raise AssertionError("fit ran although the results could not be written")
+
+    monkeypatch.setattr("crispyx.dimred._fit_pca", never)
+    with h5py.File(path, "r"):
+        with pytest.raises(OSError, match="open elsewhere"):
+            cx.pp.pca(cx.AnnData(path), n_comps=5, show_progress=False)
+
+
+def test_pca_without_any_highly_variable_gene_raises():
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    adata.var["highly_variable"] = False
+    with pytest.raises(ValueError, match="marks no genes"):
+        cx.pp.pca(adata, n_comps=5, show_progress=False)
+
+
+def test_pca_records_the_chunk_the_fit_used():
+    """IncrementalPCA needs at least n_comps rows per chunk."""
+    adata = ad.AnnData(sparse.csr_matrix(_counts()))
+    cx.pp.pca(adata, n_comps=20, method="incremental", chunk_size=8, use_highly_variable=False, show_progress=False)
+    assert adata.uns["pca"]["chunk_size"] == 20

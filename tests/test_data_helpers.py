@@ -501,3 +501,16 @@ def test_inplace_label_rewrite_through_an_open_wrapper(tmp_path):
     assert wrapper.shape == (3, 2)
     normalise_perturbation_labels(wrapper, "perturbation", strip_prefixes=["sg-"])
     assert wrapper.obs["perturbation"].astype(str).tolist() == ["A", "NTC", "B"]
+
+
+def test_a_preview_leaves_the_wrapper_open(tmp_path):
+    """inplace=False writes nothing, so the caller's handle stays usable."""
+    from crispyx.data import AnnData as CrispyxAnnData
+
+    path = tmp_path / "pert.h5ad"
+    obs = pd.DataFrame({"perturbation": ["sg-A", "ctrl", "sg-B"]}, index=["c0", "c1", "c2"])
+    ad.AnnData(np.ones((3, 2), dtype=np.float32), obs=obs).write(path)
+    wrapper = CrispyxAnnData(path)
+    X = wrapper.X
+    normalise_perturbation_labels(wrapper, "perturbation", strip_prefixes=["sg-"], inplace=False)
+    np.testing.assert_array_equal(np.asarray(X[0:1]), np.ones((1, 2), dtype=np.float32))

@@ -553,7 +553,7 @@ def write_varm_to_h5ad(path: "str | Path | h5py.File", key: str, data: np.ndarra
         ds.attrs["encoding-version"] = "0.2.0"
 
 
-def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
+def write_uns_dict_to_h5ad(path: "str | Path | h5py.File", key: str, data: dict) -> None:
     """Write a dict to uns/{key} in an h5ad file.
     
     Handles scalar values, numpy arrays, and nested dicts.
@@ -562,7 +562,7 @@ def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file.
+        Path to the h5ad file, or an already-open ``h5py.File`` handle.
     key
         Key under uns (e.g., 'pca').
     data
@@ -606,7 +606,7 @@ def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
             ds.attrs["encoding-type"] = "string"
             ds.attrs["encoding-version"] = "0.2.0"
     
-    with h5py.File(path, "r+") as f:
+    with _h5ad_write_handle(path) as f:
         if "uns" not in f:
             f.create_group("uns")
         uns = f["uns"]
@@ -6485,11 +6485,15 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
 
 
 def _close_backed(data: Any) -> None:
-    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
-    is rewritten in place: HDF5 will not open a file for writing that this
-    process holds open for reading. The wrapper reopens on its next access."""
+    """Close the read handle of the object a caller passed -- a crispyx
+    :class:`AnnData` wrapper (it reopens on its next access) or a backed
+    anndata object -- before its file is rewritten in place: HDF5 will not
+    open a file for writing that this process holds open for reading. Other
+    handles to the file are the caller's to close."""
     if isinstance(data, AnnData):
         data.close()
+    elif getattr(data, "isbacked", False) and getattr(data, "file", None) is not None:
+        data.file.close()
 
 
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
@@ -6622,8 +6626,7 @@ def standardise_gene_names(
     pd.Series or None
         Normalised gene names when ``inplace=False``, else ``None``.
     """
-    _close_backed(path)
-    path = Path(path)
+    source, path = path, Path(path)
     df = load_var(path)
 
     if column is None:
@@ -6695,6 +6698,7 @@ def standardise_gene_names(
     else:
         df[column] = names.to_numpy()
 
+    _close_backed(source)
     write_var(path, df)
     return None
 
@@ -6774,8 +6778,7 @@ def normalise_perturbation_labels(
     pd.Series or None
         Normalised labels when ``inplace=False``, else ``None``.
     """
-    _close_backed(path)
-    path = Path(path)
+    source, path = path, Path(path)
     df = load_obs(path)
 
     if column not in df.columns:
@@ -6825,6 +6828,7 @@ def normalise_perturbation_labels(
     else:
         df[column] = labels.to_numpy()
 
+    _close_backed(source)
     write_obs(path, df)
     return None
 
