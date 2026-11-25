@@ -10,6 +10,12 @@ from crispyx.glm import build_design_matrix, fit_glm_deseq2, fit_two_group_deseq
 
 pydeseq2 = pytest.importorskip("pydeseq2")
 
+# From 0.7 PyDESeq2 holds the fitted mean at ``min_mu`` in the Wald weights, and
+# in the IRLS means its gene-wise dispersions are fitted at (designs with
+# covariates), as R DESeq2 does. crispyx keeps the floor out of both
+# (NBGLMBatchFitter._wald_weights).
+_PYDESEQ2_FLOORS = tuple(int(part) for part in pydeseq2.__version__.split(".")[:2]) >= (0, 7)
+
 
 def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300, batch_sd=0.0):
     """Controls and one perturbation; 0.3 to 30 counts per cell, dispersions
@@ -56,6 +62,27 @@ def _pydeseq2(counts, labels, sf, batch=None):
     return dds, stats.results_df
 
 
+def _floor_free(dds, sf, min_mu=0.5):
+    """The genes whose dispersions and statistics are compared with
+    PyDESeq2's: all of them before PyDESeq2 0.7, and from 0.7 those whose
+    fitted mean is below the floor in no cell (most of them), since only
+    there do the two treat the floor alike."""
+    if not _PYDESEQ2_FLOORS:
+        return np.ones(dds.n_vars, dtype=bool)
+    mu = sf[:, None] * np.exp(dds.obsm["design_matrix"].to_numpy() @ dds.varm["LFC"].to_numpy().T)
+    free = mu.min(axis=0) >= min_mu
+    assert free.mean() > 0.5
+    return free
+
+
+def _z_tolerances(covariates):
+    """Bounds on the median and the largest difference in z over the compared
+    genes. With covariates and PyDESeq2 >= 0.7 they are twice as wide: the
+    floored genes' gene-wise dispersions differ, which moves the trend and
+    the prior every gene is shrunk with."""
+    return (2e-3, 0.1) if covariates and _PYDESEQ2_FLOORS else (1e-3, 0.05)
+
+
 def _fit(counts, labels, sf, bin_width=0.02, blocks=1):
     ctrl = labels == "ctrl"
     rows = np.array_split(np.arange(ctrl.sum()), blocks)
@@ -97,7 +124,7 @@ def test_matches_pydeseq2_given_the_same_size_factors(screen_and_reference, pyde
 
     np.testing.assert_allclose(res.map_dispersion, dds.var["MAP_dispersions"], rtol=2e-2)
     np.testing.assert_allclose(res.lfc, ref["log2FoldChange"] * np.log(2), atol=1e-3)
-    dz = np.abs(res.statistic - ref["stat"].to_numpy())
+    dz = np.abs(res.statistic - ref["stat"].to_numpy())[_floor_free(dds, sf)]
     assert np.median(dz) < 1e-3 and dz.max() < 0.05
     assert res.converged.all()
 
@@ -139,13 +166,14 @@ def test_glm_with_a_covariate_matches_pydeseq2_given_the_same_size_factors(pydes
     res = fit_glm_deseq2(design, counts, sf, columns.index("perturbation"))
     at_bound = _bound_losses_are_lower(res, dds, counts, design, sf, pydeseq2_helper("nb_nll"))
     theirs = dds.var["genewise_dispersions"].to_numpy()
-    np.testing.assert_allclose(res.genewise_dispersion[~at_bound], theirs[~at_bound], rtol=1e-3)
+    free = _floor_free(dds, sf)
+    np.testing.assert_allclose(res.genewise_dispersion[~at_bound & free], theirs[~at_bound & free], rtol=1e-3)
     np.testing.assert_allclose(
         fit_dispersion_trend(dds.var["_normed_means"].to_numpy(), theirs), dds.var["fitted_dispersions"], rtol=1e-4,
     )
-    np.testing.assert_allclose(res.map_dispersion, dds.var["MAP_dispersions"], rtol=0.1)
-    np.testing.assert_allclose(res.lfc, ref["log2FoldChange"] * np.log(2), atol=1e-3)
-    dz = np.abs(res.statistic - ref["stat"].to_numpy())
+    np.testing.assert_allclose(res.map_dispersion[free], dds.var["MAP_dispersions"][free], rtol=0.1)
+    np.testing.assert_allclose(res.lfc[free], (ref["log2FoldChange"] * np.log(2))[free], atol=1e-3)
+    dz = np.abs(res.statistic - ref["stat"].to_numpy())[free]
     assert np.median(dz) < 1e-3 and dz.max() < 0.05
     assert res.converged.all()
     assert res.coef.shape == (counts.shape[1], design.shape[1])
@@ -203,6 +231,7 @@ def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size
     """End to end: nb_glm_test agrees with PyDESeq2 on each perturbation's
     cells, given the size factors nb_glm_test computes; without covariates
     through the control summary, with a batch covariate on the cells."""
+    median_tol, max_tol = _z_tolerances(covariates)
     import anndata as ad
 
     from crispyx.de import _global_size_factors, nb_glm_test
@@ -225,10 +254,10 @@ def test_nb_glm_test_matches_pydeseq2_given_the_same_size_factors(tmp_path, size
         keep = np.isin(labels, ["ctrl", name])
         sub = labels[keep].copy()
         sub[sub == name] = "KO1"
-        _, ref = _pydeseq2(counts[keep], sub, sf[keep], batch[keep] if covariates else None)
+        dds, ref = _pydeseq2(counts[keep], sub, sf[keep], batch[keep] if covariates else None)
         z = result[name].statistic
-        dz = np.abs(z - ref["stat"].to_numpy())
-        assert np.median(dz) < 1e-3 and dz.max() < 0.05, (name, np.median(dz), dz.max())
+        dz = np.abs(z - ref["stat"].to_numpy())[_floor_free(dds, sf[keep])]
+        assert np.median(dz) < median_tol and dz.max() < max_tol, (name, np.median(dz), dz.max())
 
 
 def test_control_summary_does_not_depend_on_the_blocks(screen_and_reference):
@@ -289,12 +318,14 @@ def test_perturbations_fitted_together_match_pydeseq2_with_one_factor(tmp_path, 
     for step in ("fit_genewise_dispersions", "fit_dispersion_trend", "fit_dispersion_prior",
                  "fit_MAP_dispersions", "fit_LFC", "calculate_cooks"):
         getattr(dds, step)()
+    free = _floor_free(dds, sf)
+    median_tol, max_tol = _z_tolerances(covariates)
     for name in ("KO1", "KO2", "KO3"):
         stats = DeseqStats(dds, contrast=["condition", name, "ctrl"], cooks_filter=False,
                            independent_filter=False, quiet=True)
         stats.summary()
-        dz = np.abs(result[name].statistic - stats.results_df["stat"].to_numpy())
-        assert np.median(dz) < 1e-3 and np.nanmax(dz) < 0.05, (name, np.median(dz), np.nanmax(dz))
+        dz = np.abs(result[name].statistic - stats.results_df["stat"].to_numpy())[free]
+        assert np.median(dz) < median_tol and np.nanmax(dz) < max_tol, (name, np.median(dz), np.nanmax(dz))
 
 
 def test_perturbations_are_fitted_in_groups_of_targets_per_fit(tmp_path):

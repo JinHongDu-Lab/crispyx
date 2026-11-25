@@ -689,7 +689,7 @@ def _fit_gene_apeglm_lbfgsb(
     # Estimate SE from inverse Hessian at MAP
     try:
         eta = design_matrix @ beta_map + log_size_factors
-        # No min_mu clamping in SE computation (matching PyDESeq2)
+        # No min_mu clamping in SE computation (see NBGLMBatchFitter._wald_weights)
         mu = np.exp(eta)
         
         # NB weights: W = mu * (1 + mu/size)^(-1) = mu * size / (mu + size)
@@ -1701,12 +1701,15 @@ class NBGLMBatchFitter:
         """IRLS weights for the reported covariance, from the *unfloored* mean.
 
         ``min_mu`` stabilises the iteration; it is not part of the model whose
-        uncertainty is being reported, and DESeq2 keeps it out of the Wald
-        standard error -- ``irls_solver`` returns an unthresholded ``mu`` "as
-        in the R code" and ``wald_test`` rebuilds ``W`` from that.  Leaving the
-        floor in overstates how much every floored cell knows: at 0.05 counts
-        per cell it made the standard errors a quarter too small and the Wald
-        statistics correspondingly too large.
+        uncertainty is being reported.  Leaving the floor in overstates how
+        much every floored cell knows: at 0.05 counts per cell it made the
+        standard errors a quarter too small and the Wald statistics
+        correspondingly too large.  R DESeq2 leaves it in (``fitBeta`` forms
+        the covariance from the floored mean), and so does PyDESeq2 from 0.7;
+        before 0.7 PyDESeq2 rebuilt ``W`` from an unthresholded ``mu``, as
+        here.  Where a fitted mean is below the floor, crispyx's standard
+        errors are therefore larger than theirs (docs/nb_glm.rst, "Matching
+        PyDESeq2 or DESeq2").
 
         The linear predictor is still clipped, but at the generic
         ``ETA_MIN``/``ETA_MAX`` divergence bounds rather than at the mean

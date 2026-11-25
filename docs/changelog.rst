@@ -21,6 +21,7 @@ Version 0.2.10
 
 * :doc:`data_preparation` gains "From a MatrixMarket file"; the comparison page no longer says crispyx does not read MatrixMarket or CSV.
 * The single basic tutorial is replaced by three, each run on the bundled dataset in under a minute and ending with a table of its area's functions: reading and preparing data (the MatrixMarket and CSV readers, guide assignment, label and gene-name helpers, ``check_data``, ``collapse_genes``, ``recover_counts``, ``concat_h5ad``, layout conversion and compression), QC, normalisation and embedding, and effects and differential expression (pseudo-bulk, the three tests, ``nb_offset_test``, fold-change shrinkage, plots, overlap, profiling). 29 public names that no notebook showed are now run or named; ``tests/test_tutorial_coverage.py`` fails when a public function is in none of the three. The ``crispyx_tutorial`` page is removed.
+* :doc:`nb_glm` says where NB-GLM differs from R DESeq2 and from PyDESeq2 0.7 or later: they build the Wald standard error (and, with covariates, the means of the gene-wise dispersions) from the mean held at ``min_mu``, crispyx from the fitted mean, as PyDESeq2 did before 0.7, so genes with a fitted mean under the floor get a larger standard error here. No result of crispyx changes; the tests that compare with PyDESeq2 now compare the genes the floor does not touch when PyDESeq2 is 0.7 or later.
 * :doc:`quality_control` documents ``cx.pp.subsample``, which was on no guide page; the README no longer says crispyx starts from an ``.h5ad`` file only.
 
 Version 0.2.9
