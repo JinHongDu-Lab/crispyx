@@ -124,3 +124,23 @@ def test_rest_is_refused_where_it_does_not_apply(tmp_path):
         cx.tl.rank_genes_groups(path, groupby="cluster", reference="rest", method="nb_glm", verbose=False)
     with pytest.raises(ValueError, match="neither batch_column"):
         cx.wilcoxon_test(path, groupby="cluster", reference="rest", batch_column="cluster", verbose=False)
+
+
+@pytest.mark.parametrize("test", [cx.wilcoxon_test, cx.t_test])
+def test_rest_with_an_empty_selection_writes_an_empty_result(tmp_path, test):
+    adata = _clusters()
+    path = tmp_path / "clusters.h5ad"
+    adata.write_h5ad(path)
+    test(path, groupby="cluster", reference="rest", perturbations=[], output_path=tmp_path / "empty.h5ad",
+         verbose=False)
+    assert RankGenesGroupsResult(tmp_path / "empty.h5ad").groups == []
+
+
+@pytest.mark.parametrize("test", [cx.wilcoxon_test, cx.t_test])
+def test_rest_with_one_group_raises(tmp_path, test):
+    adata = _clusters()
+    adata.obs["cluster"] = "c0"
+    path = tmp_path / "one.h5ad"
+    adata.write_h5ad(path)
+    with pytest.raises(ValueError, match="at least two labelled groups"):
+        test(path, groupby="cluster", reference="rest", output_path=tmp_path / "r.h5ad", verbose=False)

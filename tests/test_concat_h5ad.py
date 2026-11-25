@@ -334,6 +334,8 @@ def test_outer_join_fills_missing_genes_with_zeros(tmp_path, fmt, capsys):
     np.testing.assert_array_equal(got.layers["counts"].toarray(), _dense(expected.layers["counts"]))
     assert got.var["mt"].tolist() == [False, True, False, False, False]
     assert got.var["n"].tolist() == [0, 1, 2, 0, 2]
+    # Every file has these columns, so no value is missing and the dtypes stay plain.
+    assert got.var["mt"].dtype == bool and got.var["n"].dtype == np.int64
     assert "only_second" not in got.var.columns
     # join is part of the call: an inner join is not served from the outer result.
     inner = cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", verbose=False)
@@ -352,3 +354,17 @@ def test_outer_join_checks_shared_cells_over_every_gene(tmp_path):
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", join="outer", verbose=False)
     with pytest.raises(ValueError, match="join must be"):
         cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", join="left", verbose=False)
+
+
+def test_outer_join_gives_a_column_a_later_file_lacks_a_nullable_dtype(tmp_path):
+    paths = []
+    for i, (genes, var) in enumerate([(["A", "B"], {"mt": [True, False]}), (["C"], {})]):
+        a = ad.AnnData(np.ones((2, len(genes)), dtype=np.float32), obs=pd.DataFrame(index=[f"s{i}_{j}" for j in range(2)]),
+                       var=pd.DataFrame(var, index=genes))
+        paths.append(tmp_path / f"s{i}.h5ad")
+        a.write(paths[-1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", join="outer", verbose=False).path)
+    assert str(got.var["mt"].dtype) == "boolean" and got.var["mt"].tolist()[:2] == [True, False]
+    assert pd.isna(got.var["mt"].iloc[2])
+    cx.pp.calculate_qc_metrics(got_path := tmp_path / "all.h5ad", qc_vars="mt", verbose=False)
+    assert cx.load_obs(got_path)["total_counts_mt"].tolist() == [1.0, 1.0, 0.0, 0.0]

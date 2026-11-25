@@ -581,6 +581,8 @@ def test_batch_key_writes_scanpy_columns_and_checks_batches(tmp_path):
     highly_variable_genes(path, n_top_genes=15, batch_key="sample", cell_mask=None, verbose=False)
     var = load_var(path)
     assert {"highly_variable_nbatches", "highly_variable_rank"} <= set(var.columns)
+    highly_variable_genes(path, n_top_genes=15, cell_mask=None, verbose=False)
+    assert "highly_variable_nbatches" not in load_var(path).columns  # the batched run's columns are gone
     single = highly_variable_genes(path, flavor="seurat_v3_paper", n_top_genes=15, cell_mask=None,
                                    inplace=False, verbose=False)
     plain = highly_variable_genes(path, n_top_genes=15, cell_mask=None, inplace=False, verbose=False)

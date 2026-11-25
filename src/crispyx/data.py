@@ -2841,13 +2841,15 @@ def _concat_matrices(
     var = metas[0]["var"].set_axis(metas[0]["var_names"])
     if len(genes) > len(var):  # outer join: a gene takes the first file's row that has it
         columns = var.columns
-        rows, seen = [_nullable(var, columns)], var.index
+        rows, seen = [var], var.index
         for meta in metas[1:]:
             frame = meta["var"].set_axis(meta["var_names"])
             frame = frame.loc[~frame.index.isin(seen), frame.columns.intersection(columns)]
-            rows.append(_nullable(frame, columns))
+            rows.append(frame)
             seen = seen.append(frame.index)
-        var = pd.concat(rows)
+        # Only a column some contributing file lacks gets NA, so only it needs a nullable dtype.
+        partial = {c for c in columns for frame in rows[1:] if len(frame) and c not in frame.columns}
+        var = pd.concat([_nullable(frame, partial) for frame in rows])
     var = var.loc[genes]
     uns = {
         key: value for key, value in metas[0]["uns"].items()

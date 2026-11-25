@@ -177,7 +177,7 @@ def _top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
     NaN scores are always excluded. Ties at the cutoff are all included
     (same ``>=`` semantics scanpy's own ``_nth_highest``/``_subset_genes``
     use for the dispersion-based flavors), so more than ``n_top_genes``
-    entries can come back true. Use :func:`_rank_top_n_mask` for
+    entries can come back true. Use :func:`_seurat_v3_select` for
     ``seurat_v3``, whose selection semantics are different.
     """
     finite = scores[~np.isnan(scores)]
@@ -641,6 +641,8 @@ def highly_variable_genes(
         **extra,
     }
     if inplace:
-        write_var(path, var_df.assign(**columns))
+        # A previous run's batch columns describe another selection.
+        stale = {"highly_variable_nbatches", "highly_variable_rank", "highly_variable_intersection"} - set(extra)
+        write_var(path, var_df.drop(columns=list(stale & set(var_df.columns))).assign(**columns))
         return None
     return pd.DataFrame(columns, index=var_df.index)

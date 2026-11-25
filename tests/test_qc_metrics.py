@@ -62,6 +62,18 @@ def test_qc_metrics_written_to_file(tmp_path):
     assert np.isnan(obs["pct_counts_mt"].iloc[0])
 
 
+def test_qc_metrics_take_a_nullable_gene_set(tmp_path):
+    """concat_h5ad(join="outer") stores a gene-set flag some files lack as a
+    nullable boolean; a missing flag is not in the set."""
+    adata = _counts()
+    path = _write(adata, tmp_path / "counts.h5ad", "dense")
+    var = cx.load_var(path)
+    var["mt"] = pd.array([True, None] + [False] * (adata.n_vars - 2), dtype="boolean")
+    cx.write_var(path, var)
+    obs, _ = cx.pp.calculate_qc_metrics(path, qc_vars="mt", inplace=False, verbose=False)
+    np.testing.assert_allclose(obs["total_counts_mt"], adata.X[:, 0])
+
+
 def test_qc_metrics_layer_and_errors(tmp_path):
     adata = _counts()
     adata.layers["counts"] = sp.csr_matrix(adata.X)
@@ -149,14 +161,14 @@ def _doublet_data(tmp_path, fmt: str = "csr"):
                                            index=[f"c{i}" for i in range(len(X))]),
                        var=pd.DataFrame(index=[f"g{j}" for j in range(X.shape[1])]))
     stored = adata.copy()
-    if fmt == "dense":
-        stored.X = X
+    if fmt != "csr":
+        stored.X = X if fmt == "dense" else sp.csc_matrix(X)
     path = tmp_path / "doublets.h5ad"
     stored.write_h5ad(path)
     return path, adata
 
 
-@pytest.mark.parametrize("fmt", ["csr", "dense"])
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
 def test_scrublet_matches_scanpy_per_batch(tmp_path, fmt):
     path, adata = _doublet_data(tmp_path, fmt)
     expected = adata.copy()

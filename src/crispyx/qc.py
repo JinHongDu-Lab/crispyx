@@ -477,9 +477,11 @@ def calculate_qc_metrics(
     qc_vars = [qc_vars] if isinstance(qc_vars, str) else list(qc_vars)
     var = load_var(path)
     for name in qc_vars:
-        if name not in var.columns or var[name].dtype != bool:
+        if name not in var.columns or not pd.api.types.is_bool_dtype(var[name]):
             raise ValueError(f"qc_vars: {name!r} is not a boolean var column")
-    gene_sets = sp.csr_matrix(var[qc_vars].to_numpy(dtype=np.float64)) if qc_vars else None
+    gene_sets = (
+        sp.csr_matrix(var[qc_vars].fillna(False).to_numpy(dtype=np.float64)) if qc_vars else None
+    )
 
     backed = read_backed(path)
     try:
@@ -595,6 +597,24 @@ def mad_outliers(
     return pd.DataFrame(flags, index=obs.index)
 
 
+def _selected_rows(matrix, selected: np.ndarray) -> sp.csr_matrix:
+    """The rows of a backed ``matrix`` where ``selected`` is true, as CSR,
+    read in chunks on its fast axis: indexing a CSC dataset by rows would
+    read it whole into memory."""
+    n_obs, n_vars = matrix.shape
+    if _detect_backed_sparse_format(matrix) == "csc":
+        chunks = iter_matrix_chunks(
+            None, axis=1, matrix=matrix, chunk_size=calculate_optimal_gene_chunk_size(n_obs, n_vars),
+            convert_to_dense=False,
+        )
+        return sp.hstack([sp.csc_matrix(block)[selected] for _, block in chunks], format="csr")
+    chunks = iter_matrix_chunks(
+        None, axis=0, matrix=matrix, chunk_size=calculate_optimal_chunk_size(n_obs, n_vars),
+        convert_to_dense=False, selected=selected,
+    )
+    return sp.vstack([sp.csr_matrix(block[selected[slc]]) for slc, block in chunks], format="csr")
+
+
 def scrublet(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -610,8 +630,10 @@ def scrublet(
 
     Runs :func:`scanpy.pp.scrublet` on each batch's cells read from disk, so
     the result is Scanpy's with the same ``batch_key``, but memory holds one
-    batch (and Scrublet's simulated doublets for it), never the file. The
-    automatic threshold needs scikit-image: ``pip install 'crispyx[scrublet]'``.
+    batch (and Scrublet's simulated doublets for it), never the file. A batch
+    is read a chunk at a time on the matrix's fast axis, so a CSC matrix is
+    read once per batch. The automatic threshold needs scikit-image:
+    ``pip install 'crispyx[scrublet]'``.
 
     Parameters
     ----------
@@ -656,8 +678,9 @@ def scrublet(
     score, called = np.full(len(obs), np.nan), np.zeros(len(obs), dtype=bool)
     with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
         for batch in pd.unique(batches[used]):
-            rows = np.flatnonzero(used & (batches == batch))
-            cells = ad.AnnData(sp.csr_matrix(matrix[rows]), obs=pd.DataFrame(index=obs.index[rows]))
+            selected = used & (batches == batch)
+            rows = np.flatnonzero(selected)
+            cells = ad.AnnData(_selected_rows(matrix, selected), obs=pd.DataFrame(index=obs.index[rows]))
             sc.pp.scrublet(cells, random_state=random_state, verbose=False, **scrublet_kwargs)
             # A cell Scrublet drops (under 3 genes) has no score and is not called.
             score[rows] = cells.obs["doublet_score"].to_numpy(dtype=np.float64)

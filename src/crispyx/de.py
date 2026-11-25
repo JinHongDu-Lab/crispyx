@@ -1243,6 +1243,8 @@ def t_test(
             control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
+        if rest:
+            _check_rest_has_cells(labels)
         # With the rest as reference, every other labelled cell goes in a last group.
         groups = candidates + [REST] if rest else [control_label] + candidates
         group_index = {label: idx for idx, label in enumerate(groups)}
@@ -1336,7 +1338,8 @@ def t_test(
     )
 
     _t_test_disk_estimate = warn_if_disk_space_low(
-        _t_test_disk_bytes(*shape),
+        # + the rest's pts_rest layer, in the partial and the output
+        _t_test_disk_bytes(*shape) + (2 * estimate_bytes(*shape, itemsize=4) if rest else 0),
         output_path,
         context="t_test",
     )
@@ -3573,6 +3576,13 @@ def _write_wilcoxon_chunk(handle: h5py.File, slc: slice, *, auc, u, z, p, lfc, p
         handle["var/pts_rest"][slc] = pts_rest
 
 
+def _check_rest_has_cells(labels: np.ndarray) -> None:
+    """Raise unless ``reference="rest"`` leaves every group a rest: at least
+    two labelled groups."""
+    if pd.unique(labels[labels != UNLABELLED]).size < 2:
+        raise ValueError("reference='rest' needs at least two labelled groups: with one, the rest is empty")
+
+
 def _check_wilcoxon_input(block) -> None:
     """Raise unless ``block`` (a matrix chunk) is sparse and log-normalised,
     not counts."""
@@ -4323,8 +4333,9 @@ def wilcoxon_test(
             control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
-        control_n = int((labels != UNLABELLED).sum() if control_label == REST else (labels == control_label).sum())
-        if control_n == 0:
+        if control_label == REST:
+            _check_rest_has_cells(labels)
+        elif not (labels == control_label).any():
             raise ValueError("Control group contains no cells")
         # Memory-efficient validation: avoid creating per-group bool masks (n_groups × n_cells
         # memory, e.g. 18K groups × 3.4M cells = 62 GB for Huang-HCT116). Instead use
@@ -4362,7 +4373,8 @@ def wilcoxon_test(
             corr_method=corr_method, resume=False, fingerprint=_checkpoint_fingerprint(fingerprint),
             chunk_size=chunk_size or 1, batch_column=batch_column, distribution=distribution,
         )
-        run.file["var/pts_rest"][...] = np.nan
+        if control_label != REST:  # the rest's pts_rest is an (empty) layer
+            run.file["var/pts_rest"][...] = np.nan
         return _finish_result(
             run, output_path, obs=_result_obs([], perturbation_column), method="wilcoxon",
             corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
@@ -4447,7 +4459,9 @@ def _wilcoxon_test_rest(
     n_gene_chunks = -(-n_genes // chunk_size)
     interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
     _messages.print_disk_estimate(verbose, "wilcoxon_test", warn_if_disk_space_low(
-        _wilcoxon_disk_bytes(n_groups, n_genes), output_path, context="wilcoxon_test",
+        # + the pts_rest layer, in the partial and the output
+        _wilcoxon_disk_bytes(n_groups, n_genes) + 2 * estimate_bytes(n_groups, n_genes, itemsize=4),
+        output_path, context="wilcoxon_test",
     ))
     run = _wilcoxon_resumable_result(
         output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
