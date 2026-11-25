@@ -35,6 +35,37 @@ Plot the QC summary:
    )
    cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
 
+Fewer cells, fewer counts
+-------------------------
+
+Two functions reduce a dataset before normalisation, each streamed to a new
+file:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 42 30
+
+   * - Function
+     - Decides
+     - Typical use
+   * - :func:`crispyx.pp.subsample`
+     - Which cells stay: ``n`` or ``frac`` drawn within each stratum of
+       ``groupby``. With ``unit="batch"`` (any ``obs`` column) whole units
+       are kept or dropped. A stratum smaller than ``n`` is dropped, or kept
+       whole with ``drop_insufficient=False``.
+     - The same number of cells for every perturbation
+   * - :func:`crispyx.pp.downsample_counts`
+     - How many counts stay in a cell: thinned to ``counts_per_cell``
+       without replacement.
+     - Equal sequencing depth across datasets
+
+.. code-block:: python
+
+   capped = cx.pp.subsample(
+       "data/filtered.h5ad", n=200, groupby="perturbation", random_state=0,
+       output_path="data/subsampled.h5ad",
+   )
+
 Assign guides to cells
 ----------------------
 

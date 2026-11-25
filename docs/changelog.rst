@@ -4,15 +4,23 @@ Changelog
 Version 0.2.10
 --------------
 
-*Released 2026-11-25.* MatrixMarket count matrices convert to h5ad without being read into memory.
+*Released 2026-11-25.* MatrixMarket count matrices convert to h5ad without being read into memory, and three basic tutorials run or name every public function.
 
 **Added**
 
 * ``cx.read_10x_mtx`` and ``cx.read_mtx``: a MatrixMarket matrix (``.gz`` and ``.bz2`` read as they are), with or without its barcode and feature tables, streamed into an h5ad file with the names and defaults of Scanpy's ``sc.read_10x_mtx`` / ``sc.read_mtx``, which hold the whole matrix in memory several times over. The entries are parsed a block at a time, appended to one scratch file per band of cells (12 bytes per non-zero, in the temporary directory when it is on disk and has room, else beside the output) and written band by band, each sized to ``memory_limit_gb``, so they may come sorted by barcode, sorted by gene or unsorted; a band that holds more than its share (cells ordered by size) is built in parts. ``read_10x_mtx`` also reads what Scanpy refuses in this layout: a feature table with one column (gene names) or two (no feature types), and plain or gzipped files under either ``features.tsv`` or ``genes.tsv``; names are taken as written, so a gene called ``NA`` keeps its name. A file that is truncated (fewer entries than its header declares), has an index outside its shape, a line that is not three numbers or a value the requested ``dtype`` cannot hold, or is not an ``integer`` or ``real`` ``general`` coordinate matrix raises and leaves no output. The output is reused by the same call on unchanged files (``force=True`` converts again).
 
+**Fixed**
+
+* ``cx.detect_gene_symbol_column`` (and so ``cx.infer_columns`` and the hint in ``cx.pp.check_data``) took any ``var`` column that did not look like Ensembl IDs for the gene symbols: on a file from ``cx.read_10x_mtx`` it returned ``feature_types``, and a count or a flag (``n_cells``, ``highly_variable``) qualified as well. Only a text column whose values are mostly distinct is now a candidate.
+* ``cx.write_obs`` and ``cx.write_var`` failed with HDF5's ``file is already open for read-only`` when a ``cx.AnnData`` object in the same process had the file open (any ``.shape`` or ``.obs`` access opens it), also when given its path: they now close crispyx's own handles on the file first, and each reopens on its next access. A handle crispyx does not own (an h5py file, a backed anndata object) gives an error that says so.
+* The progress bars of ``cx.pp.highly_variable_genes`` and ``cx.pp.pca`` ignored ``TQDM_DISABLE``, which silences every other crispyx bar: they are drawn through the same helper now, as plain tqdm bars where they were notebook widgets.
+
 **Documentation**
 
 * :doc:`data_preparation` gains "From a MatrixMarket file"; the comparison page no longer says crispyx does not read MatrixMarket or CSV.
+* The single basic tutorial is replaced by three, each run on the bundled dataset in under a minute and ending with a table of its area's functions: reading and preparing data (the MatrixMarket and CSV readers, guide assignment, label and gene-name helpers, ``check_data``, ``collapse_genes``, ``recover_counts``, ``concat_h5ad``, layout conversion and compression), QC, normalisation and embedding, and effects and differential expression (pseudo-bulk, the three tests, ``nb_offset_test``, fold-change shrinkage, plots, overlap, profiling). 29 public names that no notebook showed are now run or named; ``tests/test_tutorial_coverage.py`` fails when a public function is in none of the three. The ``crispyx_tutorial`` page is removed.
+* :doc:`quality_control` documents ``cx.pp.subsample``, which was on no guide page; the README no longer says crispyx starts from an ``.h5ad`` file only.
 
 Version 0.2.9
 -------------

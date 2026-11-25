@@ -25,8 +25,8 @@ disk space for streaming intermediates and the final output file; see
 usage before running.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
-workflows can migrate with minimal changes. See the :doc:`tutorial <notebooks/crispyx_tutorial>`
-for an end-to-end walkthrough.
+workflows can migrate with minimal changes. The three basic tutorials, starting with
+:doc:`notebooks/basics_1_data`, run or name every function on a small dataset.
 
 Key features
 ------------
@@ -58,7 +58,9 @@ Key features
 
    installation
    quickstart
-   notebooks/crispyx_tutorial
+   notebooks/basics_1_data
+   notebooks/basics_2_qc_embedding
+   notebooks/basics_3_effects_tests
 
 .. toctree::
    :maxdepth: 2

@@ -18,8 +18,9 @@ The typical workflow, with the guide page for each step:
 8. **Plot** – visualise results with Scanpy-style helpers (:doc:`differential_expression`)
 
 Screens run in batches, donors or lines: :doc:`covariate_adjustment` compares
-the ways crispyx adjusts for them. The :doc:`crispyx tutorial
-<notebooks/crispyx_tutorial>` runs the whole workflow on a small dataset.
+the ways crispyx adjusts for them. Three basic tutorials run the whole workflow on
+a small dataset and name every function: :doc:`notebooks/basics_1_data`,
+:doc:`notebooks/basics_2_qc_embedding` and :doc:`notebooks/basics_3_effects_tests`.
 
 
 A first run
