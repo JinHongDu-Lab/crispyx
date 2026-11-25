@@ -4,7 +4,7 @@ Changelog
 Version 0.2.11
 --------------
 
-*Unreleased.* A multi-sample single-cell dataset without perturbations goes from counts to QC flags, per-sample highly variable genes, clusters and cluster markers with crispyx alone: per-cell QC metrics, MAD outlier flags, per-sample Scrublet, ``batch_key`` for highly variable genes, Leiden clustering, one-vs-rest markers and zero-filled concatenation.
+*Released 2026-11-26.* A multi-sample single-cell dataset without perturbations goes from counts to QC flags, per-sample highly variable genes, clusters and cluster markers with crispyx alone: per-cell QC metrics, MAD outlier flags, per-sample Scrublet, ``batch_key`` for highly variable genes, Leiden clustering, one-vs-rest markers and zero-filled concatenation.
 
 **Added**
 
