@@ -166,7 +166,7 @@ class _LazyFrameAccessor:
         if self._cache is None:
             # Only this table: materialising the AnnData would read X too
             # (a 151 GB QC output, to look up one obs column).
-            loaded = _read_h5ad_element(self._parent.path, self._attr)
+            loaded = _read_h5ad_element(self._parent._reading(), self._attr)
             if isinstance(loaded, pd.DataFrame):
                 loaded = loaded.copy()
             else:
@@ -224,7 +224,7 @@ class _LazyUnsEntry:
 
     def load(self) -> Any:
         if self._cache is _MISSING:
-            self._cache = _read_h5ad_element(self._parent.path, f"uns/{self._key}")
+            self._cache = _read_h5ad_element(self._parent._reading(), f"uns/{self._key}")
         return self._cache
 
     def preview(self, n: int = 5) -> Any:
@@ -306,7 +306,10 @@ class AnnData:
         self.path = Path(path)
         self._mode = mode
         self._backed: ad.AnnData | None = None
-        self._opened: str | None = None
+        # The absolute path of the file this wrapper holds an open handle or
+        # a table of, None while it holds nothing: a relative path names
+        # another file once the working directory changes.
+        self._held: str | None = None
         self._obs_view: _LazyFrameAccessor | None = None
         self._var_view: _LazyFrameAccessor | None = None
         self._uns_view: _LazyUnsMapping | None = None
@@ -330,10 +333,16 @@ class AnnData:
         """Return the lazily opened backed AnnData handle."""
 
         if self._backed is None:
-            self._backed = read_backed(self.path, mode=self._mode)
-            # absolute: a relative path names another file once the working directory changes
-            self._opened = _os.path.abspath(self.path)
+            self._backed = read_backed(self._reading(), mode=self._mode)
         return self._backed
+
+    def _reading(self) -> Path:
+        """``path``, recording the file it names now as one this wrapper holds
+        something of (see :func:`_close_wrappers_on`). Reads go through the
+        caller's path so that what crispyx echoes keeps its shape."""
+        if self._held is None:
+            self._held = _os.path.abspath(self.path)
+        return self.path
 
     def close(self) -> None:
         """Close the underlying file handle if it is open."""
@@ -343,7 +352,7 @@ class AnnData:
                 self._backed.file.close()
             finally:
                 self._backed = None
-                self._opened = None
+        self._held = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -399,7 +408,7 @@ class AnnData:
         self.path = state["path"]
         self._mode = state["_mode"]
         self._backed = None
-        self._opened = None
+        self._held = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -6983,8 +6992,11 @@ def _close_wrappers_on(path: Path) -> None:
     with _WRAPPERS_LOCK:
         wrappers = list(_WRAPPERS)
     for wrapper in wrappers:
+        held = wrapper._held
+        if held is None:
+            continue
         try:
-            same = _os.path.samefile(wrapper._opened or wrapper.path, path)
+            same = _os.path.samefile(held, path)
         except OSError:
             same = False
         if same:

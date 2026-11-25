@@ -121,10 +121,15 @@ def test_a_crispyx_handle_open_on_the_file_is_closed_and_reopens(tmp_path, monke
     # a wrapper opened by a relative path is still found after the working directory changes
     held = cx.AnnData("obs.h5ad")
     assert held.shape == (40, 2)
+    # and so is one that has only shown its obs, which leaves no file open
+    shown = cx.AnnData("obs.h5ad")
+    assert shown.obs.load()["h"].eq(1).all()
     (tmp_path / "elsewhere").mkdir()
     monkeypatch.chdir(tmp_path / "elsewhere")
     write_obs(path, load_obs(path).assign(h=3))
     assert load_obs(path)["h"].eq(3).all()
+    monkeypatch.chdir(tmp_path)
+    assert shown.obs.load()["h"].eq(3).all()
 
 
 def test_a_wrapper_that_showed_a_table_reads_it_again_after_a_rewrite(tmp_path):

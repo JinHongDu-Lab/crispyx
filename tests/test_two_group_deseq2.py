@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
+from packaging.version import Version
 
 from crispyx.glm import build_design_matrix, fit_glm_deseq2, fit_two_group_deseq2, summarize_controls
 
@@ -15,7 +16,7 @@ pydeseq2 = pytest.importorskip("pydeseq2")
 # R DESeq2, by crispyx (NBGLMBatchFitter._wald_weights) and by PyDESeq2 from
 # 0.7. Before 0.7 PyDESeq2 took the fitted mean itself for both; it is what
 # CI's Python 3.10 and 3.11 jobs install (0.6 and later need Python 3.12).
-_PYDESEQ2_UNFLOORED = tuple(int(part) for part in pydeseq2.__version__.split(".")[:2]) < (0, 7)
+_PYDESEQ2_UNFLOORED = Version(pydeseq2.__version__) < Version("0.7")
 
 
 def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300, batch_sd=0.0):
@@ -440,7 +441,7 @@ def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
 
     path, *_ = _three_targets(tmp_path, covariates=False)
     result = cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
-                                     control_label="ctrl", output_dir=tmp_path, verbose=False,
+                                     control_label="ctrl", output_path=tmp_path / "rgg.h5ad", verbose=False,
                                      targets_per_fit=3, size_factor_method="geomeans", min_mu=0.5,
                                      shrink_dispersion=False)
     assert result.uns["targets_per_fit"].load() == 3
@@ -448,7 +449,7 @@ def test_rank_genes_groups_passes_the_nb_glm_options(tmp_path):
     assert result.uns["min_mu"].load() == 0.5
     with pytest.raises(TypeError, match="fit_method"):
         cx.tl.rank_genes_groups(path, method="nb_glm", perturbation_column="perturbation",
-                                control_label="ctrl", output_dir=tmp_path, fit_method="joint")
+                                control_label="ctrl", output_path=tmp_path / "rgg.h5ad", fit_method="joint")
 
 
 def test_a_gene_held_at_a_bound_is_not_reported_converged():

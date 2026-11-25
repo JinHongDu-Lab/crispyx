@@ -60,7 +60,7 @@ def test_de_on_in_memory_data_matches_the_file_and_leaves_no_scratch(tmp_path, s
 def test_namespace_and_qc_take_in_memory_data(tmp_path, scratch_root):
     adata = _screen()
     result = cx.tl.rank_genes_groups(_screen(log=True), perturbation_column="perturbation", control_label="control",
-                                     method="t_test", output_dir=tmp_path, verbose=False)
+                                     method="t_test", output_path=tmp_path / "rgg.h5ad", verbose=False)
     assert result.shape == (2, 25)  # KD1, KD2 x genes
     mask = cx.pp.filter_cells(adata, min_genes=1, verbose=False)
     assert mask.shape == (adata.n_obs,)

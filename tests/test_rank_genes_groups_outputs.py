@@ -46,7 +46,7 @@ def test_rank_genes_groups_and_readers_report_the_stored_values(screen, tmp_path
     common = dict(perturbation_column="perturbation", control_label="control", verbose=False)
     direct = fn(screen / source, output_dir=tmp_path, data_name="direct", scanpy_format=scanpy_format, **common)
     wrapped = cx.tl.rank_genes_groups(
-        screen / source, method=method, output_dir=tmp_path, data_name="wrapped", **common,
+        screen / source, method=method, output_path=tmp_path / "wrapped.h5ad", **common,
     )
     # The wrapper returns the method's own result file.
     wrapped_mem = wrapped.to_memory()

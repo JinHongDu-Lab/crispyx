@@ -305,8 +305,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         method="t-test",
         control_label="ctrl",
         gene_name_column="gene_symbols",
-        output_dir=tmp_path,
-        data_name="wrapped_wald",
+        output_path=tmp_path / "wrapped_wald.h5ad",
         min_cells_expressed=0,
     )
     wald_direct = t_test(
@@ -344,8 +343,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         method="wilcoxon",
         control_label="ctrl",
         gene_name_column="gene_symbols",
-        output_dir=tmp_path,
-        data_name="wrapped_wilcoxon",
+        output_path=tmp_path / "wrapped_wilcoxon.h5ad",
         min_cells_expressed=0,
     )
     wilcoxon_direct = wilcoxon_test(

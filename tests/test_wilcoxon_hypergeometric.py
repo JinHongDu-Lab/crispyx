@@ -91,9 +91,9 @@ def test_the_distribution_is_checked_and_reaches_rank_genes_groups(tmp_path):
                            **common, **NO_FILTER)
     via = cx.tl.rank_genes_groups(tmp_path / "s.h5ad", groupby="perturbation", reference="control",
                                   method="wilcoxon", distribution="hypergeometric",
-                                  output_dir=tmp_path / "b", verbose=False, **NO_FILTER)
-    (written,) = (tmp_path / "b").glob("*.h5ad")
-    np.testing.assert_allclose(ad.read_h5ad(written).layers["pvalue"], direct.pvalues)
+                                  output_path=tmp_path / "b.h5ad", verbose=False, **NO_FILTER)
+    np.testing.assert_allclose(via.to_memory().layers["pvalue"], direct.pvalues)
+    via.close()
 
 
 def test_many_strata_merge_the_mixture_instead_of_falling_back():

@@ -216,9 +216,9 @@ def test_aliases_name_the_same_call(tmp_path, capsys):
     cx.wilcoxon_test(path, groupby="perturbation", reference="ctrl", output_path=output, **defaults)
     assert "Loading existing result" in capsys.readouterr().out
 
-    cx.wilcoxon_test(path, perturbation_column="perturbation", output_dir=tmp_path / "rgg", verbose=False)
+    cx.wilcoxon_test(path, perturbation_column="perturbation", output_path=tmp_path / "rgg.h5ad", verbose=False)
     capsys.readouterr()
-    cx.tl.rank_genes_groups(path, groupby="perturbation", output_dir=tmp_path / "rgg")
+    cx.tl.rank_genes_groups(path, groupby="perturbation", output_path=tmp_path / "rgg.h5ad")
     assert "Loading existing result" in capsys.readouterr().out
 
 

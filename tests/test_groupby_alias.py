@@ -73,7 +73,7 @@ def screen(tmp_path_factory) -> tuple[Path, Path]:
 
 def _rank_genes_groups(path, out, **kw):
     result = cx.tl.rank_genes_groups(
-        path, method="wilcoxon", output_dir=out.parent, data_name=out.stem, verbose=False, **kw
+        path, method="wilcoxon", output_path=out, verbose=False, **kw
     )
     effect = np.asarray(result.to_memory().X)
     result.close()
