@@ -18,9 +18,9 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from tqdm.auto import tqdm
 
 from . import _messages
+from ._checkpoint import _create_progress_context
 from .data import (
     AnnData,
     _looks_like_counts,
@@ -34,7 +34,6 @@ from .data import (
     read_backed,
     resolve_control_label,
     resolve_data_path,
-    _close_backed,
     write_var,
 )
 
@@ -68,36 +67,32 @@ def _stream_reduce(
         n_chunks = (backed.n_vars + chunk_size - 1) // chunk_size
         out_a = np.empty(backed.n_vars)
         out_b = np.empty(backed.n_vars)
-        for slc, block in tqdm(
-            iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-            total=n_chunks,
-            desc=f"{desc} (CSC)",
-            disable=not show_progress,
-        ):
-            if cell_mask is not None:
-                block = block[cell_mask]
-            a, b = block_fn(block, slc)
-            out_a[slc] = a
-            out_b[slc] = b
+        chunks = iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False)
+        with _create_progress_context(n_chunks, f"{desc} (CSC)", show_progress, unit="chunk") as bar:
+            for slc, block in chunks:
+                if cell_mask is not None:
+                    block = block[cell_mask]
+                a, b = block_fn(block, slc)
+                out_a[slc] = a
+                out_b[slc] = b
+                bar.update(1)
         return out_a, out_b
 
     n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
     out_a = np.zeros(backed.n_vars)
     out_b = np.zeros(backed.n_vars)
-    for slc, block in tqdm(
-        iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-        total=n_chunks,
-        desc=desc,
-        disable=not show_progress,
-    ):
-        local_mask = None if cell_mask is None else cell_mask[slc]
-        if local_mask is not None:
-            if not np.any(local_mask):
-                continue
-            block = block[local_mask]
-        a, b = block_fn(block, slc)
-        out_a += a
-        out_b += b
+    chunks = iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False)
+    with _create_progress_context(n_chunks, desc, show_progress, unit="chunk") as bar:
+        for slc, block in chunks:
+            bar.update(1)
+            local_mask = None if cell_mask is None else cell_mask[slc]
+            if local_mask is not None:
+                if not np.any(local_mask):
+                    continue
+                block = block[local_mask]
+            a, b = block_fn(block, slc)
+            out_a += a
+            out_b += b
     return out_a, out_b
 
 
@@ -635,7 +630,6 @@ def highly_variable_genes(
         var_df["variances"] = var
         var_df["variances_norm"] = variances_norm
         var_df["highly_variable"] = highly_variable
-        _close_backed(data)
         write_var(path, var_df)
         return None
 

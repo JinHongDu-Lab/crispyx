@@ -509,3 +509,32 @@ def test_without_psutil_pca_assumes_16_gb_and_warns(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="crispyx.dimred"):
         assert _pca_chunk_size(33_000, 50)[1] == "incremental"
     assert "psutil is not installed" in caplog.text
+
+
+def test_progress_bars_follow_tqdm_disable(tmp_path):
+    """HVG selection and PCA draw their bars through the shared helper, so
+    TQDM_DISABLE silences them as it does every other crispyx bar. tqdm reads
+    the variable when it is imported, hence a fresh interpreter per case."""
+    import os
+    import subprocess
+    import sys
+
+    path = _write(tmp_path / "bars.h5ad", _counts())
+    script = (
+        "import crispyx as cx\n"
+        f"cx.pp.highly_variable_genes({str(path)!r}, flavor='mean_dispersion', n_top_genes=20, cell_mask=None)\n"
+        f"cx.pp.pca({str(path)!r}, n_comps=5)\n"
+    )
+    source = str(Path(cx.__file__).parents[1])
+
+    def stderr(**extra):
+        env = {k: v for k, v in os.environ.items() if k != "TQDM_DISABLE"}
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [source, env.get("PYTHONPATH")]))
+        run = subprocess.run([sys.executable, "-c", script], env={**env, **extra}, capture_output=True, text=True)
+        assert run.returncode == 0, run.stderr
+        return run.stderr
+
+    shown, hidden = stderr(), stderr(TQDM_DISABLE="1")
+    for bar in ("Computing gene moments", "Computing covariance", "Transforming data"):
+        assert bar in shown
+        assert bar not in hidden

@@ -8,6 +8,7 @@ import re as _re
 import socket as _socket
 import tempfile
 import time as _time
+import weakref
 import functools
 import inspect
 import shutil
@@ -279,6 +280,12 @@ class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
         return repr(previews)
 
 
+#: The wrappers whose file handle is open, so a function that rewrites a file
+#: in place can close this process's own read handles on it first
+#: (:func:`_close_wrappers_on`).
+_OPEN_WRAPPERS: "weakref.WeakSet[AnnData]" = weakref.WeakSet()
+
+
 class AnnData:
     """Thin wrapper around a backed :class:`anndata.AnnData` handle."""
 
@@ -317,6 +324,7 @@ class AnnData:
 
         if self._backed is None:
             self._backed = read_backed(self.path, mode=self._mode)
+            _OPEN_WRAPPERS.add(self)
         return self._backed
 
     def close(self) -> None:
@@ -327,6 +335,7 @@ class AnnData:
                 self._backed.file.close()
             finally:
                 self._backed = None
+                _OPEN_WRAPPERS.discard(self)
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -6860,7 +6869,9 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file (modified in-place).
+        Path to the h5ad file (modified in-place). A :class:`crispyx.AnnData`
+        that has the file open is closed first and reopens on its next
+        access; any other open handle on it must be closed by the caller.
     df
         New obs DataFrame. Must have the same number of rows as the existing
         obs table. Index values are written as cell barcodes.
@@ -6869,6 +6880,8 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     ------
     ValueError
         If the DataFrame length does not match the existing n_obs.
+    OSError
+        If an h5py file or a backed anndata object holds the file open.
     """
     _replace_dataframe(Path(path), "obs", df, unit="cells")
 
@@ -6879,7 +6892,8 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file (modified in-place).
+        Path to the h5ad file (modified in-place); open handles are treated
+        as in :func:`write_obs`.
     df
         New var DataFrame. Must have the same number of rows as the existing
         var table.
@@ -6888,17 +6902,25 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     ------
     ValueError
         If the DataFrame length does not match the existing n_vars.
+    OSError
+        If an h5py file or a backed anndata object holds the file open.
     """
     _replace_dataframe(Path(path), "var", df, unit="genes")
 
 
-def _close_backed(data: Any) -> None:
-    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
-    is rewritten in place: HDF5 will not open a file for writing that this
-    process holds open for reading. The wrapper reopens on its next access.
-    Other handles to the file are the caller's to close."""
-    if isinstance(data, AnnData):
-        data.close()
+def _close_wrappers_on(path: Path) -> None:
+    """Close every crispyx :class:`AnnData` wrapper's read handle on the file
+    at ``path`` before it is rewritten in place: HDF5 will not open a file
+    for writing that this process holds open for reading. A wrapper reopens
+    on its next access. Other handles (h5py, a backed anndata object) are
+    the caller's to close."""
+    for wrapper in list(_OPEN_WRAPPERS):
+        try:
+            same = _os.path.samefile(wrapper.path, path)
+        except OSError:
+            same = False
+        if same:
+            wrapper.close()
 
 
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
@@ -6911,7 +6933,17 @@ def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> 
     :func:`_finish_interrupted_swaps`), after which anndata reads it too. Resumable runs rely on this: they
     rewrite ``obs`` of a work file they may be killed in.
     """
-    with h5py.File(path, "r+") as f:
+    _close_wrappers_on(path)
+    try:
+        handle = h5py.File(path, "r+")
+    except OSError as error:
+        if "already open" not in str(error):
+            raise
+        raise OSError(
+            f"{path} is open elsewhere in this process (an h5py file or a backed anndata object holds it), "
+            f"so its {key} table could not be rewritten ({error}); close that handle first."
+        ) from error
+    with handle as f:
         _finish_dataframe_swap(f, key)
         n_rows = _h5_index_length(f[key])
         if len(df) != n_rows:
@@ -7103,7 +7135,6 @@ def standardise_gene_names(
     else:
         df[column] = names.to_numpy()
 
-    _close_backed(source)
     write_var(path, df)
     return None
 
@@ -7233,7 +7264,6 @@ def normalise_perturbation_labels(
     else:
         df[column] = labels.to_numpy()
 
-    _close_backed(source)
     write_obs(path, df)
     return None
 
@@ -7342,7 +7372,11 @@ def detect_gene_symbol_column(
 ) -> str | None:
     """Heuristically identify the var column containing gene symbols.
 
-    Scoring:
+    Only a text column whose values are mostly distinct can hold gene names:
+    a numeric or boolean column (``n_cells``, ``highly_variable``) and a label
+    many genes share (``feature_types``, a chromosome) are not candidates.
+
+    Scoring of the candidates:
 
     * +3 if column name matches known aliases (``gene_symbols``, ``symbol``, …).
     * +2 if values pass :func:`_validate_gene_symbols` without error.
@@ -7368,6 +7402,8 @@ def detect_gene_symbol_column(
     ensembl_3 = frozenset(p[:3].upper() for p in ENSEMBL_PREFIXES)
     scores: dict[str, int] = {}
     for col in var.columns:
+        if pd.api.types.is_numeric_dtype(var[col].dtype) or var[col].nunique() <= len(var) / 2:
+            continue
         score = 0
         if col.lower() in _GENE_SYMBOL_COL_ALIASES:
             score += 3

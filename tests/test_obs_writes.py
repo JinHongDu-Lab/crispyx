@@ -99,3 +99,29 @@ def test_a_swap_killed_between_its_moves_is_finished_by_any_crispyx_read(tmp_pat
         backed.file.close()
     finally:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def test_a_crispyx_handle_open_on_the_file_is_closed_and_reopens(tmp_path, monkeypatch):
+    """HDF5 refuses to open for writing a file this process reads: crispyx's
+    own wrappers are closed first, whatever spelling of the path they hold."""
+    import crispyx as cx
+
+    path = _obs_file(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    by_absolute_path, by_relative_path = cx.AnnData(path), cx.AnnData("obs.h5ad")
+    assert by_absolute_path.shape == by_relative_path.shape == (40, 2)  # both hold the file open
+
+    write_obs(path, load_obs(path).assign(h=1))
+    cx.write_var("obs.h5ad", cx.load_var(path).assign(v=2))
+    assert by_absolute_path.obs.load()["h"].eq(1).all()  # reopened, and sees the new table
+    assert by_relative_path.var.load()["v"].eq(2).all()
+    by_absolute_path.close()
+    by_relative_path.close()
+
+
+def test_a_handle_crispyx_does_not_own_gives_a_clear_error(tmp_path):
+    path = _obs_file(tmp_path)
+    with h5py.File(path, "r"):
+        with pytest.raises(OSError, match="open elsewhere in this process.*close that handle"):
+            write_obs(path, load_obs(path).assign(h=1))
+    assert "h" not in load_obs(path)

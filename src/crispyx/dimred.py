@@ -23,11 +23,11 @@ from scipy.linalg import eigh
 from scipy.linalg.blas import dsyrk
 from sklearn.decomposition import IncrementalPCA
 from sklearn.utils.extmath import svd_flip
-from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     import anndata as AnnData
 
+from ._checkpoint import _create_progress_context
 from ._memory import _detected_available_bytes, _granted_bytes, _resolve_memory_limit_bytes
 from .data import (
     iter_matrix_chunks,
@@ -175,7 +175,7 @@ def _row_blocks(
 ) -> Iterator[tuple[slice, np.ndarray | sparse.spmatrix]]:
     """Row chunks of ``matrix`` restricted to ``gene_indices``, as read:
     sparse stays sparse, and a dense chunk may be a view of the input."""
-    with tqdm(total=matrix.shape[0], desc=desc, disable=not show_progress, unit="cells") as bar:
+    with _create_progress_context(matrix.shape[0], desc, show_progress, unit="cells") as bar:
         for slc, block in iter_matrix_chunks(None, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False):
             if gene_indices is not None:
                 block = block[:, gene_indices]
