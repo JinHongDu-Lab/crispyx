@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Version 0.2.10
+--------------
+
+*Unreleased.* MatrixMarket count matrices convert to h5ad without being read into memory.
+
+**Added**
+
+* ``cx.read_10x_mtx`` and ``cx.read_mtx``: a MatrixMarket matrix (``.gz`` and ``.bz2`` read as they are), with or without its barcode and feature tables, streamed into an h5ad file with the names and defaults of Scanpy's ``sc.read_10x_mtx`` / ``sc.read_mtx``, which hold the whole matrix in memory several times over. The entries are parsed a block at a time, appended to one scratch file per band of cells (12 bytes per non-zero, in the temporary directory when it is on disk and has room, else beside the output) and written band by band, each sized to ``memory_limit_gb``, so they may come sorted by barcode, sorted by gene or unsorted; a band that holds more than its share (cells ordered by size) is built in parts. ``read_10x_mtx`` also reads what Scanpy refuses in this layout: a feature table with one column (gene names) or two (no feature types), and plain or gzipped files under either ``features.tsv`` or ``genes.tsv``; names are read as text, so a gene called ``NA`` keeps its name. A file that is truncated (fewer entries than its header declares), has an index outside its shape or is not an ``integer`` or ``real`` ``general`` coordinate matrix raises and leaves no output. The output is reused by the same call on unchanged files (``force=True`` converts again).
+
+**Documentation**
+
+* :doc:`data_preparation` gains "From a MatrixMarket file"; the comparison page no longer says crispyx does not read MatrixMarket or CSV.
+
 Version 0.2.9
 -------------
 

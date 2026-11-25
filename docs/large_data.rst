@@ -178,6 +178,11 @@ B batches or strata, k principal components.
    * - ``read_csv`` / ``read_text``
      - One parsed block; O(n) row names.
      - Block size
+   * - ``read_mtx`` / ``read_10x_mtx``
+     - One parsed block of entries, then one band of cells, held twice as
+       12-byte records; O(n + g) names. The non-zeros are also written once
+       to scratch files on disk.
+     - Block size, band size
    * - ``aggregate_pseudobulk``
      - P × g sums in a memory-mapped file on disk.
      - Chunk size

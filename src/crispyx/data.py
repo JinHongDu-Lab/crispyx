@@ -4615,6 +4615,16 @@ def _is_float(text: str) -> bool:
     return True
 
 
+def _append_sparse_block(h5: h5py.File, block: sp.spmatrix) -> None:
+    """Append ``block`` to the compressed-sparse ``X`` of the open h5ad
+    ``h5`` along its compressed axis, creating ``X`` from the first block."""
+    if "X" in h5:
+        sparse_dataset(h5["X"]).append(block)
+    else:
+        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
+        write_elem(h5, "X", block)
+
+
 def read_text(
     filename: str | Path,
     *,
@@ -4757,11 +4767,7 @@ def _read_table(
                         shape=(len(indptr) - 1, n_values),
                     )
                     block = block.T.tocsc() if transpose else block  # genes as columns
-                    if "X" in h5:
-                        sparse_dataset(h5["X"]).append(block)
-                    else:
-                        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
-                        write_elem(h5, "X", block)
+                    _append_sparse_block(h5, block)
                     evict(block.nnz * (dtype.itemsize + 4))
                     indptr[:] = [0]
                     indices.clear()
@@ -4846,6 +4852,379 @@ def _read_table(
         write_stamp(partial, stamp("text", fingerprint))
     _messages.vprint(verbose, name, f"{path} -> {output_path}: {len(cells):,} cells x {len(genes):,} genes")
     return AnnData(output_path)
+
+
+#: Entries parsed per block at most.
+_MTX_BLOCK_ENTRIES = 1 << 24
+
+#: Bytes a block holds per entry: pandas' parsed columns and parser buffers
+#: (about 90, measured), their zero-based copies and the spill records.
+_MTX_ENTRY_BYTES = 160
+
+
+def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int]:
+    """``(rows, columns, entries)`` of the MatrixMarket coordinate file open
+    as the text stream ``handle``, which is left at the first entry."""
+    banner = handle.readline().lower().split()
+    if banner[:3] != ["%%matrixmarket", "matrix", "coordinate"] or len(banner) != 5:
+        raise ValueError(
+            f"{name}: {path} does not start with a '%%MatrixMarket matrix coordinate' header"
+        )
+    if banner[3] not in ("integer", "real") or banner[4] != "general":
+        raise ValueError(
+            f"{name}: {path} is a '{banner[3]} {banner[4]}' matrix; only 'integer' or 'real' "
+            "'general' ones are streamed (scipy.io.mmread reads the others, in memory)"
+        )
+    for line in handle:
+        if line.startswith("%") or not line.strip():
+            continue
+        try:
+            n_rows, n_cols, n_entries = (int(field) for field in line.split())
+        except ValueError:
+            raise ValueError(
+                f"{name}: {path}: expected 'rows columns entries' after the header, found {line.strip()!r}"
+            ) from None
+        return n_rows, n_cols, n_entries
+    raise ValueError(f"{name}: {path} has no 'rows columns entries' line")
+
+
+def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: int):
+    """``(rows, columns, values)`` of the entries left in ``handle``, a block
+    at a time: one-based int64 indices as written, values as ``dtype``."""
+    reader = pd.read_csv(
+        handle, sep=r"\s+", header=None, names=["row", "col", "value"],
+        dtype={"row": np.int64, "col": np.int64, "value": dtype}, chunksize=block_entries,
+    )
+    while True:
+        try:
+            frame = next(reader)
+        except StopIteration:
+            return
+        except ValueError as error:  # a line that is not 'row column value'
+            raise ValueError(f"{name}: {path}: {error}") from None
+        values = frame["value"].to_numpy()
+        if values.dtype.kind == "f" and np.isnan(values).any():
+            raise ValueError(f"{name}: {path} has an entry without a value")
+        yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
+
+
+def _spilled_records(path: Path, record_dtype: np.dtype) -> Iterator[np.ndarray]:
+    """The records of a spill file, :data:`_SPILL_READ_ITEMS` at a time."""
+    with open(path, "rb") as handle:
+        while True:
+            records = np.fromfile(handle, dtype=record_dtype, count=_SPILL_READ_ITEMS)
+            if not records.size:
+                return
+            yield records
+
+
+def _append_mtx_band(
+    h5: h5py.File, path: Path, record_dtype: np.dtype, lo: int, hi: int, n_genes: int, max_items: int,
+    evict: _EvictEvery,
+) -> None:
+    """Append the cells ``[lo, hi)``, whose ``(cell, gene, value)`` records
+    were spilled to ``path``, to the CSR ``X`` of ``h5``: columns sorted,
+    duplicate entries summed. One block when the records fit ``max_items``;
+    else the cells are split by their counts into parts that do, and the
+    file is read once per part. Each array is dropped as soon as the next
+    step has what it needs, so a block is never held beside the next one's
+    records."""
+    spans = [(lo, hi)]
+    if path.stat().st_size // record_dtype.itemsize > max_items:
+        counts = np.zeros(hi - lo, dtype=np.int64)
+        for records in _spilled_records(path, record_dtype):
+            counts += np.bincount(records["cell"] - lo, minlength=hi - lo)
+        spans = [(lo + a, lo + b) for a, b in _contiguous_bands(counts, per_item_bytes=1, budget_bytes=max_items)]
+    for a, b in spans:
+        if len(spans) == 1:
+            records = np.fromfile(path, dtype=record_dtype)
+        else:
+            records = np.concatenate([
+                part[(part["cell"] >= a) & (part["cell"] < b)] for part in _spilled_records(path, record_dtype)
+            ])
+        # Contiguous copies of the fields, so the records can be freed before
+        # scipy builds the block from them.
+        cells, genes, values = records["cell"] - a, records["gene"].copy(), records["value"].copy()
+        del records
+        block = sp.csr_matrix((values, (cells, genes)), shape=(b - a, n_genes))
+        del cells, genes, values
+        _append_sparse_block(h5, block)
+        evict(block.nnz * (2 * block.data.itemsize + block.indices.itemsize))
+        del block
+
+
+def _read_mtx(
+    name: str, path: Path, *, output_path, fingerprint: dict, dtype, transpose: bool,
+    obs: pd.DataFrame | None, var: pd.DataFrame | None, keep_genes: np.ndarray | None,
+    memory_limit_gb, verbose, force,
+) -> "AnnData":
+    """:func:`read_mtx` and :func:`read_10x_mtx`, reporting as ``name``:
+    the coordinate file ``path`` into ``output_path``, its rows the genes
+    when ``transpose``; ``obs`` and ``var`` name the file's cells and genes
+    (numbered when None), and the genes not in ``keep_genes`` are left out.
+    """
+    output_path = Path(output_path)
+    _refuse_overwriting_input([path], output_path)
+    if not force and reusable(output_path, "mtx", fingerprint, verbose):
+        return AnnData(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = np.dtype(dtype)
+    # A tenth of the budget for a parsed block, half of it for a band.
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    block_entries = min(_MTX_BLOCK_ENTRIES, max(100_000, int(budget * 0.1 / _MTX_ENTRY_BYTES)))
+
+    scratch = None
+    with _replace_on_success(output_path) as partial:
+        try:
+            with open(path, "rb") as raw, _text_stream(raw) as handle:
+                n_rows, n_cols, n_entries = _mtx_header(handle, name, path)
+                n_cells, n_file_genes = (n_cols, n_rows) if transpose else (n_rows, n_cols)
+                for table, n, kind in ((obs, n_cells, "cells"), (var, n_file_genes, "genes")):
+                    if table is not None and len(table) != n:
+                        raise ValueError(f"{name}: {path} has {n:,} {kind} but {len(table):,} names were read for them")
+                obs = pd.DataFrame(index=pd.RangeIndex(n_cells).astype(str)) if obs is None else obs
+                var = pd.DataFrame(index=pd.RangeIndex(n_file_genes).astype(str)) if var is None else var
+                gene_map = None
+                if keep_genes is not None and not keep_genes.all():
+                    gene_map = np.where(keep_genes, np.cumsum(keep_genes) - 1, -1)
+                    var = var[keep_genes]
+                n_genes = len(var)
+
+                cell_dtype, gene_dtype = (
+                    np.dtype(np.int32 if n <= np.iinfo(np.int32).max else np.int64) for n in (n_cells, n_genes)
+                )
+                # Widest field first, so every field is aligned.
+                record_dtype = np.dtype(sorted(
+                    [("cell", cell_dtype), ("gene", gene_dtype), ("value", dtype)],
+                    key=lambda field: -field[1].itemsize,
+                ), align=True)
+                # A band holds its records twice while its block is built
+                # (as read, then field by field). Cells go in contiguous
+                # bands of one width: with the non-zeros spread evenly, each
+                # band's fit band_items.
+                band_items = max(1, int(_conversion_buffer_budget_bytes(memory_limit_gb) // (2 * record_dtype.itemsize)))
+                n_bands = max(1, min(n_cells, -(-n_entries // band_items)))
+                width = max(1, -(-n_cells // n_bands))
+                root = _scratch_root(n_entries * record_dtype.itemsize, output_path.parent)
+                _sweep_stale_scratch_copies(root, fn_name=name, verbose=verbose)
+                scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_", dir=root))
+                bands = [scratch / f"band{b}" for b in range(-(-n_cells // width) or 1)]
+                for band in bands:
+                    band.touch()
+
+                evict = _EvictEvery(path, *bands)
+                n_read, read_mb = 0, 0
+                with _create_progress_context(max(1, path.stat().st_size >> 20), name, verbose, unit="MB") as pbar:
+                    blocks = _mtx_blocks(handle, name, path, dtype, block_entries) if n_entries else ()
+                    for rows, cols, values in blocks:
+                        n_read += values.size
+                        cells, genes = (cols, rows) if transpose else (rows, cols)
+                        if cells.min() < 1 or cells.max() > n_cells or genes.min() < 1 or genes.max() > n_file_genes:
+                            raise ValueError(
+                                f"{name}: {path} has an entry outside its declared {n_rows:,} x {n_cols:,} shape"
+                            )
+                        genes = genes - 1 if gene_map is None else gene_map[genes - 1]
+                        stored = np.flatnonzero((values != 0) & (genes >= 0))
+                        records = np.empty(stored.size, dtype=record_dtype)
+                        records["cell"], records["gene"], records["value"] = cells[stored] - 1, genes[stored], values[stored]
+                        if len(bands) > 1:
+                            band_of = records["cell"] // width
+                            order = np.argsort(band_of, kind="stable")
+                            records = records[order]
+                            bounds = np.searchsorted(band_of[order], np.arange(len(bands) + 1))
+                        else:
+                            bounds = np.array([0, records.size])
+                        for b in np.flatnonzero(np.diff(bounds)):
+                            with open(bands[b], "ab") as spill:
+                                records[bounds[b]:bounds[b + 1]].tofile(spill)
+                        done_mb = raw.tell() >> 20
+                        pbar.update(done_mb - read_mb)
+                        evict(((done_mb - read_mb) << 20) + records.nbytes)
+                        read_mb = done_mb
+            if n_read != n_entries:
+                raise ValueError(
+                    f"{name}: {path} declares {n_entries:,} entries and has {n_read:,}: "
+                    "the file is truncated or was edited"
+                )
+
+            with h5py.File(partial, "w") as h5:
+                h5.attrs["encoding-type"], h5.attrs["encoding-version"] = "anndata", "0.1.0"
+                evict = _EvictEvery(partial, *bands)
+                for b, band in enumerate(bands):
+                    _append_mtx_band(h5, band, record_dtype, b * width, min(n_cells, (b + 1) * width), n_genes,
+                                     band_items, evict)
+                    band.unlink()
+                write_elem(h5, "obs", obs)
+                write_elem(h5, "var", var)
+                write_elem(h5, "uns", {})
+        finally:
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+        write_stamp(partial, stamp("mtx", fingerprint))
+    _messages.vprint(verbose, name, f"{path} -> {output_path}: {n_cells:,} cells x {n_genes:,} genes")
+    return AnnData(output_path)
+
+
+def read_mtx(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a MatrixMarket file of counts into an h5ad file, never holding it in memory.
+
+    :func:`anndata.io.read_mtx` (Scanpy's ``sc.read_mtx``) for matrices too
+    large for memory: that reader holds the whole matrix several times over
+    (``scipy.io.mmread``, a cast, a CSR copy), while this one parses the
+    entries a block at a time and writes ``output_path`` as a CSR matrix in
+    bands of cells sized to ``memory_limit_gb``. As there, cells and genes
+    are numbered and duplicate entries are summed; explicit zeros are not
+    stored. Use :func:`read_10x_mtx` for a folder that also holds the
+    barcodes and features.
+
+    The entries may come in any order -- sorted by column (Cell Ranger),
+    sorted by row, or unsorted -- because each is first appended to a
+    scratch file for its band of cells, 12 bytes per non-zero for float32
+    counts, in the temporary directory when that is on disk and has room,
+    else beside the output; the scratch files are removed when the call
+    ends.
+
+    The file's rows are cells unless ``transpose`` is True, which takes them
+    as genes (``.T`` after ``sc.read_mtx``). Only ``coordinate`` matrices
+    with ``integer`` or ``real`` values and ``general`` symmetry are read,
+    which is what count matrices are.
+
+    The output carries crispyx's provenance: an existing output written by
+    the same call on the same file is reused (``force=True`` converts
+    again).
+
+    Parameters
+    ----------
+    filename
+        The MatrixMarket file; ``.gz`` and ``.bz2`` are decompressed as read.
+    output_path
+        The h5ad file to write.
+    dtype
+        The stored values' type.
+    transpose
+        Rows of the file are genes and columns cells.
+    memory_limit_gb
+        Bounds the block of entries parsed at once and the band of cells
+        built at once (``None``: the memory available).
+    verbose
+        Print progress.
+    force
+        Convert even when ``output_path`` holds this call's output.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    path = Path(filename)
+    fingerprint = run_fingerprint(path, params={"dtype": str(np.dtype(dtype)), "transpose": bool(transpose)})
+    return _read_mtx(
+        "read_mtx", path, output_path=output_path, fingerprint=fingerprint, dtype=dtype, transpose=transpose,
+        obs=None, var=None, keep_genes=None, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
+
+
+def read_10x_mtx(
+    path: str | Path,
+    *,
+    output_path: str | Path,
+    var_names: Literal["gene_symbols", "gene_ids"] = "gene_symbols",
+    make_unique: bool = True,
+    gex_only: bool = True,
+    prefix: str | None = None,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a 10x-style matrix folder into an h5ad file, never holding it in memory.
+
+    Scanpy's ``sc.read_10x_mtx`` with its names and defaults, for matrices
+    too large for memory (see :func:`read_mtx` for how the matrix is
+    streamed): ``path`` holds ``matrix.mtx`` (genes as rows), ``barcodes.tsv``
+    and ``features.tsv`` or ``genes.tsv``, each as it is or gzipped. The
+    cells are named by the barcodes and the genes by the feature table.
+
+    It also reads what other pipelines write in this layout and Scanpy
+    refuses: a feature table with one column (the gene names, whatever
+    ``var_names`` says) or two (IDs and symbols, no feature types), and a
+    matrix whose entries are not sorted by barcode. Names are read as text,
+    so a gene called ``NA`` keeps its name.
+
+    Parameters
+    ----------
+    path
+        The folder holding the three files.
+    output_path
+        The h5ad file to write.
+    var_names
+        The genes are named by their symbols (the feature table's second
+        column; the IDs go to ``var["gene_ids"]``) or by their IDs (its
+        first; the symbols go to ``var["gene_symbols"]``).
+    make_unique
+        Make gene symbols unique by appending ``-1``, ``-2``, ... to repeats
+        (:func:`anndata.utils.make_index_unique`). Sum the repeats instead
+        with :func:`collapse_genes` when they are one gene.
+    gex_only
+        Keep only the rows whose feature type (the table's third column,
+        stored as ``var["feature_types"]``) is ``Gene Expression``. With
+        False, the other rows -- guide capture, antibody capture -- stay as
+        genes; split them off with :func:`write_filtered_subset`.
+    prefix
+        Text before each of the three file names, as in
+        ``<prefix>matrix.mtx.gz``.
+    memory_limit_gb, verbose, force
+        As in :func:`read_mtx`.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    name = "read_10x_mtx"
+    if var_names not in ("gene_symbols", "gene_ids"):
+        raise ValueError(f"{name}: var_names must be 'gene_symbols' or 'gene_ids'; received {var_names!r}")
+    folder = Path(path)
+
+    def find(*stems: str) -> Path:
+        for stem in stems:
+            for suffix in (".gz", ""):
+                candidate = folder / f"{prefix or ''}{stem}{suffix}"
+                if candidate.is_file():
+                    return candidate
+        wanted = " or ".join(f"{prefix or ''}{stem}" for stem in stems)
+        raise FileNotFoundError(f"{name}: no {wanted} (as it is or .gz) in {folder}")
+
+    matrix, barcode_file, feature_file = find("matrix.mtx"), find("barcodes.tsv"), find("features.tsv", "genes.tsv")
+    fingerprint = run_fingerprint(
+        matrix, params={"var_names": var_names, "make_unique": bool(make_unique), "gex_only": bool(gex_only)},
+        inputs=[_file_identity(barcode_file), _file_identity(feature_file)],
+    )
+    barcodes, features = (
+        pd.read_csv(file, sep="\t", header=None, dtype=str, na_filter=False) for file in (barcode_file, feature_file)
+    )
+    obs = pd.DataFrame(index=pd.Index(barcodes[0].to_numpy(), dtype=str))
+    by_symbol = features.shape[1] == 1 or var_names == "gene_symbols"
+    names = pd.Index(features[min(features.shape[1] - 1, 1 if by_symbol else 0)].to_numpy(), dtype=str)
+    var = pd.DataFrame(index=ad.utils.make_index_unique(names) if make_unique and by_symbol else names)
+    if features.shape[1] > 1:
+        other, column = ("gene_ids", 0) if by_symbol else ("gene_symbols", 1)
+        var[other] = features[column].to_numpy()
+    keep_genes = None
+    if features.shape[1] > 2:
+        var["feature_types"] = features[2].to_numpy()
+        if gex_only:
+            keep_genes = (features[2] == "Gene Expression").to_numpy()
+    return _read_mtx(
+        name, matrix, output_path=output_path, fingerprint=fingerprint, dtype="float32", transpose=True,
+        obs=obs, var=var, keep_genes=keep_genes, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
 
 
 def convert_to_csr(

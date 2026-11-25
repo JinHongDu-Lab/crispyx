@@ -40,6 +40,7 @@ SCHEMAS = {
     "concat": 1,
     "residual_effects": 1,
     "text": 1,  # read_text / read_csv
+    "mtx": 1,  # read_mtx / read_10x_mtx
 }
 
 
