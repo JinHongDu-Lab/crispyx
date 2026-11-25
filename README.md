@@ -11,7 +11,7 @@
 
 Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, requiring large RAM allocations and often making routine workflows impractical on laptops or shared compute nodes.
 
-**crispyx** runs quality control, normalisation, pseudo-bulk aggregation, differential expression (t-test, Wilcoxon, NB-GLM with covariates, covariate-adjusted residual effects), control checks and PCA/KNN on screens stored as `.h5ad` files, streaming from disk with a peak memory you can predict from the file's shape, so that million-cell screens run on a laptop or a cluster node. Each function's peak, and what in it still grows with the screen, is in the [memory model](https://crispyx.readthedocs.io/en/latest/large_data.html#memory-model). The API mirrors Scanpy. It works on `.h5ad` files and converts a MatrixMarket folder or a text table of counts into one; it does not read sequencing reads, and it is not a general single-cell toolkit.
+**crispyx** runs quality control, normalisation, pseudo-bulk aggregation, differential expression (t-test, Wilcoxon, NB-GLM with covariates, covariate-adjusted residual effects), control checks and PCA/KNN on screens stored on disk, streaming from `.h5ad` files with a peak memory you can predict from the file's shape, so that million-cell screens run on a laptop or a cluster node. Each function's peak, and what in it still grows with the screen, is in the [memory model](https://crispyx.readthedocs.io/en/latest/large_data.html#memory-model). The API mirrors Scanpy. Counts delivered as a MatrixMarket folder (`matrix.mtx` with barcodes and features) or as a text table are converted to `.h5ad` the same way, a block at a time. crispyx does not read sequencing reads or 10x HDF5 files, and it is not a general single-cell toolkit.
 
 **Documentation:** [crispyx.readthedocs.io](https://crispyx.readthedocs.io/en/latest/) — [installation](https://crispyx.readthedocs.io/en/latest/installation.html), [quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), [tutorials](https://crispyx.readthedocs.io/en/latest/notebooks/basics_1_data.html) and [API reference](https://crispyx.readthedocs.io/en/latest/api.html).
 
@@ -61,10 +61,21 @@ print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
 ```
 
-For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), which links each step's guide page, and the [tutorial](https://crispyx.readthedocs.io/en/latest/notebooks/basics_1_data.html). [Covariate adjustment](https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html) compares the ways to adjust for batches, donors and lines.
+If the counts are not an `.h5ad` file yet, convert them first; neither reader holds the matrix in memory, and both reuse their output when called again:
+
+```python
+# a folder with matrix.mtx, barcodes.tsv and features.tsv (each plain or .gz)
+counts = cx.read_10x_mtx("data/filtered_feature_bc_matrix", output_path="data/counts.h5ad")
+
+# a text table with genes as rows (.gz and .bz2 are read as they are)
+counts = cx.read_csv("data/counts.csv.gz", output_path="data/counts.h5ad", transpose=True)
+```
+
+For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), which links each step's guide page, and the three basic tutorials, starting with [reading and preparing data](https://crispyx.readthedocs.io/en/latest/notebooks/basics_1_data.html), which run or name every function on a small dataset. [Covariate adjustment](https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html) compares the ways to adjust for batches, donors and lines.
 
 ## Features
 
+- **Input formats** – `.h5ad` files, read from disk in blocks; MatrixMarket folders and files (`cx.read_10x_mtx`, `cx.read_mtx`, with Scanpy's names and defaults, entries in any order, feature tables with one to three columns) and text tables (`cx.read_csv`, `cx.read_text`), each streamed into an `.h5ad` file under `memory_limit_gb`
 - **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; streamed from disk, except that `qc_summary` reads a file into memory when it fits well within the memory budget
 - **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
 - **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation

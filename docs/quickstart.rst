@@ -7,7 +7,8 @@ on commodity hardware without loading the full count matrix into memory.
 
 The typical workflow, with the guide page for each step:
 
-1. **Load** – open a dataset on disk (:doc:`data_preparation`)
+1. **Load** – open an ``.h5ad`` file on disk, or convert a MatrixMarket folder or a text
+   table of counts to one (:doc:`data_preparation`)
 2. **QC** – filter cells, perturbations, and genes (:doc:`quality_control`)
 3. **Preprocess** – normalise and log-transform, streaming (:doc:`large_data`
    covers the storage formats each step prefers)

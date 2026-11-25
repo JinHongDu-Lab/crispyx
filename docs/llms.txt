@@ -17,6 +17,10 @@ without materializing the full matrix.
 
 ## Key capabilities
 
+- Input: .h5ad files read from disk in blocks; MatrixMarket folders and files
+  (cx.read_10x_mtx, cx.read_mtx) and text tables (cx.read_csv, cx.read_text)
+  streamed into an .h5ad file without loading the matrix; not 10x HDF5 or
+  sequencing reads
 - Streaming QC and preprocessing (filter cells, perturbations, genes;
   normalize and log-transform; subsample; thin counts) without loading the
   full matrix
