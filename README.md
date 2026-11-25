@@ -61,7 +61,7 @@ print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
 ```
 
-For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), which links each step's guide page, and the [tutorial](https://crispyx.readthedocs.io/en/latest/notebooks/crispyx_tutorial.html). [Covariate adjustment](https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html) compares the ways to adjust for batches, donors and lines.
+For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Quick start](https://crispyx.readthedocs.io/en/latest/quickstart.html), which links each step's guide page, and the [tutorial](https://crispyx.readthedocs.io/en/latest/notebooks/basics_1_data.html). [Covariate adjustment](https://crispyx.readthedocs.io/en/latest/covariate_adjustment.html) compares the ways to adjust for batches, donors and lines.
 
 ## Features
 

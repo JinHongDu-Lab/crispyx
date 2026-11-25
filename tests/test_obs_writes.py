@@ -118,6 +118,14 @@ def test_a_crispyx_handle_open_on_the_file_is_closed_and_reopens(tmp_path, monke
     by_absolute_path.close()
     by_relative_path.close()
 
+    # a wrapper opened by a relative path is still found after the working directory changes
+    held = cx.AnnData("obs.h5ad")
+    assert held.shape == (40, 2)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    write_obs(path, load_obs(path).assign(h=3))
+    assert load_obs(path)["h"].eq(3).all()
+
 
 def test_a_handle_crispyx_does_not_own_gives_a_clear_error(tmp_path):
     path = _obs_file(tmp_path)

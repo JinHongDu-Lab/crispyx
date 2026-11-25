@@ -46,7 +46,7 @@ dependencies = [
     "scanpy>=1.9.2",
     "seaborn>=0.12",
     "matplotlib>=3.5",
-    "tqdm>=4.50",
+    "tqdm>=4.66",  # 4.66 reads TQDM_DISABLE
 ]
 
 [project.optional-dependencies]
@@ -60,7 +60,7 @@ test = [
 benchmark = [
     "pertpy>=0.4",
     "pyyaml>=6.0",
-    "tqdm>=4.65",
+    "tqdm>=4.66",
     "psutil>=5.9",
 ]
 docs = [

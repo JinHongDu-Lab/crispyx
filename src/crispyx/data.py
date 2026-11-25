@@ -302,6 +302,7 @@ class AnnData:
         self.path = Path(path)
         self._mode = mode
         self._backed: ad.AnnData | None = None
+        self._opened: str | None = None
         self._obs_view: _LazyFrameAccessor | None = None
         self._var_view: _LazyFrameAccessor | None = None
         self._uns_view: _LazyUnsMapping | None = None
@@ -324,6 +325,8 @@ class AnnData:
 
         if self._backed is None:
             self._backed = read_backed(self.path, mode=self._mode)
+            # absolute: a relative path names another file once the working directory changes
+            self._opened = _os.path.abspath(self.path)
             _OPEN_WRAPPERS.add(self)
         return self._backed
 
@@ -391,6 +394,7 @@ class AnnData:
         self.path = state["path"]
         self._mode = state["_mode"]
         self._backed = None
+        self._opened = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -4930,6 +4934,8 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
             values = values.astype(dtype)
         elif np.isnan(values).any():
             raise ValueError(f"{name}: {path} has an entry without a value")
+        elif np.isinf(values).any():
+            raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
         yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
 
 
@@ -5159,6 +5165,28 @@ def read_mtx(
     )
 
 
+def _read_name_table(file: Path, name: str) -> pd.DataFrame:
+    """The tab-separated barcode or feature table ``file``, every field as
+    written: no quoting, no missing-value words, an empty line an empty name.
+    Empty lines at its end are not names, and lines with different numbers of
+    fields are refused -- pandas would pad a short one, and a feature row
+    without its type would then be dropped as not ``Gene Expression``."""
+    with open(file, "rb") as raw, _text_stream(raw) as handle:
+        lines = handle.read().split("\n")
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        raise ValueError(f"{name}: {file} is empty")
+    rows = [line.split("\t") for line in lines]
+    width = len(rows[0])
+    ragged = next((number for number, row in enumerate(rows, start=1) if len(row) != width), None)
+    if ragged is not None:
+        raise ValueError(
+            f"{name}: line {ragged} of {file} has {len(rows[ragged - 1])} tab-separated fields; the first line has {width}"
+        )
+    return pd.DataFrame(rows)
+
+
 def read_10x_mtx(
     path: str | Path,
     *,
@@ -5235,16 +5263,7 @@ def read_10x_mtx(
     )
 
     def names() -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray | None]:
-        import csv
-
-        tables = []
-        for file in (barcode_file, feature_file):
-            try:  # every field as written: no quoting, no missing-value words, no skipped lines
-                tables.append(pd.read_csv(file, sep="\t", header=None, dtype=str, na_filter=False,
-                                          quoting=csv.QUOTE_NONE, skip_blank_lines=False))
-            except ValueError as error:  # an empty table, or lines of unequal length
-                raise ValueError(f"{name}: {file}: {error}") from None
-        barcodes, features = tables
+        barcodes, features = (_read_name_table(file, name) for file in (barcode_file, feature_file))
         obs = pd.DataFrame(index=pd.Index(barcodes[0].to_numpy(), dtype=str))
         by_symbol = features.shape[1] == 1 or var_names == "gene_symbols"
         index = pd.Index(features[min(features.shape[1] - 1, 1 if by_symbol else 0)].to_numpy(), dtype=str)
@@ -6916,7 +6935,7 @@ def _close_wrappers_on(path: Path) -> None:
     the caller's to close."""
     for wrapper in list(_OPEN_WRAPPERS):
         try:
-            same = _os.path.samefile(wrapper.path, path)
+            same = _os.path.samefile(wrapper._opened, path)
         except OSError:
             same = False
         if same:
@@ -7372,9 +7391,11 @@ def detect_gene_symbol_column(
 ) -> str | None:
     """Heuristically identify the var column containing gene symbols.
 
-    Only a text column whose values are mostly distinct can hold gene names:
-    a numeric or boolean column (``n_cells``, ``highly_variable``) and a label
+    Only a text column can hold gene names, and unless it is named for them
+    (``gene_symbols``, ``symbol``, …) its values must be mostly distinct: a
+    numeric or boolean column (``n_cells``, ``highly_variable``) and a label
     many genes share (``feature_types``, a chromosome) are not candidates.
+    Missing values do not count against a column.
 
     Scoring of the candidates:
 
@@ -7402,10 +7423,12 @@ def detect_gene_symbol_column(
     ensembl_3 = frozenset(p[:3].upper() for p in ENSEMBL_PREFIXES)
     scores: dict[str, int] = {}
     for col in var.columns:
-        if pd.api.types.is_numeric_dtype(var[col].dtype) or var[col].nunique() <= len(var) / 2:
+        named = col.lower() in _GENE_SYMBOL_COL_ALIASES
+        present = var[col].dropna()
+        if pd.api.types.is_numeric_dtype(var[col].dtype) or (not named and present.nunique() <= len(present) / 2):
             continue
         score = 0
-        if col.lower() in _GENE_SYMBOL_COL_ALIASES:
+        if named:
             score += 3
         try:
             _validate_gene_symbols(var[col].astype(str))

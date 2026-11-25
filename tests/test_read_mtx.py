@@ -172,10 +172,29 @@ def test_names_are_taken_as_written(tmp_path):
     cx.read_10x_mtx(folder, output_path=tmp_path / "x.h5ad", make_unique=False, verbose=False)
     assert list(cx.load_var(tmp_path / "x.h5ad").index) == ["NA", '"A', "", '"B"']
     assert list(cx.load_obs(tmp_path / "x.h5ad").index) == ["NA", "nan", "A"]
-    # a table whose lines differ in length is refused, named
-    (folder / "features.tsv").write_text("a\nb\tc\td\ne\nf\n")
-    with pytest.raises(ValueError, match="read_10x_mtx: .*features.tsv"):
-        cx.read_10x_mtx(folder, output_path=tmp_path / "y.h5ad", verbose=False)
+    # empty lines at the end of a table are not names
+    (folder / "barcodes.tsv").write_text("NA\nnan\nA\n\n\n")
+    cx.read_10x_mtx(folder, output_path=tmp_path / "t.h5ad", make_unique=False, verbose=False)
+    assert list(cx.load_obs(tmp_path / "t.h5ad").index) == ["NA", "nan", "A"]
+
+
+def test_a_feature_table_with_lines_of_unequal_length_is_refused(tmp_path):
+    """pandas pads a short line, and the gene whose type is then missing
+    would be dropped by gex_only with its counts."""
+    folder = tmp_path / "mex"
+    folder.mkdir()
+    (folder / "matrix.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n3 2 3\n1 1 1\n2 1 5\n3 2 2\n")
+    (folder / "barcodes.tsv").write_text("c1\nc2\n")
+    for table, match in (
+        ("E1\tA\tGene Expression\nE2\tB\nE3\tC\tGene Expression\n", "line 2 of .*features.tsv has 2 tab-separated fields; the first line has 3"),
+        ("a\nb\tc\td\ne\n", "line 2 of .*features.tsv has 3 tab-separated fields; the first line has 1"),
+        ("E1\tA\tGene Expression\n\nE3\tC\tGene Expression\n", "line 2 of .*features.tsv has 1 tab-separated fields"),
+        ("", ".*features.tsv is empty"),
+    ):
+        (folder / "features.tsv").write_text(table)
+        with pytest.raises(ValueError, match="read_10x_mtx: " + match):
+            cx.read_10x_mtx(folder, output_path=tmp_path / "y.h5ad", verbose=False)
+    assert not (tmp_path / "y.h5ad").exists()
 
 
 def test_integer_dtype_is_stored_or_refused_never_wrapped(tmp_path):
@@ -193,6 +212,17 @@ def test_integer_dtype_is_stored_or_refused_never_wrapped(tmp_path):
     with pytest.raises(ValueError, match="read_mtx"):
         cx.read_mtx(tmp_path / "real.mtx", output_path=tmp_path / "u.h5ad", dtype="int32", verbose=False)
     assert not (tmp_path / "u.h5ad").exists()
+
+
+@pytest.mark.parametrize("value", ["1e40", "inf", "-inf"])
+def test_a_real_value_float32_cannot_hold_is_refused(tmp_path, value):
+    (tmp_path / "m.mtx").write_text(f"%%MatrixMarket matrix coordinate real general\n2 2 2\n1 1 {value}\n2 2 3\n")
+    with pytest.raises(ValueError, match="does not fit dtype float32"), np.errstate(over="ignore"):
+        cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", verbose=False)
+    assert not (tmp_path / "m.h5ad").exists()
+    if value == "1e40":  # float64 holds it
+        cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", dtype="float64", verbose=False)
+        assert ad.read_h5ad(tmp_path / "m.h5ad").X[0, 0] == 1e40
 
 
 def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
@@ -269,7 +299,7 @@ def test_the_output_is_reused_until_a_file_or_the_call_changes(tmp_path, capsys,
         assert not reused(gex_only=False)
     assert reused(gex_only=False) and not reused(gex_only=False, force=True)
     # a reused output is returned without reading the barcode and feature tables again
-    monkeypatch.setattr(cx_data.pd, "read_csv", lambda *args, **kwargs: pytest.fail("the tables were read"))
+    monkeypatch.setattr(cx_data, "_read_name_table", lambda *args: pytest.fail("the tables were read"))
     assert reused(gex_only=False)
 
 

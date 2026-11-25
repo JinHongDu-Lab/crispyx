@@ -405,6 +405,15 @@ class TestAutoDetect:
         var.index = var["gene_ids"].to_numpy()
         ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
         assert detect_gene_symbol_column(path, verbose=False) == "gene_symbols"
+        # ... also when most genes have no symbol, or rows share one (transcripts of a gene):
+        # a column named for symbols is one, and missing values do not count against any
+        for symbols in ([None] * 25 + [f"G{i}" for i in range(15)], [f"G{i % 15}" for i in range(40)]):
+            var["gene_symbols"] = symbols
+            ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+            assert detect_gene_symbol_column(path, verbose=False) == "gene_symbols"
+        var = var.rename(columns={"gene_symbols": "label"}).assign(label=[None] * 25 + [f"G{i}" for i in range(15)])
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) == "label"
 
     def test_infer_columns_returns_dict(self, tmp_path):
         path = _create_full_dataset(tmp_path)
