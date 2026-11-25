@@ -175,7 +175,7 @@ def _row_blocks(
 ) -> Iterator[tuple[slice, np.ndarray | sparse.spmatrix]]:
     """Row chunks of ``matrix`` restricted to ``gene_indices``, as read:
     sparse stays sparse, and a dense chunk may be a view of the input."""
-    with _create_progress_context(matrix.shape[0], desc, show_progress, unit="cells") as bar:
+    with _create_progress_context(matrix.shape[0], desc, bool(show_progress), unit="cells") as bar:
         for slc, block in iter_matrix_chunks(None, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False):
             if gene_indices is not None:
                 block = block[:, gene_indices]

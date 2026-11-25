@@ -214,6 +214,47 @@ def test_integer_dtype_is_stored_or_refused_never_wrapped(tmp_path):
     assert not (tmp_path / "u.h5ad").exists()
 
 
+def test_real_values_are_parsed_as_scipy_parses_them(tmp_path):
+    """pandas' default float converter can be one unit in the last place
+    off; a 'real' matrix is read with the correctly rounded one."""
+    rng = np.random.default_rng(7)
+    values = rng.lognormal(0, 3, 4000)
+    lines = ["%%MatrixMarket matrix coordinate real general", f"4000 1 {values.size}"]
+    lines += [f"{i + 1} 1 {float(value)!r}" for i, value in enumerate(values)]
+    (tmp_path / "real.mtx").write_text("\n".join(lines) + "\n")
+    cx.read_mtx(tmp_path / "real.mtx", output_path=tmp_path / "real.h5ad", dtype="float64", verbose=False)
+    got = ad.read_h5ad(tmp_path / "real.h5ad").X.toarray().ravel()
+    np.testing.assert_array_equal(got, values)
+    np.testing.assert_array_equal(got, ad.io.read_mtx(tmp_path / "real.mtx", dtype="float64").X.toarray().ravel())
+
+
+@pytest.mark.parametrize("field, first, second, dtype", [
+    ("integer", "200", "100", "uint8"),
+    ("integer", "-100", "-100", "int8"),
+    ("real", "3e38", "3e38", "float32"),
+])
+def test_duplicates_whose_sum_does_not_fit_the_dtype_are_refused(tmp_path, field, first, second, dtype):
+    """Each entry fits; summed in the stored dtype they would wrap, or go to inf."""
+    header = f"%%MatrixMarket matrix coordinate {field} general\n2 2 3\n"
+    (tmp_path / "m.mtx").write_text(header + f"1 1 {first}\n2 2 7\n1 1 {second}\n")
+    with pytest.raises(ValueError, match=f"read_mtx: .*duplicate entries whose sum does not fit dtype {dtype}"):
+        with np.errstate(over="ignore"):
+            cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", dtype=dtype, verbose=False)
+    assert [p.name for p in tmp_path.iterdir()] == ["m.mtx"]
+    # a sum that fits is stored
+    (tmp_path / "ok.mtx").write_text(header + "1 1 60\n2 2 7\n1 1 60\n")
+    cx.read_mtx(tmp_path / "ok.mtx", output_path=tmp_path / "ok.h5ad", dtype=dtype, verbose=False)
+    assert ad.read_h5ad(tmp_path / "ok.h5ad").X[0, 0] == 120
+
+
+def test_a_dtype_scipy_cannot_store_is_refused_before_the_file_is_read(tmp_path, monkeypatch):
+    _write_mtx(tmp_path / "m.mtx", _counts())
+    monkeypatch.setattr(cx_data, "_mtx_header", lambda *args: pytest.fail("the file was read"))
+    with pytest.raises(ValueError, match="read_mtx: dtype float16 is not one scipy.sparse stores"):
+        cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", dtype="float16", verbose=False)
+    assert not (tmp_path / "m.h5ad").exists()
+
+
 @pytest.mark.parametrize("value", ["1e40", "inf", "-inf"])
 def test_a_real_value_float32_cannot_hold_is_refused(tmp_path, value):
     (tmp_path / "m.mtx").write_text(f"%%MatrixMarket matrix coordinate real general\n2 2 2\n1 1 {value}\n2 2 3\n")

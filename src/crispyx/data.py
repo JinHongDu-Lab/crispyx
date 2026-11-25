@@ -4875,9 +4875,10 @@ _MTX_BLOCK_ENTRIES = 1 << 24
 _MTX_ENTRY_BYTES = 160
 
 
-def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int]:
-    """``(rows, columns, entries)`` of the MatrixMarket coordinate file open
-    as the text stream ``handle``, which is left at the first entry."""
+def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int, str]:
+    """``(rows, columns, entries, field)`` of the MatrixMarket coordinate
+    file open as the text stream ``handle``, which is left at the first
+    entry; ``field`` is ``"integer"`` or ``"real"``."""
     banner = handle.readline().lower().split()
     if banner[:3] != ["%%matrixmarket", "matrix", "coordinate"] or len(banner) != 5:
         raise ValueError(
@@ -4897,15 +4898,17 @@ def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int]:
             raise ValueError(
                 f"{name}: {path}: expected 'rows columns entries' after the header, found {line.strip()!r}"
             ) from None
-        return n_rows, n_cols, n_entries
+        return n_rows, n_cols, n_entries, banner[3]
     raise ValueError(f"{name}: {path} has no 'rows columns entries' line")
 
 
-def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: int):
+def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: int, exact: bool):
     """``(rows, columns, values)`` of the entries left in ``handle``, a block
     at a time: one-based int64 indices as written, values as ``dtype``.
     Raises on a line that is not three numbers and on a value ``dtype``
-    cannot hold."""
+    cannot hold. ``exact`` parses decimal values with correct rounding, as
+    ``scipy.io.mmread`` does; pandas' default converter is a third faster and
+    can be one unit in the last place off, which integers never are."""
     # pandas casts to a narrower integer by wrapping around, so integers are
     # parsed as int64 and checked. A fourth name with index_col=False keeps a
     # line's fields in place: without them, pandas takes the first field of a
@@ -4914,6 +4917,7 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
     reader = pd.read_csv(
         handle, sep=r"\s+", header=None, names=["row", "col", "value", "extra"], index_col=False,
         dtype={"row": np.int64, "col": np.int64, "value": np.int64 if integer else dtype}, chunksize=block_entries,
+        float_precision="round_trip" if exact else None,
     )
     while True:
         try:
@@ -4939,11 +4943,11 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
         yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
 
 
-def _spilled_records(path: Path, record_dtype: np.dtype) -> Iterator[np.ndarray]:
-    """The records of a spill file, :data:`_SPILL_READ_ITEMS` at a time."""
+def _spilled_records(path: Path, record_dtype: np.dtype, count: int) -> Iterator[np.ndarray]:
+    """The records of a spill file, ``count`` at a time."""
     with open(path, "rb") as handle:
         while True:
-            records = np.fromfile(handle, dtype=record_dtype, count=_SPILL_READ_ITEMS)
+            records = np.fromfile(handle, dtype=record_dtype, count=count)
             if not records.size:
                 return
             yield records
@@ -4951,19 +4955,21 @@ def _spilled_records(path: Path, record_dtype: np.dtype) -> Iterator[np.ndarray]
 
 def _append_mtx_band(
     h5: h5py.File, path: Path, record_dtype: np.dtype, lo: int, hi: int, n_genes: int, max_items: int,
-    evict: _EvictEvery,
+    evict: _EvictEvery, source: str,
 ) -> None:
     """Append the cells ``[lo, hi)``, whose ``(cell, gene, value)`` records
     were spilled to ``path``, to the CSR ``X`` of ``h5``: columns sorted,
     duplicate entries summed. One block when the records fit ``max_items``;
     else the cells are split by their counts into parts that do, and the
-    file is read once per part. Each array is dropped as soon as the next
-    step has what it needs, so a block is never held beside the next one's
-    records."""
+    file is read once per part, in pieces no larger than a part. Each array
+    is dropped as soon as the next step has what it needs, so a block is
+    never held beside the next one's records. ``source`` names the matrix
+    file in the error raised when summed duplicates do not fit the dtype."""
     spans = [(lo, hi)]
+    piece = min(_SPILL_READ_ITEMS, max_items)
     if path.stat().st_size // record_dtype.itemsize > max_items:
         counts = np.zeros(hi - lo, dtype=np.int64)
-        for records in _spilled_records(path, record_dtype):
+        for records in _spilled_records(path, record_dtype, piece):
             counts += np.bincount(records["cell"] - lo, minlength=hi - lo)
         spans = [(lo + a, lo + b) for a, b in _contiguous_bands(counts, per_item_bytes=1, budget_bytes=max_items)]
     for a, b in spans:
@@ -4971,13 +4977,24 @@ def _append_mtx_band(
             records = np.fromfile(path, dtype=record_dtype)
         else:
             records = np.concatenate([
-                part[(part["cell"] >= a) & (part["cell"] < b)] for part in _spilled_records(path, record_dtype)
+                part[(part["cell"] >= a) & (part["cell"] < b)] for part in _spilled_records(path, record_dtype, piece)
             ])
         # Contiguous copies of the fields, so the records can be freed before
         # scipy builds the block from them.
         cells, genes, values = records["cell"] - a, records["gene"].copy(), records["value"].copy()
         del records
         block = sp.csr_matrix((values, (cells, genes)), shape=(b - a, n_genes))
+        if block.nnz < values.size:
+            # Duplicate entries were summed, in the stored dtype: each fitted
+            # it, their sum may not (integers wrap, float32 goes to inf).
+            if values.dtype.kind in "iu":
+                sums = sp.csr_matrix((values.astype(np.int64), (cells, genes)), shape=block.shape).data
+                limits = np.iinfo(values.dtype)
+                fits = sums.size == 0 or (sums.min() >= limits.min and sums.max() <= limits.max)
+            else:
+                fits = bool(np.isfinite(block.data).all())
+            if not fits:
+                raise ValueError(f"{source} has duplicate entries whose sum does not fit dtype {values.dtype}")
         del cells, genes, values
         _append_sparse_block(h5, block)
         evict(block.nnz * (2 * block.data.itemsize + block.indices.itemsize))
@@ -5003,6 +5020,10 @@ def _read_mtx(
     obs, var, keep_genes = names() if names is not None else (None, None, None)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dtype = np.dtype(dtype)
+    try:  # before the file is parsed and spilled, not after
+        sp.csr_matrix((1, 1), dtype=dtype)
+    except ValueError:
+        raise ValueError(f"{name}: dtype {dtype} is not one scipy.sparse stores; use float32, float64 or an integer type") from None
     # A tenth of the budget for a parsed block, half of it for a band.
     budget = _resolve_memory_limit_bytes(memory_limit_gb)
     block_entries = min(_MTX_BLOCK_ENTRIES, max(100_000, int(budget * 0.1 / _MTX_ENTRY_BYTES)))
@@ -5011,7 +5032,7 @@ def _read_mtx(
     with _replace_on_success(output_path) as partial:
         try:
             with open(path, "rb") as raw, _text_stream(raw) as handle:
-                n_rows, n_cols, n_entries = _mtx_header(handle, name, path)
+                n_rows, n_cols, n_entries, field = _mtx_header(handle, name, path)
                 n_cells, n_file_genes = (n_cols, n_rows) if transpose else (n_rows, n_cols)
                 for table, n, kind in ((obs, n_cells, "cells"), (var, n_file_genes, "genes")):
                     if table is not None and len(table) != n:
@@ -5049,7 +5070,7 @@ def _read_mtx(
                 evict = _EvictEvery(path, *bands)
                 n_read, read_mb = 0, 0
                 with _create_progress_context(max(1, path.stat().st_size >> 20), name, verbose, unit="MB") as pbar:
-                    for rows, cols, values in _mtx_blocks(handle, name, path, dtype, block_entries):
+                    for rows, cols, values in _mtx_blocks(handle, name, path, dtype, block_entries, field == "real"):
                         n_read += values.size
                         cells, genes = (cols, rows) if transpose else (rows, cols)
                         if cells.min() < 1 or cells.max() > n_cells or genes.min() < 1 or genes.max() > n_file_genes:
@@ -5085,7 +5106,7 @@ def _read_mtx(
                 evict = _EvictEvery(partial, *bands)
                 for b, band in enumerate(bands):
                     _append_mtx_band(h5, band, record_dtype, b * width, min(n_cells, (b + 1) * width), n_genes,
-                                     band_items, evict)
+                                     band_items, evict, f"{name}: {path}")
                     band.unlink()
                 write_elem(h5, "obs", obs)
                 write_elem(h5, "var", var)

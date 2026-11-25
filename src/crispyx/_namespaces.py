@@ -933,7 +933,8 @@ class _ToolsNamespace:
         reference: str | None = None,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
-        output_dir: str | Path | None = None,
+        output_path: str | Path | None = None,
+        output_dir: str | Path | None = None,  # deprecated; use output_path; will be removed in next major version
         data_name: str | None = None,
         corr_method: str = "benjamini-hochberg",
         verbose: int | bool = True,
@@ -969,6 +970,7 @@ class _ToolsNamespace:
             control_label=control_label,
             gene_name_column=gene_name_column,
             perturbations=perturbations,
+            output_path=output_path,
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,

@@ -97,3 +97,16 @@ def test_an_nb_offset_result_materialises_its_log_fold_changes(screen, tmp_path)
     np.testing.assert_array_equal(df["logfoldchanges"].to_numpy(), direct.logfoldchanges[row, idx])
     rgg = cx.pl.materialize_rank_genes_groups(direct.result_path, n_genes=5).uns["rank_genes_groups"]
     assert "logfoldchanges" in rgg
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+def test_rank_genes_groups_writes_where_output_path_says(screen, tmp_path, method):
+    """The wrapper takes ``output_path`` as the functions behind it do."""
+    target = tmp_path / "results" / f"{method}.h5ad"
+    target.parent.mkdir()
+    result = cx.tl.rank_genes_groups(
+        screen / METHODS[method][1], method=method, output_path=target,
+        perturbation_column="perturbation", control_label="control", verbose=False,
+    )
+    assert target.is_file() and str(result.path) == str(target)
+    result.close()

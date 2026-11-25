@@ -538,3 +538,9 @@ def test_progress_bars_follow_tqdm_disable(tmp_path):
     for bar in ("Computing gene moments", "Computing covariance", "Transforming data"):
         assert bar in shown
         assert bar not in hidden
+
+
+def test_show_progress_none_means_no_bar(tmp_path):
+    path = _write(tmp_path / "quiet.h5ad", _counts())
+    cx.pp.pca(path, n_comps=5, show_progress=None)
+    assert ad.read_h5ad(path).obsm["X_pca"].shape == (400, 5)
