@@ -231,6 +231,8 @@ def test_real_values_are_parsed_as_scipy_parses_them(tmp_path):
 @pytest.mark.parametrize("field, first, second, dtype", [
     ("integer", "200", "100", "uint8"),
     ("integer", "-100", "-100", "int8"),
+    ("integer", "9223372036854775807", "9223372036854775807", "int64"),
+    ("integer", "-9223372036854775808", "-1", "int64"),
     ("real", "3e38", "3e38", "float32"),
 ])
 def test_duplicates_whose_sum_does_not_fit_the_dtype_are_refused(tmp_path, field, first, second, dtype):
@@ -245,6 +247,17 @@ def test_duplicates_whose_sum_does_not_fit_the_dtype_are_refused(tmp_path, field
     (tmp_path / "ok.mtx").write_text(header + "1 1 60\n2 2 7\n1 1 60\n")
     cx.read_mtx(tmp_path / "ok.mtx", output_path=tmp_path / "ok.h5ad", dtype=dtype, verbose=False)
     assert ad.read_h5ad(tmp_path / "ok.h5ad").X[0, 0] == 120
+
+
+def test_sixty_four_bit_sums_are_judged_exactly(tmp_path):
+    """The largest sums that fit int64 and uint64 are stored, not taken for a wrap."""
+    top = 2**63 - 1
+    header = "%%MatrixMarket matrix coordinate integer general\n2 2 3\n"
+    for dtype, entries, total in [("uint64", (top, top), 2 * top), ("int64", (top - 5, 5), top),
+                                  ("int64", (-top, -1), -top - 1)]:
+        (tmp_path / "m.mtx").write_text(header + f"1 1 {entries[0]}\n2 2 7\n1 1 {entries[1]}\n")
+        cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", dtype=dtype, verbose=False, force=True)
+        assert int(ad.read_h5ad(tmp_path / "m.h5ad").X[0, 0]) == total
 
 
 def test_a_dtype_scipy_cannot_store_is_refused_before_the_file_is_read(tmp_path, monkeypatch):

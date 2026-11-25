@@ -414,6 +414,11 @@ class TestAutoDetect:
         var = var.rename(columns={"gene_symbols": "label"}).assign(label=[None] * 25 + [f"G{i}" for i in range(15)])
         ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
         assert detect_gene_symbol_column(path, verbose=False) == "label"
+        # identifiers that are not Ensembl's look like symbols; a column named for identifiers is still not one
+        var = pd.DataFrame({"gene_ids": [f"LOC{i}" for i in range(40)], "feature_id": [f"E{i}" for i in range(40)]},
+                           index=[f"GENE{i}" for i in range(40)])
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) is None
 
     def test_infer_columns_returns_dict(self, tmp_path):
         path = _create_full_dataset(tmp_path)

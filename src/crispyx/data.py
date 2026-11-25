@@ -7,6 +7,7 @@ import os as _os
 import re as _re
 import socket as _socket
 import tempfile
+import threading
 import time as _time
 import weakref
 import functools
@@ -284,6 +285,9 @@ class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
 #: this process's own read handles on it and drop the tables they cached
 #: (:func:`_close_wrappers_on`).
 _WRAPPERS: "weakref.WeakSet[AnnData]" = weakref.WeakSet()
+#: Held to add a wrapper and to list them: a set cannot be listed while
+#: another thread adds to it.
+_WRAPPERS_LOCK = threading.Lock()
 
 
 class AnnData:
@@ -306,7 +310,8 @@ class AnnData:
         self._obs_view: _LazyFrameAccessor | None = None
         self._var_view: _LazyFrameAccessor | None = None
         self._uns_view: _LazyUnsMapping | None = None
-        _WRAPPERS.add(self)
+        with _WRAPPERS_LOCK:
+            _WRAPPERS.add(self)
 
     @property
     def filename(self) -> str:
@@ -398,7 +403,8 @@ class AnnData:
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
-        _WRAPPERS.add(self)
+        with _WRAPPERS_LOCK:
+            _WRAPPERS.add(self)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"AnnData(path={self.path!s}, mode='{self._mode}')"
@@ -4994,10 +5000,20 @@ def _append_mtx_band(
         if block.nnz < values.size:
             # Duplicate entries were summed, in the stored dtype: each fitted
             # it, their sum may not (integers wrap, float32 goes to inf).
-            if values.dtype.kind in "iu":
+            if values.dtype.kind in "iu" and values.dtype.itemsize < 8:
                 sums = sp.csr_matrix((values.astype(np.int64), (cells, genes)), shape=block.shape).data
                 limits = np.iinfo(values.dtype)
                 fits = sums.size == 0 or (sums.min() >= limits.min and sums.max() <= limits.max)
+            elif values.dtype.kind in "iu":
+                # A 64-bit sum wraps in int64 as well: sum the halves of
+                # value = high * 2**32 + low apart, and look at the upper one.
+                high, low = (
+                    sp.csr_matrix((half.astype(np.int64), (cells, genes)), shape=block.shape).data
+                    for half in (values >> 32, values & 0xFFFFFFFF)
+                )
+                upper = high + (low >> 32)
+                bound = 1 << (32 if values.dtype.kind == "u" else 31)
+                fits = upper.size == 0 or (upper.min() >= bound - (1 << 32) and upper.max() < bound)
             else:
                 fits = bool(np.isfinite(block.data).all())
             if not fits:
@@ -6964,7 +6980,9 @@ def _close_wrappers_on(path: Path) -> None:
     its ``obs`` or ``var`` keeps that table. A wrapper reopens, and reads
     its tables again, on its next access. Other handles (h5py, a backed
     anndata object) are the caller's to close."""
-    for wrapper in list(_WRAPPERS):
+    with _WRAPPERS_LOCK:
+        wrappers = list(_WRAPPERS)
+    for wrapper in wrappers:
         try:
             same = _os.path.samefile(wrapper._opened or wrapper.path, path)
         except OSError:
@@ -7113,7 +7131,7 @@ def standardise_gene_names(
     pd.Series or None
         Normalised gene names when ``inplace=False``, else ``None``.
     """
-    source, path = path, Path(path)
+    path = Path(path)
     df = load_var(path)
 
     if column is None:
@@ -7264,7 +7282,7 @@ def normalise_perturbation_labels(
     pd.Series or None
         Normalised labels when ``inplace=False``, else ``None``.
     """
-    source, path = path, Path(path)
+    path = Path(path)
     df = load_obs(path)
 
     if column not in df.columns:
@@ -7331,6 +7349,12 @@ _PERTURBATION_COL_ALIASES: frozenset[str] = frozenset({
 _GENE_SYMBOL_COL_ALIASES: frozenset[str] = frozenset({
     "gene_symbols", "gene_name", "gene", "symbol",
     "hgnc_symbol", "gene_symbol", "feature_name",
+})
+
+#: Columns named for identifiers, which are never the symbol column
+#: whatever their values look like (``E1``, ``LOC101``, ``FBgn0000008``).
+_GENE_ID_COL_ALIASES: frozenset[str] = frozenset({
+    "gene_ids", "gene_id", "ensembl_id", "ensembl_gene_id", "feature_id", "feature_ids", "id", "ids",
 })
 
 _CTRL_TERMS: frozenset[str] = frozenset({
@@ -7426,7 +7450,9 @@ def detect_gene_symbol_column(
     (``gene_symbols``, ``symbol``, …) its values must be mostly distinct: a
     numeric or boolean column (``n_cells``, ``highly_variable``) and a label
     many genes share (``feature_types``, a chromosome) are not candidates.
-    Missing values do not count against a column.
+    Nor is a column named for identifiers (``gene_ids``, ``feature_id``, …):
+    only Ensembl IDs can be told from symbols by their values. Missing
+    values do not count against a column.
 
     Scoring of the candidates:
 
@@ -7456,7 +7482,11 @@ def detect_gene_symbol_column(
     for col in var.columns:
         named = col.lower() in _GENE_SYMBOL_COL_ALIASES
         present = var[col].dropna()
-        if pd.api.types.is_numeric_dtype(var[col].dtype) or (not named and present.nunique() <= len(present) / 2):
+        if (
+            pd.api.types.is_numeric_dtype(var[col].dtype)
+            or col.lower() in _GENE_ID_COL_ALIASES
+            or (not named and present.nunique() <= len(present) / 2)
+        ):
             continue
         score = 0
         if named:
