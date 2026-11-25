@@ -4,7 +4,7 @@ Changelog
 Version 0.2.10
 --------------
 
-*Released 2026-11-25.* MatrixMarket count matrices convert to h5ad without being read into memory, and three basic tutorials run or name every public function.
+*Released 2026-11-25.* MatrixMarket count matrices convert to h5ad without being read into memory, three basic tutorials run or name every public function, and NB-GLM applies its mean floor where DESeq2 does, which changes results at a floor of 0.5 (pseudo-bulk, bulk) and none at the single-cell default.
 
 **Added**
 
