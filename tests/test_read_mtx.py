@@ -278,6 +278,41 @@ def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
     (tmp_path / "empty.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n3 4 0\n")
     cx.read_mtx(tmp_path / "empty.mtx", output_path=tmp_path / "empty.h5ad", verbose=False)
     assert ad.read_h5ad(tmp_path / "empty.h5ad").shape == (3, 4)
+    # duplicates that cancel are a zero, and zeros are not stored
+    (tmp_path / "cancel.mtx").write_text(
+        "%%MatrixMarket matrix coordinate real general\n2 2 3\n1 1 1.5\n1 1 -1.5\n2 2 1\n"
+    )
+    cx.read_mtx(tmp_path / "cancel.mtx", output_path=tmp_path / "cancel.h5ad", verbose=False)
+    got = ad.read_h5ad(tmp_path / "cancel.h5ad").X
+    np.testing.assert_array_equal(got.toarray(), [[0, 0], [0, 1]])
+    assert got.nnz == 1
+
+
+def test_the_progress_bar_of_a_small_file_reaches_its_total(tmp_path, monkeypatch):
+    """The bars count whole MiB of the file read, so one under 1 MiB is
+    topped up at the end instead of closing at 0 of 1."""
+    bars = []
+
+    class Bar:
+        def __init__(self, total):
+            self.total, self.done = total, 0
+            bars.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def update(self, n):
+            self.done += n
+
+    monkeypatch.setattr(cx_data, "_create_progress_context", lambda total, *args, **kwargs: Bar(total))
+    _write_mtx(tmp_path / "m.mtx", _counts())
+    cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "m.h5ad", verbose=False)
+    (tmp_path / "t.csv").write_text("gene,c1,c2\ng1,1,0\ng2,0,3\n")
+    cx.read_csv(tmp_path / "t.csv", output_path=tmp_path / "t.h5ad", verbose=False)
+    assert [(bar.total, bar.done) for bar in bars] == [(1, 1), (1, 1)]
 
 
 @pytest.mark.parametrize("text, match", [
@@ -287,6 +322,8 @@ def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
     ("%%MatrixMarket matrix coordinate real symmetric\n2 2 1\n1 1 1\n", "real symmetric"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2\n1 1 1\n", "rows columns entries"),
     ("%%MatrixMarket matrix coordinate integer general\n% only comments\n", "rows columns entries"),
+    ("%%MatrixMarket matrix coordinate integer general\n-2 2 0\n", "rows columns entries"),
+    ("%%MatrixMarket matrix coordinate integer general\n2 2 -1\n", "rows columns entries"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n3 1 1\n", "outside its declared 2 x 2"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n0 1 1\n", "outside its declared"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 3\n1 1 1\n2 1 1\n", "declares 3 entries and has 2"),
@@ -294,6 +331,9 @@ def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 1\n", "without a value"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 x 1\n", "read_mtx"),
     ("%%MatrixMarket matrix coordinate integer general\n3 3 2\n3 1 2 7\n2 2 3 9\n", "more than three fields"),
+    ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 5 NA\n2 2 7\n", "more than three fields"),
+    ("%%MatrixMarket matrix coordinate real general\n2 2 2\n1 1 5 nan\n2 2 7\n", "more than three fields"),
+    ("%%MatrixMarket matrix coordinate real general\n2 2 2\n1 1 NA\n2 2 7\n", "read_mtx"),
     ("%%MatrixMarket matrix coordinate integer general\n3 3 2\n1 1 1\n3 1 2 7 9\n", "read_mtx"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 0\n1 1 5\n2 2 7\n", "declares 0 entries and has 2"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n", "declares 2 entries and has 0"),

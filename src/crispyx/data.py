@@ -280,10 +280,10 @@ class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
         return repr(previews)
 
 
-#: The wrappers whose file handle is open, so a function that rewrites a file
-#: in place can close this process's own read handles on it first
+#: Every live wrapper, so a function that rewrites a file in place can close
+#: this process's own read handles on it and drop the tables they cached
 #: (:func:`_close_wrappers_on`).
-_OPEN_WRAPPERS: "weakref.WeakSet[AnnData]" = weakref.WeakSet()
+_WRAPPERS: "weakref.WeakSet[AnnData]" = weakref.WeakSet()
 
 
 class AnnData:
@@ -306,6 +306,7 @@ class AnnData:
         self._obs_view: _LazyFrameAccessor | None = None
         self._var_view: _LazyFrameAccessor | None = None
         self._uns_view: _LazyUnsMapping | None = None
+        _WRAPPERS.add(self)
 
     @property
     def filename(self) -> str:
@@ -327,7 +328,6 @@ class AnnData:
             self._backed = read_backed(self.path, mode=self._mode)
             # absolute: a relative path names another file once the working directory changes
             self._opened = _os.path.abspath(self.path)
-            _OPEN_WRAPPERS.add(self)
         return self._backed
 
     def close(self) -> None:
@@ -338,7 +338,7 @@ class AnnData:
                 self._backed.file.close()
             finally:
                 self._backed = None
-                _OPEN_WRAPPERS.discard(self)
+                self._opened = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -398,6 +398,7 @@ class AnnData:
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
+        _WRAPPERS.add(self)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"AnnData(path={self.path!s}, mode='{self._mode}')"
@@ -4840,6 +4841,7 @@ def _read_table(
                         pbar.update(done_mb - read_mb)
                         evict((done_mb - read_mb) << 20)
                         read_mb = done_mb
+                pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
                 if n_values is None:
                     raise ValueError(f"{name}: {path} has no data lines")
                 if len(indptr) > 1 or "X" not in h5:
@@ -4894,6 +4896,8 @@ def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int, str]:
             continue
         try:
             n_rows, n_cols, n_entries = (int(field) for field in line.split())
+            if min(n_rows, n_cols, n_entries) < 0:
+                raise ValueError
         except ValueError:
             raise ValueError(
                 f"{name}: {path}: expected 'rows columns entries' after the header, found {line.strip()!r}"
@@ -4912,12 +4916,15 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
     # pandas casts to a narrower integer by wrapping around, so integers are
     # parsed as int64 and checked. A fourth name with index_col=False keeps a
     # line's fields in place: without them, pandas takes the first field of a
-    # four-field line for an index and reads the other three.
+    # four-field line for an index and reads the other three. Only an absent
+    # field is missing: pandas' words for a missing value (NA, null, ...)
+    # would hide a fourth field that is one of them.
     integer = dtype.kind in "iu"
+    names = ["row", "col", "value", "extra"]
     reader = pd.read_csv(
-        handle, sep=r"\s+", header=None, names=["row", "col", "value", "extra"], index_col=False,
+        handle, sep=r"\s+", header=None, names=names, index_col=False,
         dtype={"row": np.int64, "col": np.int64, "value": np.int64 if integer else dtype}, chunksize=block_entries,
-        float_precision="round_trip" if exact else None,
+        float_precision="round_trip" if exact else None, keep_default_na=False, na_values={name: [""] for name in names},
     )
     while True:
         try:
@@ -4995,6 +5002,7 @@ def _append_mtx_band(
                 fits = bool(np.isfinite(block.data).all())
             if not fits:
                 raise ValueError(f"{source} has duplicate entries whose sum does not fit dtype {values.dtype}")
+            block.eliminate_zeros()  # duplicates that cancel
         del cells, genes, values
         _append_sparse_block(h5, block)
         evict(block.nnz * (2 * block.data.itemsize + block.indices.itemsize))
@@ -5095,6 +5103,7 @@ def _read_mtx(
                         pbar.update(done_mb - read_mb)
                         evict(((done_mb - read_mb) << 20) + records.nbytes)
                         read_mb = done_mb
+                    pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
             if n_read != n_entries:
                 raise ValueError(
                     f"{name}: {path} declares {n_entries:,} entries and has {n_read:,}: "
@@ -6949,14 +6958,15 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
 
 
 def _close_wrappers_on(path: Path) -> None:
-    """Close every crispyx :class:`AnnData` wrapper's read handle on the file
-    at ``path`` before it is rewritten in place: HDF5 will not open a file
-    for writing that this process holds open for reading. A wrapper reopens
-    on its next access. Other handles (h5py, a backed anndata object) are
-    the caller's to close."""
-    for wrapper in list(_OPEN_WRAPPERS):
+    """Close every crispyx :class:`AnnData` wrapper on the file at ``path``
+    before it is rewritten in place: HDF5 will not open a file for writing
+    that this process holds open for reading, and a wrapper that has shown
+    its ``obs`` or ``var`` keeps that table. A wrapper reopens, and reads
+    its tables again, on its next access. Other handles (h5py, a backed
+    anndata object) are the caller's to close."""
+    for wrapper in list(_WRAPPERS):
         try:
-            same = _os.path.samefile(wrapper._opened, path)
+            same = _os.path.samefile(wrapper._opened or wrapper.path, path)
         except OSError:
             same = False
         if same:
