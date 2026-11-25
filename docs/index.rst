@@ -16,7 +16,8 @@ crispyx
 Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 of cells and tens of thousands of genes. Standard single-cell toolkits load the
 entire count matrix into memory, which can require 30–100+ GB of RAM. **crispyx**
-streams data directly from on-disk AnnData ``.h5ad`` files so that quality
+streams data directly from on-disk AnnData ``.h5ad`` files (and converts
+MatrixMarket folders and text tables of counts to one, also streamed) so that quality
 control, normalisation, pseudo-bulk aggregation, and differential expression all
 run without materialising the full matrix — even the largest screens can be
 processed with modest resources. These memory savings assume sufficient free
@@ -25,12 +26,14 @@ disk space for streaming intermediates and the final output file; see
 usage before running.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
-workflows can migrate with minimal changes. See the :doc:`tutorial <notebooks/crispyx_tutorial>`
-for an end-to-end walkthrough.
+workflows can migrate with minimal changes. The three basic tutorials, starting with
+:doc:`notebooks/basics_1_data`, run or name every function on a small dataset.
 
 Key features
 ------------
 
+- **Input formats** — ``.h5ad`` files, and MatrixMarket folders or text
+  tables streamed into one (:doc:`data_preparation`)
 - **Streaming QC & preprocessing** — filter and normalise by streaming
   from disk (``qc_summary`` reads a small file into memory)
 - **Data preparation** — normalise labels and take targets out of guide
@@ -58,7 +61,9 @@ Key features
 
    installation
    quickstart
-   notebooks/crispyx_tutorial
+   notebooks/basics_1_data
+   notebooks/basics_2_qc_embedding
+   notebooks/basics_3_effects_tests
 
 .. toctree::
    :maxdepth: 2

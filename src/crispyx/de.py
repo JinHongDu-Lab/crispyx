@@ -1681,12 +1681,16 @@ def nb_glm_test(
         (PyDESeq2: 250 and 1e-8). Without covariates the two-group fit
         converges to 1e-10 in at most 250 steps.
     min_mu
-        Floor on fitted means: means are held at ``max(min_mu, mean)`` while
-        fitting (DESeq2's ``minmu``). DESeq2 uses 0.5 for bulk counts and
-        recommends 1e-6 for single cells, where many genes have means below
-        one count and a floor of 0.5 binds unevenly between the groups
-        compared: tests become conservative, and low-count genes are biased
-        when the groups differ in depth (see :ref:`size-factors`). None (the
+        Floor on fitted means (DESeq2's ``minmu``): means are held at
+        ``max(min_mu, mean)`` where DESeq2 holds them, that is while
+        fitting, in the means the gene-wise dispersions are fitted at and in
+        the weights behind the standard error. DESeq2 uses 0.5 for bulk
+        counts and recommends 1e-6 for single cells, where many genes have
+        means below one count and a floor of 0.5 binds unevenly between the
+        groups compared: tests are miscalibrated (too few false positives
+        under weak perturbations, about twice the nominal rate when the
+        groups differ in depth), and low-count genes are biased (see
+        :ref:`mean-floor`). None (the
         default) chooses from the input: 1e-6 when at least half of a sample
         of the counts are zero (single cells), 0.5 otherwise (pseudo-bulk,
         bulk). The value used is in ``uns["min_mu"]``.
@@ -2894,8 +2898,8 @@ def _default_min_mu(sample, *, verbose: int | bool, name: str) -> float:
     sample of the counts: 1e-6 when at least half are zero (single cells),
     0.5 otherwise (pseudo-bulk, bulk). DESeq2's 0.5 is a bulk setting; in
     sparse single-cell counts it binds more often in the shallower group,
-    which makes tests conservative and biases low-count genes when the
-    groups differ in depth (docs/notebooks/size_factor_comparison.ipynb)."""
+    which miscalibrates tests in both directions and biases low-count genes
+    when the groups differ in depth (docs/notebooks/size_factor_comparison.ipynb)."""
     n_values = sample.shape[0] * sample.shape[1]
     nonzero = sample.nnz if sp.issparse(sample) else np.count_nonzero(sample)
     zero_share = 1.0 - nonzero / max(n_values, 1)

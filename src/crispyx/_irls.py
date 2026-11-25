@@ -188,8 +188,10 @@ def irls_weights(mu: np.ndarray, alpha: np.ndarray | float | None) -> np.ndarray
 
     For the negative binomial ``V = mu + alpha mu**2`` this is
     ``mu / (1 + alpha mu)``; ``alpha=0`` (or ``None``) gives the Poisson weight
-    ``mu``.  The weights are returned unclamped: clamping them at a mean floor
-    is what over-weights low-count cells.
+    ``mu``.  The weights are those of the ``mu`` given, which is the caller's
+    to floor: the NB-GLM fits, and the covariance they report, pass the
+    fitted mean held at ``min_mu``, as DESeq2 does (see
+    ``NBGLMBatchFitter._wald_weights``).
     """
     if alpha is None:
         return mu

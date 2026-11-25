@@ -39,6 +39,48 @@ reuses it rather than converting again. Rename cells and genes or attach
 metadata afterwards with :func:`crispyx.write_obs` and
 :func:`crispyx.write_var` (below).
 
+From a MatrixMarket file
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the counts come as a ``matrix.mtx`` file with its barcodes and features
+(the folder Cell Ranger and many other pipelines write), convert the folder
+with :func:`crispyx.read_10x_mtx`. It takes the names and defaults of
+Scanpy's ``sc.read_10x_mtx``, which reads the whole matrix into memory, and
+streams it into an h5ad file instead:
+
+.. code-block:: python
+
+   counts = cx.read_10x_mtx(
+       "data/filtered_feature_bc_matrix",   # matrix.mtx, barcodes.tsv, features.tsv; each plain or .gz
+       output_path="data/counts.h5ad",
+   )
+
+It also reads folders Scanpy refuses: a feature table with only gene names
+(one column) or without feature types (two). The matrix's entries may come in
+any order. While it runs it keeps a scratch copy of the non-zeros, 12 bytes
+each, in the temporary directory or beside the output.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - You have
+     - Do
+   * - Guide-capture or antibody rows in the same matrix
+     - ``gex_only=False`` keeps them (the default drops them, as in Scanpy);
+       ``var["feature_types"]`` tells them apart, and
+       :func:`crispyx.write_filtered_subset` splits them off, for example as
+       the guide matrix :func:`crispyx.pp.assign_guides` takes
+   * - Files named ``<sample>_matrix.mtx.gz``, ...
+     - ``prefix="<sample>_"``
+   * - Gene symbols on several rows
+     - They are made unique (``GENE``, ``GENE-1``) as in Scanpy; to sum the
+       rows of one gene instead, use :func:`crispyx.pp.collapse_genes`
+   * - Only the matrix file, or cells as its rows
+     - :func:`crispyx.read_mtx` (``transpose=True`` when its rows are genes),
+       then name the cells and genes with :func:`crispyx.write_obs` and
+       :func:`crispyx.write_var`
+
 Data preparation utilities
 --------------------------
 

@@ -30,8 +30,9 @@ KEY = "crispyx"
 #: read under the new one.
 SCHEMAS = {
     # 2: all-tied Wilcoxon genes NaN; 3: Wilcoxon X is the AUC (was AUC - 0.5);
-    # 4: nb_offset_test's stratum baselines, saturated NB fits converge
-    "de_result": 4,
+    # 4: nb_offset_test's stratum baselines, saturated NB fits converge;
+    # 5: NB-GLM standard errors and dispersion means from the floored mean
+    "de_result": 5,
     "pseudobulk": 2,  # 2: profiles named by group key, constant obs columns carried over
     "pseudobulk_effects": 1,
     "batch": 1,
@@ -40,6 +41,7 @@ SCHEMAS = {
     "concat": 1,
     "residual_effects": 1,
     "text": 1,  # read_text / read_csv
+    "mtx": 1,  # read_mtx / read_10x_mtx
 }
 
 

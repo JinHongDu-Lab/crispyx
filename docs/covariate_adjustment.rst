@@ -184,7 +184,7 @@ the test accounts for variation between guides and donors.
 
 - **Strengths:** a count model with log2 fold changes and standard errors. On
   pseudo-bulk it reproduces Zhu *et al.*'s PyDESeq2 estimates of their
-  CD4+ T-cell screen (median per-target r 0.9999) and is the best calibrated of
+  CD4+ T-cell screen (median per-target r 0.9995) and is the best calibrated of
   these methods on fake targets.
 - **Weaknesses:** slower: on pseudo-bulk, about 0.4 seconds per target on 32
   cores with ``targets_per_fit=50``, so about an hour and a half for a

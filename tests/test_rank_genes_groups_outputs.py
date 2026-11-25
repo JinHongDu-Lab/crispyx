@@ -46,7 +46,7 @@ def test_rank_genes_groups_and_readers_report_the_stored_values(screen, tmp_path
     common = dict(perturbation_column="perturbation", control_label="control", verbose=False)
     direct = fn(screen / source, output_dir=tmp_path, data_name="direct", scanpy_format=scanpy_format, **common)
     wrapped = cx.tl.rank_genes_groups(
-        screen / source, method=method, output_dir=tmp_path, data_name="wrapped", **common,
+        screen / source, method=method, output_path=tmp_path / "wrapped.h5ad", **common,
     )
     # The wrapper returns the method's own result file.
     wrapped_mem = wrapped.to_memory()
@@ -97,3 +97,16 @@ def test_an_nb_offset_result_materialises_its_log_fold_changes(screen, tmp_path)
     np.testing.assert_array_equal(df["logfoldchanges"].to_numpy(), direct.logfoldchanges[row, idx])
     rgg = cx.pl.materialize_rank_genes_groups(direct.result_path, n_genes=5).uns["rank_genes_groups"]
     assert "logfoldchanges" in rgg
+
+
+@pytest.mark.parametrize("method", list(METHODS))
+def test_rank_genes_groups_writes_where_output_path_says(screen, tmp_path, method):
+    """The wrapper takes ``output_path`` as the functions behind it do."""
+    target = tmp_path / "results" / f"{method}.h5ad"
+    target.parent.mkdir()
+    result = cx.tl.rank_genes_groups(
+        screen / METHODS[method][1], method=method, output_path=target,
+        perturbation_column="perturbation", control_label="control", verbose=False,
+    )
+    assert target.is_file() and str(result.path) == str(target)
+    result.close()

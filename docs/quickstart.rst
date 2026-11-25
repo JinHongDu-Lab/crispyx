@@ -7,7 +7,8 @@ on commodity hardware without loading the full count matrix into memory.
 
 The typical workflow, with the guide page for each step:
 
-1. **Load** – open a dataset on disk (:doc:`data_preparation`)
+1. **Load** – open an ``.h5ad`` file on disk, or convert a MatrixMarket folder or a text
+   table of counts to one (:doc:`data_preparation`)
 2. **QC** – filter cells, perturbations, and genes (:doc:`quality_control`)
 3. **Preprocess** – normalise and log-transform, streaming (:doc:`large_data`
    covers the storage formats each step prefers)
@@ -18,8 +19,9 @@ The typical workflow, with the guide page for each step:
 8. **Plot** – visualise results with Scanpy-style helpers (:doc:`differential_expression`)
 
 Screens run in batches, donors or lines: :doc:`covariate_adjustment` compares
-the ways crispyx adjusts for them. The :doc:`crispyx tutorial
-<notebooks/crispyx_tutorial>` runs the whole workflow on a small dataset.
+the ways crispyx adjusts for them. Three basic tutorials run the whole workflow on
+a small dataset and name every function: :doc:`notebooks/basics_1_data`,
+:doc:`notebooks/basics_2_qc_embedding` and :doc:`notebooks/basics_3_effects_tests`.
 
 
 A first run

@@ -130,9 +130,9 @@ Limitations of crispyx
 - The NB-GLM tests one perturbation (or a few, ``targets_per_fit``) against
   the controls per fit, with categorical and continuous covariates; it does
   not fit arbitrary contrasts or filter outliers by Cook's distance.
-- crispyx does not read raw sequencing outputs (Cell Ranger matrices,
-  MatrixMarket, CSV): it starts from an ``.h5ad`` file, which Scanpy or
-  anndata write from those.
+- crispyx reads count matrices from ``.h5ad``, MatrixMarket folders and text
+  tables (:doc:`data_preparation`). It does not read 10x HDF5 (``.h5``) or
+  Loom files; write an ``.h5ad`` from those with Scanpy or anndata first.
 - On a dataset that fits in RAM, the memory savings do not matter. The
   reasons to use crispyx there are the methods: cell-level NB-GLM with
   covariates, covariate-adjusted residual effects, the control checks and

@@ -7,7 +7,9 @@ import os as _os
 import re as _re
 import socket as _socket
 import tempfile
+import threading
 import time as _time
+import weakref
 import functools
 import inspect
 import shutil
@@ -164,7 +166,7 @@ class _LazyFrameAccessor:
         if self._cache is None:
             # Only this table: materialising the AnnData would read X too
             # (a 151 GB QC output, to look up one obs column).
-            loaded = _read_h5ad_element(self._parent.path, self._attr)
+            loaded = _read_h5ad_element(self._parent._reading(), self._attr)
             if isinstance(loaded, pd.DataFrame):
                 loaded = loaded.copy()
             else:
@@ -222,7 +224,7 @@ class _LazyUnsEntry:
 
     def load(self) -> Any:
         if self._cache is _MISSING:
-            self._cache = _read_h5ad_element(self._parent.path, f"uns/{self._key}")
+            self._cache = _read_h5ad_element(self._parent._reading(), f"uns/{self._key}")
         return self._cache
 
     def preview(self, n: int = 5) -> Any:
@@ -279,6 +281,15 @@ class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
         return repr(previews)
 
 
+#: Every live wrapper, so a function that rewrites a file in place can close
+#: this process's own read handles on it and drop the tables they cached
+#: (:func:`_close_wrappers_on`).
+_WRAPPERS: "weakref.WeakSet[AnnData]" = weakref.WeakSet()
+#: Held to add a wrapper and to list them: a set cannot be listed while
+#: another thread adds to it.
+_WRAPPERS_LOCK = threading.Lock()
+
+
 class AnnData:
     """Thin wrapper around a backed :class:`anndata.AnnData` handle."""
 
@@ -295,9 +306,15 @@ class AnnData:
         self.path = Path(path)
         self._mode = mode
         self._backed: ad.AnnData | None = None
+        # The absolute path of the file this wrapper holds an open handle or
+        # a table of, None while it holds nothing: a relative path names
+        # another file once the working directory changes.
+        self._held: str | None = None
         self._obs_view: _LazyFrameAccessor | None = None
         self._var_view: _LazyFrameAccessor | None = None
         self._uns_view: _LazyUnsMapping | None = None
+        with _WRAPPERS_LOCK:
+            _WRAPPERS.add(self)
 
     @property
     def filename(self) -> str:
@@ -316,8 +333,16 @@ class AnnData:
         """Return the lazily opened backed AnnData handle."""
 
         if self._backed is None:
-            self._backed = read_backed(self.path, mode=self._mode)
+            self._backed = read_backed(self._reading(), mode=self._mode)
         return self._backed
+
+    def _reading(self) -> Path:
+        """``path``, recording the file it names now as one this wrapper holds
+        something of (see :func:`_close_wrappers_on`). Reads go through the
+        caller's path so that what crispyx echoes keeps its shape."""
+        if self._held is None:
+            self._held = _os.path.abspath(self.path)
+        return self.path
 
     def close(self) -> None:
         """Close the underlying file handle if it is open."""
@@ -327,6 +352,7 @@ class AnnData:
                 self._backed.file.close()
             finally:
                 self._backed = None
+        self._held = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
@@ -382,9 +408,12 @@ class AnnData:
         self.path = state["path"]
         self._mode = state["_mode"]
         self._backed = None
+        self._held = None
         self._obs_view = None
         self._var_view = None
         self._uns_view = None
+        with _WRAPPERS_LOCK:
+            _WRAPPERS.add(self)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"AnnData(path={self.path!s}, mode='{self._mode}')"
@@ -4615,6 +4644,16 @@ def _is_float(text: str) -> bool:
     return True
 
 
+def _append_sparse_block(h5: h5py.File, block: sp.spmatrix) -> None:
+    """Append ``block`` to the compressed-sparse ``X`` of the open h5ad
+    ``h5`` along its compressed axis, creating ``X`` from the first block."""
+    if "X" in h5:
+        sparse_dataset(h5["X"]).append(block)
+    else:
+        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
+        write_elem(h5, "X", block)
+
+
 def read_text(
     filename: str | Path,
     *,
@@ -4757,11 +4796,7 @@ def _read_table(
                         shape=(len(indptr) - 1, n_values),
                     )
                     block = block.T.tocsc() if transpose else block  # genes as columns
-                    if "X" in h5:
-                        sparse_dataset(h5["X"]).append(block)
-                    else:
-                        block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
-                        write_elem(h5, "X", block)
+                    _append_sparse_block(h5, block)
                     evict(block.nnz * (dtype.itemsize + 4))
                     indptr[:] = [0]
                     indices.clear()
@@ -4821,6 +4856,7 @@ def _read_table(
                         pbar.update(done_mb - read_mb)
                         evict((done_mb - read_mb) << 20)
                         read_mb = done_mb
+                pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
                 if n_values is None:
                     raise ValueError(f"{name}: {path} has no data lines")
                 if len(indptr) > 1 or "X" not in h5:
@@ -4846,6 +4882,461 @@ def _read_table(
         write_stamp(partial, stamp("text", fingerprint))
     _messages.vprint(verbose, name, f"{path} -> {output_path}: {len(cells):,} cells x {len(genes):,} genes")
     return AnnData(output_path)
+
+
+#: Entries parsed per block at most.
+_MTX_BLOCK_ENTRIES = 1 << 24
+
+#: Bytes a block holds per entry: pandas' parsed columns and parser buffers
+#: (about 90, measured), their zero-based copies and the spill records.
+_MTX_ENTRY_BYTES = 160
+
+
+def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int, str]:
+    """``(rows, columns, entries, field)`` of the MatrixMarket coordinate
+    file open as the text stream ``handle``, which is left at the first
+    entry; ``field`` is ``"integer"`` or ``"real"``."""
+    banner = handle.readline().lower().split()
+    if banner[:3] != ["%%matrixmarket", "matrix", "coordinate"] or len(banner) != 5:
+        raise ValueError(
+            f"{name}: {path} does not start with a '%%MatrixMarket matrix coordinate' header"
+        )
+    if banner[3] not in ("integer", "real") or banner[4] != "general":
+        raise ValueError(
+            f"{name}: {path} is a '{banner[3]} {banner[4]}' matrix; only 'integer' or 'real' "
+            "'general' ones are streamed (scipy.io.mmread reads the others, in memory)"
+        )
+    for line in handle:
+        if line.startswith("%") or not line.strip():
+            continue
+        try:
+            n_rows, n_cols, n_entries = (int(field) for field in line.split())
+            if min(n_rows, n_cols, n_entries) < 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f"{name}: {path}: expected 'rows columns entries' after the header, found {line.strip()!r}"
+            ) from None
+        return n_rows, n_cols, n_entries, banner[3]
+    raise ValueError(f"{name}: {path} has no 'rows columns entries' line")
+
+
+def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: int, exact: bool):
+    """``(rows, columns, values)`` of the entries left in ``handle``, a block
+    at a time: one-based int64 indices as written, values as ``dtype``.
+    Raises on a line that is not three numbers and on a value ``dtype``
+    cannot hold. ``exact`` parses decimal values with correct rounding, as
+    ``scipy.io.mmread`` does; pandas' default converter is a third faster and
+    can be one unit in the last place off, which integers never are."""
+    # pandas casts to a narrower integer by wrapping around, so integers are
+    # parsed as int64 and checked. A fourth name with index_col=False keeps a
+    # line's fields in place: without them, pandas takes the first field of a
+    # four-field line for an index and reads the other three. Only an absent
+    # field is missing: pandas' words for a missing value (NA, null, ...)
+    # would hide a fourth field that is one of them.
+    integer = dtype.kind in "iu"
+    names = ["row", "col", "value", "extra"]
+    reader = pd.read_csv(
+        handle, sep=r"\s+", header=None, names=names, index_col=False,
+        dtype={"row": np.int64, "col": np.int64, "value": np.int64 if integer else dtype}, chunksize=block_entries,
+        float_precision="round_trip" if exact else None, keep_default_na=False, na_values={name: [""] for name in names},
+    )
+    while True:
+        try:
+            frame = next(reader)
+        except StopIteration:
+            return
+        except (ValueError, OverflowError) as error:  # a field that is not a number, or too many fields
+            raise ValueError(f"{name}: {path}: {error}") from None
+        if not len(frame):  # no entries at all: pandas yields one empty block
+            continue
+        if frame["extra"].notna().any():
+            raise ValueError(f"{name}: {path} has a line with more than three fields")
+        values = frame["value"].to_numpy()
+        if integer:
+            limits = np.iinfo(dtype)
+            if values.min() < limits.min or values.max() > limits.max:
+                raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
+            values = values.astype(dtype)
+        elif np.isnan(values).any():
+            raise ValueError(f"{name}: {path} has an entry without a value")
+        elif np.isinf(values).any():
+            raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
+        yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
+
+
+def _spilled_records(path: Path, record_dtype: np.dtype, count: int) -> Iterator[np.ndarray]:
+    """The records of a spill file, ``count`` at a time."""
+    with open(path, "rb") as handle:
+        while True:
+            records = np.fromfile(handle, dtype=record_dtype, count=count)
+            if not records.size:
+                return
+            yield records
+
+
+def _append_mtx_band(
+    h5: h5py.File, path: Path, record_dtype: np.dtype, lo: int, hi: int, n_genes: int, max_items: int,
+    evict: _EvictEvery, source: str,
+) -> None:
+    """Append the cells ``[lo, hi)``, whose ``(cell, gene, value)`` records
+    were spilled to ``path``, to the CSR ``X`` of ``h5``: columns sorted,
+    duplicate entries summed. One block when the records fit ``max_items``;
+    else the cells are split by their counts into parts that do, and the
+    file is read once per part, in pieces no larger than a part. Each array
+    is dropped as soon as the next step has what it needs, so a block is
+    never held beside the next one's records. ``source`` names the matrix
+    file in the error raised when summed duplicates do not fit the dtype."""
+    spans = [(lo, hi)]
+    piece = min(_SPILL_READ_ITEMS, max_items)
+    if path.stat().st_size // record_dtype.itemsize > max_items:
+        counts = np.zeros(hi - lo, dtype=np.int64)
+        for records in _spilled_records(path, record_dtype, piece):
+            counts += np.bincount(records["cell"] - lo, minlength=hi - lo)
+        spans = [(lo + a, lo + b) for a, b in _contiguous_bands(counts, per_item_bytes=1, budget_bytes=max_items)]
+    for a, b in spans:
+        if len(spans) == 1:
+            records = np.fromfile(path, dtype=record_dtype)
+        else:
+            records = np.concatenate([
+                part[(part["cell"] >= a) & (part["cell"] < b)] for part in _spilled_records(path, record_dtype, piece)
+            ])
+        # Contiguous copies of the fields, so the records can be freed before
+        # scipy builds the block from them.
+        cells, genes, values = records["cell"] - a, records["gene"].copy(), records["value"].copy()
+        del records
+        block = sp.csr_matrix((values, (cells, genes)), shape=(b - a, n_genes))
+        if block.nnz < values.size:
+            # Duplicate entries were summed, in the stored dtype: each fitted
+            # it, their sum may not (integers wrap, float32 goes to inf).
+            if values.dtype.kind in "iu" and values.dtype.itemsize < 8:
+                sums = sp.csr_matrix((values.astype(np.int64), (cells, genes)), shape=block.shape).data
+                limits = np.iinfo(values.dtype)
+                fits = sums.size == 0 or (sums.min() >= limits.min and sums.max() <= limits.max)
+            elif values.dtype.kind in "iu":
+                # A 64-bit sum wraps in int64 as well: sum the halves of
+                # value = high * 2**32 + low apart, and look at the upper one.
+                high, low = (
+                    sp.csr_matrix((half.astype(np.int64), (cells, genes)), shape=block.shape).data
+                    for half in (values >> 32, values & 0xFFFFFFFF)
+                )
+                upper = high + (low >> 32)
+                bound = 1 << (32 if values.dtype.kind == "u" else 31)
+                fits = upper.size == 0 or (upper.min() >= bound - (1 << 32) and upper.max() < bound)
+            else:
+                fits = bool(np.isfinite(block.data).all())
+            if not fits:
+                raise ValueError(f"{source} has duplicate entries whose sum does not fit dtype {values.dtype}")
+            block.eliminate_zeros()  # duplicates that cancel
+        del cells, genes, values
+        _append_sparse_block(h5, block)
+        evict(block.nnz * (2 * block.data.itemsize + block.indices.itemsize))
+        del block
+
+
+def _read_mtx(
+    name: str, path: Path, *, output_path, fingerprint: dict, dtype, transpose: bool,
+    names: "Callable[[], tuple[pd.DataFrame, pd.DataFrame, np.ndarray | None]] | None",
+    memory_limit_gb, verbose, force,
+) -> "AnnData":
+    """:func:`read_mtx` and :func:`read_10x_mtx`, reporting as ``name``:
+    the coordinate file ``path`` into ``output_path``, its rows the genes
+    when ``transpose``. ``names()`` gives the ``obs`` and ``var`` that name
+    the file's cells and genes and the mask of the genes to keep (None: all);
+    it is called only when the output is not reused. Without it, cells and
+    genes are numbered.
+    """
+    output_path = Path(output_path)
+    _refuse_overwriting_input([path], output_path)
+    if not force and reusable(output_path, "mtx", fingerprint, verbose):
+        return AnnData(output_path)
+    obs, var, keep_genes = names() if names is not None else (None, None, None)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = np.dtype(dtype)
+    try:  # before the file is parsed and spilled, not after
+        sp.csr_matrix((1, 1), dtype=dtype)
+    except ValueError:
+        raise ValueError(f"{name}: dtype {dtype} is not one scipy.sparse stores; use float32, float64 or an integer type") from None
+    # A tenth of the budget for a parsed block, half of it for a band.
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    block_entries = min(_MTX_BLOCK_ENTRIES, max(100_000, int(budget * 0.1 / _MTX_ENTRY_BYTES)))
+
+    scratch = None
+    with _replace_on_success(output_path) as partial:
+        try:
+            with open(path, "rb") as raw, _text_stream(raw) as handle:
+                n_rows, n_cols, n_entries, field = _mtx_header(handle, name, path)
+                n_cells, n_file_genes = (n_cols, n_rows) if transpose else (n_rows, n_cols)
+                for table, n, kind in ((obs, n_cells, "cells"), (var, n_file_genes, "genes")):
+                    if table is not None and len(table) != n:
+                        raise ValueError(f"{name}: {path} has {n:,} {kind} but {len(table):,} names were read for them")
+                obs = pd.DataFrame(index=pd.RangeIndex(n_cells).astype(str)) if obs is None else obs
+                var = pd.DataFrame(index=pd.RangeIndex(n_file_genes).astype(str)) if var is None else var
+                gene_map = None
+                if keep_genes is not None and not keep_genes.all():
+                    gene_map = np.where(keep_genes, np.cumsum(keep_genes) - 1, -1)
+                    var = var[keep_genes]
+                n_genes = len(var)
+
+                cell_dtype, gene_dtype = (
+                    np.dtype(np.int32 if n <= np.iinfo(np.int32).max else np.int64) for n in (n_cells, n_genes)
+                )
+                # Widest field first, so every field is aligned.
+                record_dtype = np.dtype(sorted(
+                    [("cell", cell_dtype), ("gene", gene_dtype), ("value", dtype)],
+                    key=lambda field: -field[1].itemsize,
+                ), align=True)
+                # A band holds its records twice while its block is built
+                # (as read, then field by field). Cells go in contiguous
+                # bands of one width: with the non-zeros spread evenly, each
+                # band's fit band_items.
+                band_items = max(1, int(_conversion_buffer_budget_bytes(memory_limit_gb) // (2 * record_dtype.itemsize)))
+                n_bands = max(1, min(n_cells, -(-n_entries // band_items)))
+                width = max(1, -(-n_cells // n_bands))
+                root = _scratch_root(n_entries * record_dtype.itemsize, output_path.parent)
+                _sweep_stale_scratch_copies(root, fn_name=name, verbose=verbose)
+                scratch = Path(tempfile.mkdtemp(prefix=f"{_SCRATCH_PREFIX}{name}_{_os.getpid()}-{_HOST_TAG}_", dir=root))
+                bands = [scratch / f"band{b}" for b in range(-(-n_cells // width) or 1)]
+                for band in bands:
+                    band.touch()
+
+                evict = _EvictEvery(path, *bands)
+                n_read, read_mb = 0, 0
+                with _create_progress_context(max(1, path.stat().st_size >> 20), name, verbose, unit="MB") as pbar:
+                    for rows, cols, values in _mtx_blocks(handle, name, path, dtype, block_entries, field == "real"):
+                        n_read += values.size
+                        cells, genes = (cols, rows) if transpose else (rows, cols)
+                        if cells.min() < 1 or cells.max() > n_cells or genes.min() < 1 or genes.max() > n_file_genes:
+                            raise ValueError(
+                                f"{name}: {path} has an entry outside its declared {n_rows:,} x {n_cols:,} shape"
+                            )
+                        genes = genes - 1 if gene_map is None else gene_map[genes - 1]
+                        stored = np.flatnonzero((values != 0) & (genes >= 0))
+                        records = np.empty(stored.size, dtype=record_dtype)
+                        records["cell"], records["gene"], records["value"] = cells[stored] - 1, genes[stored], values[stored]
+                        if len(bands) > 1:
+                            band_of = records["cell"] // width
+                            order = np.argsort(band_of, kind="stable")
+                            records = records[order]
+                            bounds = np.searchsorted(band_of[order], np.arange(len(bands) + 1))
+                        else:
+                            bounds = np.array([0, records.size])
+                        for b in np.flatnonzero(np.diff(bounds)):
+                            with open(bands[b], "ab") as spill:
+                                records[bounds[b]:bounds[b + 1]].tofile(spill)
+                        done_mb = raw.tell() >> 20
+                        pbar.update(done_mb - read_mb)
+                        evict(((done_mb - read_mb) << 20) + records.nbytes)
+                        read_mb = done_mb
+                    pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
+            if n_read != n_entries:
+                raise ValueError(
+                    f"{name}: {path} declares {n_entries:,} entries and has {n_read:,}: "
+                    "the file is truncated or was edited"
+                )
+
+            with h5py.File(partial, "w") as h5:
+                h5.attrs["encoding-type"], h5.attrs["encoding-version"] = "anndata", "0.1.0"
+                evict = _EvictEvery(partial, *bands)
+                for b, band in enumerate(bands):
+                    _append_mtx_band(h5, band, record_dtype, b * width, min(n_cells, (b + 1) * width), n_genes,
+                                     band_items, evict, f"{name}: {path}")
+                    band.unlink()
+                write_elem(h5, "obs", obs)
+                write_elem(h5, "var", var)
+                write_elem(h5, "uns", {})
+        finally:
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+        write_stamp(partial, stamp("mtx", fingerprint))
+    _messages.vprint(verbose, name, f"{path} -> {output_path}: {n_cells:,} cells x {n_genes:,} genes")
+    return AnnData(output_path)
+
+
+def read_mtx(
+    filename: str | Path,
+    *,
+    output_path: str | Path,
+    dtype: str = "float32",
+    transpose: bool = False,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a MatrixMarket file of counts into an h5ad file, never holding it in memory.
+
+    :func:`anndata.io.read_mtx` (Scanpy's ``sc.read_mtx``) for matrices too
+    large for memory: that reader holds the whole matrix several times over
+    (``scipy.io.mmread``, a cast, a CSR copy), while this one parses the
+    entries a block at a time and writes ``output_path`` as a CSR matrix in
+    bands of cells sized to ``memory_limit_gb``. As there, cells and genes
+    are numbered and duplicate entries are summed; explicit zeros are not
+    stored. Use :func:`read_10x_mtx` for a folder that also holds the
+    barcodes and features.
+
+    The entries may come in any order -- sorted by column (Cell Ranger),
+    sorted by row, or unsorted -- because each is first appended to a
+    scratch file for its band of cells, 12 bytes per non-zero for float32
+    counts, in the temporary directory when that is on disk and has room,
+    else beside the output; the scratch files are removed when the call
+    ends.
+
+    The file's rows are cells unless ``transpose`` is True, which takes them
+    as genes (``.T`` after ``sc.read_mtx``). Only ``coordinate`` matrices
+    with ``integer`` or ``real`` values and ``general`` symmetry are read,
+    which is what count matrices are.
+
+    The output carries crispyx's provenance: an existing output written by
+    the same call on the same file is reused (``force=True`` converts
+    again).
+
+    Parameters
+    ----------
+    filename
+        The MatrixMarket file; ``.gz`` and ``.bz2`` are decompressed as read.
+    output_path
+        The h5ad file to write.
+    dtype
+        The stored values' type.
+    transpose
+        Rows of the file are genes and columns cells.
+    memory_limit_gb
+        Bounds the block of entries parsed at once and the band of cells
+        built at once (``None``: the memory available).
+    verbose
+        Print progress.
+    force
+        Convert even when ``output_path`` holds this call's output.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    path = Path(filename)
+    fingerprint = run_fingerprint(path, params={"dtype": str(np.dtype(dtype)), "transpose": bool(transpose)})
+    return _read_mtx(
+        "read_mtx", path, output_path=output_path, fingerprint=fingerprint, dtype=dtype, transpose=transpose,
+        names=None, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
+
+
+def _read_name_table(file: Path, name: str) -> pd.DataFrame:
+    """The tab-separated barcode or feature table ``file``, every field as
+    written: no quoting, no missing-value words, an empty line an empty name.
+    Empty lines at its end are not names, and lines with different numbers of
+    fields are refused -- pandas would pad a short one, and a feature row
+    without its type would then be dropped as not ``Gene Expression``."""
+    with open(file, "rb") as raw, _text_stream(raw) as handle:
+        lines = handle.read().split("\n")
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        raise ValueError(f"{name}: {file} is empty")
+    rows = [line.split("\t") for line in lines]
+    width = len(rows[0])
+    ragged = next((number for number, row in enumerate(rows, start=1) if len(row) != width), None)
+    if ragged is not None:
+        raise ValueError(
+            f"{name}: line {ragged} of {file} has {len(rows[ragged - 1])} tab-separated fields; the first line has {width}"
+        )
+    return pd.DataFrame(rows)
+
+
+def read_10x_mtx(
+    path: str | Path,
+    *,
+    output_path: str | Path,
+    var_names: Literal["gene_symbols", "gene_ids"] = "gene_symbols",
+    make_unique: bool = True,
+    gex_only: bool = True,
+    prefix: str | None = None,
+    memory_limit_gb: float | None = None,
+    verbose: int | bool = True,
+    force: bool = False,
+) -> "AnnData":
+    """Stream a 10x-style matrix folder into an h5ad file, never holding it in memory.
+
+    Scanpy's ``sc.read_10x_mtx`` with its names and defaults, for matrices
+    too large for memory (see :func:`read_mtx` for how the matrix is
+    streamed): ``path`` holds ``matrix.mtx`` (genes as rows), ``barcodes.tsv``
+    and ``features.tsv`` or ``genes.tsv``, each as it is or gzipped. The
+    cells are named by the barcodes and the genes by the feature table.
+
+    It also reads what other pipelines write in this layout and Scanpy
+    refuses: a feature table with one column (the gene names, whatever
+    ``var_names`` says) or two (IDs and symbols, no feature types). Names
+    are taken as written: a gene called ``NA`` keeps its name, and quotes
+    are part of a name.
+
+    Parameters
+    ----------
+    path
+        The folder holding the three files.
+    output_path
+        The h5ad file to write.
+    var_names
+        The genes are named by their symbols (the feature table's second
+        column; the IDs go to ``var["gene_ids"]``) or by their IDs (its
+        first; the symbols go to ``var["gene_symbols"]``).
+    make_unique
+        Make gene symbols unique by appending ``-1``, ``-2``, ... to repeats
+        (:func:`anndata.utils.make_index_unique`). Sum the repeats instead
+        with :func:`collapse_genes` when they are one gene.
+    gex_only
+        Keep only the rows whose feature type (the table's third column,
+        stored as ``var["feature_types"]``) is ``Gene Expression``. With
+        False, the other rows -- guide capture, antibody capture -- stay as
+        genes; split them off with :func:`write_filtered_subset`.
+    prefix
+        Text before each of the three file names, as in
+        ``<prefix>matrix.mtx.gz``.
+    memory_limit_gb, verbose, force
+        As in :func:`read_mtx`.
+
+    Returns
+    -------
+    The output, backed.
+    """
+    name = "read_10x_mtx"
+    if var_names not in ("gene_symbols", "gene_ids"):
+        raise ValueError(f"{name}: var_names must be 'gene_symbols' or 'gene_ids'; received {var_names!r}")
+    folder = Path(path)
+
+    def find(*stems: str) -> Path:
+        for stem in stems:
+            for suffix in (".gz", ""):
+                candidate = folder / f"{prefix or ''}{stem}{suffix}"
+                if candidate.is_file():
+                    return candidate
+        wanted = " or ".join(f"{prefix or ''}{stem}" for stem in stems)
+        raise FileNotFoundError(f"{name}: no {wanted} (as it is or .gz) in {folder}")
+
+    matrix, barcode_file, feature_file = find("matrix.mtx"), find("barcodes.tsv"), find("features.tsv", "genes.tsv")
+    fingerprint = run_fingerprint(
+        matrix, params={"var_names": var_names, "make_unique": bool(make_unique), "gex_only": bool(gex_only)},
+        inputs=[_file_identity(barcode_file), _file_identity(feature_file)],
+    )
+
+    def names() -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray | None]:
+        barcodes, features = (_read_name_table(file, name) for file in (barcode_file, feature_file))
+        obs = pd.DataFrame(index=pd.Index(barcodes[0].to_numpy(), dtype=str))
+        by_symbol = features.shape[1] == 1 or var_names == "gene_symbols"
+        index = pd.Index(features[min(features.shape[1] - 1, 1 if by_symbol else 0)].to_numpy(), dtype=str)
+        var = pd.DataFrame(index=ad.utils.make_index_unique(index) if make_unique and by_symbol else index)
+        if features.shape[1] > 1:
+            other, column = ("gene_ids", 0) if by_symbol else ("gene_symbols", 1)
+            var[other] = features[column].to_numpy()
+        keep_genes = None
+        if features.shape[1] > 2:
+            var["feature_types"] = features[2].to_numpy()
+            if gex_only:
+                keep_genes = (features[2] == "Gene Expression").to_numpy()
+        return obs, var, keep_genes
+
+    return _read_mtx(
+        name, matrix, output_path=output_path, fingerprint=fingerprint, dtype="float32", transpose=True,
+        names=names, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+    )
 
 
 def convert_to_csr(
@@ -6452,7 +6943,9 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file (modified in-place).
+        Path to the h5ad file (modified in-place). A :class:`crispyx.AnnData`
+        that has the file open is closed first and reopens on its next
+        access; any other open handle on it must be closed by the caller.
     df
         New obs DataFrame. Must have the same number of rows as the existing
         obs table. Index values are written as cell barcodes.
@@ -6461,6 +6954,8 @@ def write_obs(path: str | Path, df: pd.DataFrame) -> None:
     ------
     ValueError
         If the DataFrame length does not match the existing n_obs.
+    OSError
+        If an h5py file or a backed anndata object holds the file open.
     """
     _replace_dataframe(Path(path), "obs", df, unit="cells")
 
@@ -6471,7 +6966,8 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     Parameters
     ----------
     path
-        Path to the h5ad file (modified in-place).
+        Path to the h5ad file (modified in-place); open handles are treated
+        as in :func:`write_obs`.
     df
         New var DataFrame. Must have the same number of rows as the existing
         var table.
@@ -6480,17 +6976,31 @@ def write_var(path: str | Path, df: pd.DataFrame) -> None:
     ------
     ValueError
         If the DataFrame length does not match the existing n_vars.
+    OSError
+        If an h5py file or a backed anndata object holds the file open.
     """
     _replace_dataframe(Path(path), "var", df, unit="genes")
 
 
-def _close_backed(data: Any) -> None:
-    """Close a crispyx :class:`AnnData` wrapper's read handle before its file
-    is rewritten in place: HDF5 will not open a file for writing that this
-    process holds open for reading. The wrapper reopens on its next access.
-    Other handles to the file are the caller's to close."""
-    if isinstance(data, AnnData):
-        data.close()
+def _close_wrappers_on(path: Path) -> None:
+    """Close every crispyx :class:`AnnData` wrapper on the file at ``path``
+    before it is rewritten in place: HDF5 will not open a file for writing
+    that this process holds open for reading, and a wrapper that has shown
+    its ``obs`` or ``var`` keeps that table. A wrapper reopens, and reads
+    its tables again, on its next access. Other handles (h5py, a backed
+    anndata object) are the caller's to close."""
+    with _WRAPPERS_LOCK:
+        wrappers = list(_WRAPPERS)
+    for wrapper in wrappers:
+        held = wrapper._held
+        if held is None:
+            continue
+        try:
+            same = _os.path.samefile(held, path)
+        except OSError:
+            same = False
+        if same:
+            wrapper.close()
 
 
 def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> None:
@@ -6503,7 +7013,17 @@ def _replace_dataframe(path: Path, key: str, df: pd.DataFrame, *, unit: str) -> 
     :func:`_finish_interrupted_swaps`), after which anndata reads it too. Resumable runs rely on this: they
     rewrite ``obs`` of a work file they may be killed in.
     """
-    with h5py.File(path, "r+") as f:
+    _close_wrappers_on(path)
+    try:
+        handle = h5py.File(path, "r+")
+    except OSError as error:
+        if "already open" not in str(error):
+            raise
+        raise OSError(
+            f"{path} is open elsewhere in this process (an h5py file or a backed anndata object holds it), "
+            f"so its {key} table could not be rewritten ({error}); close that handle first."
+        ) from error
+    with handle as f:
         _finish_dataframe_swap(f, key)
         n_rows = _h5_index_length(f[key])
         if len(df) != n_rows:
@@ -6623,7 +7143,7 @@ def standardise_gene_names(
     pd.Series or None
         Normalised gene names when ``inplace=False``, else ``None``.
     """
-    source, path = path, Path(path)
+    path = Path(path)
     df = load_var(path)
 
     if column is None:
@@ -6695,7 +7215,6 @@ def standardise_gene_names(
     else:
         df[column] = names.to_numpy()
 
-    _close_backed(source)
     write_var(path, df)
     return None
 
@@ -6775,7 +7294,7 @@ def normalise_perturbation_labels(
     pd.Series or None
         Normalised labels when ``inplace=False``, else ``None``.
     """
-    source, path = path, Path(path)
+    path = Path(path)
     df = load_obs(path)
 
     if column not in df.columns:
@@ -6825,7 +7344,6 @@ def normalise_perturbation_labels(
     else:
         df[column] = labels.to_numpy()
 
-    _close_backed(source)
     write_obs(path, df)
     return None
 
@@ -6843,6 +7361,12 @@ _PERTURBATION_COL_ALIASES: frozenset[str] = frozenset({
 _GENE_SYMBOL_COL_ALIASES: frozenset[str] = frozenset({
     "gene_symbols", "gene_name", "gene", "symbol",
     "hgnc_symbol", "gene_symbol", "feature_name",
+})
+
+#: Columns named for identifiers, which are never the symbol column
+#: whatever their values look like (``E1``, ``LOC101``, ``FBgn0000008``).
+_GENE_ID_COL_ALIASES: frozenset[str] = frozenset({
+    "gene_ids", "gene_id", "ensembl_id", "ensembl_gene_id", "feature_id", "feature_ids", "id", "ids",
 })
 
 _CTRL_TERMS: frozenset[str] = frozenset({
@@ -6934,7 +7458,15 @@ def detect_gene_symbol_column(
 ) -> str | None:
     """Heuristically identify the var column containing gene symbols.
 
-    Scoring:
+    Only a text column can hold gene names, and unless it is named for them
+    (``gene_symbols``, ``symbol``, …) its values must be mostly distinct: a
+    numeric or boolean column (``n_cells``, ``highly_variable``) and a label
+    many genes share (``feature_types``, a chromosome) are not candidates.
+    Nor is a column named for identifiers (``gene_ids``, ``feature_id``, …):
+    only Ensembl IDs can be told from symbols by their values. Missing
+    values do not count against a column.
+
+    Scoring of the candidates:
 
     * +3 if column name matches known aliases (``gene_symbols``, ``symbol``, …).
     * +2 if values pass :func:`_validate_gene_symbols` without error.
@@ -6960,8 +7492,16 @@ def detect_gene_symbol_column(
     ensembl_3 = frozenset(p[:3].upper() for p in ENSEMBL_PREFIXES)
     scores: dict[str, int] = {}
     for col in var.columns:
+        named = col.lower() in _GENE_SYMBOL_COL_ALIASES
+        present = var[col].dropna()
+        if (
+            pd.api.types.is_numeric_dtype(var[col].dtype)
+            or col.lower() in _GENE_ID_COL_ALIASES
+            or (not named and present.nunique() <= len(present) / 2)
+        ):
+            continue
         score = 0
-        if col.lower() in _GENE_SYMBOL_COL_ALIASES:
+        if named:
             score += 3
         try:
             _validate_gene_symbols(var[col].astype(str))

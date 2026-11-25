@@ -99,3 +99,62 @@ def test_a_swap_killed_between_its_moves_is_finished_by_any_crispyx_read(tmp_pat
         backed.file.close()
     finally:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def test_a_crispyx_handle_open_on_the_file_is_closed_and_reopens(tmp_path, monkeypatch):
+    """HDF5 refuses to open for writing a file this process reads: crispyx's
+    own wrappers are closed first, whatever spelling of the path they hold."""
+    import crispyx as cx
+
+    path = _obs_file(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    by_absolute_path, by_relative_path = cx.AnnData(path), cx.AnnData("obs.h5ad")
+    assert by_absolute_path.shape == by_relative_path.shape == (40, 2)  # both hold the file open
+
+    write_obs(path, load_obs(path).assign(h=1))
+    cx.write_var("obs.h5ad", cx.load_var(path).assign(v=2))
+    assert by_absolute_path.obs.load()["h"].eq(1).all()  # reopened, and sees the new table
+    assert by_relative_path.var.load()["v"].eq(2).all()
+    by_absolute_path.close()
+    by_relative_path.close()
+
+    # a wrapper opened by a relative path is still found after the working directory changes
+    held = cx.AnnData("obs.h5ad")
+    assert held.shape == (40, 2)
+    # and so is one that has only shown its obs, which leaves no file open
+    shown = cx.AnnData("obs.h5ad")
+    assert shown.obs.load()["h"].eq(1).all()
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    write_obs(path, load_obs(path).assign(h=3))
+    assert load_obs(path)["h"].eq(3).all()
+    monkeypatch.chdir(tmp_path)
+    assert shown.obs.load()["h"].eq(3).all()
+
+
+def test_a_wrapper_that_showed_a_table_reads_it_again_after_a_rewrite(tmp_path):
+    """obs and var are cached without opening the file, so a wrapper with no
+    open handle is told of a rewrite as well: through write_obs / write_var,
+    and through the functions that update a file in place."""
+    import crispyx as cx
+
+    path = _obs_file(tmp_path)
+    shown, passed_in = cx.AnnData(path), cx.AnnData(path)
+    assert list(shown.obs.load().columns) == list(passed_in.obs.head().columns) == ["g"]
+    assert shown.var.load().shape[1] == 0
+    assert shown._backed is None and passed_in._backed is None  # neither holds the file open
+
+    write_obs(path, load_obs(path).assign(h=1))
+    assert shown.obs.load()["h"].eq(1).all()
+    cx.normalise_perturbation_labels(passed_in, "g", control_aliases=["t0"], canonical_control="control")
+    assert set(passed_in.obs.load()["g"]) == set(shown.obs.load()["g"]) == {"control", "t1", "t2", "t3"}
+    cx.write_var(path, cx.load_var(path).assign(v=2))
+    assert shown.var.load()["v"].eq(2).all()
+
+
+def test_a_handle_crispyx_does_not_own_gives_a_clear_error(tmp_path):
+    path = _obs_file(tmp_path)
+    with h5py.File(path, "r"):
+        with pytest.raises(OSError, match="open elsewhere in this process.*close that handle"):
+            write_obs(path, load_obs(path).assign(h=1))
+    assert "h" not in load_obs(path)

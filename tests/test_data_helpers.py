@@ -382,6 +382,44 @@ class TestAutoDetect:
         col = detect_gene_symbol_column(path, verbose=False)
         assert col == "gene_symbols"
 
+    def test_detect_gene_symbol_column_skips_columns_that_cannot_be_names(self, tmp_path):
+        """A label many genes share, a count and a flag are not gene names:
+        with symbols as var_names, no column is detected."""
+        import scipy.sparse as sp
+
+        var = pd.DataFrame(
+            {
+                "gene_ids": [f"ENSG{i:011d}" for i in range(40)],
+                "feature_types": "Gene Expression",
+                "chromosome": [f"chr{i % 4}" for i in range(40)],
+                "n_cells": np.arange(40),
+                "highly_variable": np.arange(40) % 2 == 0,
+            },
+            index=[f"GENE{i}" for i in range(40)],
+        )
+        path = tmp_path / "mex_like.h5ad"
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) is None
+        # a real symbol column is still found beside them
+        var["gene_symbols"] = var.index
+        var.index = var["gene_ids"].to_numpy()
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) == "gene_symbols"
+        # ... also when most genes have no symbol, or rows share one (transcripts of a gene):
+        # a column named for symbols is one, and missing values do not count against any
+        for symbols in ([None] * 25 + [f"G{i}" for i in range(15)], [f"G{i % 15}" for i in range(40)]):
+            var["gene_symbols"] = symbols
+            ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+            assert detect_gene_symbol_column(path, verbose=False) == "gene_symbols"
+        var = var.rename(columns={"gene_symbols": "label"}).assign(label=[None] * 25 + [f"G{i}" for i in range(15)])
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) == "label"
+        # identifiers that are not Ensembl's look like symbols; a column named for identifiers is still not one
+        var = pd.DataFrame({"gene_ids": [f"LOC{i}" for i in range(40)], "feature_id": [f"E{i}" for i in range(40)]},
+                           index=[f"GENE{i}" for i in range(40)])
+        ad.AnnData(sp.csr_matrix((3, 40), dtype=np.float32), var=var).write(path)
+        assert detect_gene_symbol_column(path, verbose=False) is None
+
     def test_infer_columns_returns_dict(self, tmp_path):
         path = _create_full_dataset(tmp_path)
         result = infer_columns(path, verbose=False)
