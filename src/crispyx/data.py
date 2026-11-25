@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, NamedTuple, Sequence
 
 import h5py
 import anndata as ad
@@ -891,6 +891,18 @@ def resolve_data_path(
         raise FileNotFoundError(f"Data file not found: {result}")
     
     return result
+
+
+def resolve_path_to_update(data: str | Path | "AnnData" | ad.AnnData, table: str) -> Path:
+    """:func:`resolve_data_path` for a call that rewrites ``table`` (``obs`` or
+    ``var``) in place: a backed anndata object holds its file open, and
+    closing it would leave its layers on dead handles and its table stale."""
+    if isinstance(data, ad.AnnData) and data.isbacked:
+        raise ValueError(
+            f"A backed anndata object holds its file open, so its {table} cannot be rewritten in place: "
+            "pass the path or cx.read_h5ad_ondisk(path) instead, or inplace=False."
+        )
+    return resolve_data_path(data)
 
 
 def _anndata_nbytes(adata: ad.AnnData) -> int:
@@ -1925,8 +1937,9 @@ def _extract_csr_components_dense(
 class _RowSegment:
     """Rows of one source matrix to stream into an output matrix:
     ``cell_mask`` picks the rows (kept in source order) and ``gene_indices``
-    the columns, in output order. ``key`` is the matrix's place in the file,
-    ``"X"`` or ``"layers/<name>"``."""
+    the columns, in output order (``-1``: a gene the source lacks, written as
+    zeros). ``key`` is the matrix's place in the file, ``"X"`` or
+    ``"layers/<name>"``."""
 
     source_path: Path
     key: str
@@ -1956,6 +1969,7 @@ def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
     rows_from = segment.rows_from() if segment.rows_from is not None else nullcontext(segment.source_path)
     with rows_from as path, _open_matrix(path, segment.key) as matrix:
         all_columns = _keeps_all_columns(segment.gene_indices, matrix.shape[1])
+        zero_filled = bool(segment.gene_indices.size) and segment.gene_indices.min() < 0
         for slc, block in iter_matrix_chunks(
             None, axis=0, chunk_size=chunk_size, convert_to_dense=False, matrix=matrix,
             selected=segment.cell_mask,
@@ -1965,8 +1979,15 @@ def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
                 block = block[local_mask]
             if all_columns:
                 yield block
+            elif not segment.gene_indices.size:
+                yield block[:, []]
             else:
-                yield block[:, segment.gene_indices] if segment.gene_indices.size else block[:, []]
+                if zero_filled:  # index -1 takes an appended column of zeros
+                    if sp.issparse(block):
+                        block = sp.hstack([block, sp.csr_matrix((block.shape[0], 1), dtype=block.dtype)], format="csr")
+                    else:
+                        block = np.hstack([block, np.zeros((block.shape[0], 1), dtype=block.dtype)])
+                yield block[:, segment.gene_indices]
 
 
 def _keeps_all_columns(gene_indices: np.ndarray, n_vars: int) -> bool:
@@ -2451,7 +2472,7 @@ def _scan_csc_rows(
     indptr = elem["indptr"][:].astype(np.int64)
     n_cols = indptr.size - 1
     selected = np.zeros(n_cols, dtype=bool)
-    selected[gene_indices] = True
+    selected[gene_indices[gene_indices >= 0]] = True
     nnz = np.zeros(n_obs, dtype=np.int64)
     sums = np.zeros(n_obs, dtype=np.float64)
     data_ds, indices_ds = elem["data"], elem["indices"]
@@ -2524,6 +2545,18 @@ def _merged_categorical_dtype(parts: Sequence[pd.Series], merged: pd.Series) -> 
     return pd.CategoricalDtype(categories.append(extra[~extra.isin(categories)]))
 
 
+def _nullable(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    """``frame`` with its bool and integer ``columns`` in nullable dtypes, so
+    they stay writable beside the NA of files that lack the column or row."""
+    frame = frame.copy()
+    for column in frame.columns.intersection(list(columns)):
+        if pd.api.types.is_bool_dtype(frame[column]):
+            frame[column] = frame[column].astype("boolean")
+        elif pd.api.types.is_integer_dtype(frame[column]):
+            frame[column] = frame[column].astype("Int64")
+    return frame
+
+
 def _stringify_mixed_columns(obs: pd.DataFrame) -> list[str]:
     """Store as text the object columns whose values are not all text (one
     file's numbers beside another's strings), which h5ad cannot write; the
@@ -2544,6 +2577,7 @@ def concat_h5ad(
     paths: Sequence[str | Path],
     *,
     output_path: str | Path,
+    join: Literal["inner", "outer"] = "inner",
     shared_cells: Literal["drop", "error"] = "drop",
     label: str | None = None,
     chunk_size: int = 4096,
@@ -2557,9 +2591,10 @@ def concat_h5ad(
     control cells; concatenating them as they are counts every shared cell
     once per file. Cells are matched by ``obs_names``: a barcode that occurs
     in more than one file must be the same cell there -- the same number of
-    non-zeros and the same total over the shared genes -- or the call
-    raises. ``obs`` values that differ between the copies (e.g. QC metrics
-    computed per file) are warned about, and the first file's are kept.
+    non-zeros and the same total over the output's genes (a gene a file
+    lacks is zero there) -- or the call raises. ``obs`` values that differ
+    between the copies (e.g. QC metrics computed per file) are warned about,
+    and the first file's are kept.
 
     Each file's matrix is read twice, row chunk by row chunk: once to size
     the output and check the shared cells, once to write it into one CSR
@@ -2571,6 +2606,10 @@ def concat_h5ad(
         The h5ad files, in output order.
     output_path
         Where to write the result (not one of ``paths``).
+    join
+        ``"inner"`` (default) keeps the genes every file has; ``"outer"``
+        keeps every gene, as zeros in the files that lack it (pipelines that
+        list only the genes detected in each sample).
     shared_cells
         ``"drop"`` (default) keeps each shared cell where it first occurs and
         drops its later copies, after checking they are the same cell.
@@ -2598,8 +2637,10 @@ def concat_h5ad(
     -------
     AnnData
         The concatenated file. ``var`` holds the genes every file has, in the
-        first file's order, with the first file's ``var`` columns; genes
-        missing from any file are dropped. ``X`` (always CSR) and every
+        first file's order, with the first file's ``var`` columns; with
+        ``join="outer"``, every file's genes in the order first seen, each
+        with the values of the first file that has it (NA where that file
+        lacks the column). ``X`` (always CSR) and every
         layer present in all files are concatenated; ``obs`` is the union of
         the files' columns (missing values are NA; a shared cell takes the
         values its first file lacks from a later copy); ``obsm`` keys
@@ -2617,6 +2658,8 @@ def concat_h5ad(
     sources = [resolve_data_path(path) for path in paths]
     if not sources:
         raise ValueError("concat_h5ad needs at least one input file")
+    if join not in ("inner", "outer"):
+        raise ValueError(f"join must be 'inner' or 'outer'; received {join!r}")
     if shared_cells not in ("drop", "error"):
         raise ValueError(f"shared_cells must be 'drop' or 'error'; received {shared_cells!r}")
     output_path = Path(output_path)
@@ -2626,7 +2669,7 @@ def concat_h5ad(
 
     fingerprint = run_fingerprint(
         sources[0],
-        params={"shared_cells": shared_cells, "label": label},
+        params={"join": join, "shared_cells": shared_cells, "label": label},
         inputs=[_file_identity(source) for source in sources],
     )
     if not force and reusable(output_path, "concat", fingerprint, verbose):
@@ -2659,13 +2702,18 @@ def concat_h5ad(
     if label is not None and any(label in meta["obs"].columns for meta in metas):
         raise ValueError(f"label column {label!r} already exists in obs")
 
-    # ---- genes: those every file has, in the first file's order ----
+    # ---- genes: those every file has (inner) or any file has (outer) ----
     genes = metas[0]["var_names"]
     for meta in metas[1:]:
-        genes = genes[genes.isin(meta["var_names"])]
-    all_genes = set().union(*(set(meta["var_names"]) for meta in metas))
-    if len(all_genes) > len(genes):
-        _messages.vprint(verbose, name, f"{len(all_genes) - len(genes)} genes not in every file are dropped")
+        if join == "inner":
+            genes = genes[genes.isin(meta["var_names"])]
+        else:
+            genes = genes.append(meta["var_names"][~meta["var_names"].isin(genes)])
+    n_partial = len(set().union(*map(set, (meta["var_names"] for meta in metas)))) - len(
+        functools.reduce(pd.Index.intersection, (meta["var_names"] for meta in metas)))
+    if n_partial:
+        action = "dropped" if join == "inner" else "filled with zeros where missing"
+        _messages.vprint(verbose, name, f"{n_partial} genes not in every file are {action}")
     gene_indices = [meta["var_names"].get_indexer(genes).astype(np.int64) for meta in metas]
 
     # ---- cells: a shared cell is kept where it first occurs ----
@@ -2696,17 +2744,7 @@ def concat_h5ad(
         c for meta in metas for c in meta["obs"].columns
         if not all(c in other["obs"].columns for other in metas)
     }
-    frames = []
-    for meta in metas:
-        frame = meta["obs"].copy()
-        for column in partial_columns.intersection(frame.columns):
-            # Nullable dtypes keep bools and ints writable beside the NA of
-            # the files without the column.
-            if pd.api.types.is_bool_dtype(frame[column]):
-                frame[column] = frame[column].astype("boolean")
-            elif pd.api.types.is_integer_dtype(frame[column]):
-                frame[column] = frame[column].astype("Int64")
-        frames.append(frame)
+    frames = [_nullable(meta["obs"], partial_columns) for meta in metas]
     obs = pd.concat([frame[mask] for frame, mask in zip(frames, keep)], join="outer")
     categorical = {
         c for meta in metas for c in meta["obs"].columns
@@ -2800,8 +2838,16 @@ def _concat_matrices(
     data_dtype = np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
 
     # ---- var, uns, layers, obsm ----
-    var = metas[0]["var"].copy()
-    var.index = metas[0]["var_names"]
+    var = metas[0]["var"].set_axis(metas[0]["var_names"])
+    if len(genes) > len(var):  # outer join: a gene takes the first file's row that has it
+        columns = var.columns
+        rows, seen = [_nullable(var, columns)], var.index
+        for meta in metas[1:]:
+            frame = meta["var"].set_axis(meta["var_names"])
+            frame = frame.loc[~frame.index.isin(seen), frame.columns.intersection(columns)]
+            rows.append(_nullable(frame, columns))
+            seen = seen.append(frame.index)
+        var = pd.concat(rows)
     var = var.loc[genes]
     uns = {
         key: value for key, value in metas[0]["uns"].items()

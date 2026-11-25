@@ -95,14 +95,17 @@ from .pseudobulk import (
 from .qc import (
     Issue,
     assign_guides,
+    calculate_qc_metrics,
     check_perturbation_data,
     compare_controls,
     control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
+    mad_outliers,
     quality_control_summary,
     raise_on_errors,
+    scrublet,
 )
 from .residual import residual_effects
 from .sample import subsample
@@ -135,6 +138,9 @@ __all__ = [
     "tl",
     "pl",
     # Quality control
+    "calculate_qc_metrics",
+    "mad_outliers",
+    "scrublet",
     "filter_cells_by_gene_count",
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",

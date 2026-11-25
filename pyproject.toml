@@ -43,15 +43,19 @@ dependencies = [
     "joblib>=1.4",
     "scikit-learn>=1.0",
     "scikit-misc>=0.1.4",
-    "scanpy>=1.9.2",
+    "scanpy>=1.10",  # sc.pp.scrublet, sc.tl.leiden(flavor="igraph")
     "seaborn>=0.12",
     "matplotlib>=3.5",
     "tqdm>=4.66",  # 4.66 reads TQDM_DISABLE
 ]
 
 [project.optional-dependencies]
+leiden = ["igraph>=0.10"]
+scrublet = ["scikit-image"]
 test = [
     "filelock",
+    "igraph>=0.10",
+    "scikit-image",
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",

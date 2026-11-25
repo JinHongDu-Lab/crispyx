@@ -378,6 +378,30 @@ def test_pca_neighbors_umap_pipeline_on_a_backed_file(tmp_path):
     assert "umap" in reopened.uns
 
 
+def test_leiden_matches_scanpy_on_the_stored_graph(tmp_path):
+    pytest.importorskip("igraph")
+    import scanpy as sc
+
+    path = _write(tmp_path / "leiden.h5ad", _counts(n_obs=150))
+    cx.pp.pca(path, n_comps=10, show_progress=False)
+    cx.pp.neighbors(path, n_neighbors=10, method="sklearn", show_progress=False)
+    cx.tl.leiden(path, 0.8, random_state=3)
+    stored = ad.read_h5ad(path)
+    expected = stored.copy()
+    sc.tl.leiden(expected, 0.8, flavor="igraph", directed=False, n_iterations=2, random_state=3)
+    assert stored.obs["leiden"].dtype == "category"
+    assert stored.obs["leiden"].tolist() == expected.obs["leiden"].tolist()
+    assert list(stored.obs["leiden"].cat.categories) == list(expected.obs["leiden"].cat.categories)
+    assert stored.uns["leiden"]["params"]["resolution"] == 0.8
+
+
+def test_leiden_without_neighbors_raises(tmp_path):
+    pytest.importorskip("igraph")
+    path = _write(tmp_path / "plain.h5ad", _counts(n_obs=20))
+    with pytest.raises(ValueError, match="run cx.pp.neighbors first"):
+        cx.tl.leiden(path)
+
+
 # ---------------------------------------------------------------------------
 # h5ad write helpers
 # ---------------------------------------------------------------------------

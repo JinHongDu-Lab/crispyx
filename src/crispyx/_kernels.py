@@ -940,7 +940,76 @@ def _wilcoxon_single_pert_presorted(
 
 
 @nb.njit(parallel=True, cache=True)
+def _rank_sums_by_group_csc(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    codes: np.ndarray,
+    group_sizes: np.ndarray,
+    rank_sums: np.ndarray,
+    tie_sums: np.ndarray,
+) -> None:
+    """Rank every cell within each column of a CSC block (ties averaged) and
+    add each group's rank sum to ``rank_sums[group, column]``; the column's
+    tie term ``sum(t^3 - t)`` goes to ``tie_sums[column]``.
+
+    ``codes`` gives each cell's group (``-1``: ranked, in no group), and
+    ``group_sizes`` each group's number of cells. The
+    cells a column does not store, and stored zeros, are one tie at value
+    0, placed between the negative and positive values, so a column costs a
+    sort of its non-zeros, not of every cell.
+    """
+    n_cells = codes.shape[0]
+    for j in nb.prange(indptr.shape[0] - 1):
+        lo = indptr[j]
+        values = data[lo:indptr[j + 1]].astype(np.float64)
+        rows = indices[lo:indptr[j + 1]]
+        order = np.argsort(values, kind="mergesort")
+        n_nonzero = 0
+        for k in range(values.shape[0]):
+            if values[k] != 0.0:
+                n_nonzero += 1
+        n_zero = n_cells - n_nonzero
+        group_nonzero = np.zeros(group_sizes.shape[0])
+        ranked = 0.0
+        zero_rank = 0.0
+        zeros_placed = False
+        tie = 0.0
+        k = 0
+        while k < values.shape[0]:
+            value = values[order[k]]
+            if value == 0.0:
+                k += 1
+                continue
+            if value > 0.0 and not zeros_placed:
+                zero_rank = ranked + (n_zero + 1) / 2.0
+                tie += float(n_zero) ** 3 - n_zero
+                ranked += n_zero
+                zeros_placed = True
+            end = k
+            while end < values.shape[0] and values[order[end]] == value:
+                end += 1
+            t = end - k
+            rank = ranked + (t + 1) / 2.0
+            tie += float(t) ** 3 - t
+            for q in range(k, end):
+                group = codes[rows[order[q]]]
+                if group >= 0:
+                    rank_sums[group, j] += rank
+                    group_nonzero[group] += 1.0
+            ranked += t
+            k = end
+        if not zeros_placed:
+            zero_rank = ranked + (n_zero + 1) / 2.0
+            tie += float(n_zero) ** 3 - n_zero
+        tie_sums[j] = tie
+        for group in range(group_sizes.shape[0]):
+            rank_sums[group, j] += zero_rank * (group_sizes[group] - group_nonzero[group])
+
+
+@nb.njit(parallel=True, cache=True)
 def _wilcoxon_batch_perts_presorted_numba(
+
     control_dense: np.ndarray,
     ctrl_sorted_flat: np.ndarray,
     ctrl_offsets: np.ndarray,

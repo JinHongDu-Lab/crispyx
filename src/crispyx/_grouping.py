@@ -78,6 +78,10 @@ def canonical_call_args(
 # they fall into no comparison (``str(NaN)`` would make a group named "nan").
 UNLABELLED = "\0unlabelled"
 
+# The reference that compares each group with every other labelled cell
+# (Scanpy's ``reference="rest"``), in place of a control label.
+REST = "rest"
+
 
 def cell_labels(obs: pd.DataFrame, labels: str | pd.Series) -> tuple[pd.Series, str]:
     """Each cell's value, in ``obs`` order (NaN = the cell is not used), and its

@@ -414,7 +414,7 @@ one copy of every shared cell:
    )
 
 Cells are matched by ``obs_names``. A barcode in more than one file must be
-the same cell there -- the same expression over the shared genes -- or the
+the same cell there -- the same expression over the output's genes -- or the
 call raises; ``obs`` values that differ between the copies (such as QC
 metrics computed per file) are warned about and the first file's are kept.
 Pass ``shared_cells="error"`` to refuse any overlap instead of dropping it.
@@ -425,6 +425,11 @@ DataFrame); ``label`` records each cell's source file (its stem, or its path
 if two files share a stem).
 Cell-cell graphs (``obsp``), ``varm``/``varp`` and ``.raw`` describe one file
 and are not carried over; ``verbose=1`` lists what was dropped.
+
+Some pipelines list only the genes detected in each sample. ``join="outer"``
+keeps every file's genes instead, as zeros in the files that lack them (in
+the order first seen, each with the ``var`` values of the first file that has
+it); it costs no extra pass, since zeros are not stored.
 
 .. _compress-h5ad:
 

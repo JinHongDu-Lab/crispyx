@@ -1,6 +1,29 @@
 Changelog
 =========
 
+Version 0.2.11
+--------------
+
+*Unreleased.* A multi-sample single-cell dataset without perturbations goes from counts to QC flags, per-sample highly variable genes, clusters and cluster markers with crispyx alone: per-cell QC metrics, MAD outlier flags, per-sample Scrublet, ``batch_key`` for highly variable genes, Leiden clustering, one-vs-rest markers and zero-filled concatenation.
+
+**Added**
+
+* ``cx.pp.calculate_qc_metrics``: Scanpy's per-cell (``n_genes_by_counts``, ``total_counts``, ``total_counts_<set>``, ``pct_counts_<set>`` for each boolean ``var`` column in ``qc_vars``, and their ``log1p_`` columns) and per-gene metrics, in one pass over the matrix in its stored layout (CSR, CSC or dense). They are written to the file's ``obs`` and ``var`` by default; ``inplace=False`` returns them as Scanpy does. ``percent_top`` is not computed.
+* ``cx.pp.mad_outliers``: ``<key>_low`` / ``<key>_high`` flags for ``obs`` values more than ``nmads`` (unscaled) median absolute deviations from the median of each ``groupby`` group, so samples sequenced at different depths each get their own thresholds. Reads ``obs`` only.
+* ``cx.pp.scrublet``: :func:`scanpy.pp.scrublet` on each ``batch_key`` group (and ``cell_mask``) read from disk in turn, so memory holds one sample, never the file; same scores as Scanpy's ``batch_key``. The automatic threshold needs scikit-image: ``pip install 'crispyx[scrublet]'``.
+* ``batch_key`` in ``cx.pp.highly_variable_genes``: genes are selected within each batch and combined as Scanpy does (``highly_variable_nbatches``, ``highly_variable_rank`` or ``highly_variable_intersection``), for all flavors, with ``cell_mask`` applied within each batch. Both passes accumulate every batch at once, so the matrix is still read twice whatever the number of batches. ``flavor="seurat_v3_paper"`` (Scanpy's) ranks by the number of batches first, then median rank; without ``batch_key`` it equals ``"seurat_v3"``.
+* ``cx.tl.leiden``: Leiden clusters of the neighbour graph that ``cx.pp.neighbors`` stored, in ``obs["leiden"]``, by :func:`scanpy.tl.leiden` with ``flavor="igraph"`` on the graph alone (``X`` is not read); needs ``pip install 'crispyx[leiden]'``.
+* ``reference="rest"`` (or ``control_label="rest"``) in ``cx.tl.rank_genes_groups``, ``cx.wilcoxon_test`` and ``cx.t_test``: each group against every other labelled cell, Scanpy's one-vs-rest markers, with the same scores, p-values, fold changes and detection rates. The Wilcoxon test ranks all cells once per gene chunk, which gives every group's rank sum at once; the t-test takes the rest's moments from the totals of the pass it already makes. ``pts_rest`` is then a layer, since the rest differs by group. Resumable as the control comparison is; NB-GLM, ``batch_column`` and ``distribution="hypergeometric"`` refuse it.
+* ``join="outer"`` in ``cx.pp.concat_h5ad``: every file's genes, as zeros in the files that lack them (pipelines that list only the genes detected in each sample), each with the ``var`` values of the first file that has it; no extra pass over the matrices. A cell shared by two files is compared over all the output's genes.
+
+**Changed**
+
+* Scanpy 1.10 is the minimum (was 1.9.2), for ``sc.pp.scrublet`` and ``sc.tl.leiden(flavor="igraph")``.
+
+**Documentation**
+
+* :doc:`quality_control` gains "Per-cell metrics, outliers and doublets", HVGs over several samples and Leiden clustering; :doc:`differential_expression` gains "Markers: each group against the rest"; :doc:`large_data` describes ``join="outer"``.
+
 Version 0.2.10
 --------------
 

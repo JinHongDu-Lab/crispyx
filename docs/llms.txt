@@ -22,23 +22,26 @@ without materializing the full matrix.
   streamed into an .h5ad file without loading the matrix; not 10x HDF5 or
   sequencing reads
 - Streaming QC and preprocessing (filter cells, perturbations, genes;
-  normalize and log-transform; subsample; thin counts) without loading the
-  full matrix
+  Scanpy's per-cell QC metrics; per-sample MAD outlier flags; Scrublet
+  doublets one sample at a time; normalize and log-transform; subsample;
+  thin counts) without loading the full matrix
 - Data preparation: edit obs/var without reading X; normalise perturbation
   labels and take target genes out of guide names; assign guides from
   guide-capture counts; recover integer counts from log1p-normalised data;
   sum the rows of a gene split over several (cx.pp.collapse_genes);
-  concatenate multi-file screens; check a file for the mistakes that mislead
+  concatenate multi-file screens (also zero-filling genes a file lacks); check a file for the mistakes that mislead
   an analysis (cx.pp.check_data)
 - Pseudobulk aggregation: average log expression and pseudobulk count matrices
 - Differential expression: t-test, Wilcoxon rank-sum (also batch-stratified),
   negative binomial GLM at cell level or on pseudo-bulk with covariates and
   apeGLM log-fold-change shrinkage; a fixed-offset NB test for many small
   perturbations against a large, stratified control set
-  (cx.tl.nb_offset_test); covariate-adjusted residual effects
+  (cx.tl.nb_offset_test); covariate-adjusted residual effects; one-vs-rest
+  cluster markers (reference="rest")
 - Control checks: do the control guides agree, and may unassigned cells join
   the controls?
-- Memory-efficient PCA and KNN graph construction on backed AnnData
+- Memory-efficient highly variable genes (also per sample, batch_key), PCA,
+  KNN graph and Leiden clustering on backed AnnData
 - Scanpy-compatible API: cx.pp, cx.pb, cx.tl, cx.pl namespaces
 - HPC support: resume/checkpoint, configurable memory_limit_gb, Docker and
   Singularity images
