@@ -10,11 +10,12 @@ from crispyx.glm import build_design_matrix, fit_glm_deseq2, fit_two_group_deseq
 
 pydeseq2 = pytest.importorskip("pydeseq2")
 
-# From 0.7 PyDESeq2 holds the fitted mean at ``min_mu`` in the Wald weights, and
-# in the IRLS means its gene-wise dispersions are fitted at (designs with
-# covariates), as R DESeq2 does. crispyx keeps the floor out of both
-# (NBGLMBatchFitter._wald_weights).
-_PYDESEQ2_FLOORS = tuple(int(part) for part in pydeseq2.__version__.split(".")[:2]) >= (0, 7)
+# The fitted mean is held at ``min_mu`` in the Wald weights, and in the IRLS
+# means the gene-wise dispersions are fitted at (designs with covariates), by
+# R DESeq2, by crispyx (NBGLMBatchFitter._wald_weights) and by PyDESeq2 from
+# 0.7. Before 0.7 PyDESeq2 took the fitted mean itself for both; it is what
+# CI's Python 3.10 and 3.11 jobs install (0.6 and later need Python 3.12).
+_PYDESEQ2_UNFLOORED = tuple(int(part) for part in pydeseq2.__version__.split(".")[:2]) < (0, 7)
 
 
 def _screen(seed=0, n_ctrl=400, n_pert=150, n_genes=300, batch_sd=0.0):
@@ -64,10 +65,10 @@ def _pydeseq2(counts, labels, sf, batch=None):
 
 def _floor_free(dds, sf, min_mu=0.5):
     """The genes whose dispersions and statistics are compared with
-    PyDESeq2's: all of them before PyDESeq2 0.7, and from 0.7 those whose
+    PyDESeq2's: all of them from PyDESeq2 0.7, and before 0.7 those whose
     fitted mean is below the floor in no cell (most of them), since only
     there do the two treat the floor alike."""
-    if not _PYDESEQ2_FLOORS:
+    if not _PYDESEQ2_UNFLOORED:
         return np.ones(dds.n_vars, dtype=bool)
     mu = sf[:, None] * np.exp(dds.obsm["design_matrix"].to_numpy() @ dds.varm["LFC"].to_numpy().T)
     free = mu.min(axis=0) >= min_mu
@@ -77,10 +78,10 @@ def _floor_free(dds, sf, min_mu=0.5):
 
 def _z_tolerances(covariates):
     """Bounds on the median and the largest difference in z over the compared
-    genes. With covariates and PyDESeq2 >= 0.7 they are twice as wide: the
-    floored genes' gene-wise dispersions differ, which moves the trend and
-    the prior every gene is shrunk with."""
-    return (2e-3, 0.1) if covariates and _PYDESEQ2_FLOORS else (1e-3, 0.05)
+    genes. With covariates and PyDESeq2 before 0.7 they are twice as wide:
+    the floored genes' gene-wise dispersions differ, which moves the trend
+    and the prior every gene is shrunk with."""
+    return (2e-3, 0.1) if covariates and _PYDESEQ2_UNFLOORED else (1e-3, 0.05)
 
 
 def _fit(counts, labels, sf, bin_width=0.02, blocks=1):

@@ -30,7 +30,6 @@ from ._kernels import (
 from ._irls import (
     EPS,
     ETA_MAX,
-    ETA_MIN,
     PIVOT_FLOOR,
     Deviance,
     OneHotGroups,
@@ -68,7 +67,7 @@ def _nb_irls_kernel(design, labels, n_groups, offset, counts, alpha, *, ridge, r
         design, np.asarray(labels, dtype=np.int64), offset, np.asfortranarray(counts, dtype=np.float64),
         np.asarray(alpha, dtype=np.float64), int(n_groups), column,
         float(design[0, column]) if column >= 0 else 1.0, float(np.exp(offset).mean()),
-        eta_floor(min_mu), ETA_MAX, ETA_MIN, min_mu > 0.0, int(max_iter), float(tol),
+        eta_floor(min_mu), ETA_MAX, min_mu > 0.0, int(max_iter), float(tol),
         np.asarray(ridge, dtype=np.float64), float(ridge_group), float(clip_group), _MAX_STEP_HALVINGS, EPS,
     )
 
@@ -689,7 +688,7 @@ def _fit_gene_apeglm_lbfgsb(
     # Estimate SE from inverse Hessian at MAP
     try:
         eta = design_matrix @ beta_map + log_size_factors
-        # No min_mu clamping in SE computation (see NBGLMBatchFitter._wald_weights)
+        # No min_mu clamping in the SE of the shrunken coefficient (apeglm has no mean floor)
         mu = np.exp(eta)
         
         # NB weights: W = mu * (1 + mu/size)^(-1) = mu * size / (mu + size)
@@ -1236,7 +1235,7 @@ class NBGLMBatchFitter:
             alpha_final, beta_result
         )
         iter_result = first_iters + second_iters
-        # Standard errors from the unfloored mean; see _wald_weights.
+        # Standard errors from the floored mean; see _wald_weights.
         se_result = self._compute_se_batch(
             self._wald_weights(beta_result, alpha_final)
         )
@@ -1556,7 +1555,7 @@ class NBGLMBatchFitter:
             gene_n_iter[batch] = first_iters + second_iters
             gene_deviance[batch] = dev_batch
 
-        # Standard errors from the unfloored fitted mean; see _wald_weights.
+        # Standard errors from the floored fitted mean; see _wald_weights.
         se_valid = self._compute_se_batch(self._wald_weights(beta_all, alpha_all))
 
         # Store to output arrays
@@ -1698,22 +1697,18 @@ class NBGLMBatchFitter:
         alpha: np.ndarray,
         extra_offset: np.ndarray | None = None,
     ) -> np.ndarray:
-        """IRLS weights for the reported covariance, from the *unfloored* mean.
+        """IRLS weights for the reported covariance, from the fitted mean
+        held at ``min_mu`` as the iteration holds it.
 
-        ``min_mu`` stabilises the iteration; it is not part of the model whose
-        uncertainty is being reported.  Leaving the floor in overstates how
-        much every floored cell knows: at 0.05 counts per cell it made the
-        standard errors a quarter too small and the Wald statistics
-        correspondingly too large.  R DESeq2 leaves it in (``fitBeta`` forms
-        the covariance from the floored mean), and so does PyDESeq2 from 0.7;
-        before 0.7 PyDESeq2 rebuilt ``W`` from an unthresholded ``mu``, as
-        here.  Where a fitted mean is below the floor, crispyx's standard
-        errors are therefore larger than theirs (docs/nb_glm.rst, "Matching
-        PyDESeq2 or DESeq2").
-
-        The linear predictor is still clipped, but at the generic
-        ``ETA_MIN``/``ETA_MAX`` divergence bounds rather than at the mean
-        floor, so a diverging gene stays finite.
+        This is DESeq2's convention: ``fitBeta`` forms the covariance from
+        the weights of its last iteration, floor included, and PyDESeq2 does
+        the same from 0.7 (before, it rebuilt ``W`` from an unthresholded
+        ``mu``).  A floored cell then weighs ``min_mu / (1 + alpha min_mu)``
+        whatever its fitted mean, which overstates what it knows where the
+        floor is far above the counts: at 0.05 counts per cell and a floor of
+        0.5 the standard errors come out a quarter smaller than from the
+        fitted mean.  That is why sparse counts get a floor of 1e-6 by
+        default (``nb_glm_test``), where no cell is floored.
 
         Parameters
         ----------
@@ -1728,7 +1723,7 @@ class NBGLMBatchFitter:
         eta = self.design @ beta + self.offset[:, None]
         if extra_offset is not None:
             eta = eta + extra_offset
-        np.clip(eta, ETA_MIN, ETA_MAX, out=eta)
+        np.clip(eta, self._eta_min, ETA_MAX, out=eta)
         return irls_weights(np.exp(eta), alpha)
 
     def _compute_se_batch(self, weights: np.ndarray) -> np.ndarray:
@@ -2265,22 +2260,9 @@ class StructuredGLMBatchFitter:
         if final_blocks:
             # Standard errors need the blocks at the converged fit for *every*
             # gene; the iterations only ever formed them for the active subset.
-            # They are also built from the unfloored mean, because ``min_mu``
-            # steadies the iteration and has no place in the reported
-            # covariance -- see NBGLMBatchFitter._wald_weights.  With no floor
-            # the two weight sets are the same array, so nothing extra is
-            # formed on the default path.
-            weights = irls_weights(mu, alpha)
-            if self.min_mu > 0.0:
-                eta_wald = np.clip(
-                    self.offset[:, None]
-                    + self.design @ beta_features.T
-                    + self.groups.expand(beta_groups),
-                    ETA_MIN,
-                    ETA_MAX,
-                )
-                weights = irls_weights(np.exp(eta_wald), alpha)
-            gram, cross, diagonal = self._hessian_blocks(weights)
+            # The mean is the iteration's, floor included -- see
+            # NBGLMBatchFitter._wald_weights.
+            gram, cross, diagonal = self._hessian_blocks(irls_weights(mu, alpha))
             blocks = (cross, diagonal, schur_complement(gram, cross, diagonal))
 
         return (
@@ -3112,7 +3094,8 @@ def fit_glm_deseq2(
     The steps are PyDESeq2's: starting dispersions (the smaller of the rough
     and the moments estimates); means from a linear model when the design has
     one distinct row per coefficient, else from IRLS at the starting
-    dispersions; gene-wise Cox-Reid dispersions at those means; the trend
+    dispersions, held at ``min_mu`` either way; gene-wise Cox-Reid
+    dispersions at those means; the trend
     and prior variance as :func:`fit_two_group_deseq2`; MAP dispersions at
     the same means; genes more than two residual SDs above the trend keep
     their gene-wise dispersion; IRLS for the coefficients at the final
@@ -3202,7 +3185,7 @@ def fit_glm_deseq2(
             mu = lin_mu
         else:
             coef = start_coef[cols]
-            mu = s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30))
+            mu = np.maximum(s[:, None] * np.exp(np.clip(design @ coef.T, -30, 30)), min_mu)
             finite = np.isfinite(coef).all(axis=1)
             mu[:, ~finite] = lin_mu[:, ~finite]
         return np.asfortranarray(np.maximum(mu, 1e-10))

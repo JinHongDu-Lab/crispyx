@@ -296,11 +296,14 @@ composition shift.
 The mean floor
 --------------
 
-NB-GLM holds fitted means at least ``min_mu`` while fitting, as DESeq2 does.
-DESeq2's 0.5 suits bulk counts. On sparse counts it makes tests conservative
-and biases genes with means below one when groups differ in depth; 1e-6,
-DESeq2's single-cell setting, does not (numbers in
-:doc:`notebooks/size_factor_comparison`).
+NB-GLM holds fitted means at least ``min_mu``, where DESeq2 does: while
+fitting, in the means the gene-wise dispersions are fitted at, and in the
+weights behind the Wald standard error.
+DESeq2's 0.5 suits bulk counts. On sparse counts it is miscalibrated in both
+directions: under weak perturbations too few null genes fall below p = 0.05
+(1.4-1.9%), and when the groups differ in depth too many do (8-11%), with
+genes of mean below one biased. 1e-6, DESeq2's single-cell setting, is
+calibrated in both cases (numbers in :doc:`notebooks/size_factor_comparison`).
 
 The default, ``min_mu=None``, chooses from the counts: **1e-6 when at least
 half of the counts are zero, 0.5 otherwise**. The value used is in
@@ -315,9 +318,10 @@ Matching PyDESeq2 or DESeq2
 
 Given the same size factors and mean floor, crispyx's statistics agree with
 PyDESeq2's: median difference in z 0.0004-0.004 on six screens (z correlation
-0.997-0.9999, PyDESeq2 before 0.7), about 0.001 on simulated data. With each
-tool's default floor (1e-6 here on single cells, 0.5 in PyDESeq2) the median
-difference is 0.3-0.4. To compare like with like:
+0.997-0.9999; measured with crispyx 0.2.9 and PyDESeq2 before 0.7, see below),
+about 0.001 on simulated data. With each tool's default floor (1e-6 here on
+single cells, 0.5 in PyDESeq2) the median difference is 0.3-0.4. To compare
+like with like:
 
 1. Give both the same size factors (``dds.obs["size_factors"]`` in PyDESeq2,
    ``sizeFactors(dds) <- ...`` in DESeq2). A per-perturbation PyDESeq2 run
@@ -333,16 +337,17 @@ difference is 0.3-0.4. To compare like with like:
    perturbations PyDESeq2 replaced them in 4-15 of ~18,800 genes and changed
    the hits at q < 0.1 by 0-3.
 
-One difference remains where the floor binds, that is on genes whose fitted
-mean is below ``min_mu`` in some cell. R DESeq2, and PyDESeq2 from 0.7, build
-the Wald standard error from the floored mean, and with covariates also the
-means the gene-wise dispersions are fitted at. crispyx uses the fitted mean
-itself, as PyDESeq2 did before 0.7: a floored cell is counted as knowing no
-more than its fitted mean says, so those genes get a larger standard error
-here. On simulated counts with a floor of 0.5, a quarter of the genes were
-floored; their standard errors were 0.8% larger at the median and at most 22%
-(z differed by up to 2.2), the calls at p < 0.05 were the same, and the other
-genes agreed as above. At 1e-6 nothing is floored and every gene agrees.
+Use PyDESeq2 0.7 or later for a comparison at a floor that binds, that is
+with genes whose fitted mean is below ``min_mu`` in some cell. R DESeq2,
+PyDESeq2 from 0.7 and crispyx from 0.2.10 build the Wald standard error from
+the floored mean, and with covariates also the means the gene-wise
+dispersions are fitted at. PyDESeq2 before 0.7, and crispyx before 0.2.10,
+used the fitted mean itself, which gives a floored gene a larger standard
+error. On simulated counts with a floor of 0.5, a quarter of the genes were
+floored; between the two conventions their standard errors differed by 0.8%
+at the median and at most 22% (z by up to 2.2), the calls at p < 0.05 were the
+same, and the other genes agreed as above. At 1e-6 nothing is floored and the
+conventions coincide.
 
 Gene-wise dispersions can still differ on sparse genes, most often in
 pseudo-bulk: where the likelihood has a second mode at the lower bound

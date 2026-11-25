@@ -1868,15 +1868,21 @@ def _cells_score(y_nz, s_nz, s, b, alpha, min_mu):
 
 
 @nb.njit(cache=True)
-def _control_weight(a, alpha, centre, s_mom):
-    """Sum over controls of mu/(1 + alpha mu) with the unthresholded mu = s exp(a)."""
+def _control_weight(a, alpha, min_mu, centre, s_mom):
+    """Sum over controls of mu/(1 + alpha mu), mu = s exp(a) held at min_mu
+    as :func:`_control_score` holds it: a bin whose centre is under the floor
+    is floored whole."""
     k = math.exp(a)
     out = 0.0
+    w_floor = min_mu / (1.0 + alpha * min_mu)
     for b in range(centre.shape[0]):
         n_b = s_mom[0, b]
         if n_b == 0.0:
             continue
         c = centre[b]
+        if c * k < min_mu:
+            out += n_b * w_floor
+            continue
         v = 1.0 + alpha * k * c
         out += (n_b * k * c / v + s_mom[1, b] * k / (v * v) - s_mom[2, b] * alpha * k * k / (v * v * v)
                 + s_mom[3, b] * alpha * alpha * k ** 3 / v ** 4)
@@ -1889,7 +1895,7 @@ def _two_group_lfc(genes, dispersion, a0, b0, t_ptr, t_y, t_s, s_t, min_mu, cent
     """PyDESeq2's IRLS solution for the control intercept a and the perturbed
     group's log mean b (LFC = b - a) at the given dispersions -- damped Newton
     on the fixed-point equations X'(W (z - X beta)) = ridge beta -- and the
-    Wald standard error of b - a from the unthresholded means. The perturbed
+    Wald standard error of b - a from the means held at min_mu. The perturbed
     cells have size factors s_t; gene g's non-zero counts are
     t_y[t_ptr[g]:t_ptr[g+1]], at size factors t_s (as _two_group_dispersions)."""
     n = genes.shape[0]
@@ -1941,9 +1947,9 @@ def _two_group_lfc(genes, dispersion, a0, b0, t_ptr, t_y, t_s, s_t, min_mu, cent
         k_t = math.exp(b)
         w_t = 0.0
         for j in range(s_t.shape[0]):
-            mu = s_t[j] * k_t
+            mu = max(s_t[j] * k_t, min_mu)
             w_t += mu / (1.0 + alpha * mu)
-        w_c = _control_weight(a, alpha, centre, s_mom)
+        w_c = _control_weight(a, alpha, min_mu, centre, s_mom)
         # M = [[w_c + w_t, w_t], [w_t, w_t]]; H = (M + ridge I)^-1;
         # se^2 = (H M H)[1, 1], PyDESeq2's wald_test
         m11 = w_c + w_t + ridge
@@ -2117,7 +2123,7 @@ def _schur(gram, cross, diag):
 
 @nb.njit(parallel=True, cache=True)
 def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_val, mean_exp_offset,
-                        eta_lo, eta_hi, wald_lo, floored, max_iter, tol, ridge, ridge_group, clip_group,
+                        eta_lo, eta_hi, floored, max_iter, tol, ridge, ridge_group, clip_group,
                         max_halvings, eps):
     """StructuredGLMBatchFitter._irls and its standard errors at the fixed NB
     dispersions alpha, for each column of Y (Fortran order), one gene per
@@ -2248,14 +2254,10 @@ def _structured_nb_irls(X, labels, offset, Y, alpha, n_groups, const_col, const_
             if conv or worse:
                 break
 
-        # Standard errors from the blocks at the fit, with the unfloored mean.
-        if floored:
-            _structured_predictor(X, labels, offset, bf, bg, wald_lo, eta_hi, half_eta, half_mu)
-            for i in range(n):
-                w[i] = half_mu[i] / (1.0 + ag * half_mu[i])
-        else:
-            for i in range(n):
-                w[i] = mu[i] / (1.0 + ag * mu[i])
+        # Standard errors from the blocks at the fit: the mean as the
+        # iteration holds it, floor included, as DESeq2's fitBeta does.
+        for i in range(n):
+            w[i] = mu[i] / (1.0 + ag * mu[i])
         _structured_blocks(X, labels, w, wz, False, gram, cross, diag, rx, rg, ridge, ridge_group)
         S = _schur(gram, cross, diag)
         rhs = np.zeros((dx, dx + a))

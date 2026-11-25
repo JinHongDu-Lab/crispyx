@@ -957,12 +957,13 @@ def test_floored_genes_match_pydeseq2_irls(pydeseq2_helper):
 
 
 def test_standard_errors_match_pydeseq2_wald_test(pydeseq2_helper):
-    """``min_mu`` steadies the iteration and has no place in the covariance.
+    """The covariance is formed from the fitted mean held at ``min_mu``, as
+    the iteration holds it.
 
-    DESeq2 keeps it out: ``irls_solver`` returns an unthresholded ``mu`` and
-    ``wald_test`` rebuilds the weights from it.  Building them from the
-    floored mean instead made the standard errors a median of 24% too small on
-    floor-binding genes, and the Wald statistics correspondingly too large.
+    This is DESeq2's convention (``fitBeta`` takes the weights of its last
+    iteration) and PyDESeq2's from 0.7, where ``DeseqStats`` floors the mean
+    it hands to ``wald_test``; the test hands it the floored mean itself, so
+    it holds on every PyDESeq2 version.
     """
     wald_test = pydeseq2_helper("wald_test")
 
@@ -976,7 +977,7 @@ def test_standard_errors_match_pydeseq2_wald_test(pydeseq2_helper):
     contrast = np.array([0.0, 1.0, 0.0])
     reference = np.array([
         wald_test(design, alpha[g], result.coef[g],
-                  size_factors * np.exp(design @ result.coef[g]),
+                  np.maximum(size_factors * np.exp(design @ result.coef[g]), 0.5),
                   ridge, contrast, 0.0, None)[2]
         for g in range(counts.shape[1])
     ])
@@ -985,9 +986,10 @@ def test_standard_errors_match_pydeseq2_wald_test(pydeseq2_helper):
     np.testing.assert_allclose(result.se[:, 1], reference, rtol=1e-5)
 
 
-def test_reported_standard_errors_are_invariant_to_the_mean_floor():
-    """Stated directly: the floor may move the coefficients, never the
-    uncertainty attached to them."""
+def test_reported_standard_errors_use_the_floored_mean():
+    """Stated directly: in the covariance a cell whose fitted mean is under
+    the floor weighs ``min_mu / (1 + alpha min_mu)``, so at the same
+    coefficients the floor can only shrink a standard error."""
     counts, design, size_factors, alpha = _floored_fixture()
     offset = np.log(size_factors)
     coef = NBGLMBatchFitter(
@@ -998,10 +1000,13 @@ def test_reported_standard_errors_are_invariant_to_the_mean_floor():
 
     floored = NBGLMBatchFitter(design, offset=offset, min_mu=0.5)
     free = NBGLMBatchFitter(design, offset=offset, min_mu=0.0)
-    np.testing.assert_array_equal(
-        floored._compute_se_batch(floored._wald_weights(coef, alpha)),
-        free._compute_se_batch(free._wald_weights(coef, alpha)),
-    )
+    mu = size_factors[:, None] * np.exp(design @ coef)
+    held = np.maximum(mu, 0.5)
+    np.testing.assert_allclose(floored._wald_weights(coef, alpha), held / (1 + alpha * held))
+    np.testing.assert_allclose(free._wald_weights(coef, alpha), mu / (1 + alpha * mu))
+    se_floored = floored._compute_se_batch(floored._wald_weights(coef, alpha))
+    se_free = free._compute_se_batch(free._wald_weights(coef, alpha))
+    assert (se_floored <= se_free * (1 + 1e-9)).all() and (se_floored < se_free * 0.99).any()
 
 
 # ---------------------------------------------------------------------------
