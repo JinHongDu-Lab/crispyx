@@ -148,8 +148,6 @@ def test_one_and_two_column_features_and_legacy_names(tmp_path):
         cx.read_10x_mtx(one, output_path=tmp_path / "one.h5ad", var_names=var_names, verbose=False)
         var = cx.load_var(tmp_path / "one.h5ad")
         assert list(var.index) == list(symbols) and list(var.columns) == []
-    with pytest.raises(KeyError):
-        sc.read_10x_mtx(one)
     # two columns in an uncompressed genes.tsv (Cell Ranger 2), as Scanpy reads it
     legacy = _write_folder(tmp_path / "legacy", matrix, gz=False, feature_columns=2, feature_file="genes.tsv")
     cx.read_10x_mtx(legacy, output_path=tmp_path / "legacy.h5ad", verbose=False)
@@ -164,15 +162,37 @@ def test_one_and_two_column_features_and_legacy_names(tmp_path):
     np.testing.assert_array_equal(_x(tmp_path / "two.h5ad"), matrix.toarray().T)
 
 
-def test_names_are_read_as_text(tmp_path):
+def test_names_are_taken_as_written(tmp_path):
+    """Missing-value words, quotes and an empty line are names like any other."""
     folder = tmp_path / "mex"
     folder.mkdir()
-    (folder / "matrix.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 2 3\n")
-    (folder / "features.tsv").write_text("NA\nnan\n")
-    (folder / "barcodes.tsv").write_text("NA\nA\n")
-    cx.read_10x_mtx(folder, output_path=tmp_path / "x.h5ad", verbose=False)
-    assert list(cx.load_var(tmp_path / "x.h5ad").index) == ["NA", "nan"]
-    assert list(cx.load_obs(tmp_path / "x.h5ad").index) == ["NA", "A"]
+    (folder / "matrix.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n4 3 2\n1 1 1\n2 2 3\n")
+    (folder / "features.tsv").write_text('NA\n"A\n\n"B"\n')
+    (folder / "barcodes.tsv").write_text("NA\nnan\nA\n")
+    cx.read_10x_mtx(folder, output_path=tmp_path / "x.h5ad", make_unique=False, verbose=False)
+    assert list(cx.load_var(tmp_path / "x.h5ad").index) == ["NA", '"A', "", '"B"']
+    assert list(cx.load_obs(tmp_path / "x.h5ad").index) == ["NA", "nan", "A"]
+    # a table whose lines differ in length is refused, named
+    (folder / "features.tsv").write_text("a\nb\tc\td\ne\nf\n")
+    with pytest.raises(ValueError, match="read_10x_mtx: .*features.tsv"):
+        cx.read_10x_mtx(folder, output_path=tmp_path / "y.h5ad", verbose=False)
+
+
+def test_integer_dtype_is_stored_or_refused_never_wrapped(tmp_path):
+    (tmp_path / "m.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 300\n2 2 7\n")
+    cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "i.h5ad", dtype="int32", verbose=False)
+    got = ad.read_h5ad(tmp_path / "i.h5ad").X
+    assert got.dtype == np.int32
+    np.testing.assert_array_equal(got.toarray(), [[300, 0], [0, 7]])
+    with pytest.raises(ValueError, match="does not fit dtype uint8"):
+        cx.read_mtx(tmp_path / "m.mtx", output_path=tmp_path / "u.h5ad", dtype="uint8", verbose=False)
+    (tmp_path / "neg.mtx").write_text("%%MatrixMarket matrix coordinate integer general\n2 2 1\n1 1 -1\n")
+    with pytest.raises(ValueError, match="does not fit dtype uint32"):
+        cx.read_mtx(tmp_path / "neg.mtx", output_path=tmp_path / "u.h5ad", dtype="uint32", verbose=False)
+    (tmp_path / "real.mtx").write_text("%%MatrixMarket matrix coordinate real general\n2 2 1\n1 1 1.5\n")
+    with pytest.raises(ValueError, match="read_mtx"):
+        cx.read_mtx(tmp_path / "real.mtx", output_path=tmp_path / "u.h5ad", dtype="int32", verbose=False)
+    assert not (tmp_path / "u.h5ad").exists()
 
 
 def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
@@ -202,6 +222,11 @@ def test_duplicates_are_summed_and_zeros_dropped(tmp_path):
     ("%%MatrixMarket matrix coordinate integer general\n2 2 1\n1 1 1\n2 1 1\n", "declares 1 entries and has 2"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 1\n", "without a value"),
     ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 x 1\n", "read_mtx"),
+    ("%%MatrixMarket matrix coordinate integer general\n3 3 2\n3 1 2 7\n2 2 3 9\n", "more than three fields"),
+    ("%%MatrixMarket matrix coordinate integer general\n3 3 2\n1 1 1\n3 1 2 7 9\n", "read_mtx"),
+    ("%%MatrixMarket matrix coordinate integer general\n2 2 0\n1 1 5\n2 2 7\n", "declares 0 entries and has 2"),
+    ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n", "declares 2 entries and has 0"),
+    ("%%MatrixMarket matrix coordinate integer general\n2 2 2\n\n\n", "declares 2 entries and has 0"),
 ])
 def test_malformed_files_raise_and_leave_nothing(tmp_path, text, match):
     (tmp_path / "bad.mtx").write_text(text)
@@ -225,7 +250,7 @@ def test_folder_errors(tmp_path):
     assert not (tmp_path / "x.h5ad").exists() and _no_scratch(tmp_path)
 
 
-def test_the_output_is_reused_until_a_file_or_the_call_changes(tmp_path, capsys):
+def test_the_output_is_reused_until_a_file_or_the_call_changes(tmp_path, capsys, monkeypatch):
     folder = _write_folder(tmp_path / "mex", _counts(5))
     out = tmp_path / "x.h5ad"
 
@@ -243,6 +268,9 @@ def test_the_output_is_reused_until_a_file_or_the_call_changes(tmp_path, capsys)
         os.utime(folder / file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
         assert not reused(gex_only=False)
     assert reused(gex_only=False) and not reused(gex_only=False, force=True)
+    # a reused output is returned without reading the barcode and feature tables again
+    monkeypatch.setattr(cx_data.pd, "read_csv", lambda *args, **kwargs: pytest.fail("the tables were read"))
+    assert reused(gex_only=False)
 
 
 def test_a_truncated_gzip_raises_and_leaves_nothing(tmp_path, monkeypatch):

@@ -56,9 +56,9 @@ streams it into an h5ad file instead:
    )
 
 It also reads folders Scanpy refuses: a feature table with only gene names
-(one column) or without feature types (two), and a matrix whose entries are
-sorted by gene or not sorted at all. While it runs it keeps a scratch copy of
-the non-zeros, 12 bytes each, in the temporary directory or beside the output.
+(one column) or without feature types (two). The matrix's entries may come in
+any order. While it runs it keeps a scratch copy of the non-zeros, 12 bytes
+each, in the temporary directory or beside the output.
 
 .. list-table::
    :header-rows: 1

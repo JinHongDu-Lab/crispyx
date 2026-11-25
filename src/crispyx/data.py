@@ -4890,20 +4890,36 @@ def _mtx_header(handle, name: str, path: Path) -> tuple[int, int, int]:
 
 def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: int):
     """``(rows, columns, values)`` of the entries left in ``handle``, a block
-    at a time: one-based int64 indices as written, values as ``dtype``."""
+    at a time: one-based int64 indices as written, values as ``dtype``.
+    Raises on a line that is not three numbers and on a value ``dtype``
+    cannot hold."""
+    # pandas casts to a narrower integer by wrapping around, so integers are
+    # parsed as int64 and checked. A fourth name with index_col=False keeps a
+    # line's fields in place: without them, pandas takes the first field of a
+    # four-field line for an index and reads the other three.
+    integer = dtype.kind in "iu"
     reader = pd.read_csv(
-        handle, sep=r"\s+", header=None, names=["row", "col", "value"],
-        dtype={"row": np.int64, "col": np.int64, "value": dtype}, chunksize=block_entries,
+        handle, sep=r"\s+", header=None, names=["row", "col", "value", "extra"], index_col=False,
+        dtype={"row": np.int64, "col": np.int64, "value": np.int64 if integer else dtype}, chunksize=block_entries,
     )
     while True:
         try:
             frame = next(reader)
         except StopIteration:
             return
-        except ValueError as error:  # a line that is not 'row column value'
+        except (ValueError, OverflowError) as error:  # a field that is not a number, or too many fields
             raise ValueError(f"{name}: {path}: {error}") from None
+        if not len(frame):  # no entries at all: pandas yields one empty block
+            continue
+        if frame["extra"].notna().any():
+            raise ValueError(f"{name}: {path} has a line with more than three fields")
         values = frame["value"].to_numpy()
-        if values.dtype.kind == "f" and np.isnan(values).any():
+        if integer:
+            limits = np.iinfo(dtype)
+            if values.min() < limits.min or values.max() > limits.max:
+                raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
+            values = values.astype(dtype)
+        elif np.isnan(values).any():
             raise ValueError(f"{name}: {path} has an entry without a value")
         yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
 
@@ -4955,18 +4971,21 @@ def _append_mtx_band(
 
 def _read_mtx(
     name: str, path: Path, *, output_path, fingerprint: dict, dtype, transpose: bool,
-    obs: pd.DataFrame | None, var: pd.DataFrame | None, keep_genes: np.ndarray | None,
+    names: "Callable[[], tuple[pd.DataFrame, pd.DataFrame, np.ndarray | None]] | None",
     memory_limit_gb, verbose, force,
 ) -> "AnnData":
     """:func:`read_mtx` and :func:`read_10x_mtx`, reporting as ``name``:
     the coordinate file ``path`` into ``output_path``, its rows the genes
-    when ``transpose``; ``obs`` and ``var`` name the file's cells and genes
-    (numbered when None), and the genes not in ``keep_genes`` are left out.
+    when ``transpose``. ``names()`` gives the ``obs`` and ``var`` that name
+    the file's cells and genes and the mask of the genes to keep (None: all);
+    it is called only when the output is not reused. Without it, cells and
+    genes are numbered.
     """
     output_path = Path(output_path)
     _refuse_overwriting_input([path], output_path)
     if not force and reusable(output_path, "mtx", fingerprint, verbose):
         return AnnData(output_path)
+    obs, var, keep_genes = names() if names is not None else (None, None, None)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dtype = np.dtype(dtype)
     # A tenth of the budget for a parsed block, half of it for a band.
@@ -5015,8 +5034,7 @@ def _read_mtx(
                 evict = _EvictEvery(path, *bands)
                 n_read, read_mb = 0, 0
                 with _create_progress_context(max(1, path.stat().st_size >> 20), name, verbose, unit="MB") as pbar:
-                    blocks = _mtx_blocks(handle, name, path, dtype, block_entries) if n_entries else ()
-                    for rows, cols, values in blocks:
+                    for rows, cols, values in _mtx_blocks(handle, name, path, dtype, block_entries):
                         n_read += values.size
                         cells, genes = (cols, rows) if transpose else (rows, cols)
                         if cells.min() < 1 or cells.max() > n_cells or genes.min() < 1 or genes.max() > n_file_genes:
@@ -5128,7 +5146,7 @@ def read_mtx(
     fingerprint = run_fingerprint(path, params={"dtype": str(np.dtype(dtype)), "transpose": bool(transpose)})
     return _read_mtx(
         "read_mtx", path, output_path=output_path, fingerprint=fingerprint, dtype=dtype, transpose=transpose,
-        obs=None, var=None, keep_genes=None, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+        names=None, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
     )
 
 
@@ -5154,9 +5172,9 @@ def read_10x_mtx(
 
     It also reads what other pipelines write in this layout and Scanpy
     refuses: a feature table with one column (the gene names, whatever
-    ``var_names`` says) or two (IDs and symbols, no feature types), and a
-    matrix whose entries are not sorted by barcode. Names are read as text,
-    so a gene called ``NA`` keeps its name.
+    ``var_names`` says) or two (IDs and symbols, no feature types). Names
+    are taken as written: a gene called ``NA`` keeps its name, and quotes
+    are part of a name.
 
     Parameters
     ----------
@@ -5206,24 +5224,35 @@ def read_10x_mtx(
         matrix, params={"var_names": var_names, "make_unique": bool(make_unique), "gex_only": bool(gex_only)},
         inputs=[_file_identity(barcode_file), _file_identity(feature_file)],
     )
-    barcodes, features = (
-        pd.read_csv(file, sep="\t", header=None, dtype=str, na_filter=False) for file in (barcode_file, feature_file)
-    )
-    obs = pd.DataFrame(index=pd.Index(barcodes[0].to_numpy(), dtype=str))
-    by_symbol = features.shape[1] == 1 or var_names == "gene_symbols"
-    names = pd.Index(features[min(features.shape[1] - 1, 1 if by_symbol else 0)].to_numpy(), dtype=str)
-    var = pd.DataFrame(index=ad.utils.make_index_unique(names) if make_unique and by_symbol else names)
-    if features.shape[1] > 1:
-        other, column = ("gene_ids", 0) if by_symbol else ("gene_symbols", 1)
-        var[other] = features[column].to_numpy()
-    keep_genes = None
-    if features.shape[1] > 2:
-        var["feature_types"] = features[2].to_numpy()
-        if gex_only:
-            keep_genes = (features[2] == "Gene Expression").to_numpy()
+
+    def names() -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray | None]:
+        import csv
+
+        tables = []
+        for file in (barcode_file, feature_file):
+            try:  # every field as written: no quoting, no missing-value words, no skipped lines
+                tables.append(pd.read_csv(file, sep="\t", header=None, dtype=str, na_filter=False,
+                                          quoting=csv.QUOTE_NONE, skip_blank_lines=False))
+            except ValueError as error:  # an empty table, or lines of unequal length
+                raise ValueError(f"{name}: {file}: {error}") from None
+        barcodes, features = tables
+        obs = pd.DataFrame(index=pd.Index(barcodes[0].to_numpy(), dtype=str))
+        by_symbol = features.shape[1] == 1 or var_names == "gene_symbols"
+        index = pd.Index(features[min(features.shape[1] - 1, 1 if by_symbol else 0)].to_numpy(), dtype=str)
+        var = pd.DataFrame(index=ad.utils.make_index_unique(index) if make_unique and by_symbol else index)
+        if features.shape[1] > 1:
+            other, column = ("gene_ids", 0) if by_symbol else ("gene_symbols", 1)
+            var[other] = features[column].to_numpy()
+        keep_genes = None
+        if features.shape[1] > 2:
+            var["feature_types"] = features[2].to_numpy()
+            if gex_only:
+                keep_genes = (features[2] == "Gene Expression").to_numpy()
+        return obs, var, keep_genes
+
     return _read_mtx(
         name, matrix, output_path=output_path, fingerprint=fingerprint, dtype="float32", transpose=True,
-        obs=obs, var=var, keep_genes=keep_genes, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
+        names=names, memory_limit_gb=memory_limit_gb, verbose=verbose, force=force,
     )
 
 
