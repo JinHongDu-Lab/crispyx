@@ -143,6 +143,10 @@ def test_mad_outliers_edge_cases():
         cx.pp.mad_outliers(obs, "x", side="up")
 
 
+# Scanpy's approximate neighbours (pynndescent) vary from run to run; exact ones do not.
+EXACT = dict(use_approx_neighbors=False)
+
+
 def _doublet_data(tmp_path, fmt: str = "csr"):
     """Two samples of cell types plus summed pairs (doublets) within each.
     The in-memory copy is CSR, as crispyx hands Scrublet each batch: Scanpy
@@ -172,8 +176,8 @@ def _doublet_data(tmp_path, fmt: str = "csr"):
 def test_scrublet_matches_scanpy_per_batch(tmp_path, fmt):
     path, adata = _doublet_data(tmp_path, fmt)
     expected = adata.copy()
-    sc.pp.scrublet(expected, batch_key="sample", random_state=0, verbose=False)
-    cx.pp.scrublet(path, batch_key="sample", verbose=False)
+    sc.pp.scrublet(expected, batch_key="sample", random_state=0, verbose=False, **EXACT)
+    cx.pp.scrublet(path, batch_key="sample", verbose=False, **EXACT)
     got = cx.load_obs(path)
     np.testing.assert_allclose(got["doublet_score"], expected.obs["doublet_score"], rtol=1e-6)
     np.testing.assert_array_equal(got["predicted_doublet"], expected.obs["predicted_doublet"].astype(bool))
@@ -183,7 +187,7 @@ def test_scrublet_on_a_cell_mask(tmp_path):
     path, adata = _doublet_data(tmp_path)
     mask = np.arange(adata.n_obs) % 4 != 0
     expected = adata[mask].copy()
-    sc.pp.scrublet(expected, random_state=0, verbose=False)
-    got = cx.pp.scrublet(path, cell_mask=mask, inplace=False, verbose=False)
+    sc.pp.scrublet(expected, random_state=0, verbose=False, **EXACT)
+    got = cx.pp.scrublet(path, cell_mask=mask, inplace=False, verbose=False, **EXACT)
     assert got["doublet_score"][~mask].isna().all() and not got["predicted_doublet"][~mask].any()
     np.testing.assert_allclose(got["doublet_score"][mask], expected.obs["doublet_score"], rtol=1e-6)

@@ -9,7 +9,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from ._grouping import resolve_group_reference_aliases
+from ._grouping import REST, resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
@@ -998,7 +998,7 @@ class _ToolsNamespace:
             "nb-glm-test": "nb_glm",
         }
         normalised = method_map.get(method_key, method_key)
-        if normalised == "nb_glm" and control_label == "rest":
+        if normalised == "nb_glm" and control_label == REST:
             raise ValueError("reference='rest' is for method='wilcoxon' and 't-test'; NB-GLM needs a control label")
         # The control, when not given, is inferred by the DE function itself,
         # so this call records the same arguments as a direct one and reuses

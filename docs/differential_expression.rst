@@ -63,9 +63,10 @@ Scanpy does for cluster markers. It works with ``method="wilcoxon"`` and
 The Wilcoxon test ranks all cells once per gene, which gives every group's
 statistic at once, so it costs no more for 50 clusters than for 2. Cells of
 groups left out of ``perturbations`` still count in the rest; cells with no
-label count nowhere. The rest differs by group, so ``pts_rest`` is a layer
-here, where with a control label it is ``var["pts_rest"]``. The ``*_ctrl``
-low-expression filters apply to the rest; a gene detected in one cluster only
+label count nowhere (Scanpy puts them in the rest). The rest differs by
+group, so ``pts_rest`` is a layer here, where with a control label it is
+``var["pts_rest"]``. The ``*_ctrl`` low-expression filters apply to the
+rest; a gene detected in one cluster only
 is still tested, since a gene is dropped only when it is low on both sides.
 NB-GLM needs a control label and refuses ``"rest"``.
 

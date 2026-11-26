@@ -368,3 +368,17 @@ def test_outer_join_gives_a_column_a_later_file_lacks_a_nullable_dtype(tmp_path)
     assert pd.isna(got.var["mt"].iloc[2])
     cx.pp.calculate_qc_metrics(got_path := tmp_path / "all.h5ad", qc_vars="mt", verbose=False)
     assert cx.load_obs(got_path)["total_counts_mt"].tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("categorical", [True, False])
+def test_outer_join_stores_a_var_column_with_numbers_and_text_as_text(tmp_path, categorical, capsys):
+    paths = []
+    for i, (genes, chrom) in enumerate([(["A", "B"], [1, 2]), (["C"], ["X"])]):
+        values = pd.Categorical(chrom) if categorical else chrom
+        a = ad.AnnData(np.ones((2, len(genes)), dtype=np.float32), obs=pd.DataFrame(index=[f"s{i}_{j}" for j in range(2)]),
+                       var=pd.DataFrame({"chrom": values}, index=genes))
+        paths.append(tmp_path / f"s{i}.h5ad")
+        a.write(paths[-1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", join="outer").path)
+    assert "var columns with text in some files and other values in others are stored as text: ['chrom']" in capsys.readouterr().out
+    assert got.var["chrom"].astype(str).tolist() == ["1", "2", "X"]

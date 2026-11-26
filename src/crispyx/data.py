@@ -2530,7 +2530,7 @@ def _obs_differs(a: pd.Series, b: pd.Series) -> np.ndarray:
 
 
 def _merged_categorical_dtype(parts: Sequence[pd.Series], merged: pd.Series) -> pd.CategoricalDtype:
-    """The dtype of a categorical obs column after concatenation: the files'
+    """The dtype of a categorical column after concatenation: the files'
     own when they all have the same one (order and ``ordered`` kept), else
     their categories in order of first appearance, plus any values a file
     stored without categories."""
@@ -2571,6 +2571,27 @@ def _stringify_mixed_columns(obs: pd.DataFrame) -> list[str]:
         obs[column] = obs[column].where(obs[column].isna(), obs[column].astype(str))
         mixed.append(column)
     return mixed
+
+
+def _merge_column_dtypes(merged: pd.DataFrame, sources: Sequence[pd.DataFrame]) -> list[str]:
+    """Give ``merged`` (the concatenation of ``sources``) one categorical dtype
+    per column categorical in some source, and store as text the columns with
+    text in some files and other values in others; the names of those."""
+    mixed = []
+    categorical = {
+        c for frame in sources for c in frame.columns.intersection(merged.columns)
+        if isinstance(frame[c].dtype, pd.CategoricalDtype)
+    }
+    for column in categorical:
+        dtype = _merged_categorical_dtype([f[column] for f in sources if column in f.columns], merged[column])
+        is_text = dtype.categories.map(lambda v: isinstance(v, str))
+        if is_text.any() and not is_text.all():
+            # h5ad cannot write mixed categories, so the column is stored as text.
+            merged[column] = merged[column].where(merged[column].isna(), merged[column].astype(str))
+            dtype = pd.CategoricalDtype(dtype.categories.astype(str).unique())
+            mixed.append(column)
+        merged[column] = merged[column].astype(dtype)
+    return mixed + _stringify_mixed_columns(merged)
 
 
 def concat_h5ad(
@@ -2755,20 +2776,7 @@ def concat_h5ad(
     for frame, mask in zip(frames, keep):
         if not mask.all():
             obs.update(frame[~mask], overwrite=False)
-    mixed = []
-    for column in categorical:
-        dtype = _merged_categorical_dtype(
-            [meta["obs"][column] for meta in metas if column in meta["obs"].columns], obs[column],
-        )
-        is_text = dtype.categories.map(lambda v: isinstance(v, str))
-        if is_text.any() and not is_text.all():
-            # One file's text categories beside another's numbers: h5ad
-            # cannot write mixed categories, so the column is stored as text.
-            obs[column] = obs[column].where(obs[column].isna(), obs[column].astype(str))
-            dtype = pd.CategoricalDtype(dtype.categories.astype(str).unique())
-            mixed.append(column)
-        obs[column] = obs[column].astype(dtype)
-    mixed += _stringify_mixed_columns(obs)
+    mixed = _merge_column_dtypes(obs, [meta["obs"] for meta in metas])
     if mixed:
         _messages.vprint(
             verbose, name,
@@ -2850,6 +2858,12 @@ def _concat_matrices(
         # Only a column some contributing file lacks gets NA, so only it needs a nullable dtype.
         partial = {c for c in columns for frame in rows[1:] if len(frame) and c not in frame.columns}
         var = pd.concat([_nullable(frame, partial) for frame in rows])
+        mixed = _merge_column_dtypes(var, [meta["var"] for meta in metas])
+        if mixed:
+            _messages.vprint(
+                verbose, name,
+                f"var columns with text in some files and other values in others are stored as text: {mixed}",
+            )
     var = var.loc[genes]
     uns = {
         key: value for key, value in metas[0]["uns"].items()
