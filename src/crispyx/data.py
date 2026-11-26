@@ -893,14 +893,17 @@ def resolve_data_path(
     return result
 
 
-def resolve_path_to_update(data: str | Path | "AnnData" | ad.AnnData, table: str) -> Path:
+def resolve_path_to_update(
+    data: str | Path | "AnnData" | ad.AnnData, table: str, *, has_inplace: bool = True,
+) -> Path:
     """:func:`resolve_data_path` for a call that rewrites ``table`` (``obs`` or
     ``var``) in place: a backed anndata object holds its file open, and
-    closing it would leave its layers on dead handles and its table stale."""
+    closing it would leave its layers on dead handles and its table stale.
+    ``has_inplace``: the call can return its result instead (``inplace=False``)."""
     if isinstance(data, ad.AnnData) and data.isbacked:
         raise ValueError(
             f"A backed anndata object holds its file open, so its {table} cannot be rewritten in place: "
-            "pass the path or cx.read_h5ad_ondisk(path) instead, or inplace=False."
+            "pass the path or cx.read_h5ad_ondisk(path) instead" + (", or inplace=False." if has_inplace else ".")
         )
     return resolve_data_path(data)
 

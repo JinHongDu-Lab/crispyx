@@ -573,7 +573,8 @@ def mad_outliers(
         One boolean column per key and side, ``<key>_low`` and/or
         ``<key>_high``, indexed like ``obs``. A missing value is never
         flagged; in a group whose MAD is 0, every value off the median is.
-        Write them with :func:`crispyx.write_obs`.
+        To keep them in the file, join them to its ``obs``:
+        ``cx.write_obs(path, cx.load_obs(path).join(flags))``.
     """
     if side not in ("both", "low", "high"):
         raise ValueError(f"side must be 'both', 'low' or 'high'; received {side!r}")

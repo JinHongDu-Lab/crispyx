@@ -400,6 +400,8 @@ def test_leiden_without_neighbors_raises(tmp_path):
     path = _write(tmp_path / "plain.h5ad", _counts(n_obs=20))
     with pytest.raises(ValueError, match="run cx.pp.neighbors first"):
         cx.tl.leiden(path)
+    with pytest.raises(ValueError, match=r"read_h5ad_ondisk\(path\) instead\.$"):  # no inplace=False to offer
+        cx.tl.leiden(ad.read_h5ad(path, backed="r"))
 
 
 # ---------------------------------------------------------------------------

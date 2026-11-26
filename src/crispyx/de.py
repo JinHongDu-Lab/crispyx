@@ -1244,7 +1244,7 @@ def t_test(
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         if rest:
-            _check_rest_has_cells(labels)
+            _check_rest_labels(labels)
         # With the rest as reference, every other labelled cell goes in a last group.
         groups = candidates + [REST] if rest else [control_label] + candidates
         group_index = {label: idx for idx, label in enumerate(groups)}
@@ -3576,9 +3576,14 @@ def _write_wilcoxon_chunk(handle: h5py.File, slc: slice, *, auc, u, z, p, lfc, p
         handle["var/pts_rest"][slc] = pts_rest
 
 
-def _check_rest_has_cells(labels: np.ndarray) -> None:
-    """Raise unless ``reference="rest"`` leaves every group a rest: at least
-    two labelled groups."""
+def _check_rest_labels(labels: np.ndarray) -> None:
+    """Raise unless ``reference="rest"`` is unambiguous and leaves every group
+    a rest: no group is named "rest", and at least two are labelled."""
+    if (labels == REST).any():
+        raise ValueError(
+            "reference='rest' compares each group with all other cells, but a group is named 'rest': "
+            "rename it to compare each group with all others, or to use it as the control"
+        )
     if pd.unique(labels[labels != UNLABELLED]).size < 2:
         raise ValueError("reference='rest' needs at least two labelled groups: with one, the rest is empty")
 
@@ -4334,7 +4339,7 @@ def wilcoxon_test(
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         if control_label == REST:
-            _check_rest_has_cells(labels)
+            _check_rest_labels(labels)
         elif not (labels == control_label).any():
             raise ValueError("Control group contains no cells")
         # Memory-efficient validation: avoid creating per-group bool masks (n_groups × n_cells

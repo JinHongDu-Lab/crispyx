@@ -118,6 +118,8 @@ def _stream_gene_moments(
                 block.data = np.expm1(block.data)
             else:
                 block = np.expm1(block)
+        if not np.issubdtype(block.dtype, np.floating):
+            block = block.astype(np.float64)  # an integer count's square can overflow its dtype
         return block, block.multiply(block) if sp.issparse(block) else np.square(block)
 
     sums, sqsums = _stream_reduce(

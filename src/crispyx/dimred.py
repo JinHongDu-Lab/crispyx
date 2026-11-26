@@ -1019,7 +1019,7 @@ def leiden(
     import scanpy as sc
     from anndata.io import read_elem
 
-    path = resolve_path_to_update(data, "obs")
+    path = resolve_path_to_update(data, "obs", has_inplace=False)
     with h5py.File(path, "r") as f:
         if neighbors_key not in f.get("uns", {}):
             raise ValueError(f"uns[{neighbors_key!r}] not found; run cx.pp.neighbors first")

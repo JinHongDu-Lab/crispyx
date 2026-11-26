@@ -137,6 +137,16 @@ def test_rest_with_an_empty_selection_writes_an_empty_result(tmp_path, test):
 
 
 @pytest.mark.parametrize("test", [cx.wilcoxon_test, cx.t_test])
+def test_rest_with_a_group_named_rest_raises(tmp_path, test):
+    adata = _clusters()
+    adata.obs["cluster"] = adata.obs["cluster"].replace("c3", "rest")
+    path = tmp_path / "named.h5ad"
+    adata.write_h5ad(path)
+    with pytest.raises(ValueError, match="a group is named 'rest'"):
+        test(path, groupby="cluster", reference="rest", output_path=tmp_path / "r.h5ad", verbose=False)
+
+
+@pytest.mark.parametrize("test", [cx.wilcoxon_test, cx.t_test])
 def test_rest_with_one_group_raises(tmp_path, test):
     adata = _clusters()
     adata.obs["cluster"] = "c0"

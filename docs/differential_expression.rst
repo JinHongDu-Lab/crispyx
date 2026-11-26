@@ -68,7 +68,8 @@ group, so ``pts_rest`` is a layer here, where with a control label it is
 ``var["pts_rest"]``. The ``*_ctrl`` low-expression filters apply to the
 rest; a gene detected in one cluster only
 is still tested, since a gene is dropped only when it is low on both sides.
-NB-GLM needs a control label and refuses ``"rest"``.
+NB-GLM needs a control label and refuses ``"rest"``; a group named ``rest``
+is refused too, so rename it first.
 
 Batch-stratified Wilcoxon (van Elteren test)
 --------------------------------------------

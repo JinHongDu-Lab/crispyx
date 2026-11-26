@@ -12,7 +12,7 @@ import scanpy as sc
 import scipy.sparse as sp
 
 from crispyx.data import get_matrix_storage_format, load_var
-from crispyx.hvg import highly_variable_genes
+from crispyx.hvg import _stream_gene_moments, highly_variable_genes
 
 
 def _make_hvg_dataset(
@@ -500,6 +500,20 @@ def test_hvg_in_place_on_a_backed_anndata_object_says_to_pass_the_path(tmp_path)
     result = highly_variable_genes(a, flavor="mean_dispersion", n_top_genes=10, cell_mask=None, inplace=False)
     assert result["highly_variable"].sum() >= 10
     assert a.X[0:2].shape == (2, 50)  # the object still works
+
+
+def test_moments_of_integer_counts_do_not_overflow(tmp_path):
+    """Squares of int32 counts above 46340 overflow int32; the moments are taken in float64."""
+    X = np.random.default_rng(0).poisson(5, (40, 20)).astype(np.int32)
+    X[0, 0] = 60_000
+    path = tmp_path / "int.h5ad"
+    ad.AnnData(sp.csr_matrix(X)).write_h5ad(path)
+    backed = ad.read_h5ad(path, backed="r")
+    sums, sqsums, n = _stream_gene_moments(
+        backed, storage_format="csr", layer=None, codes=np.zeros(40, dtype=np.int64), n_batches=1,
+        transform="identity", chunk_size=16, show_progress=False,
+    )
+    np.testing.assert_array_equal(sqsums[0], np.square(X.astype(np.float64)).sum(axis=0))
 
 
 def _batched_counts(tmp_path, fmt: str, *, g: int = 60) -> tuple[Path, ad.AnnData]:
