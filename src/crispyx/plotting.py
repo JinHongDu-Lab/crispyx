@@ -289,7 +289,7 @@ def _materialize_rank_genes_groups_from_layers(
 
         # Each metric is a per-group row: a layer, X (NB-GLM stores the LFC
         # only as X), or a per-gene var column shared by every group
-        # (pts_rest describes the control arm).
+        # (pts_rest of a control arm; one-vs-rest stores it as a layer).
         def layer_row(name: str):
             return lambda idx: np.asarray(backed.layers[name][idx]).ravel()
 

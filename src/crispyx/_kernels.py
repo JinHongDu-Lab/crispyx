@@ -1009,7 +1009,6 @@ def _rank_sums_by_group_csc(
 
 @nb.njit(parallel=True, cache=True)
 def _wilcoxon_batch_perts_presorted_numba(
-
     control_dense: np.ndarray,
     ctrl_sorted_flat: np.ndarray,
     ctrl_offsets: np.ndarray,

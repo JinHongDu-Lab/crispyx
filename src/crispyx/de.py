@@ -697,10 +697,11 @@ def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
 # the final h5ad, which coexist until the run finishes. One function per
 # method, shared by the run's own low-disk warning and estimate_disk_usage.
 
-def _t_test_disk_bytes(n_groups: int, n_genes: int) -> float:
+def _t_test_disk_bytes(n_groups: int, n_genes: int, rest: bool = False) -> float:
     # partial: statistics/pvalues/pvalues_adj/order (8 B) + lfc/effect/pts (4 B)
     # output: z/pvalue/pvalue_adj (8 B) + X/logfoldchanges/pts (4 B)
-    return estimate_bytes(n_groups, n_genes, itemsize=8) * 7 + estimate_bytes(n_groups, n_genes, itemsize=4) * 6
+    # + with the rest as reference, the pts_rest layer in each (4 B)
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 7 + estimate_bytes(n_groups, n_genes, itemsize=4) * (6 + 2 * rest)
 
 
 def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
@@ -714,11 +715,12 @@ def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
     )
 
 
-def _wilcoxon_disk_bytes(n_groups: int, n_genes: int) -> float:
+def _wilcoxon_disk_bytes(n_groups: int, n_genes: int, rest: bool = False) -> float:
     # partial: effect/u/pvalue/pvalue_adj/z/lfc (8 B) + pts (4 B); the output
-    # holds the same seven matrices. The streaming path writes only the
-    # output-sized file, so this bounds every path.
-    return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+    # holds the same seven matrices, + with the rest as reference the pts_rest
+    # layer in each (4 B). The streaming path writes only the output-sized
+    # file, so this bounds every path.
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * (2 + 2 * rest)
 
 
 class _PhaseTimer:
@@ -1176,8 +1178,10 @@ def t_test(
         The h5ad file holds one row per perturbation: the difference of means
         (``mean_difference``) in ``X`` and the layers ``z_score``, ``pvalue``,
         ``pvalue_adj``, ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
-        arm, so it is the per-gene column ``var["pts_rest"]``. ``obs["n_genes_tested"]``
-        counts the genes each perturbation was tested on, after the filters.
+        arm, so it is the per-gene column ``var["pts_rest"]``; with
+        ``control_label="rest"`` the rest differs by group, so it is the layer
+        ``pts_rest``. ``obs["n_genes_tested"]`` counts the genes each
+        perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -1338,8 +1342,7 @@ def t_test(
     )
 
     _t_test_disk_estimate = warn_if_disk_space_low(
-        # + the rest's pts_rest layer, in the partial and the output
-        _t_test_disk_bytes(*shape) + (2 * estimate_bytes(*shape, itemsize=4) if rest else 0),
+        _t_test_disk_bytes(*shape, rest=rest),
         output_path,
         context="t_test",
     )
@@ -1529,6 +1532,8 @@ def t_test(
                         for out in (out_x, out_z, out_p, out_lfc):
                             out[row] = np.nan
                         out_pts[row] = 0
+                        if rest:  # not the file's zeros, which read as a rest that expresses nothing
+                            run.file["layers/pts_rest"][row] = np.nan
                         continue
 
                 for local_idx, label in enumerate(batch_labels):
@@ -4249,8 +4254,9 @@ def wilcoxon_test(
         ``z_score``, ``pvalue``, ``pvalue_adj``, ``logfoldchanges``,
         ``u_statistic`` and ``pts``. ``pts_rest``
         describes the control arm, so it is the per-gene column
-        ``var["pts_rest"]``. ``obs["n_genes_tested"]`` counts the genes each
-        perturbation was tested on, after the filters.
+        ``var["pts_rest"]``; with ``control_label="rest"`` the rest differs by
+        group, so it is the layer ``pts_rest``. ``obs["n_genes_tested"]``
+        counts the genes each perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -4464,8 +4470,7 @@ def _wilcoxon_test_rest(
     n_gene_chunks = -(-n_genes // chunk_size)
     interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
     _messages.print_disk_estimate(verbose, "wilcoxon_test", warn_if_disk_space_low(
-        # + the pts_rest layer, in the partial and the output
-        _wilcoxon_disk_bytes(n_groups, n_genes) + 2 * estimate_bytes(n_groups, n_genes, itemsize=4),
+        _wilcoxon_disk_bytes(n_groups, n_genes, rest=True),
         output_path, context="wilcoxon_test",
     ))
     run = _wilcoxon_resumable_result(
@@ -4483,14 +4488,16 @@ def _wilcoxon_test_rest(
 
     backed = read_backed(path)
     try:
+        dtype_checked = False  # the first chunk this call reads, resumed or not
         with _create_progress_context(n_gene_chunks, "Wilcoxon DE vs rest (gene chunks)", verbose,
                                       initial=current) as bar:
             for slc, block in iter_matrix_chunks(
                 backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
                 start_chunk=current, warn_slow_axis=False,
             ):
-                if current == 0:
+                if not dtype_checked:
                     _check_wilcoxon_input(block)
+                    dtype_checked = True
                 block = sp.csc_matrix(block)
                 if not labelled.all():
                     block = block[labelled]
@@ -5582,13 +5589,14 @@ def _estimate_shape_for_t_test(
     backed = read_backed(path)
     try:
         labels = label_strings(backed.obs[perturbation_column])
-        control_label = resolve_control_label(list(labels), control_label)
+        if control_label != REST:
+            control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    return {"output": _t_test_disk_bytes(n_groups, n_genes)}
+    return {"output": _t_test_disk_bytes(n_groups, n_genes, rest=control_label == REST)}
 
 
 def _estimate_shape_for_nb_glm_test(
@@ -5631,7 +5639,8 @@ def _estimate_shape_for_wilcoxon_test(
             if isinstance(perturbation_column, pd.Series)
             else label_strings(backed.obs[perturbation_column])
         )
-        control_label = resolve_control_label(labels, control_label)
+        if control_label != REST:
+            control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
         if chunk_size is None:
@@ -5644,7 +5653,7 @@ def _estimate_shape_for_wilcoxon_test(
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    estimate = {"output": _wilcoxon_disk_bytes(n_groups, n_genes)}
+    estimate = {"output": _wilcoxon_disk_bytes(n_groups, n_genes, rest=control_label == REST)}
     # A CSR source may first be converted to a temporary CSC copy beside the
     # output; scratch_copy_bytes makes that call the same way the run does.
     scratch = scratch_copy_bytes(

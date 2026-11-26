@@ -579,6 +579,18 @@ def test_batch_key_matches_scanpy_mean_dispersion(tmp_path, n_top_genes):
     np.testing.assert_allclose(got["variances_norm"], expected["dispersions_norm"], rtol=1e-6)
 
 
+def test_mean_dispersion_batch_of_empty_cells_selects_nothing(tmp_path):
+    path, adata = _batched_counts(tmp_path, "csr", g=400)
+    logged = adata.copy()
+    logged.X[logged.obs["sample"].to_numpy() == "b2"] = 0
+    sc.pp.normalize_total(logged)
+    sc.pp.log1p(logged)
+    logged.write_h5ad(path)
+    got = highly_variable_genes(path, flavor="mean_dispersion", n_top_genes=15, batch_key="sample",
+                                cell_mask=None, inplace=False, verbose=False)
+    assert got["highly_variable"].sum() == 15 and got["highly_variable_nbatches"].max() == 2
+
+
 def test_batch_key_with_cell_mask_matches_the_subset(tmp_path):
     path, adata = _batched_counts(tmp_path, "csr")
     mask = np.random.default_rng(1).random(adata.n_obs) < 0.7

@@ -154,3 +154,15 @@ def test_rest_with_one_group_raises(tmp_path, test):
     adata.write_h5ad(path)
     with pytest.raises(ValueError, match="at least two labelled groups"):
         test(path, groupby="cluster", reference="rest", output_path=tmp_path / "r.h5ad", verbose=False)
+
+
+@pytest.mark.parametrize("name", ["wilcoxon_test", "t_test"])
+def test_rest_disk_estimate_counts_the_pts_rest_layer(tmp_path, name):
+    from crispyx.de import _t_test_disk_bytes, _wilcoxon_disk_bytes
+
+    adata = _clusters()
+    path = tmp_path / "clusters.h5ad"
+    adata.write_h5ad(path)
+    got = cx.estimate_disk_usage(name, path, perturbation_column="cluster", control_label="rest")
+    bytes_for = _wilcoxon_disk_bytes if name == "wilcoxon_test" else _t_test_disk_bytes
+    assert got["output"].required_bytes == bytes_for(4, adata.n_vars, rest=True) > bytes_for(4, adata.n_vars)

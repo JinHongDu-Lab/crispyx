@@ -354,6 +354,8 @@ def _mean_dispersion_batches(
     log_mean = np.zeros(mean.shape)
     selected = np.zeros(mean.shape, dtype=bool)
     for b, expressed in enumerate(sums > 0):
+        if not expressed.any():  # a batch of empty cells selects nothing
+            continue
         norm[b, expressed], selected[b, expressed] = _mean_dispersion_flavor(
             mean[b, expressed], var[b, expressed], n_top_genes=n_top_genes,
             min_mean=min_mean, max_mean=max_mean, min_disp=min_disp, n_bins=n_bins,
