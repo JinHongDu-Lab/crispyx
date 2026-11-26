@@ -42,7 +42,9 @@ def screen(tmp_path_factory):
 
 
 def _run(method, screen, out: Path, **kw):
-    common = dict(perturbation_column="perturbation", control_label="control", verbose=False, output_path=out)
+    reference = "rest" if method.endswith("_rest") else "control"
+    method = method.removesuffix("_rest")
+    common = dict(perturbation_column="perturbation", control_label=reference, verbose=False, output_path=out)
     if method == "t_test":
         return de.t_test(screen / "norm.h5ad", n_jobs=1, checkpoint_interval=1, **common, **kw)
     if method == "nb_glm":
@@ -123,7 +125,7 @@ def _resume_dir(out: Path) -> Path:
 CASES = ["t_test", "nb_glm", "nb_offset", "wilcoxon", "wilcoxon_stratified"]
 
 
-@pytest.mark.parametrize("method", CASES)
+@pytest.mark.parametrize("method", CASES + ["wilcoxon_rest", "t_test_rest"])
 def test_interrupted_run_resumes_to_the_uninterrupted_result(screen, tmp_path, monkeypatch, method):
     reference = tmp_path / "reference.h5ad"
     _run(method, screen, reference)

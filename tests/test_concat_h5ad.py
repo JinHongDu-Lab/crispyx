@@ -305,3 +305,80 @@ def test_no_file_is_opened_as_a_backed_anndata(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cx.data, "read_backed", refuse)
     cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", verbose=False)
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+def test_outer_join_fills_missing_genes_with_zeros(tmp_path, fmt, capsys):
+    """Files that list only the genes detected in them keep every gene."""
+    rng = np.random.default_rng(3)
+    adatas, paths = [], []
+    for i, names in enumerate([["A", "B", "C"], ["D", "B", "E"], ["C", "A"]]):
+        X = rng.poisson(2, (4, len(names))).astype(np.float32)
+        var = pd.DataFrame({"mt": [n == "B" for n in names], "n": np.arange(len(names))}, index=names)
+        if i == 1:
+            var["only_second"] = "x"
+        a = ad.AnnData(X, obs=pd.DataFrame(index=[f"s{i}_c{j}" for j in range(4)]), var=var)
+        if fmt != "dense":
+            a.X = sp.csr_matrix(X) if fmt == "csr" else sp.csc_matrix(X)
+        a.layers["counts"] = a.X.copy()
+        paths.append(tmp_path / f"s{i}.h5ad")
+        a.write(paths[-1])
+        adatas.append(a)
+    result = cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", join="outer",
+                               format_mismatch_policy="off")
+    assert "5 genes not in every file are filled with zeros where missing" in capsys.readouterr().out
+    got = ad.read_h5ad(result.path)
+    expected = ad.concat(adatas, join="outer", fill_value=0)[:, got.var_names]
+    assert got.var_names.tolist() == ["A", "B", "C", "D", "E"]
+    np.testing.assert_array_equal(got.X.toarray(), _dense(expected.X))
+    np.testing.assert_array_equal(got.layers["counts"].toarray(), _dense(expected.layers["counts"]))
+    assert got.var["mt"].tolist() == [False, True, False, False, False]
+    assert got.var["n"].tolist() == [0, 1, 2, 0, 2]
+    # Every file has these columns, so no value is missing and the dtypes stay plain.
+    assert got.var["mt"].dtype == bool and got.var["n"].dtype == np.int64
+    assert "only_second" not in got.var.columns
+    # join is part of the call: an inner join is not served from the outer result.
+    inner = cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", verbose=False)
+    assert inner.shape == (12, 0)
+
+
+def test_outer_join_checks_shared_cells_over_every_gene(tmp_path):
+    first = ad.AnnData(np.array([[1.0, 2.0]], dtype=np.float32), obs=pd.DataFrame(index=["c"]),
+                       var=pd.DataFrame(index=["A", "B"]))
+    second = ad.AnnData(np.array([[2.0, 3.0]], dtype=np.float32), obs=pd.DataFrame(index=["c"]),
+                        var=pd.DataFrame(index=["B", "C"]))
+    paths = [tmp_path / "a.h5ad", tmp_path / "b.h5ad"]
+    first.write(paths[0])
+    second.write(paths[1])
+    with pytest.raises(ValueError, match="different expression"):
+        cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", join="outer", verbose=False)
+    with pytest.raises(ValueError, match="join must be"):
+        cx.pp.concat_h5ad(paths, output_path=tmp_path / "x.h5ad", join="left", verbose=False)
+
+
+def test_outer_join_gives_a_column_a_later_file_lacks_a_nullable_dtype(tmp_path):
+    paths = []
+    for i, (genes, var) in enumerate([(["A", "B"], {"mt": [True, False]}), (["C"], {})]):
+        a = ad.AnnData(np.ones((2, len(genes)), dtype=np.float32), obs=pd.DataFrame(index=[f"s{i}_{j}" for j in range(2)]),
+                       var=pd.DataFrame(var, index=genes))
+        paths.append(tmp_path / f"s{i}.h5ad")
+        a.write(paths[-1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", join="outer", verbose=False).path)
+    assert str(got.var["mt"].dtype) == "boolean" and got.var["mt"].tolist()[:2] == [True, False]
+    assert pd.isna(got.var["mt"].iloc[2])
+    cx.pp.calculate_qc_metrics(got_path := tmp_path / "all.h5ad", qc_vars="mt", verbose=False)
+    assert cx.load_obs(got_path)["total_counts_mt"].tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("categorical", [True, False])
+def test_outer_join_stores_a_var_column_with_numbers_and_text_as_text(tmp_path, categorical, capsys):
+    paths = []
+    for i, (genes, chrom) in enumerate([(["A", "B"], [1, 2]), (["C"], ["X"])]):
+        values = pd.Categorical(chrom) if categorical else chrom
+        a = ad.AnnData(np.ones((2, len(genes)), dtype=np.float32), obs=pd.DataFrame(index=[f"s{i}_{j}" for j in range(2)]),
+                       var=pd.DataFrame({"chrom": values}, index=genes))
+        paths.append(tmp_path / f"s{i}.h5ad")
+        a.write(paths[-1])
+    got = ad.read_h5ad(cx.pp.concat_h5ad(paths, output_path=tmp_path / "all.h5ad", join="outer").path)
+    assert "var columns with text in some files and other values in others are stored as text: ['chrom']" in capsys.readouterr().out
+    assert got.var["chrom"].astype(str).tolist() == ["1", "2", "X"]

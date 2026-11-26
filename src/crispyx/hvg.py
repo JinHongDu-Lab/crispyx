@@ -11,6 +11,7 @@ in this package are crispyx's own reimplementations.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -34,6 +35,7 @@ from .data import (
     read_backed,
     resolve_control_label,
     resolve_data_path,
+    resolve_path_to_update,
     write_var,
 )
 
@@ -43,57 +45,53 @@ def _stream_reduce(
     *,
     storage_format: str,
     layer: str | None,
-    cell_mask: np.ndarray | None,
+    codes: np.ndarray,
+    n_batches: int,
     chunk_size: int,
     show_progress: bool,
     desc: str,
-    block_fn: Callable[[np.ndarray | sp.spmatrix, slice], tuple[np.ndarray, np.ndarray]],
+    block_fn: Callable[[np.ndarray | sp.spmatrix, np.ndarray, slice], tuple],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Stream ``matrix`` off disk, applying ``block_fn`` per chunk and combining results.
+    """Stream ``matrix`` off disk and sum ``block_fn``'s two outputs over each batch's cells.
 
-    Shared dispatch/looping core for :func:`_stream_gene_moments` and
-    :func:`_stream_clipped_sums`: column-chunked for CSC (each chunk already
-    holds every cell for its genes, so ``block_fn``'s per-gene outputs are
-    assigned directly by ``slc``), row-chunked with a running accumulator
-    otherwise (``block_fn``'s outputs are summed across cell chunks).
-    ``convert_to_dense=False`` throughout so a chunk's memory is ``O(nnz in
-    that chunk)``, not ``O(chunk_size x n_genes)`` -- for the CSC path in
-    particular, a "column chunk" spans every cell, so staying sparse is not
-    optional.
+    ``codes`` holds each cell's batch (``-1``: a cell not used).
+    ``block_fn(block, codes, genes)`` gets a chunk's used rows, their batch
+    codes and the chunk's genes, and returns two arrays shaped like the
+    block (sparse when it is); their rows are summed per batch here, giving
+    two ``(n_batches, n_vars)`` arrays. Column chunks for CSC (each holds
+    every cell of its genes), row chunks otherwise; ``convert_to_dense=False``
+    throughout, so a chunk's memory is that of its non-zeros.
     """
     matrix = backed.X if layer is None else backed.layers[layer]
-
-    if storage_format == "csc":
-        n_chunks = (backed.n_vars + chunk_size - 1) // chunk_size
-        out_a = np.empty(backed.n_vars)
-        out_b = np.empty(backed.n_vars)
-        chunks = iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False)
-        with _create_progress_context(n_chunks, f"{desc} (CSC)", show_progress, unit="chunk") as bar:
-            for slc, block in chunks:
-                if cell_mask is not None:
-                    block = block[cell_mask]
-                a, b = block_fn(block, slc)
-                out_a[slc] = a
-                out_b[slc] = b
-                bar.update(1)
-        return out_a, out_b
-
-    n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
-    out_a = np.zeros(backed.n_vars)
-    out_b = np.zeros(backed.n_vars)
-    chunks = iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False)
-    with _create_progress_context(n_chunks, desc, show_progress, unit="chunk") as bar:
+    by_gene = storage_format == "csc"
+    out_a = np.zeros((n_batches, backed.n_vars))
+    out_b = np.zeros((n_batches, backed.n_vars))
+    n_chunks = -(-(backed.n_vars if by_gene else backed.n_obs) // chunk_size)
+    chunks = iter_matrix_chunks(
+        backed, axis=int(by_gene), matrix=matrix, chunk_size=chunk_size, convert_to_dense=False,
+    )
+    with _create_progress_context(n_chunks, f"{desc} (CSC)" if by_gene else desc, show_progress, unit="chunk") as bar:
         for slc, block in chunks:
             bar.update(1)
-            local_mask = None if cell_mask is None else cell_mask[slc]
-            if local_mask is not None:
-                if not np.any(local_mask):
-                    continue
-                block = block[local_mask]
-            a, b = block_fn(block, slc)
-            out_a += a
-            out_b += b
+            cells, genes = (slice(None), slc) if by_gene else (slc, slice(None))
+            block_codes = codes[cells]
+            used = block_codes >= 0
+            if not used.any():
+                continue
+            if not used.all():
+                block, block_codes = block[used], block_codes[used]
+            indicator = sp.csr_matrix(
+                (np.ones(block_codes.size), (block_codes, np.arange(block_codes.size))),
+                shape=(n_batches, block_codes.size),
+            )
+            x, x2 = block_fn(block, block_codes, genes)
+            out_a[:, genes] += _dense(indicator @ x)
+            out_b[:, genes] += _dense(indicator @ x2)
     return out_a, out_b
+
+
+def _dense(values) -> np.ndarray:
+    return values.toarray() if sp.issparse(values) else np.asarray(values)
 
 
 def _stream_gene_moments(
@@ -101,53 +99,48 @@ def _stream_gene_moments(
     *,
     storage_format: str,
     layer: str | None,
-    cell_mask: np.ndarray | None,
+    codes: np.ndarray,
+    n_batches: int,
     transform: Literal["identity", "expm1"],
     chunk_size: int,
     show_progress: bool,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Return ``(mean, var, n_cells_used)`` per gene, streamed off disk.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(sum, sum of squares)`` per batch and gene and the cells per batch.
 
-    ``expm1``/masking are applied to a per-block copy (never the shared
-    backed slice) and, for the sparse case, only to ``block.data`` -- both
-    operations are sparsity-preserving (``expm1(0) == 0``; masking rows
-    never touches nonzero *values*), so no dense transformed copy of a
-    chunk is ever materialized. Variance uses the unbiased (``ddof=1``)
-    estimator, computed from the per-gene sum/sum-of-squares totals after
-    streaming -- these totals are already summed over every cell in both
-    the CSC and row-chunked dispatch, so the same closed-form pass works
-    for either.
+    ``expm1`` is applied to a per-block copy, and only to ``block.data`` when
+    sparse (``expm1(0) == 0``), so no dense transformed copy is made.
     """
-    n_used = int(cell_mask.sum()) if cell_mask is not None else backed.n_obs
 
-    def _sum_and_sqsum(block, _slc: slice) -> tuple[np.ndarray, np.ndarray]:
+    def _values_and_squares(block, _codes, _genes):
         if transform == "expm1":
             if sp.issparse(block):
                 block = block.copy()
                 block.data = np.expm1(block.data)
             else:
                 block = np.expm1(block)
-        if sp.issparse(block):
-            s = np.asarray(block.sum(axis=0)).ravel()
-            ss = np.asarray(block.multiply(block).sum(axis=0)).ravel()
-        else:
-            s = block.sum(axis=0)
-            ss = np.square(block).sum(axis=0)
-        return s, ss
+        if not np.issubdtype(block.dtype, np.floating):
+            block = block.astype(np.float64)  # an integer count's square can overflow its dtype
+        return block, block.multiply(block) if sp.issparse(block) else np.square(block)
 
-    s_acc, ss_acc = _stream_reduce(
+    sums, sqsums = _stream_reduce(
         backed,
         storage_format=storage_format,
         layer=layer,
-        cell_mask=cell_mask,
+        codes=codes,
+        n_batches=n_batches,
         chunk_size=chunk_size,
         show_progress=show_progress,
         desc="Computing gene moments",
-        block_fn=_sum_and_sqsum,
+        block_fn=_values_and_squares,
     )
-    mean = s_acc / n_used
-    var = (ss_acc - n_used * np.square(mean)) / max(n_used - 1, 1)
-    return mean, var, n_used
+    return sums, sqsums, np.bincount(codes[codes >= 0], minlength=n_batches)
+
+
+def _mean_var(sums: np.ndarray, sqsums: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and unbiased (``ddof=1``) variance from sums over ``n`` cells (last axis: genes)."""
+    n = np.asarray(n, dtype=np.float64)[..., None]
+    mean = sums / n
+    return mean, (sqsums - n * np.square(mean)) / np.maximum(n - 1, 1)
 
 
 def _check_looks_like_counts(
@@ -186,7 +179,7 @@ def _top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
     NaN scores are always excluded. Ties at the cutoff are all included
     (same ``>=`` semantics scanpy's own ``_nth_highest``/``_subset_genes``
     use for the dispersion-based flavors), so more than ``n_top_genes``
-    entries can come back true. Use :func:`_rank_top_n_mask` for
+    entries can come back true. Use :func:`_seurat_v3_select` for
     ``seurat_v3``, whose selection semantics are different.
     """
     finite = scores[~np.isnan(scores)]
@@ -197,73 +190,31 @@ def _top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
     return np.nan_to_num(scores, nan=-np.inf) >= cutoff
 
 
-def _rank_top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
-    """Boolean mask selecting exactly the top ``n_top_genes`` by ``scores``.
+def _seurat_v3_select(
+    norm: np.ndarray, n_top_genes: int, *, paper: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Scanpy's ``seurat_v3`` selection over batches: ``(highly_variable,
+    nbatches, median_rank)`` from the ``(n_batches, n_vars)`` normalised variances.
 
-    Unlike :func:`_top_n_mask`'s ``>=`` cutoff, this always returns exactly
-    ``min(n_top_genes, scores.size)`` entries -- ties are broken by argsort
-    order rather than all being included. This is ``scanpy``'s own
-    ``flavor="seurat_v3"`` selection mechanism (``argsort(argsort(-x))``
-    ranks, then ``rank < n_top_genes``), and matters in practice: real
-    low-count genes can share an identical normalized variance (e.g.
-    several genes each detected in a single cell with the same count), and
-    a ``>=`` cutoff would let every tied gene at the boundary through,
-    silently returning more genes than requested.
+    Genes are ranked within each batch (``argsort(argsort(-x))``: ties broken
+    by position, so exactly ``n_top_genes`` are chosen even when low-count
+    genes share a normalised variance); a gene's ``nbatches`` counts the
+    batches where it ranks in the top ``n_top_genes`` and its median rank is
+    taken over those. ``seurat_v3`` sorts by median rank, then batches;
+    ``seurat_v3_paper`` by batches, then median rank. With one batch both
+    are the top ``n_top_genes``.
     """
-    n_top = min(n_top_genes, scores.size)
-    ranks = np.argsort(np.argsort(-scores))
-    return ranks < n_top
-
-
-def _stream_clipped_sums(
-    backed: ad.AnnData,
-    *,
-    storage_format: str,
-    layer: str | None,
-    cell_mask: np.ndarray | None,
-    clip_val: np.ndarray,
-    chunk_size: int,
-    show_progress: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(clipped_sum, clipped_sqsum)`` per gene -- ``seurat_v3``'s second pass.
-
-    Clips each entry to its own gene's ``clip_val`` directly on
-    ``block.data`` (sparse) or the dense block, never materializing a dense
-    clipped copy of a chunk. This is safe because ``clip_val`` is always
-    non-negative (``reg_std * sqrt(n) + mean``, both terms >= 0), so
-    clipping a zero entry is a no-op and sparsity is preserved. Dispatches
-    the same way as :func:`_stream_gene_moments`.
-    """
-
-    def _clip_and_sum(block, slc: slice) -> tuple[np.ndarray, np.ndarray]:
-        clip_local = clip_val[slc] if storage_format == "csc" else clip_val
-        if sp.issparse(block):
-            block = block.tocsc() if storage_format == "csc" else block.tocsr()
-            block = block.copy()
-            if storage_format == "csc":
-                col_sizes = np.diff(block.indptr)
-                per_element_clip = np.repeat(clip_local, col_sizes)
-            else:
-                per_element_clip = clip_local[block.indices]
-            block.data = np.minimum(block.data, per_element_clip)
-            s = np.asarray(block.sum(axis=0)).ravel()
-            ss = np.asarray(block.multiply(block).sum(axis=0)).ravel()
-        else:
-            clipped = np.minimum(block, clip_local[None, :])
-            s = clipped.sum(axis=0)
-            ss = np.square(clipped).sum(axis=0)
-        return s, ss
-
-    return _stream_reduce(
-        backed,
-        storage_format=storage_format,
-        layer=layer,
-        cell_mask=cell_mask,
-        chunk_size=chunk_size,
-        show_progress=show_progress,
-        desc="Clipping counts",
-        block_fn=_clip_and_sum,
-    )
+    ranks = np.argsort(np.argsort(-norm, axis=1), axis=1).astype(np.float32)
+    nbatches = (ranks < n_top_genes).sum(axis=0)
+    ranks[ranks >= n_top_genes] = np.nan
+    median_rank = np.ma.median(np.ma.masked_invalid(ranks), axis=0).filled(np.nan)
+    order = pd.DataFrame({"rank": median_rank, "n": nbatches}).sort_values(
+        ["n", "rank"] if paper else ["rank", "n"], ascending=[False, True] if paper else [True, False],
+        na_position="last",
+    ).index
+    highly_variable = np.zeros(norm.shape[1], dtype=bool)
+    highly_variable[order[:n_top_genes]] = True
+    return highly_variable, nbatches, median_rank
 
 
 def _seurat_v3_flavor(
@@ -271,66 +222,56 @@ def _seurat_v3_flavor(
     *,
     storage_format: str,
     layer: str | None,
-    cell_mask: np.ndarray | None,
+    codes: np.ndarray,
+    n_batches: int,
     span: float,
     chunk_size: int,
     show_progress: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(mean, variances, norm_gene_var)`` via the vst method (Stuart et al. 2019).
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(sums, sqsums, n_cells, norm_gene_var)`` per batch via the vst method (Stuart et al. 2019).
 
-    Reproduces ``scanpy.pp.highly_variable_genes(..., flavor="seurat_v3")``:
-    fit a degree-2 LOESS of ``log10(variance)`` on ``log10(mean)`` from raw
-    counts (pass 1), then compute the variance of each gene after clipping
-    to a regularized standard deviation (pass 2), via the closed-form
-    identity ``Var(clip(x)) = (n*mean^2 + sum(clip(x)^2) - 2*mean*sum(clip(x)))
-    / ((n-1)*reg_std^2)`` -- exactly what makes pass 2 chunk- and
-    sparse-friendly instead of needing a materialized standardized array.
-    Two full passes are inherent to the method: the clip threshold is a
-    global, all-genes-dependent quantity from the pass-1 LOESS fit, so pass
-    2 cannot start until pass 1 has finished for every gene.
+    Reproduces ``scanpy.pp.highly_variable_genes(..., flavor="seurat_v3")``
+    per batch: fit a degree-2 LOESS of ``log10(variance)`` on ``log10(mean)``
+    from raw counts (pass 1), then compute the variance of each gene after
+    clipping to a regularized standard deviation (pass 2), via the
+    closed-form identity ``Var(clip(x)) = (n*mean^2 + sum(clip(x)^2) -
+    2*mean*sum(clip(x))) / ((n-1)*reg_std^2)``, which makes pass 2 chunk- and
+    sparse-friendly. Two passes whatever the number of batches: each pass
+    accumulates every batch's sums at once.
     """
     from skmisc.loess import loess
 
     _check_looks_like_counts(backed, storage_format=storage_format, layer=layer)
+    moments = dict(storage_format=storage_format, layer=layer, codes=codes, n_batches=n_batches,
+                   chunk_size=chunk_size, show_progress=show_progress)
+    sums, sqsums, n = _stream_gene_moments(backed, transform="identity", **moments)
+    mean, var = _mean_var(sums, sqsums, n)
 
-    mean, var, n_used = _stream_gene_moments(
-        backed,
-        storage_format=storage_format,
-        layer=layer,
-        cell_mask=cell_mask,
-        transform="identity",
-        chunk_size=chunk_size,
-        show_progress=show_progress,
-    )
+    reg_std = np.ones_like(mean)
+    for b in range(n_batches):
+        not_const = var[b] > 0
+        if not_const.any():
+            model = loess(
+                np.log10(mean[b, not_const]), np.log10(var[b, not_const]),
+                span=span, degree=2, surface="interpolate",
+            )
+            model.fit()
+            reg_std[b, not_const] = np.sqrt(10.0 ** model.outputs.fitted_values)
+    clip_val = reg_std * np.sqrt(n)[:, None] + mean  # >= 0: clipping keeps zeros
 
-    not_const = var > 0
-    estimated_log_var = np.zeros(mean.shape[0], dtype=np.float64)
-    if not_const.any():
-        model = loess(
-            np.log10(mean[not_const]), np.log10(var[not_const]),
-            span=span, degree=2, surface="interpolate",
-        )
-        model.fit()
-        estimated_log_var[not_const] = model.outputs.fitted_values
-    reg_std = np.sqrt(10.0 ** estimated_log_var)
+    def _clipped(block, block_codes, genes):
+        clip = clip_val[:, genes]
+        if sp.issparse(block):
+            block = block.tocoo(copy=True)
+            block.data = np.minimum(block.data, clip[block_codes[block.row], block.col])
+            return block, block.multiply(block)
+        clipped = np.minimum(block, clip[block_codes])
+        return clipped, np.square(clipped)
 
-    clip_val = reg_std * np.sqrt(n_used) + mean
-
-    clipped_sum, clipped_sqsum = _stream_clipped_sums(
-        backed,
-        storage_format=storage_format,
-        layer=layer,
-        cell_mask=cell_mask,
-        clip_val=clip_val,
-        chunk_size=chunk_size,
-        show_progress=show_progress,
-    )
-
-    norm_gene_var = (
-        n_used * np.square(mean) + clipped_sqsum - 2 * clipped_sum * mean
-    ) / ((n_used - 1) * np.square(reg_std))
-
-    return mean, var, norm_gene_var
+    clipped_sum, clipped_sqsum = _stream_reduce(desc="Clipping counts", block_fn=_clipped, backed=backed, **moments)
+    n = n[:, None]
+    norm_gene_var = (n * np.square(mean) + clipped_sqsum - 2 * clipped_sum * mean) / ((n - 1) * np.square(reg_std))
+    return sums, sqsums, n.ravel(), norm_gene_var
 
 
 def _mean_dispersion_flavor(
@@ -393,6 +334,71 @@ def _mean_dispersion_flavor(
     return variances_norm, highly_variable
 
 
+def _mean_dispersion_batches(
+    sums: np.ndarray,
+    sqsums: np.ndarray,
+    n: np.ndarray,
+    *,
+    n_top_genes: int | None,
+    min_mean: float,
+    max_mean: float,
+    min_disp: float,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Scanpy's ``flavor="seurat"`` with ``batch_key``: each batch on the
+    genes expressed in it (zeros for the others), averaged over batches. The
+    top ``n_top_genes`` by the number of batches selecting them, then by mean
+    normalised dispersion; or the thresholds applied to the averages."""
+    mean, var = _mean_var(sums, sqsums, n)
+    norm = np.zeros(mean.shape)
+    log_mean = np.zeros(mean.shape)
+    selected = np.zeros(mean.shape, dtype=bool)
+    for b, expressed in enumerate(sums > 0):
+        if not expressed.any():  # a batch of empty cells selects nothing
+            continue
+        norm[b, expressed], selected[b, expressed] = _mean_dispersion_flavor(
+            mean[b, expressed], var[b, expressed], n_top_genes=n_top_genes,
+            min_mean=min_mean, max_mean=max_mean, min_disp=min_disp, n_bins=n_bins,
+        )
+        log_mean[b, expressed] = np.log1p(mean[b, expressed])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # a gene with no dispersion in any batch
+        variances_norm = np.nanmean(norm, axis=0)
+    nbatches = selected.sum(axis=0)
+    if n_top_genes is not None:
+        order = pd.DataFrame({"n": nbatches, "norm": variances_norm}).sort_values(
+            ["n", "norm"], ascending=False, na_position="last",
+        ).index
+        highly_variable = np.zeros(mean.shape[1], dtype=bool)
+        highly_variable[order[:n_top_genes]] = True
+    else:
+        log_mean = log_mean.mean(axis=0)
+        highly_variable = (
+            (log_mean > min_mean) & (log_mean < max_mean) & (np.nan_to_num(variances_norm) > min_disp)
+        )
+    extra = {"highly_variable_nbatches": nbatches, "highly_variable_intersection": nbatches == len(n)}
+    return variances_norm, highly_variable, extra
+
+
+def _batch_codes(
+    path: Path, batch_key: str | None, cell_mask: np.ndarray | None, n_obs: int,
+) -> tuple[np.ndarray, int]:
+    """Each cell's batch code (``-1``: not used) and the number of batches."""
+    used = np.ones(n_obs, dtype=bool) if cell_mask is None else cell_mask
+    codes = np.full(n_obs, -1, dtype=np.int64)
+    if batch_key is None:
+        codes[used] = 0
+        return codes, 1
+    labels = load_obs(path)[batch_key][used]
+    if labels.isna().any():
+        raise ValueError(f"obs[{batch_key!r}] has missing values")
+    codes[used], names = pd.factorize(labels, sort=True)
+    sizes = np.bincount(codes[used], minlength=len(names))
+    if (sizes < 2).any():
+        raise ValueError(f"batch {names[np.argmax(sizes < 2)]!r} has fewer than 2 cells")
+    return codes, len(names)
+
+
 def _resolve_cell_mask(
     path: Path,
     *,
@@ -453,7 +459,7 @@ def _resolve_cell_mask(
 def highly_variable_genes(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    flavor: Literal["seurat_v3", "mean_dispersion"] = "seurat_v3",
+    flavor: Literal["seurat_v3", "seurat_v3_paper", "mean_dispersion"] = "seurat_v3",
     n_top_genes: int | None = 2000,
     min_mean: float = 0.0125,
     max_mean: float = 3.0,
@@ -461,6 +467,7 @@ def highly_variable_genes(
     n_bins: int = 20,
     span: float = 0.3,
     layer: str | None = None,
+    batch_key: str | None = None,
     perturbation_column: str | None = None,
     control_label: str | None = None,
     cell_mask: "Literal['control'] | np.ndarray | None" = "control",
@@ -481,13 +488,16 @@ def highly_variable_genes(
         - ``"seurat_v3"`` (default; Stuart et al. 2019, scanpy's
           ``flavor="seurat_v3"``): ranks genes by standardized variance fit
           via LOESS. Expects **raw counts**; requires ``n_top_genes``.
+        - ``"seurat_v3_paper"`` (scanpy's): as ``"seurat_v3"``, but with
+          ``batch_key`` genes are ranked by the number of batches selecting
+          them first, then by median rank (``"seurat_v3"``: the reverse).
         - ``"mean_dispersion"`` (Satija et al. 2015, scanpy's
           ``flavor="seurat"``): bins genes by mean expression and
           z-normalizes dispersion within each bin. Expects
           **log1p-normalized data**; needs no extra dependency.
     n_top_genes
         Number of top genes to select by normalized variance/dispersion.
-        Required for ``flavor="seurat_v3"``. For ``flavor="mean_dispersion"``,
+        Required for the ``seurat_v3`` flavors. For ``flavor="mean_dispersion"``,
         if ``None``, ``min_mean``/``max_mean``/``min_disp`` thresholds are
         used instead.
     min_mean, max_mean, min_disp
@@ -501,6 +511,11 @@ def highly_variable_genes(
         estimate the variance at each point).
     layer
         If provided, use ``adata.layers[layer]`` instead of ``adata.X``.
+    batch_key
+        ``obs`` column of batches (e.g. samples): genes are selected within
+        each batch and combined as Scanpy does, so variation between batches
+        does not dominate the set. Each batch needs two cells (within
+        ``cell_mask``). Two passes over the matrix however many batches.
     perturbation_column
         Column in ``obs`` containing perturbation labels. Required when
         ``cell_mask="control"`` (its default); ignored when ``cell_mask`` is
@@ -531,7 +546,12 @@ def highly_variable_genes(
         (bool), ``var["means"]``, ``var["variances"]``,
         ``var["variances_norm"]`` back to the file and return ``None``. If
         ``False``, return a DataFrame with those same columns, indexed by
-        gene, without modifying the file.
+        gene, without modifying the file. With ``batch_key``, ``means`` and
+        ``variances`` are over all cells used, ``variances_norm`` is the mean
+        over batches, and ``highly_variable_nbatches`` is added, with
+        ``highly_variable_rank`` (``seurat_v3`` flavors) or
+        ``highly_variable_intersection`` (``mean_dispersion``), Scanpy's
+        columns.
     verbose
         Print progress and a completion summary.
 
@@ -545,21 +565,17 @@ def highly_variable_genes(
     ValueError
         If ``cell_mask="control"`` is requested without
         ``perturbation_column``, if the resolved/explicit cell mask selects
-        zero cells, or if ``flavor="seurat_v3"`` is used without
-        ``n_top_genes``.
+        zero cells, if a ``seurat_v3`` flavor is used without
+        ``n_top_genes``, or if a batch has fewer than two cells.
     """
-    if flavor not in ("seurat_v3", "mean_dispersion"):
-        raise ValueError(f"Unknown flavor {flavor!r}; expected 'seurat_v3' or 'mean_dispersion'.")
-    if flavor == "seurat_v3" and n_top_genes is None:
-        raise ValueError("n_top_genes is required for flavor='seurat_v3'.")
-
-    if inplace and isinstance(data, ad.AnnData) and data.isbacked:
-        # Closing it would leave its layers on dead handles and its var stale.
+    if flavor not in ("seurat_v3", "seurat_v3_paper", "mean_dispersion"):
         raise ValueError(
-            "A backed anndata object holds its file open, so its var cannot be rewritten in place: "
-            "pass the path or cx.read_h5ad_ondisk(path) instead, or inplace=False."
+            f"Unknown flavor {flavor!r}; expected 'seurat_v3', 'seurat_v3_paper' or 'mean_dispersion'."
         )
-    path = resolve_data_path(data)
+    if flavor != "mean_dispersion" and n_top_genes is None:
+        raise ValueError(f"n_top_genes is required for flavor={flavor!r}.")
+
+    path = resolve_path_to_update(data, "var") if inplace else resolve_data_path(data)
     _messages.print_reading(verbose, "pp.highly_variable_genes", path)
 
     backed = read_backed(path)
@@ -586,59 +602,51 @@ def highly_variable_genes(
                 else calculate_optimal_chunk_size(n_obs, n_vars)
             )
 
-        if flavor == "seurat_v3":
-            mean, var, variances_norm = _seurat_v3_flavor(
-                backed,
-                storage_format=storage_format,
-                layer=layer,
-                cell_mask=cell_mask_arr,
-                span=span,
-                chunk_size=chunk_size,
-                show_progress=bool(verbose),
-            )
-            highly_variable = _rank_top_n_mask(variances_norm, n_top_genes)
+        codes, n_batches = _batch_codes(path, batch_key, cell_mask_arr, n_obs)
+        common = dict(
+            storage_format=storage_format, layer=layer, codes=codes, n_batches=n_batches,
+            chunk_size=chunk_size, show_progress=bool(verbose),
+        )
+        if flavor == "mean_dispersion":
+            sums, sqsums, n = _stream_gene_moments(backed, transform="expm1", **common)
+            thresholds = dict(n_top_genes=n_top_genes, min_mean=min_mean, max_mean=max_mean,
+                              min_disp=min_disp, n_bins=n_bins)
+            if batch_key is None:
+                variances_norm, highly_variable = _mean_dispersion_flavor(
+                    *_mean_var(sums[0], sqsums[0], n[0]), **thresholds,
+                )
+                extra = {}
+            else:
+                variances_norm, highly_variable, extra = _mean_dispersion_batches(sums, sqsums, n, **thresholds)
         else:
-            mean, var, _n_used = _stream_gene_moments(
-                backed,
-                storage_format=storage_format,
-                layer=layer,
-                cell_mask=cell_mask_arr,
-                transform="expm1",
-                chunk_size=chunk_size,
-                show_progress=bool(verbose),
+            sums, sqsums, n, norm = _seurat_v3_flavor(backed, span=span, **common)
+            highly_variable, nbatches, rank = _seurat_v3_select(
+                norm, n_top_genes, paper=flavor == "seurat_v3_paper",
             )
-            variances_norm, highly_variable = _mean_dispersion_flavor(
-                mean,
-                var,
-                n_top_genes=n_top_genes,
-                min_mean=min_mean,
-                max_mean=max_mean,
-                min_disp=min_disp,
-                n_bins=n_bins,
-            )
+            variances_norm = norm.mean(axis=0)
+            extra = {} if batch_key is None else {
+                "highly_variable_rank": rank, "highly_variable_nbatches": nbatches,
+            }
     finally:
         backed.file.close()
 
+    mean, var = _mean_var(sums.sum(axis=0), sqsums.sum(axis=0), n.sum())
     var_df = load_var(path)
     kept = int(highly_variable.sum())
     _messages.print_done(
         verbose, "pp.highly_variable_genes", f"{kept}/{n_vars} genes marked highly variable",
     )
 
+    columns = {
+        "means": mean,
+        "variances": var,
+        "variances_norm": variances_norm,
+        "highly_variable": highly_variable,
+        **extra,
+    }
     if inplace:
-        var_df["means"] = mean
-        var_df["variances"] = var
-        var_df["variances_norm"] = variances_norm
-        var_df["highly_variable"] = highly_variable
-        write_var(path, var_df)
+        # A previous run's batch columns describe another selection.
+        stale = {"highly_variable_nbatches", "highly_variable_rank", "highly_variable_intersection"} - set(extra)
+        write_var(path, var_df.drop(columns=list(stale & set(var_df.columns))).assign(**columns))
         return None
-
-    return pd.DataFrame(
-        {
-            "means": mean,
-            "variances": var,
-            "variances_norm": variances_norm,
-            "highly_variable": highly_variable,
-        },
-        index=var_df.index,
-    )
+    return pd.DataFrame(columns, index=var_df.index)

@@ -12,7 +12,7 @@ import scanpy as sc
 import scipy.sparse as sp
 
 from crispyx.data import get_matrix_storage_format, load_var
-from crispyx.hvg import highly_variable_genes
+from crispyx.hvg import _stream_gene_moments, highly_variable_genes
 
 
 def _make_hvg_dataset(
@@ -500,3 +500,122 @@ def test_hvg_in_place_on_a_backed_anndata_object_says_to_pass_the_path(tmp_path)
     result = highly_variable_genes(a, flavor="mean_dispersion", n_top_genes=10, cell_mask=None, inplace=False)
     assert result["highly_variable"].sum() >= 10
     assert a.X[0:2].shape == (2, 50)  # the object still works
+
+
+def test_moments_of_integer_counts_do_not_overflow(tmp_path):
+    """Squares of int32 counts above 46340 overflow int32; the moments are taken in float64."""
+    X = np.random.default_rng(0).poisson(5, (40, 20)).astype(np.int32)
+    X[0, 0] = 60_000
+    path = tmp_path / "int.h5ad"
+    ad.AnnData(sp.csr_matrix(X)).write_h5ad(path)
+    backed = ad.read_h5ad(path, backed="r")
+    sums, sqsums, n = _stream_gene_moments(
+        backed, storage_format="csr", layer=None, codes=np.zeros(40, dtype=np.int64), n_batches=1,
+        transform="identity", chunk_size=16, show_progress=False,
+    )
+    np.testing.assert_array_equal(sqsums[0], np.square(X.astype(np.float64)).sum(axis=0))
+
+
+def _batched_counts(tmp_path, fmt: str, *, g: int = 60) -> tuple[Path, ad.AnnData]:
+    """Three batches at different depths; one gene expressed in one batch only.
+
+    Counts are high enough that no two genes of a batch share a mean (checked
+    in the seurat_v3 test): LOESS on tied means turns last-bit differences in
+    the moments (Scanpy 1.12 computes them another way) into percent-sized
+    differences in the fit."""
+    rng = np.random.default_rng(1)
+    n = 240
+    batch = np.repeat(["b0", "b1", "b2"], n // 3)
+    depth = np.repeat([1.0, 3.0, 0.5], n // 3)[:, None]
+    means = rng.gamma(0.6, 2.0, g)[None, :] * depth * 20
+    X = rng.negative_binomial(2, 2 / (2 + means)).astype(np.float32)
+    X[batch != "b1", 0] = 0
+    adata = ad.AnnData(X, obs=pd.DataFrame({"sample": pd.Categorical(batch)}, index=[f"c{i}" for i in range(n)]),
+                       var=pd.DataFrame(index=[f"G{j}" for j in range(g)]))
+    stored = adata.copy()
+    stored.X = sp.csr_matrix(X) if fmt == "csr" else sp.csc_matrix(X)
+    path = tmp_path / f"batched_{fmt}.h5ad"
+    stored.write_h5ad(path)
+    return path, adata
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("flavor", ["seurat_v3", "seurat_v3_paper"])
+def test_batch_key_matches_scanpy_seurat_v3(tmp_path, fmt, flavor):
+    path, adata = _batched_counts(tmp_path, fmt)
+    for batch in ("b0", "b1", "b2"):
+        sums = np.asarray(adata.X[(adata.obs["sample"] == batch).to_numpy()].sum(axis=0)).ravel()
+        assert len(np.unique(sums[sums > 0])) == (sums > 0).sum(), "tied means make the LOESS fit unstable"
+    expected = sc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=15, batch_key="sample",
+                                           inplace=False)
+    got = highly_variable_genes(path, flavor=flavor, n_top_genes=15, batch_key="sample", cell_mask=None,
+                                inplace=False, verbose=False)
+    np.testing.assert_array_equal(got["highly_variable"], expected["highly_variable"])
+    np.testing.assert_array_equal(got["highly_variable_nbatches"], expected["highly_variable_nbatches"])
+    np.testing.assert_allclose(got["highly_variable_rank"], expected["highly_variable_rank"])
+    np.testing.assert_allclose(got["variances_norm"], expected["variances_norm"], rtol=1e-6)
+    np.testing.assert_allclose(got["means"], expected["means"], rtol=1e-6)
+    np.testing.assert_allclose(got["variances"], expected["variances"], rtol=1e-5)
+
+
+@pytest.mark.parametrize("n_top_genes", [15, None])
+def test_batch_key_matches_scanpy_mean_dispersion(tmp_path, n_top_genes):
+    # Enough genes that no bin holds two (whose normalised dispersions tie
+    # at 1/sqrt(2) up to rounding, which then decides the cut).
+    path, adata = _batched_counts(tmp_path, "csr", g=400)
+    logged = adata.copy()
+    sc.pp.normalize_total(logged)
+    sc.pp.log1p(logged)
+    logged.write_h5ad(path)
+    expected = sc.pp.highly_variable_genes(logged, flavor="seurat", n_top_genes=n_top_genes, batch_key="sample",
+                                           inplace=False)
+    expected = expected.loc[logged.var_names]  # Scanpy returns the threshold case sorted by name
+    got = highly_variable_genes(path, flavor="mean_dispersion", n_top_genes=n_top_genes, batch_key="sample",
+                                cell_mask=None, inplace=False, verbose=False)
+    assert got["highly_variable"].sum() > 0
+    np.testing.assert_array_equal(got["highly_variable"], expected["highly_variable"])
+    np.testing.assert_array_equal(got["highly_variable_nbatches"], expected["highly_variable_nbatches"])
+    np.testing.assert_array_equal(got["highly_variable_intersection"], expected["highly_variable_intersection"])
+    np.testing.assert_allclose(got["variances_norm"], expected["dispersions_norm"], rtol=1e-6)
+
+
+def test_mean_dispersion_batch_of_empty_cells_selects_nothing(tmp_path):
+    path, adata = _batched_counts(tmp_path, "csr", g=400)
+    logged = adata.copy()
+    logged.X[logged.obs["sample"].to_numpy() == "b2"] = 0
+    sc.pp.normalize_total(logged)
+    sc.pp.log1p(logged)
+    logged.write_h5ad(path)
+    got = highly_variable_genes(path, flavor="mean_dispersion", n_top_genes=15, batch_key="sample",
+                                cell_mask=None, inplace=False, verbose=False)
+    assert got["highly_variable"].sum() == 15 and got["highly_variable_nbatches"].max() == 2
+
+
+def test_batch_key_with_cell_mask_matches_the_subset(tmp_path):
+    path, adata = _batched_counts(tmp_path, "csr")
+    mask = np.random.default_rng(1).random(adata.n_obs) < 0.7
+    expected = sc.pp.highly_variable_genes(adata[mask].copy(), flavor="seurat_v3", n_top_genes=15,
+                                           batch_key="sample", inplace=False)
+    got = highly_variable_genes(path, n_top_genes=15, batch_key="sample", cell_mask=mask,
+                                inplace=False, verbose=False)
+    np.testing.assert_array_equal(got["highly_variable"], expected["highly_variable"])
+    np.testing.assert_allclose(got["variances_norm"], expected["variances_norm"], rtol=1e-6)
+
+
+def test_batch_key_writes_scanpy_columns_and_checks_batches(tmp_path):
+    path, adata = _batched_counts(tmp_path, "csr")
+    highly_variable_genes(path, n_top_genes=15, batch_key="sample", cell_mask=None, verbose=False)
+    var = load_var(path)
+    assert {"highly_variable_nbatches", "highly_variable_rank"} <= set(var.columns)
+    highly_variable_genes(path, n_top_genes=15, cell_mask=None, verbose=False)
+    assert "highly_variable_nbatches" not in load_var(path).columns  # the batched run's columns are gone
+    single = highly_variable_genes(path, flavor="seurat_v3_paper", n_top_genes=15, cell_mask=None,
+                                   inplace=False, verbose=False)
+    plain = highly_variable_genes(path, n_top_genes=15, cell_mask=None, inplace=False, verbose=False)
+    pd.testing.assert_frame_equal(single, plain)
+    assert list(plain.columns) == ["means", "variances", "variances_norm", "highly_variable"]
+    mask = np.ones(adata.n_obs, dtype=bool)
+    mask[adata.obs["sample"].to_numpy() == "b2"] = False
+    mask[-1] = True
+    with pytest.raises(ValueError, match="'b2' has fewer than 2 cells"):
+        highly_variable_genes(path, n_top_genes=15, batch_key="sample", cell_mask=mask, verbose=False)

@@ -31,6 +31,9 @@ from ._checkpoint import _create_progress_context
 from ._memory import _detected_available_bytes, _granted_bytes, _resolve_memory_limit_bytes
 from .data import (
     iter_matrix_chunks,
+    load_obs,
+    resolve_path_to_update,
+    write_obs,
     write_obsm_to_h5ad,
     write_varm_to_h5ad,
     write_uns_dict_to_h5ad,
@@ -973,3 +976,65 @@ def umap(
         if copy:
             return adata
         return None
+
+
+def leiden(
+    data: "str | Path | CrispyxAnnData",
+    resolution: float = 1.0,
+    *,
+    key_added: str = "leiden",
+    neighbors_key: str = "neighbors",
+    n_iterations: int = 2,
+    random_state: int = 0,
+) -> None:
+    """Leiden clusters of the neighbour graph stored by :func:`crispyx.pp.neighbors`.
+
+    Only the graph is read into memory, never ``X``; the clustering is
+    :func:`scanpy.tl.leiden` with ``flavor="igraph"`` (which needs the
+    ``igraph`` package: ``pip install 'crispyx[leiden]'``), so the same
+    arguments give Scanpy's clusters.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file with a neighbour graph, or a crispyx AnnData on it.
+    resolution
+        Higher values give more, smaller clusters.
+    key_added
+        ``obs`` column the clusters are written to (categorical: ``"0"``,
+        ``"1"``, ...), and ``uns`` key of the parameters.
+    neighbors_key
+        ``uns`` key of the graph, as written by :func:`crispyx.pp.neighbors`.
+    n_iterations
+        Iterations of the algorithm; negative runs until no improvement.
+    random_state
+        Random seed.
+    """
+    try:
+        import igraph  # noqa: F401
+    except ImportError as err:
+        raise ImportError("cx.tl.leiden needs igraph: pip install 'crispyx[leiden]'") from err
+    import anndata as ad
+    import pandas as pd
+    import scanpy as sc
+    from anndata.io import read_elem
+
+    path = resolve_path_to_update(data, "obs", has_inplace=False)
+    with h5py.File(path, "r") as f:
+        if neighbors_key not in f.get("uns", {}):
+            raise ValueError(f"uns[{neighbors_key!r}] not found; run cx.pp.neighbors first")
+        neighbors = read_elem(f["uns"][neighbors_key])
+        graph_key = neighbors.get("connectivities_key", "connectivities")
+        graph = read_elem(f["obsp"][graph_key])
+    holder = ad.AnnData(
+        obs=pd.DataFrame(index=np.arange(graph.shape[0]).astype(str)),
+        obsp={graph_key: graph}, uns={neighbors_key: neighbors},
+    )
+    sc.tl.leiden(
+        holder, resolution, flavor="igraph", directed=False, n_iterations=n_iterations,
+        random_state=random_state, neighbors_key=neighbors_key, key_added=key_added,
+    )
+    obs = load_obs(path)
+    obs[key_added] = holder.obs[key_added].values
+    write_obs(path, obs)
+    write_uns_dict_to_h5ad(path, key_added, holder.uns[key_added])

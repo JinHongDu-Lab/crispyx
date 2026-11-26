@@ -289,7 +289,7 @@ def _materialize_rank_genes_groups_from_layers(
 
         # Each metric is a per-group row: a layer, X (NB-GLM stores the LFC
         # only as X), or a per-gene var column shared by every group
-        # (pts_rest describes the control arm).
+        # (pts_rest of a control arm; one-vs-rest stores it as a layer).
         def layer_row(name: str):
             return lambda idx: np.asarray(backed.layers[name][idx]).ravel()
 
@@ -303,11 +303,14 @@ def _materialize_rank_genes_groups_from_layers(
         elif backed.uns.get("method") in ("nb_glm", "nb_offset"):
             # the NB tests store the log fold change as X (de._RESULT_KEYS)
             rows["logfoldchanges"] = x_row
-        for metric, options in (("pvals", ["pvalue", "pvals"]), ("pvals_adj", ["pvalue_adj", "pvals_adj"]), ("pts", ["pts"])):
+        for metric, options in (
+            ("pvals", ["pvalue", "pvals"]), ("pvals_adj", ["pvalue_adj", "pvals_adj"]),
+            ("pts", ["pts"]), ("pts_rest", ["pts_rest"]),  # a layer when the reference is the rest
+        ):
             name = pick_layer(options)
             if name is not None:
                 rows[metric] = layer_row(name)
-        if "pts_rest" in backed.var:
+        if "pts_rest" not in rows and "pts_rest" in backed.var:
             pts_rest = backed.var["pts_rest"].to_numpy()
             rows["pts_rest"] = lambda idx: pts_rest
 

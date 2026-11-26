@@ -75,6 +75,7 @@ from .glm import (
 from ._kernels import (
     _presort_control_nonzeros,
     _compute_ctrl_tie_sums,
+    _rank_sums_by_group_csc,
     _wilcoxon_batch_perts_presorted_numba,
     _wilcoxon_stratified_batch_perts_numba,
     _ZERO_PARTITION_THRESHOLD,
@@ -94,7 +95,7 @@ from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import (
-    UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, resolve_group_reference_aliases,
+    REST, UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, resolve_group_reference_aliases,
 )
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._irls import ETA_MAX, ETA_MIN
@@ -344,10 +345,15 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             self.groupby = _uns_value(uns, "perturbation_column")
             self.pvalue_correction = _uns_value(uns, "pvalue_correction", "benjamini-hochberg")
             self.tie_correct = bool(_uns_value(uns, "tie_correct", self.method == "wilcoxon"))
-            pts_rest = np.asarray(handle["var/pts_rest"][()], dtype=np.float32)
+            per_group = "pts_rest" in handle["layers"]
+            if not per_group:
+                pts_rest = np.asarray(handle["var/pts_rest"][()], dtype=np.float32)
         for name, key in _RESULT_KEYS[self.method].items():
             setattr(self, name, None if key is None else _ResultLayer(self.path, key))
-        self.pts_rest = np.broadcast_to(pts_rest, (len(self.groups), len(self.genes)))
+        self.pts_rest = (
+            _ResultLayer(self.path, "layers/pts_rest") if per_group
+            else np.broadcast_to(pts_rest, (len(self.groups), len(self.genes)))
+        )
         self.order = _RankOrder(self.statistics)
         self.result: AnnData | None = AnnData(self.path)
 
@@ -691,10 +697,11 @@ def _checkpoint_fingerprint(fingerprint: dict, **extra) -> dict:
 # the final h5ad, which coexist until the run finishes. One function per
 # method, shared by the run's own low-disk warning and estimate_disk_usage.
 
-def _t_test_disk_bytes(n_groups: int, n_genes: int) -> float:
+def _t_test_disk_bytes(n_groups: int, n_genes: int, rest: bool = False) -> float:
     # partial: statistics/pvalues/pvalues_adj/order (8 B) + lfc/effect/pts (4 B)
     # output: z/pvalue/pvalue_adj (8 B) + X/logfoldchanges/pts (4 B)
-    return estimate_bytes(n_groups, n_genes, itemsize=8) * 7 + estimate_bytes(n_groups, n_genes, itemsize=4) * 6
+    # + with the rest as reference, the pts_rest layer in each (4 B)
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 7 + estimate_bytes(n_groups, n_genes, itemsize=4) * (6 + 2 * rest)
 
 
 def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
@@ -708,11 +715,12 @@ def _nb_glm_disk_bytes(n_groups: int, n_genes: int) -> float:
     )
 
 
-def _wilcoxon_disk_bytes(n_groups: int, n_genes: int) -> float:
+def _wilcoxon_disk_bytes(n_groups: int, n_genes: int, rest: bool = False) -> float:
     # partial: effect/u/pvalue/pvalue_adj/z/lfc (8 B) + pts (4 B); the output
-    # holds the same seven matrices. The streaming path writes only the
-    # output-sized file, so this bounds every path.
-    return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * 2
+    # holds the same seven matrices, + with the rest as reference the pts_rest
+    # layer in each (4 B). The streaming path writes only the output-sized
+    # file, so this bounds every path.
+    return estimate_bytes(n_groups, n_genes, itemsize=8) * 12 + estimate_bytes(n_groups, n_genes, itemsize=4) * (2 + 2 * rest)
 
 
 class _PhaseTimer:
@@ -887,7 +895,10 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
             "tie_correct": bool(_uns_value(uns, "tie_correct", method == "wilcoxon")),
             "corr_method": _uns_value(uns, "pvalue_correction", "benjamini-hochberg"),
         }
-        pts_rest = np.asarray(handle["var/pts_rest"][()], dtype=np.float32)
+        if "pts_rest" in handle["layers"]:
+            fields["pts_rest"] = "layers/pts_rest"
+        else:
+            pts_rest = np.asarray(handle["var/pts_rest"][()], dtype=np.float32)
         n_groups, n_genes = handle["X"].shape
         if "rank_genes_groups" in uns:
             del uns["rank_genes_groups"]
@@ -895,7 +906,8 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
         full = rgg.create_group("full")
         for sl in _row_blocks(n_groups, n_genes, _chunk_rows(handle["X"])):
             block = {name: handle[key][sl] for name, key in fields.items() if key is not None}
-            block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
+            if "pts_rest" not in block:
+                block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
             block["order"] = _rank_order(block["scores"])
             for name, values in block.items():
                 target = rgg if name == "order" else full
@@ -1071,6 +1083,9 @@ def t_test(
         Mutually exclusive with ``perturbation_column``.
     control_label
         Label for the control/reference group. If None, infers from common patterns.
+        ``"rest"`` compares each group with every other labelled cell
+        (Scanpy's one-vs-rest markers); the ``*_ctrl`` filters then apply to
+        the rest, and ``pts_rest`` is a layer, since the rest differs by group.
     reference
         Alias for ``control_label`` (Scanpy-compatible).
         Mutually exclusive with ``control_label``.
@@ -1163,8 +1178,10 @@ def t_test(
         The h5ad file holds one row per perturbation: the difference of means
         (``mean_difference``) in ``X`` and the layers ``z_score``, ``pvalue``,
         ``pvalue_adj``, ``logfoldchanges`` and ``pts``. ``pts_rest`` describes the control
-        arm, so it is the per-gene column ``var["pts_rest"]``. ``obs["n_genes_tested"]``
-        counts the genes each perturbation was tested on, after the filters.
+        arm, so it is the per-gene column ``var["pts_rest"]``; with
+        ``control_label="rest"`` the rest differs by group, so it is the layer
+        ``pts_rest``. ``obs["n_genes_tested"]`` counts the genes each
+        perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -1225,12 +1242,19 @@ def t_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = label_strings(backed.obs[perturbation_column])
-        control_label = resolve_control_label(list(labels), control_label)
+        rest = control_label == REST
+        if not rest:
+            control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
-        groups = [control_label] + candidates
+        if rest:
+            _check_rest_labels(labels)
+        # With the rest as reference, every other labelled cell goes in a last group.
+        groups = candidates + [REST] if rest else [control_label] + candidates
         group_index = {label: idx for idx, label in enumerate(groups)}
         label_codes = pd.Categorical(labels, categories=groups).codes
+        if rest:
+            label_codes = np.where((label_codes < 0) & (labels != UNLABELLED), len(candidates), label_codes)
 
         # Only allow sparse matrices; raise error if dense
         for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=False):
@@ -1272,26 +1296,31 @@ def t_test(
     finally:
         backed.file.close()
 
-    control_idx = group_index[control_label]
-    control_n = counts[control_idx]
-    if control_n == 0:
-        raise ValueError("Control group contains no cells")
+    def reference_moments(total, total_sq, expr, n):
+        """Mean, variance, cells, expressing cells and ``expm1(mean) + 1e-9``
+        (the fold change's denominator) of the reference arm."""
+        mean = total / n if n else np.zeros(n_genes)
+        var = np.clip((total_sq - total ** 2 / n) / (n - 1), 0, None) if n > 1 else np.zeros(n_genes)
+        return mean, var, n, expr, np.expm1(mean) + 1e-9
 
-    control_mean = sums[control_idx] / control_n
-    # Precompute control term for LFC calculation once (avoid recomputing per perturbation)
-    control_mean_expm1 = np.expm1(control_mean) + 1e-9
-    control_var = np.zeros_like(control_mean)
-    if control_n > 1:
-        control_var = (sumsq[control_idx] - (sums[control_idx] ** 2) / control_n) / (control_n - 1)
-    control_var = np.clip(control_var, a_min=0, a_max=None)
+    if rest:
+        totals = (sums.sum(axis=0), sumsq.sum(axis=0), expr_counts.sum(axis=0), counts.sum())
 
-    # Calculate control pts (proportion of cells expressing each gene)
-    control_pts = np.divide(
-        expr_counts[control_idx],
-        control_n,
-        out=np.zeros(n_genes, dtype=float),
-        where=control_n > 0,
-    )
+        def reference(idx):
+            expr = totals[2] - expr_counts[idx]
+            # Exactly 0 where no cell of the rest expresses the gene, not a rounding residue.
+            return reference_moments(
+                np.where(expr > 0, totals[0] - sums[idx], 0.0), np.where(expr > 0, totals[1] - sumsq[idx], 0.0),
+                expr, totals[3] - counts[idx],
+            )
+    else:
+        control_idx = group_index[control_label]
+        if counts[control_idx] == 0:
+            raise ValueError("Control group contains no cells")
+        control = reference_moments(sums[control_idx], sumsq[control_idx], expr_counts[control_idx], counts[control_idx])
+
+        def reference(idx):
+            return control
 
     # Determine worker count for parallelization
     n_groups = len(candidates)
@@ -1307,11 +1336,13 @@ def t_test(
 
     obs = _result_obs(candidates, perturbation_column)
     # pts_rest describes the control arm, so it is one per-gene vector, not a
-    # per-comparison matrix.
-    var = pd.DataFrame({"pts_rest": control_pts.astype(np.float32)}, index=gene_symbols)
+    # per-comparison matrix; the rest differs by group, so it is then a layer.
+    var = pd.DataFrame(
+        {} if rest else {"pts_rest": (control[3] / control[2]).astype(np.float32)}, index=gene_symbols,
+    )
 
     _t_test_disk_estimate = warn_if_disk_space_low(
-        _t_test_disk_bytes(*shape),
+        _t_test_disk_bytes(*shape, rest=rest),
         output_path,
         context="t_test",
     )
@@ -1339,6 +1370,7 @@ def t_test(
             "pvalue_adj": np.float64,
             "logfoldchanges": np.float32,
             "pts": np.float32,
+            **({"pts_rest": np.float32} if rest else {}),
         },
     )
     # Earlier failures are retried, so only completions carry over.
@@ -1355,6 +1387,7 @@ def t_test(
     pval_buffer = np.ones((batch_size, n_genes), dtype=np.float64)
     lfc_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
     pts_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+    pts_rest_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
     mean_buffer = np.zeros(n_genes, dtype=np.float64)
     var_buffer = np.zeros(n_genes, dtype=np.float64)
     se_buffer = np.zeros(n_genes, dtype=np.float64)
@@ -1366,6 +1399,9 @@ def t_test(
         n_cells = counts[idx]
         if n_cells == 0:
             raise ValueError(f"Perturbation '{label}' contains no cells")
+        control_mean, control_var, control_n, control_expr, control_mean_expm1 = reference(idx)
+        if control_n:
+            pts_rest_buffer[slot] = control_expr / control_n
 
         np.divide(sums[idx], n_cells, out=mean_buffer)
         np.copyto(var_buffer, sumsq[idx])
@@ -1387,7 +1423,7 @@ def t_test(
         np.add(var_term_pert, var_term_ctrl, out=se_buffer)
         np.sqrt(se_buffer, out=se_buffer)
 
-        total_expr = expr_counts[idx] + expr_counts[control_idx]
+        total_expr = expr_counts[idx] + control_expr
         valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
         # A one-cell side has no variance estimate; treating it as zero
         # leaves the other side's SE alone and makes every gene look
@@ -1398,7 +1434,7 @@ def t_test(
         # jointly low in BOTH the perturbation and control groups.
         low_both = _low_expr_in_both_mask(
             pert_expr_counts=expr_counts[idx],
-            control_expr_counts=expr_counts[control_idx],
+            control_expr_counts=control_expr,
             pert_mean=mean_buffer,
             control_mean=control_mean,
             n_pert_cells=n_cells,
@@ -1496,6 +1532,8 @@ def t_test(
                         for out in (out_x, out_z, out_p, out_lfc):
                             out[row] = np.nan
                         out_pts[row] = 0
+                        if rest:  # not the file's zeros, which read as a rest that expresses nothing
+                            run.file["layers/pts_rest"][row] = np.nan
                         continue
 
                 for local_idx, label in enumerate(batch_labels):
@@ -1507,6 +1545,8 @@ def t_test(
                     out_p[global_idx] = pval_buffer[local_idx]
                     out_lfc[global_idx] = lfc_buffer[local_idx]
                     out_pts[global_idx] = pts_buffer[local_idx]
+                    if rest:
+                        run.file["layers/pts_rest"][global_idx] = pts_rest_buffer[local_idx]
 
                     newly_completed.append(label)
                     n_tested_list.append(int(n_tested_per_slot[local_idx]))
@@ -3501,10 +3541,12 @@ def _wilcoxon_resumable_result(
 ) -> ResumableRun:
     """The result file a Wilcoxon run fills one gene chunk at a time: the
     AUC in ``X``, the test's layers, and the control arm's detection rate as
-    ``var["pts_rest"]``, laid out in column blocks matching those writes
+    ``var["pts_rest"]`` (a layer with ``control_label="rest"``, whose rest
+    differs by group), laid out in column blocks matching those writes
     (:func:`_column_block_chunks`)."""
+    rest = control_label == REST
     var = pd.DataFrame(
-        {"pts_rest": np.zeros(len(gene_symbols), dtype=np.float32)},
+        {} if rest else {"pts_rest": np.zeros(len(gene_symbols), dtype=np.float32)},
         index=pd.Index(gene_symbols).astype(str),
     )
     return _resumable_result(
@@ -3518,6 +3560,7 @@ def _wilcoxon_resumable_result(
         layers={
             "z_score": np.float64, "pvalue": np.float64, "pvalue_adj": np.float64,
             "logfoldchanges": np.float64, "u_statistic": np.float64, "pts": np.float32,
+            **({"pts_rest": np.float32} if rest else {}),
         },
         chunks=_column_block_chunks(len(candidates), len(gene_symbols), chunk_size),
     )
@@ -3532,7 +3575,42 @@ def _write_wilcoxon_chunk(handle: h5py.File, slc: slice, *, auc, u, z, p, lfc, p
     layers["pvalue"][:, slc] = p
     layers["logfoldchanges"][:, slc] = lfc
     layers["pts"][:, slc] = pts
-    handle["var/pts_rest"][slc] = pts_rest
+    if "pts_rest" in layers:
+        layers["pts_rest"][:, slc] = pts_rest
+    else:
+        handle["var/pts_rest"][slc] = pts_rest
+
+
+def _check_rest_labels(labels: np.ndarray) -> None:
+    """Raise unless ``reference="rest"`` is unambiguous and leaves every group
+    a rest: no group is named "rest", and at least two are labelled."""
+    if (labels == REST).any():
+        raise ValueError(
+            "reference='rest' compares each group with all other cells, but a group is named 'rest': "
+            "rename it to compare each group with all others, or to use it as the control"
+        )
+    if pd.unique(labels[labels != UNLABELLED]).size < 2:
+        raise ValueError("reference='rest' needs at least two labelled groups: with one, the rest is empty")
+
+
+def _check_wilcoxon_input(block) -> None:
+    """Raise unless ``block`` (a matrix chunk) is sparse and log-normalised,
+    not counts."""
+    if not sp.issparse(block):
+        raise ValueError(
+            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+        )
+    if np.issubdtype(block.dtype, np.integer):
+        raise ValueError(
+            "Detected integer count data in wilcoxon_test. "
+            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+        )
+    non_zero = block.data[block.data > 0]
+    if non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero))):
+        raise ValueError(
+            "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
+            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+        )
 
 
 def _wilcoxon_test_stratified(
@@ -3697,21 +3775,6 @@ def _wilcoxon_test_stratified(
 
         dtype_checked = False
 
-        def _check_not_count_like(chunk: sp.spmatrix) -> None:
-            if np.issubdtype(chunk.dtype, np.integer):
-                raise ValueError(
-                    "Detected integer count data in wilcoxon_test. "
-                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
-                )
-            if np.issubdtype(chunk.dtype, np.floating):
-                non_zero = chunk.data[chunk.data > 0]
-                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                if is_count_like:
-                    raise ValueError(
-                        "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
-                        "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
-                    )
-
         # Resume at the first unfinished chunk; iter_matrix_chunks seeks
         # there rather than reading and discarding the completed ones.
         current_chunk = last_completed_chunk + 1
@@ -3735,11 +3798,7 @@ def _wilcoxon_test_stratified(
             ):
                 timer.lap("read")
                 if not dtype_checked:
-                    if not sp.issparse(block):
-                        raise ValueError(
-                            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                        )
-                    _check_not_count_like(block)
+                    _check_wilcoxon_input(block)
                     dtype_checked = True
 
                 csr_block = sp.csr_matrix(block)
@@ -4053,6 +4112,9 @@ def wilcoxon_test(
         Mutually exclusive with ``perturbation_column``.
     control_label
         Label for the control/reference group. If None, infers from common patterns.
+        ``"rest"`` compares each group with every other labelled cell
+        (Scanpy's one-vs-rest markers); the ``*_ctrl`` filters then apply to
+        the rest, and ``pts_rest`` is a layer, since the rest differs by group.
     reference
         Alias for ``control_label`` (Scanpy-compatible).
         Mutually exclusive with ``control_label``.
@@ -4192,8 +4254,9 @@ def wilcoxon_test(
         ``z_score``, ``pvalue``, ``pvalue_adj``, ``logfoldchanges``,
         ``u_statistic`` and ``pts``. ``pts_rest``
         describes the control arm, so it is the per-gene column
-        ``var["pts_rest"]``. ``obs["n_genes_tested"]`` counts the genes each
-        perturbation was tested on, after the filters.
+        ``var["pts_rest"]``; with ``control_label="rest"`` the rest differs by
+        group, so it is the layer ``pts_rest``. ``obs["n_genes_tested"]``
+        counts the genes each perturbation was tested on, after the filters.
 
     Notes
     -----
@@ -4238,6 +4301,8 @@ def wilcoxon_test(
         raise ValueError(f"wilcoxon_test: distribution must be 'normal' or 'hypergeometric', got {distribution!r}")
     if distribution == "hypergeometric" and not tie_correct:
         raise ValueError("wilcoxon_test: distribution='hypergeometric' conditions on the ties; it needs tie_correct=True")
+    if control_label == REST and (batch_column is not None or distribution != "normal"):
+        raise ValueError("wilcoxon_test: reference='rest' takes neither batch_column nor distribution='hypergeometric'")
 
     path = resolve_data_path(data)
     output_suffix = "wilcoxon_stratified" if batch_column is not None else "wilcoxon"
@@ -4275,12 +4340,13 @@ def wilcoxon_test(
             label_strings(backed.obs[perturbation_column]) if given_labels is None
             else label_strings(cell_labels(backed.obs, given_labels)[0])
         )
-        control_label = resolve_control_label(labels, control_label)
+        if control_label != REST:
+            control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
-        control_mask = labels == control_label
-        control_n = int(control_mask.sum())
-        if control_n == 0:
+        if control_label == REST:
+            _check_rest_labels(labels)
+        elif not (labels == control_label).any():
             raise ValueError("Control group contains no cells")
         # Memory-efficient validation: avoid creating per-group bool masks (n_groups × n_cells
         # memory, e.g. 18K groups × 3.4M cells = 62 GB for Huang-HCT116). Instead use
@@ -4318,7 +4384,8 @@ def wilcoxon_test(
             corr_method=corr_method, resume=False, fingerprint=_checkpoint_fingerprint(fingerprint),
             chunk_size=chunk_size or 1, batch_column=batch_column, distribution=distribution,
         )
-        run.file["var/pts_rest"][...] = np.nan
+        if control_label != REST:  # the rest's pts_rest is an (empty) layer
+            run.file["var/pts_rest"][...] = np.nan
         return _finish_result(
             run, output_path, obs=_result_obs([], perturbation_column), method="wilcoxon",
             corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
@@ -4335,61 +4402,157 @@ def wilcoxon_test(
         scratch_dir=output_path.parent, chunk_size=chunk_size,
         memory_limit_gb=memory_limit_gb, verbose=verbose, resumable=resume and checkpoint_path.exists(),
     ) as stream_path:
+        common = dict(
+            gene_symbols=gene_symbols, perturbation_column=perturbation_column, labels=labels,
+            candidates=candidates, n_genes=n_genes, chunk_size=chunk_size,
+            min_cells_expressed=min_cells_expressed, min_pct_ctrl=min_pct_ctrl, min_pct_pert=min_pct_pert,
+            min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert, tie_correct=tie_correct,
+            corr_method=corr_method, output_path=output_path, checkpoint_path=checkpoint_path,
+            checkpoint_interval=checkpoint_interval, scanpy_format=scanpy_format, verbose=verbose,
+            resume=resume, fingerprint=fingerprint,
+        )
+        if control_label == REST:
+            return _wilcoxon_test_rest(stream_path, **common)
         # Batch-stratified (van Elteren): rank statistics are computed
         # within-batch and combined.
         if batch_column is not None:
             return _wilcoxon_test_stratified(
-                stream_path,
-                gene_symbols=gene_symbols,
-                perturbation_column=perturbation_column,
-                labels=labels,
-                control_label=control_label,
-                batch_column=batch_column,
-                candidates=candidates,
-                n_genes=n_genes,
-                chunk_size=chunk_size,
-                min_cells_expressed=min_cells_expressed,
-                min_pct_ctrl=min_pct_ctrl,
-                min_pct_pert=min_pct_pert,
-                min_mean_ctrl=min_mean_ctrl,
-                min_mean_pert=min_mean_pert,
-                tie_correct=tie_correct,
-                distribution=distribution,
-                corr_method=corr_method,
-                output_path=output_path,
-                checkpoint_path=checkpoint_path,
-                checkpoint_interval=checkpoint_interval,
-                scanpy_format=scanpy_format,
-                verbose=verbose,
-                resume=resume,
-                fingerprint=fingerprint,
+                stream_path, control_label=control_label, batch_column=batch_column,
+                distribution=distribution, **common,
             )
-
         return _wilcoxon_test_standard(
-            stream_path,
-            gene_symbols=gene_symbols,
-            perturbation_column=perturbation_column,
-            labels=labels,
-            control_label=control_label,
-            candidates=candidates,
-            n_genes=n_genes,
-            chunk_size=chunk_size,
-            min_cells_expressed=min_cells_expressed,
-            min_pct_ctrl=min_pct_ctrl,
-            min_pct_pert=min_pct_pert,
-            min_mean_ctrl=min_mean_ctrl,
-            min_mean_pert=min_mean_pert,
-            tie_correct=tie_correct,
-            distribution=distribution,
-            corr_method=corr_method,
-            output_path=output_path,
-            checkpoint_path=checkpoint_path,
-            checkpoint_interval=checkpoint_interval,
-            scanpy_format=scanpy_format,
-            verbose=verbose,
-            resume=resume,
-            fingerprint=fingerprint,
+            stream_path, control_label=control_label, distribution=distribution, **common,
         )
+
+
+def _wilcoxon_test_rest(
+    path: Path,
+    *,
+    gene_symbols,
+    perturbation_column: str,
+    labels: np.ndarray,
+    candidates: list[str],
+    n_genes: int,
+    chunk_size: int,
+    min_cells_expressed: int,
+    min_pct_ctrl: float,
+    min_pct_pert: float,
+    min_mean_ctrl: float,
+    min_mean_pert: float,
+    tie_correct: bool,
+    corr_method: str,
+    output_path: Path,
+    checkpoint_path: Path,
+    checkpoint_interval: int | None,
+    scanpy_format: bool,
+    verbose: int | bool,
+    resume: bool,
+    fingerprint: dict,
+) -> RankGenesGroupsResult:
+    """Each group against every other labelled cell (``reference="rest"``).
+
+    One ranking of the labelled cells per gene gives every group's rank sum
+    at once (``U = R - n(n+1)/2``), so a gene chunk costs one sort of its
+    non-zeros whatever the number of groups. Written and resumed per gene
+    chunk as :func:`_wilcoxon_test_standard` is; the rest's detection rate
+    differs by group, so ``pts_rest`` is a layer.
+    """
+    n_groups = len(candidates)
+    labelled = labels != UNLABELLED
+    codes = pd.Categorical(labels[labelled], categories=candidates).codes.astype(np.int64)
+    n_cells = codes.size
+    group_n = np.bincount(codes[codes >= 0], minlength=n_groups).astype(np.float64)[:, None]
+    rest_n = n_cells - group_n
+    groups = sp.csr_matrix(
+        (np.ones(int((codes >= 0).sum())), (codes[codes >= 0], np.flatnonzero(codes >= 0))),
+        shape=(n_groups, n_cells),
+    )
+    n_gene_chunks = -(-n_genes // chunk_size)
+    interval = _get_checkpoint_interval(n_gene_chunks, checkpoint_interval)
+    _messages.print_disk_estimate(verbose, "wilcoxon_test", warn_if_disk_space_low(
+        _wilcoxon_disk_bytes(n_groups, n_genes, rest=True),
+        output_path, context="wilcoxon_test",
+    ))
+    run = _wilcoxon_resumable_result(
+        output_path, checkpoint_path, candidates=candidates, gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column, control_label=REST, tie_correct=tie_correct,
+        corr_method=corr_method, resume=resume,
+        fingerprint=_checkpoint_fingerprint(fingerprint, path="rest", chunk_size=int(chunk_size)),
+        chunk_size=chunk_size,
+    )
+    current = run.progress.get("last_gene_chunk", -1) + 1
+
+    def save(chunk: int) -> None:
+        run.save(total_gene_chunks=n_gene_chunks, last_gene_chunk=chunk,
+                 timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    backed = read_backed(path)
+    try:
+        dtype_checked = False  # the first chunk this call reads, resumed or not
+        with _create_progress_context(n_gene_chunks, "Wilcoxon DE vs rest (gene chunks)", verbose,
+                                      initial=current) as bar:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False,
+                start_chunk=current, warn_slow_axis=False,
+            ):
+                if not dtype_checked:
+                    _check_wilcoxon_input(block)
+                    dtype_checked = True
+                block = sp.csc_matrix(block)
+                if not labelled.all():
+                    block = block[labelled]
+                expressed = block.copy()
+                expressed.data = (expressed.data != 0).astype(np.float64)
+                group_sum = np.asarray((groups @ block).todense())
+                group_expr = np.asarray((groups @ expressed).todense())
+                rest_expr = np.asarray(expressed.sum(axis=0)) - group_expr
+                # Exactly 0 where no cell of the rest expresses the gene, not a rounding residue.
+                rest_sum = np.where(rest_expr > 0, np.asarray(block.sum(axis=0)) - group_sum, 0.0)
+
+                rank_sums = np.zeros((n_groups, block.shape[1]))
+                ties = np.zeros(block.shape[1])
+                _rank_sums_by_group_csc(block.indptr, block.indices, block.data, codes,
+                                        group_n.ravel(), rank_sums, ties)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    group_mean, rest_mean = group_sum / group_n, rest_sum / rest_n
+                    u = rank_sums - group_n * (group_n + 1) / 2
+                    correction = 1 - ties / (float(n_cells) ** 3 - n_cells) if tie_correct else 1.0
+                    std = np.sqrt(correction * group_n * rest_n * (n_cells + 1) / 12)
+                    z = (u - group_n * rest_n / 2) / std
+                    auc = u / (group_n * rest_n)
+                    lfc = np.log2((np.expm1(group_mean) + 1e-9) / (np.expm1(rest_mean) + 1e-9))
+                # A gene whose values all tie has no rank test, as in the control path.
+                all_tied = ties >= float(n_cells) ** 3 - n_cells
+                tested = ~all_tied & (std > 0) & (group_expr + rest_expr >= min_cells_expressed)
+                for g in range(n_groups):
+                    tested[g] &= ~_low_expr_in_both_mask(
+                        pert_expr_counts=group_expr[g], control_expr_counts=rest_expr[g],
+                        pert_mean=group_mean[g], control_mean=rest_mean[g],
+                        n_pert_cells=int(group_n[g, 0]), n_control_cells=int(rest_n[g, 0]),
+                        min_pct_ctrl=min_pct_ctrl, min_pct_pert=min_pct_pert,
+                        min_mean_ctrl=min_mean_ctrl, min_mean_pert=min_mean_pert,
+                    )
+                def untested(values):
+                    return np.where(tested, values, np.nan)
+
+                _write_wilcoxon_chunk(
+                    run.file, slc, auc=untested(auc), u=untested(u), z=untested(z),
+                    p=untested(2 * norm.sf(np.abs(z))), lfc=untested(lfc),
+                    pts=group_expr / group_n, pts_rest=rest_expr / np.maximum(rest_n, 1),
+                )
+                bar.update(1)
+                if (current + 1) % interval == 0:
+                    save(current)
+                current += 1
+            save(current - 1)
+    finally:
+        backed.file.close()
+
+    _messages.print_saving(verbose, "wilcoxon_test", output_path)
+    return _finish_result(
+        run, output_path, obs=_result_obs(candidates, perturbation_column), method="wilcoxon",
+        corr_method=corr_method, scanpy_format=scanpy_format, fingerprint=fingerprint,
+    )
 
 
 def _wilcoxon_test_standard(
@@ -4467,22 +4630,6 @@ def _wilcoxon_test_standard(
 
         dtype_checked = False
 
-        def _check_not_count_like(chunk: sp.spmatrix) -> None:
-            """Raise ValueError if the chunk looks like raw counts."""
-            if np.issubdtype(chunk.dtype, np.integer):
-                raise ValueError(
-                    "Detected integer count data in wilcoxon_test. "
-                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
-                )
-            if np.issubdtype(chunk.dtype, np.floating):
-                non_zero = chunk.data[chunk.data > 0]
-                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                if is_count_like:
-                    raise ValueError(
-                        "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
-                        "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
-                    )
-
         # Resume at the first unfinished chunk; iter_matrix_chunks seeks
         # there rather than reading and discarding the completed ones.
         current_chunk = last_completed_chunk + 1
@@ -4506,11 +4653,7 @@ def _wilcoxon_test_standard(
             ):
                 timer.lap("read")
                 if not dtype_checked:
-                    if not sp.issparse(block):
-                        raise ValueError(
-                            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                        )
-                    _check_not_count_like(block)
+                    _check_wilcoxon_input(block)
                     dtype_checked = True
 
                 csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
@@ -5446,13 +5589,14 @@ def _estimate_shape_for_t_test(
     backed = read_backed(path)
     try:
         labels = label_strings(backed.obs[perturbation_column])
-        control_label = resolve_control_label(list(labels), control_label)
+        if control_label != REST:
+            control_label = resolve_control_label(list(labels), control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    return {"output": _t_test_disk_bytes(n_groups, n_genes)}
+    return {"output": _t_test_disk_bytes(n_groups, n_genes, rest=control_label == REST)}
 
 
 def _estimate_shape_for_nb_glm_test(
@@ -5495,7 +5639,8 @@ def _estimate_shape_for_wilcoxon_test(
             if isinstance(perturbation_column, pd.Series)
             else label_strings(backed.obs[perturbation_column])
         )
-        control_label = resolve_control_label(labels, control_label)
+        if control_label != REST:
+            control_label = resolve_control_label(labels, control_label)
         candidates = _resolve_candidates(labels, control_label, perturbations)
         n_genes = backed.n_vars
         if chunk_size is None:
@@ -5508,7 +5653,7 @@ def _estimate_shape_for_wilcoxon_test(
     finally:
         backed.file.close()
     n_groups = len(candidates)
-    estimate = {"output": _wilcoxon_disk_bytes(n_groups, n_genes)}
+    estimate = {"output": _wilcoxon_disk_bytes(n_groups, n_genes, rest=control_label == REST)}
     # A CSR source may first be converted to a temporary CSC copy beside the
     # output; scratch_copy_bytes makes that call the same way the run does.
     scratch = scratch_copy_bytes(

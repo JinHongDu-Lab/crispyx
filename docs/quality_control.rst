@@ -35,6 +35,51 @@ Plot the QC summary:
    )
    cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
 
+Per-cell metrics, outliers and doublets
+---------------------------------------
+
+For a dataset with several samples and no perturbation column (a tumour
+cohort, a tissue atlas), compute Scanpy's QC metrics, flag cells far from their
+own sample's median, and score doublets one sample at a time:
+
+.. code-block:: python
+
+   var = cx.load_var("counts.h5ad")
+   var["mt"] = var.index.str.startswith("MT-")
+   cx.write_var("counts.h5ad", var)
+   cx.pp.calculate_qc_metrics("counts.h5ad", qc_vars=["mt"])  # writes obs and var columns
+
+   flags = cx.pp.mad_outliers(
+       "counts.h5ad", ["log1p_total_counts", "log1p_n_genes_by_counts", "pct_counts_mt"],
+       groupby="sample", nmads=5,
+   )
+   obs = cx.load_obs("counts.h5ad")
+   bad = (
+       flags["log1p_total_counts_low"] | flags["log1p_n_genes_by_counts_low"]
+       | (flags["pct_counts_mt_high"] & (obs["pct_counts_mt"] > 10))
+   )
+   cx.pp.scrublet("counts.h5ad", batch_key="sample", cell_mask=~bad.to_numpy())
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Function
+     - Does
+   * - :func:`crispyx.pp.calculate_qc_metrics`
+     - Scanpy's ``n_genes_by_counts``, ``total_counts``,
+       ``pct_counts_<set>`` (for each boolean ``var`` column in
+       ``qc_vars``) and the per-gene metrics, in one pass over the matrix in
+       its stored layout. Writes them to the file unless ``inplace=False``.
+   * - :func:`crispyx.pp.mad_outliers`
+     - ``<key>_low`` / ``<key>_high`` flags for values more than ``nmads``
+       median absolute deviations from the median of the cell's ``groupby``
+       group. Reads ``obs`` only.
+   * - :func:`crispyx.pp.scrublet`
+     - :func:`scanpy.pp.scrublet` on each ``batch_key`` group read from disk
+       in turn, so memory holds one sample. Writes ``doublet_score`` and
+       ``predicted_doublet``. Needs ``pip install 'crispyx[scrublet]'``.
+
 Fewer cells, fewer counts
 -------------------------
 
@@ -252,6 +297,32 @@ explicitly, or set ``cell_mask=None`` to use all cells without perturbation
 metadata. If the resolved control label matches zero cells, the call raises
 rather than silently proceeding with a degenerate (``n=0``) statistic.
 
+**Several samples.** ``batch_key`` selects genes within each sample and
+combines them as Scanpy does, so differences between samples (donors,
+patients) do not fill the list. Both passes over the matrix accumulate every
+sample at once, so the cost does not grow with the number of samples.
+
+.. code-block:: python
+
+   cx.pp.highly_variable_genes(
+       "counts.h5ad", batch_key="sample", cell_mask=None, n_top_genes=2000,
+       flavor="seurat_v3_paper",
+   )
+
+``var["highly_variable_nbatches"]`` counts the samples that select a gene. The
+two ``seurat_v3`` flavors differ only in how they rank genes across samples:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - ``flavor``
+     - Genes ranked by
+   * - ``"seurat_v3"``
+     - median rank among the samples that select the gene, then the number of samples
+   * - ``"seurat_v3_paper"``
+     - number of samples, then median rank (Seurat's ``SelectIntegrationFeatures``)
+
 .. _quality-control-pca:
 
 Dimension reduction
@@ -267,6 +338,13 @@ graph construction that works with on-disk data:
    
    # Build KNN graph from PCA embeddings
    cx.pp.neighbors(adata_norm, n_neighbors=15)
+
+   # Leiden clusters of that graph, in obs["leiden"]
+   cx.tl.leiden(adata_norm, resolution=1.0)
+
+:func:`crispyx.tl.leiden` reads only the graph, never ``X``, and runs
+:func:`scanpy.tl.leiden` with ``flavor="igraph"`` on it (``pip install
+'crispyx[leiden]'``). Markers of the clusters: :ref:`one-vs-rest`.
 
 Plot the embedding:
 

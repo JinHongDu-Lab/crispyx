@@ -9,7 +9,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from ._grouping import resolve_group_reference_aliases
+from ._grouping import REST, resolve_group_reference_aliases
 from ._preflight import estimate_disk_usage
 from .batch import BatchReducer, batch_process
 from .data import (
@@ -60,13 +60,16 @@ from .pseudobulk import (
 from .residual import ResidualNull, residual_effects
 from .qc import (
     assign_guides,
+    calculate_qc_metrics,
     check_perturbation_data,
     compare_controls,
     control_guide_correlation,
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
     filter_perturbations_by_cell_count,
+    mad_outliers,
     quality_control_summary,
+    scrublet,
 )
 from .sample import subsample
 
@@ -225,6 +228,27 @@ class _PreprocessingNamespace:
         See :func:`crispyx.qc.assign_guides`.
         """
         return assign_guides(guide_counts, guide_names, **kwargs)
+
+    def calculate_qc_metrics(self, data, **kwargs):
+        """Per-cell and per-gene QC metrics (Scanpy's), in one pass over the matrix.
+
+        See :func:`crispyx.qc.calculate_qc_metrics`.
+        """
+        return calculate_qc_metrics(data, **kwargs)
+
+    def mad_outliers(self, data, keys, **kwargs):
+        """Flag cells more than ``nmads`` MADs from their group's median.
+
+        See :func:`crispyx.qc.mad_outliers`.
+        """
+        return mad_outliers(data, keys, **kwargs)
+
+    def scrublet(self, data, **kwargs):
+        """Scrublet doublet scores per batch, one batch in memory at a time.
+
+        See :func:`crispyx.qc.scrublet`.
+        """
+        return scrublet(data, **kwargs)
 
     def check_data(self, data, **kwargs):
         """Check a screen's file for labels, genes and counts that would
@@ -475,6 +499,7 @@ class _PreprocessingNamespace:
         paths: Sequence[str | Path],
         *,
         output_path: str | Path,
+        join: Literal["inner", "outer"] = "inner",
         shared_cells: Literal["drop", "error"] = "drop",
         label: str | None = None,
         chunk_size: int = 4096,
@@ -490,6 +515,7 @@ class _PreprocessingNamespace:
         return concat_h5ad(
             paths,
             output_path=output_path,
+            join=join,
             shared_cells=shared_cells,
             label=label,
             chunk_size=chunk_size,
@@ -502,7 +528,7 @@ class _PreprocessingNamespace:
         self,
         data: str | Path | ad.AnnData,
         *,
-        flavor: Literal["seurat_v3", "mean_dispersion"] = "seurat_v3",
+        flavor: Literal["seurat_v3", "seurat_v3_paper", "mean_dispersion"] = "seurat_v3",
         n_top_genes: int | None = 2000,
         min_mean: float = 0.0125,
         max_mean: float = 3.0,
@@ -510,6 +536,7 @@ class _PreprocessingNamespace:
         n_bins: int = 20,
         span: float = 0.3,
         layer: str | None = None,
+        batch_key: str | None = None,
         perturbation_column: str | None = None,
         control_label: str | None = None,
         cell_mask: "Literal['control'] | np.ndarray | None" = "control",
@@ -533,6 +560,7 @@ class _PreprocessingNamespace:
             n_bins=n_bins,
             span=span,
             layer=layer,
+            batch_key=batch_key,
             perturbation_column=perturbation_column,
             control_label=control_label,
             cell_mask=cell_mask,
@@ -860,6 +888,15 @@ class _ToolsNamespace:
             copy=copy,
         )
 
+    def leiden(self, data, resolution: float = 1.0, **kwargs) -> None:
+        """Leiden clusters of the stored neighbour graph, written to ``obs``.
+
+        See :func:`crispyx.dimred.leiden`.
+        """
+        from .dimred import leiden as _leiden
+
+        return _leiden(data, resolution, **kwargs)
+
     def batch_process(
         self,
         data: str | Path | ad.AnnData,
@@ -961,6 +998,8 @@ class _ToolsNamespace:
             "nb-glm-test": "nb_glm",
         }
         normalised = method_map.get(method_key, method_key)
+        if normalised == "nb_glm" and control_label == REST:
+            raise ValueError("reference='rest' is for method='wilcoxon' and 't-test'; NB-GLM needs a control label")
         # The control, when not given, is inferred by the DE function itself,
         # so this call records the same arguments as a direct one and reuses
         # (and is reused by) its result.

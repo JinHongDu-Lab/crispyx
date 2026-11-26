@@ -9,7 +9,7 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Literal, Tuple, Union
+from typing import Dict, Iterable, Literal, Sequence, Tuple, Union
 
 import anndata as ad
 import h5py
@@ -26,11 +26,14 @@ from .data import (
     accepts_in_memory,
     h5ad_data_bytes,
     AnnData,
+    _detect_backed_sparse_format,
     _ensure_csr,
+    _open_matrix,
     _replace_on_success,
     check_sparse_layout,
     detect_gene_symbol_column,
     calculate_optimal_chunk_size,
+    calculate_optimal_gene_chunk_size,
     ensure_gene_symbol_column,
     get_matrix_storage_format,
     is_dense_storage,
@@ -39,10 +42,12 @@ from .data import (
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
+    resolve_path_to_update,
     write_filtered_subset,
     load_obs,
     load_var,
     write_obs,
+    write_var,
     filtered_sorting_metadata,
     perturbation_sort_order,
     sorting_metadata,
@@ -421,6 +426,274 @@ def filter_cells_by_gene_count(
     if return_counts:
         return mask, gene_counts_per_cell
     return mask
+
+
+def calculate_qc_metrics(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    qc_vars: str | Sequence[str] = (),
+    layer: str | None = None,
+    log1p: bool = True,
+    chunk_size: int | None = None,
+    inplace: bool = True,
+    verbose: int | bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Per-cell and per-gene QC metrics, in one pass over the matrix.
+
+    The metrics, names and values of :func:`scanpy.pp.calculate_qc_metrics`
+    with ``percent_top=None``, without reading the matrix into memory.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file of counts, or a crispyx AnnData / backed
+        anndata.AnnData (``inplace=False`` only).
+    qc_vars
+        Boolean ``var`` columns naming gene sets (e.g. a mitochondrial flag);
+        each adds ``total_counts_<name>`` and ``pct_counts_<name>`` to ``obs``.
+    layer
+        Use ``layers[layer]`` instead of ``X``.
+    log1p
+        Also add ``log1p_`` columns of the counts and totals.
+    chunk_size
+        Cells (genes, for a CSC matrix) per chunk; ``None`` sizes it to memory.
+    inplace
+        Write the columns into the file's ``obs`` and ``var`` and return
+        ``None`` (the default, unlike Scanpy's); ``False`` returns them.
+    verbose
+        Print progress.
+
+    Returns
+    -------
+    (obs_metrics, var_metrics) or None
+        ``obs``: ``n_genes_by_counts``, ``total_counts`` and, per gene set,
+        ``total_counts_<name>``, ``pct_counts_<name>`` (NaN for a cell
+        without counts). ``var``: ``n_cells_by_counts``, ``mean_counts``,
+        ``pct_dropout_by_counts``, ``total_counts``. Stored zeros are not
+        counted as detected.
+    """
+    path = resolve_path_to_update(data, "obs and var") if inplace else resolve_data_path(data)
+    _messages.print_reading(verbose, "pp.calculate_qc_metrics", path)
+    qc_vars = [qc_vars] if isinstance(qc_vars, str) else list(qc_vars)
+    var = load_var(path)
+    for name in qc_vars:
+        if name not in var.columns or not pd.api.types.is_bool_dtype(var[name]):
+            raise ValueError(f"qc_vars: {name!r} is not a boolean var column")
+    gene_sets = (
+        sp.csr_matrix(var[qc_vars].fillna(False).to_numpy(dtype=np.float64)) if qc_vars else None
+    )
+
+    backed = read_backed(path)
+    try:
+        matrix = backed.X if layer is None else backed.layers[layer]
+        n_obs, n_vars = matrix.shape
+        by_gene = _detect_backed_sparse_format(matrix) == "csc"
+        if chunk_size is None:
+            chunk_size = (calculate_optimal_gene_chunk_size if by_gene else calculate_optimal_chunk_size)(n_obs, n_vars)
+        cell_genes, cell_total = np.zeros(n_obs, dtype=np.int64), np.zeros(n_obs)
+        cell_sets = np.zeros((n_obs, len(qc_vars)))
+        gene_cells, gene_total = np.zeros(n_vars, dtype=np.int64), np.zeros(n_vars)
+        n_chunks = -(-(n_vars if by_gene else n_obs) // chunk_size)
+        with _create_progress_context(n_chunks, "QC metrics", verbose, unit="chunk") as bar:
+            for slc, block in iter_matrix_chunks(
+                backed, axis=int(by_gene), matrix=matrix, chunk_size=chunk_size, convert_to_dense=False,
+            ):
+                block = sp.csr_matrix(block, dtype=np.float64)
+                block.eliminate_zeros()
+                cells, genes = (slice(None), slc) if by_gene else (slc, slice(None))
+                cell_genes[cells] += np.diff(block.indptr)
+                cell_total[cells] += np.asarray(block.sum(axis=1)).ravel()
+                gene_cells[genes] += np.bincount(block.indices, minlength=block.shape[1])
+                gene_total[genes] += np.asarray(block.sum(axis=0)).ravel()
+                if gene_sets is not None:
+                    cell_sets[cells] += (block @ gene_sets[genes]).toarray()
+                bar.update(1)
+    finally:
+        backed.file.close()
+
+    obs_metrics = {"n_genes_by_counts": cell_genes, "total_counts": cell_total}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for j, name in enumerate(qc_vars):
+            obs_metrics[f"total_counts_{name}"] = cell_sets[:, j]
+            obs_metrics[f"pct_counts_{name}"] = 100 * cell_sets[:, j] / cell_total
+    var_metrics = {
+        "n_cells_by_counts": gene_cells,
+        "mean_counts": gene_total / n_obs,
+        "pct_dropout_by_counts": 100 * (1 - gene_cells / n_obs),
+        "total_counts": gene_total,
+    }
+    if log1p:
+        for metrics in (obs_metrics, var_metrics):
+            for name in [n for n in metrics if n.startswith(("n_genes", "total", "mean"))]:
+                metrics[f"log1p_{name}"] = np.log1p(metrics[name])
+    _messages.print_done(verbose, "pp.calculate_qc_metrics", f"{n_obs} cells, {n_vars} genes")
+
+    obs = load_obs(path)
+    if not inplace:
+        return pd.DataFrame(obs_metrics, index=obs.index), pd.DataFrame(var_metrics, index=var.index)
+    write_obs(path, obs.assign(**obs_metrics))
+    write_var(path, var.assign(**var_metrics))
+    return None
+
+
+def mad_outliers(
+    data: str | Path | AnnData | ad.AnnData | pd.DataFrame,
+    keys: str | Sequence[str],
+    *,
+    groupby: str | None = None,
+    nmads: float = 5.0,
+    side: Literal["both", "low", "high"] = "both",
+) -> pd.DataFrame:
+    """Flag cells more than ``nmads`` median absolute deviations from their group's median.
+
+    The adaptive QC rule of the scverse best practices, per sample when
+    ``groupby`` names one, so samples sequenced at different depths each get
+    their own thresholds.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, a crispyx AnnData / backed anndata.AnnData
+        (only ``obs`` is read), or an ``obs`` DataFrame.
+    keys
+        Numeric ``obs`` columns, e.g. ``log1p_total_counts`` and
+        ``pct_counts_mt`` from :func:`calculate_qc_metrics`.
+    groupby
+        ``obs`` column whose groups each get their own median and MAD;
+        ``None`` uses all cells as one group.
+    nmads
+        Number of MADs (unscaled: the median of ``|x - median|``).
+    side
+        Flag values below the median (``"low"``), above it (``"high"``) or
+        both.
+
+    Returns
+    -------
+    pd.DataFrame
+        One boolean column per key and side, ``<key>_low`` and/or
+        ``<key>_high``, indexed like ``obs``. A missing value is never
+        flagged; in a group whose MAD is 0, every value off the median is.
+        To keep them in the file, join them to its ``obs``:
+        ``cx.write_obs(path, cx.load_obs(path).join(flags))``.
+    """
+    if side not in ("both", "low", "high"):
+        raise ValueError(f"side must be 'both', 'low' or 'high'; received {side!r}")
+    obs = data if isinstance(data, pd.DataFrame) else load_obs(resolve_data_path(data))
+    keys = [keys] if isinstance(keys, str) else list(keys)
+    groups = pd.Series(0, index=obs.index) if groupby is None else obs[groupby]
+    if groups.isna().any():
+        raise ValueError(f"obs[{groupby!r}] has missing values")
+    flags = {}
+    for key in keys:
+        values = obs[key]
+        if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
+            raise TypeError(f"obs[{key!r}] is not numeric")
+        values = values.astype(np.float64)
+        median = values.groupby(groups, observed=True).transform("median")
+        limit = nmads * (values - median).abs().groupby(groups, observed=True).transform("median")
+        if side != "high":
+            flags[f"{key}_low"] = (median - values > limit).to_numpy()
+        if side != "low":
+            flags[f"{key}_high"] = (values - median > limit).to_numpy()
+    return pd.DataFrame(flags, index=obs.index)
+
+
+def _selected_rows(matrix, selected: np.ndarray) -> sp.csr_matrix:
+    """The rows of a backed ``matrix`` where ``selected`` is true, as CSR,
+    read in chunks on its fast axis: indexing a CSC dataset by rows would
+    read it whole into memory."""
+    n_obs, n_vars = matrix.shape
+    if _detect_backed_sparse_format(matrix) == "csc":
+        chunks = iter_matrix_chunks(
+            None, axis=1, matrix=matrix, chunk_size=calculate_optimal_gene_chunk_size(n_obs, n_vars),
+            convert_to_dense=False,
+        )
+        return sp.hstack([sp.csc_matrix(block)[selected] for _, block in chunks], format="csr")
+    chunks = iter_matrix_chunks(
+        None, axis=0, matrix=matrix, chunk_size=calculate_optimal_chunk_size(n_obs, n_vars),
+        convert_to_dense=False, selected=selected,
+    )
+    return sp.vstack([sp.csr_matrix(block[selected[slc]]) for slc, block in chunks], format="csr")
+
+
+def scrublet(
+    data: str | Path | AnnData | ad.AnnData,
+    *,
+    batch_key: str | None = None,
+    cell_mask: np.ndarray | None = None,
+    layer: str | None = None,
+    random_state: int = 0,
+    inplace: bool = True,
+    verbose: int | bool = True,
+    **scrublet_kwargs,
+) -> pd.DataFrame | None:
+    """Scrublet doublet scores, one batch in memory at a time.
+
+    Runs :func:`scanpy.pp.scrublet` on each batch's cells read from disk, so
+    the result is Scanpy's with the same ``batch_key``, but memory holds one
+    batch (and Scrublet's simulated doublets for it), never the file. A batch
+    is read a chunk at a time on the matrix's fast axis, so a CSC matrix is
+    read once per batch. The automatic threshold needs scikit-image:
+    ``pip install 'crispyx[scrublet]'``.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file of raw counts, or a crispyx AnnData / backed
+        anndata.AnnData (``inplace=False`` only).
+    batch_key
+        ``obs`` column of samples: doublets form within a sample, so each is
+        scored on its own. ``None`` scores all cells together.
+    cell_mask
+        Boolean array of the cells to score (e.g. those passing QC); others
+        get a NaN score and ``False``.
+    layer
+        Use ``layers[layer]`` instead of ``X``.
+    random_state
+        Random seed, as in Scanpy.
+    inplace
+        Write ``doublet_score`` and ``predicted_doublet`` to the file's
+        ``obs`` and return ``None``; ``False`` returns them.
+    verbose
+        Print progress.
+    **scrublet_kwargs
+        Passed to :func:`scanpy.pp.scrublet` (``expected_doublet_rate``,
+        ``threshold``, ...).
+
+    Returns
+    -------
+    pd.DataFrame or None
+        ``doublet_score`` and ``predicted_doublet``, indexed like ``obs``.
+    """
+    import scanpy as sc
+
+    path = resolve_path_to_update(data, "obs") if inplace else resolve_data_path(data)
+    _messages.print_reading(verbose, "pp.scrublet", path)
+    obs = load_obs(path)
+    used = np.ones(len(obs), dtype=bool) if cell_mask is None else np.asarray(cell_mask, dtype=bool)
+    if used.shape != (len(obs),):
+        raise ValueError(f"cell_mask must be a boolean array of length n_obs ({len(obs)})")
+    batches = np.zeros(len(obs), dtype=int) if batch_key is None else obs[batch_key].to_numpy()
+    if batch_key is not None and pd.isna(batches[used]).any():
+        raise ValueError(f"obs[{batch_key!r}] has missing values")
+    score, called = np.full(len(obs), np.nan), np.zeros(len(obs), dtype=bool)
+    with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
+        for batch in pd.unique(batches[used]):
+            selected = used & (batches == batch)
+            rows = np.flatnonzero(selected)
+            cells = ad.AnnData(_selected_rows(matrix, selected), obs=pd.DataFrame(index=obs.index[rows]))
+            sc.pp.scrublet(cells, random_state=random_state, verbose=False, **scrublet_kwargs)
+            # A cell Scrublet drops (under 3 genes) has no score and is not called.
+            score[rows] = cells.obs["doublet_score"].to_numpy(dtype=np.float64)
+            called[rows] = cells.obs["predicted_doublet"].fillna(False).to_numpy(dtype=bool)
+    result = pd.DataFrame({"doublet_score": score, "predicted_doublet": called}, index=obs.index)
+    _messages.print_done(
+        verbose, "pp.scrublet", f"{int(result['predicted_doublet'].sum())}/{int(used.sum())} cells called doublets",
+    )
+    if not inplace:
+        return result
+    write_obs(path, obs.assign(**result))
+    return None
 
 
 @accepts_in_memory
