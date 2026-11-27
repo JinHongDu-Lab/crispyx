@@ -4,7 +4,7 @@ Changelog
 Version 0.2.13
 --------------
 
-*Unreleased.* The rest of what a 20-sample single-cell dataset asked of crispyx: gene-set and cell-cycle scores, copy-number profiles along the genome, dot and violin plots that read only what they draw, and ``check_data`` without a perturbation column; an explicit ``memory_limit_gb`` now counts the memory the process already holds, and ``scrublet`` takes one.
+*Released 2026-11-27.* The rest of what a 20-sample single-cell dataset asked of crispyx: gene-set and cell-cycle scores, copy-number profiles along the genome, dot and violin plots that read only what they draw, and ``check_data`` without a perturbation column; an explicit ``memory_limit_gb`` now counts the memory the process already holds, and ``scrublet`` takes one.
 
 **Added**
 
