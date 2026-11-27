@@ -19,7 +19,7 @@ import scipy.sparse as sp
 from anndata.io import write_elem
 
 from . import _messages
-from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache
+from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache, release_freed_memory
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
@@ -686,6 +686,10 @@ def scrublet(
             # A cell Scrublet drops (under 3 genes) has no score and is not called.
             score[rows] = cells.obs["doublet_score"].to_numpy(dtype=np.float64)
             called[rows] = cells.obs["predicted_doublet"].fillna(False).to_numpy(dtype=bool)
+            # The next sample allocates arrays of other sizes, so it would
+            # grow from this one's freed memory rather than reuse it.
+            del cells
+            release_freed_memory()
     result = pd.DataFrame({"doublet_score": score, "predicted_doublet": called}, index=obs.index)
     _messages.print_done(
         verbose, "pp.scrublet", f"{int(result['predicted_doublet'].sum())}/{int(used.sum())} cells called doublets",

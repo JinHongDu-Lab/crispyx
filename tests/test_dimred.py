@@ -522,21 +522,6 @@ def test_pca_checks_the_scratch_directory_before_the_passes(tmp_path, monkeypatc
         tmp_path.chmod(0o755)
 
 
-def test_without_psutil_pca_assumes_16_gb_and_warns(monkeypatch, caplog):
-    """The shared resolver falls back to 64 GB, which would send a 33,000-gene
-    covariance fit onto a small machine; PCA keeps its own, smaller default."""
-    from crispyx import dimred
-
-    def no_psutil():
-        raise ImportError("psutil")
-
-    monkeypatch.setattr(dimred, "_detected_available_bytes", no_psutil)
-    monkeypatch.setattr(dimred, "_granted_bytes", lambda: None)
-    with caplog.at_level("WARNING", logger="crispyx.dimred"):
-        assert _pca_chunk_size(33_000, 50)[1] == "incremental"
-    assert "psutil is not installed" in caplog.text
-
-
 def test_progress_bars_follow_tqdm_disable(tmp_path):
     """HVG selection and PCA draw their bars through the shared helper, so
     TQDM_DISABLE silences them as it does every other crispyx bar. tqdm reads

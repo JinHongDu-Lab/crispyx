@@ -29,7 +29,7 @@ import scipy.sparse as sp
 from . import _messages
 from ._memory import (
     _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
-    _resolve_memory_limit_bytes, _resolve_n_jobs,
+    _resolve_memory_limit_bytes, _resolve_n_jobs, release_freed_memory,
 )
 from ._checkpoint import _create_progress_context, run_fingerprint
 from ._grouping import contiguous_ranges, label_strings
@@ -3983,14 +3983,7 @@ def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     these buffers past what the job may actually allocate.
     """
     if memory_limit_gb is None:
-        try:
-            memory_limit_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for the conversion buffer budget. "
-                "Install with: pip install psutil"
-            )
-            memory_limit_gb = 16.0
+        memory_limit_gb = _detected_available_bytes() / 1e9
     budget = 0.5 * float(memory_limit_gb) * 1e9
     cgroup_available = _cgroup_available_bytes()
     if cgroup_available is not None:
@@ -5028,6 +5021,7 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
         elif np.isinf(values).any():
             raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
         yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
+        del frame, values  # or the block stays while the next is parsed
 
 
 def _spilled_records(path: Path, record_dtype: np.dtype, count: int) -> Iterator[np.ndarray]:
@@ -5184,6 +5178,7 @@ def _read_mtx(
                             order = np.argsort(band_of, kind="stable")
                             records = records[order]
                             bounds = np.searchsorted(band_of[order], np.arange(len(bands) + 1))
+                            del band_of, order
                         else:
                             bounds = np.array([0, records.size])
                         for b in np.flatnonzero(np.diff(bounds)):
@@ -5193,6 +5188,9 @@ def _read_mtx(
                         pbar.update(done_mb - read_mb)
                         evict(((done_mb - read_mb) << 20) + records.nbytes)
                         read_mb = done_mb
+                        # Free this block before the next is parsed, and the
+                        # last one before the bands are written.
+                        del rows, cols, values, cells, genes, stored, records, bounds
                     pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
             if n_read != n_entries:
                 raise ValueError(
@@ -5200,6 +5198,9 @@ def _read_mtx(
                     "the file is truncated or was edited"
                 )
 
+            # Each band allocates arrays of its own size: without handing the
+            # freed parse blocks and bands back, the next band grows from them.
+            release_freed_memory()
             with h5py.File(partial, "w") as h5:
                 h5.attrs["encoding-type"], h5.attrs["encoding-version"] = "anndata", "0.1.0"
                 evict = _EvictEvery(partial, *bands)
@@ -5207,6 +5208,7 @@ def _read_mtx(
                     _append_mtx_band(h5, band, record_dtype, b * width, min(n_cells, (b + 1) * width), n_genes,
                                      band_items, evict, f"{name}: {path}")
                     band.unlink()
+                    release_freed_memory()
                 write_elem(h5, "obs", obs)
                 write_elem(h5, "var", var)
                 write_elem(h5, "uns", {})
@@ -5806,14 +5808,7 @@ def calculate_optimal_chunk_size(
     2000
     """
     if available_memory_gb is None:
-        try:
-            available_memory_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for chunk size calculation. "
-                "Install with: pip install psutil"
-            )
-            available_memory_gb = 16.0
+        available_memory_gb = _detected_available_bytes() / 1e9
     
     # Calculate chunk size based on memory
     # Each chunk uses approximately: chunk_size * n_vars * 8 bytes (float64)
@@ -5886,14 +5881,7 @@ def calculate_optimal_gene_chunk_size(
     64
     """
     if available_memory_gb is None:
-        try:
-            available_memory_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for chunk size calculation. "
-                "Install with: pip install psutil"
-            )
-            available_memory_gb = 16.0
+        available_memory_gb = _detected_available_bytes() / 1e9
     
     # Usable memory = fraction of available (default 50%)
     usable_memory_bytes = available_memory_gb * memory_fraction * 1e9
@@ -6019,14 +6007,7 @@ def calculate_wilcoxon_chunk_size(
     1378
     """
     if available_memory_gb is None:
-        try:
-            available_memory_gb = _detected_available_bytes() / 1e9
-        except ImportError:
-            logger.warning(
-                "psutil not installed, using default 16GB for Wilcoxon chunk size calculation. "
-                "Install with: pip install psutil"
-            )
-            available_memory_gb = 16.0
+        available_memory_gb = _detected_available_bytes() / 1e9
 
     _PER_CHUNK_BUDGET_FRACTION = 0.15
     per_chunk_budget = available_memory_gb * _PER_CHUNK_BUDGET_FRACTION * 1e9

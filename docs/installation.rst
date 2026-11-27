@@ -41,7 +41,7 @@ crispyx offers optional dependency groups for different use cases:
    # Testing dependencies (pytest, statsmodels, pydeseq2)
    pip install -e ".[test]"
 
-   # Benchmarking dependencies (pertpy, pyyaml, psutil)
+   # Benchmarking dependencies (pertpy, pyyaml)
    pip install -e ".[benchmark]"
 
    # Documentation dependencies (sphinx, nbsphinx, etc.)

@@ -183,6 +183,11 @@ B batches or strata, k principal components.
        12-byte records; O(n + g) names. The non-zeros are also written once
        to scratch files on disk.
      - Block size, band size
+   * - ``scrublet``
+     - One sample's cells, run through :func:`scanpy.pp.scrublet` in memory,
+       which copies them and scales a dense matrix for PCA: Scanpy's peak for
+       that sample, whatever the number of samples.
+     - No
    * - ``aggregate_pseudobulk``
      - P × g sums in a memory-mapped file on disk.
      - Chunk size
@@ -335,6 +340,15 @@ before the subset add the term above, which predicts 0.69 GB for the
 (measured 0.71 GB).
 ``neighbors`` measured 0.41 GB at 50,000 cells and 1.26 GB at 200,000;
 ``umap`` 0.27 GB and 1.17 GB.
+
+The peaks above are what crispyx allocates. The C allocator keeps memory a
+process frees for reuse, so resident memory can stay above them;
+``scrublet`` and the MatrixMarket readers hand it back to the system after
+each sample or band, since each allocates arrays of a new size. On macOS,
+pandas' parser buffers stay resident until the system is short of memory:
+at ``memory_limit_gb=1``, ``read_mtx`` peaked at 0.82 GB on a Linux server
+(40 million non-zeros) and at 1.7-1.9 GB on a Mac with 512 GB of memory
+(100 million).
 
 .. _disk-space:
 

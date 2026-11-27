@@ -1,6 +1,28 @@
 Changelog
 =========
 
+Version 0.2.12
+--------------
+
+*Released 2026-11-27.* Fixes from running a 20-sample single-cell dataset through crispyx: Scrublet's memory no longer grows from sample to sample, one-vs-rest markers are ranked as Scanpy ranks them, and psutil is a dependency.
+
+**Changed**
+
+* ``reference="rest"`` results rank each group's genes by score, up-regulated first, as Scanpy ranks markers (``RankGenesGroupsResult.order``, Scanpy's ``uns["rank_genes_groups"]``, ``cx.pl.rank_genes_groups_df`` and the plots); they were ranked by the score's magnitude, which put down-regulated genes among a cluster's markers. Results against a control label are still ranked by magnitude, since a perturbation's effects either way matter; Scanpy ranks those by score too.
+* DE results written by an earlier release are recomputed rather than reused (result layout 6), since a one-vs-rest result written with ``scanpy_format=True`` stores the old order.
+* psutil is a dependency (it was in the ``test`` and ``benchmark`` extras): every function sized from the memory it detects needs it. Without it, crispyx warned and assumed 16 GB (64 GB in some functions); that fallback is removed.
+
+**Fixed**
+
+* ``cx.pp.scrublet`` held about twice one sample's memory over many samples: the C allocator kept each sample's freed arrays, and the next sample, whose arrays have other sizes, grew past them. It hands freed memory back to the system after each sample (``malloc_trim`` on Linux, ``malloc_zone_pressure_relief`` on macOS), so the peak is one sample's Scanpy run: on 10 samples of 10,000 cells on a Mac, 9.1 GB, where it was 14.5 GB and one sample alone takes 8.7 GB. Scanpy's own run is not streamed, so ``scrublet`` takes no ``memory_limit_gb``.
+* ``cx.read_mtx`` and ``cx.read_10x_mtx`` drop each parsed block before the next and hand freed memory back after parsing and after each band (the last block was held while the bands were written), so resident memory no longer climbs from band to band (1.55 to 1.81 GB over five bands at ``memory_limit_gb=1`` on a Mac; 1.44 GB in each now). On macOS, pandas' parser buffers still stay resident until the system is short of memory, so a run there can exceed the budget; :ref:`memory-model` gives the measurements.
+* ``cx.pl.top_genes_bar`` keeps ``de_df``'s ranking and plots only ``group``'s rows; it re-sorted by score, so against a control it showed no down-regulated genes, and a table of several groups mixed them.
+
+**Documentation**
+
+* :ref:`one-vs-rest` says how markers are ranked, and that crispyx's Wilcoxon test corrects for ties by default where Scanpy does not (``tie_correct=True`` in Scanpy for the same p-values), which with many zeros lifts genes few cells express.
+* :ref:`memory-model` gains ``scrublet`` and how freed memory the allocator keeps shows in resident memory.
+
 Version 0.2.11
 --------------
 

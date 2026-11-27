@@ -111,6 +111,7 @@ from ._statistics import (
     _adjust_pvalue_matrix,
     _low_expr_in_both_mask,
     _nonestimable_glm_mask,
+    _rank_order,
 )
 from ._memory import (
     _estimate_max_workers,
@@ -230,27 +231,23 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
         return f"<{type(self).__name__} {self.key} {self.shape} {self.dtype} of {self.path}>"
 
 
-def _rank_order(statistics: np.ndarray) -> np.ndarray:
-    """Each row's gene positions by descending ``|statistic|``, untested
-    (non-finite) genes last, ties in gene order."""
-    magnitude = np.where(np.isfinite(statistics), np.abs(statistics), -np.inf)
-    return np.argsort(-magnitude, axis=-1, kind="mergesort")
-
-
 class _RankOrder(_ResultLayer):
-    """Scanpy's ``order``: :func:`_rank_order` of the statistics, computed for
-    the rows asked for rather than stored."""
+    """Each group's genes in ranked order (:func:`_rank_order` of the
+    statistics: by score against the rest, as Scanpy ranks, by magnitude
+    against a control, where Scanpy still ranks by score), computed for the
+    rows asked for rather than stored."""
 
-    def __init__(self, statistics: _ResultLayer) -> None:
+    def __init__(self, statistics: _ResultLayer, reference: str | None) -> None:
         self.path, self.key = statistics.path, statistics.key
         self.shape, self.dtype = statistics.shape, np.dtype(np.intp)
         self._statistics = statistics
+        self._reference = reference
 
     def __getitem__(self, key) -> np.ndarray:
         rows, columns = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
         if not _is_row_key(rows):
             return np.asarray(self)[key]
-        order = _rank_order(self._statistics[rows])
+        order = _rank_order(self._statistics[rows], reference=self._reference)
         return order[(Ellipsis, *columns)] if columns else order
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -318,8 +315,9 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
     Rows follow ``groups``. The matrices are read from the file on access
     (see :class:`_ResultLayer`): ``result.pvalues[i]`` and ``result[label]``
     read one perturbation's row, and ``np.asarray(result.pvalues)`` reads
-    the whole matrix. ``order`` is Scanpy's ranking by ``|statistics|``,
-    computed for the rows read.
+    the whole matrix. ``order`` ranks each row's genes by ``|statistics|``,
+    or by ``statistics`` (up-regulated first, as Scanpy's markers) when the
+    reference is ``"rest"``, computed for the rows read.
 
     ``logfoldchanges`` is the log2 fold change of mean expression for every
     method: for ``wilcoxon_test`` and ``t_test``,
@@ -354,7 +352,7 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             _ResultLayer(self.path, "layers/pts_rest") if per_group
             else np.broadcast_to(pts_rest, (len(self.groups), len(self.genes)))
         )
-        self.order = _RankOrder(self.statistics)
+        self.order = _RankOrder(self.statistics, self.control_label)
         self.result: AnnData | None = AnnData(self.path)
 
     @property
@@ -422,7 +420,8 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             ``'pts_rest'``, ``'full'``, and ``'u_stat'`` and ``'auc'`` when
             the method has them (``wilcoxon_test``).
             Each value (except ``'params'`` and ``'full'``) is a NumPy
-            record array sorted by descending absolute score.
+            record array sorted by descending absolute score, or by
+            descending score when the reference is ``"rest"``.
         """
         full = self.to_full_order_dict()
         order = np.asarray(self.order)
@@ -875,7 +874,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
     written however large the result is.
 
     Arrays are in full matrix order (groups x genes) under
-    ``uns/rank_genes_groups/full``, with Scanpy's ``order`` beside them. This
+    ``uns/rank_genes_groups/full``, with their :func:`_rank_order` beside them. This
     avoids the recarray format, which hits HDF5 header size limits at ~2000+
     groups.
     """
@@ -908,7 +907,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
             block = {name: handle[key][sl] for name, key in fields.items() if key is not None}
             if "pts_rest" not in block:
                 block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
-            block["order"] = _rank_order(block["scores"])
+            block["order"] = _rank_order(block["scores"], reference=params["reference"])
             for name, values in block.items():
                 target = rgg if name == "order" else full
                 if name not in target:

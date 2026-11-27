@@ -38,6 +38,7 @@ dependencies = [
     "numpy>=1.23",
     "numba>=0.59",
     "pandas>=1.5",
+    "psutil>=5.9",
     "scipy>=1.10",
     "h5py>=3.10",  # 3.9 segfaults copying committed (named) datatypes
     "joblib>=1.4",
@@ -59,13 +60,11 @@ test = [
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
-    "psutil>=5.9",
 ]
 benchmark = [
     "pertpy>=0.4",
     "pyyaml>=6.0",
     "tqdm>=4.66",
-    "psutil>=5.9",
 ]
 docs = [
     "sphinx>=6.0",

@@ -7,12 +7,14 @@ determining optimal batch sizes for parallel processing.
 from __future__ import annotations
 
 import functools
+import gc
 import logging
 import os
 import re
 from pathlib import Path
 
 import joblib
+import psutil
 
 from . import _messages
 
@@ -95,6 +97,43 @@ def drop_file_cache(path: str | Path) -> None:
             os.close(fd)
     except OSError:
         pass
+
+
+@functools.lru_cache(maxsize=None)
+def _allocator_release():
+    """The C allocator's call that hands freed memory back to the system:
+    glibc's ``malloc_trim(0)``, macOS's ``malloc_zone_pressure_relief(NULL, 0)``,
+    or ``None`` where there is none (musl, Windows)."""
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None)
+    except (OSError, TypeError):  # Windows has no process-wide namespace
+        return None
+    for name, argtypes, restype, args in (
+        ("malloc_trim", [ctypes.c_size_t], ctypes.c_int, (0,)),
+        ("malloc_zone_pressure_relief", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_size_t, (None, 0)),
+    ):
+        function = getattr(libc, name, None)
+        if function is not None:
+            function.argtypes, function.restype = argtypes, restype
+            return lambda: function(*args)
+    return None
+
+
+def release_freed_memory() -> None:
+    """Collect garbage and return the memory freed so far to the system.
+
+    Both glibc and macOS keep memory a process has freed, and a loop that
+    allocates a different set of large arrays each time (one sample after
+    another) grows its resident size from that kept memory rather than
+    reusing it: twenty Scrublet runs held about twice one run's peak. Call this
+    between such steps, once the previous step's arrays are dropped.
+    """
+    gc.collect()
+    release = _allocator_release()
+    if release is not None:
+        release()
 
 
 class _EvictEvery:
@@ -385,14 +424,7 @@ def _detected_available_bytes() -> float:
     (:func:`_granted_bytes`). Every crispyx auto-sizing path routes its
     host-memory reading through here so that none of them can budget from
     memory the job will not hand out.
-
-    Raises
-    ------
-    ImportError
-        When ``psutil`` is not installed, so callers keep their own default
-        and their own warning.
     """
-    import psutil
     available = float(psutil.virtual_memory().available)
     granted = _granted_bytes()
     if granted is not None:
@@ -404,7 +436,7 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     """Resolve the effective memory limit in bytes.
 
     If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
-    the system with ``psutil`` and fall back to 64 GB. Either way the result
+    the system with ``psutil``. Either way the result
     is capped by what the job will grant when that is known, so a budget can
     never exceed what the job may actually allocate -- see
     :func:`_granted_bytes`.
@@ -420,10 +452,7 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
         Memory budget in bytes.
     """
     if memory_limit_gb is None:
-        try:
-            return _detected_available_bytes()
-        except ImportError:
-            return 64 * 1e9  # conservative default
+        return _detected_available_bytes()
     budget = memory_limit_gb * 1e9
     granted = _granted_bytes()
     if granted is not None:
