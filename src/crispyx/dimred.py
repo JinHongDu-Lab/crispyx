@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     import anndata as AnnData
 
 from ._checkpoint import _create_progress_context
-from ._memory import _detected_available_bytes, _granted_bytes, _resolve_memory_limit_bytes
+from ._memory import _resolve_memory_limit_bytes
 from .data import (
     iter_matrix_chunks,
     load_obs,
@@ -80,23 +80,6 @@ def _pca_peak_bytes(
     return 50.0 * rows * n_vars + 32.0 * rows * rows + _PCA_OVERHEAD_BYTES + scores
 
 
-def _pca_budget(memory_limit_gb: float | None) -> float:
-    """``memory_limit_gb`` in bytes, or the memory detected. Without psutil
-    nothing is detected: assume 16 GB (capped by the job's grant when known)
-    and say so, rather than the shared resolver's 64 GB, which could send a
-    small machine into a covariance fit it cannot hold."""
-    if memory_limit_gb is not None:
-        return _resolve_memory_limit_bytes(memory_limit_gb)
-    try:
-        return _detected_available_bytes()
-    except ImportError:
-        granted = _granted_bytes()
-        budget = 16e9 if granted is None else min(16e9, granted)
-        logger.warning(
-            f"psutil is not installed, so PCA cannot detect the free memory and assumes "
-            f"{budget / 1e9:.0f} GB; pass memory_limit_gb, or install psutil."
-        )
-        return budget
 
 
 def _pca_chunk_size(
@@ -124,7 +107,7 @@ def _pca_chunk_size(
     """
     if method not in ("auto", *PCA_METHODS):
         raise ValueError(f"method must be 'auto', 'covariance' or 'incremental', got {method!r}")
-    budget = _pca_budget(memory_limit_gb)
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars
 

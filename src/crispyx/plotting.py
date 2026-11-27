@@ -24,6 +24,7 @@ from .data import (
     read_backed,
     resolve_data_path,
 )
+from .de import _rank_order
 from .qc import QualityControlResult
 
 logger = logging.getLogger(__name__)
@@ -319,7 +320,7 @@ def _materialize_rank_genes_groups_from_layers(
 
         for idx in group_indices:
             scores = rows["scores"](idx)
-            order = np.argsort(-np.abs(scores), kind="mergesort")
+            order = _rank_order(scores, reference=params.get("reference"))
             if n_genes is not None:
                 order = order[:n_genes]
             name_arrays.append(genes[order].astype(str))

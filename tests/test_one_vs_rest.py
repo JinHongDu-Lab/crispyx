@@ -73,6 +73,26 @@ def test_one_vs_rest_matches_scanpy(tmp_path, method, fmt):
     assert result.pts_rest[1][0] == 0 and result.statistics[1][0] > 3
 
 
+@pytest.mark.parametrize("scanpy_format", [False, True])
+def test_rest_ranks_up_regulated_genes_first(tmp_path, scanpy_format):
+    """Markers are ranked as Scanpy ranks them, by score rather than by its
+    magnitude, in the result, Scanpy's ``uns`` and the table read from either."""
+    adata = _clusters()
+    path = tmp_path / "clusters.h5ad"
+    adata.write_h5ad(path)
+    out = tmp_path / "markers.h5ad"
+    cx.wilcoxon_test(path, groupby="cluster", reference="rest", output_path=out, scanpy_format=scanpy_format,
+                     verbose=False, **NO_FILTERS)
+    result = RankGenesGroupsResult(out)
+    expected = adata.copy()
+    sc.tl.rank_genes_groups(expected, "cluster", reference="rest", method="wilcoxon", tie_correct=True)
+    for i, group in enumerate(result.groups):
+        # Scanpy also ranks the gene no cell expresses (score 0); crispyx puts it last, untested.
+        want = [name for name in expected.uns["rank_genes_groups"]["names"][group] if name != "g29"] + ["g29"]
+        assert result.genes[np.asarray(result.order[i])].tolist() == want
+        assert cx.pl.rank_genes_groups_df(out, group=group)["names"].tolist() == want
+
+
 def test_rest_includes_groups_not_tested(tmp_path):
     adata = _clusters()
     path = tmp_path / "clusters.h5ad"

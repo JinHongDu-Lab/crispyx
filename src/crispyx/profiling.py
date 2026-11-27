@@ -40,6 +40,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
+import psutil
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["Profiler", "TimingProfiler", "MemoryProfiler"]
@@ -217,17 +219,7 @@ class Profiler:
     
     def _get_rss_mb(self) -> float:
         """Get current process RSS in MB."""
-        try:
-            import psutil
-            return psutil.Process().memory_info().rss / 1024 / 1024
-        except ImportError:
-            # Fallback for systems without psutil
-            try:
-                import resource
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB on Linux
-            except ImportError:
-                logger.warning("Neither psutil nor resource available for RSS measurement")
-                return 0.0
+        return psutil.Process().memory_info().rss / 1024 / 1024
     
     def reset_peak(self) -> None:
         """Reset peak memory tracking to current memory level.
