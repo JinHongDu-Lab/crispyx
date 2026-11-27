@@ -1,6 +1,29 @@
 Changelog
 =========
 
+Version 0.2.13
+--------------
+
+*Unreleased.* The rest of what a 20-sample single-cell dataset asked of crispyx: gene-set and cell-cycle scores, copy-number profiles along the genome, dot and violin plots that read only what they draw, and ``check_data`` without a perturbation column; an explicit ``memory_limit_gb`` now counts the memory the process already holds, and ``scrublet`` takes one.
+
+**Added**
+
+* ``cx.tl.score_genes`` and ``cx.tl.score_genes_cell_cycle``: Scanpy's gene-set scores (Seurat's method: a set's mean less that of reference genes drawn from bins of matched expression) and cell-cycle phase, with Scanpy's arguments and defaults, in two passes over the file whatever the number of sets: the genes' means, then each cell's mean over the scored and reference genes (on CSC only the gene blocks that hold them). Equal to Scanpy's on float64 data; crispyx sums the genes' means in float64 where Scanpy sums float32 data in float32, so on float32 data a gene at a bin's edge can change bins and the reference genes drawn after it differ. The draw is seeded without touching NumPy's global state, and a listed gene outside ``gene_pool`` raises ``ValueError`` (Scanpy raises ``KeyError``).
+* ``cx.tl.infercnv``: copy-number profiles of cells, infercnvpy's ``tl.infercnv`` with its arguments and defaults, streamed: the reference means, the standard deviation and the profiles each take one pass over the matrix a chunk of cells at a time (sized from ``memory_limit_gb``), and the profiles go to ``obsm["X_<key_added>"]`` (CSR) and each chromosome's first window to ``uns[key_added]["chr_pos"]``. The running means are one sparse product with a genes x windows weight matrix. infercnvpy zeroes values under ``dynamic_threshold`` standard deviations taken within each chunk of 5,000 cells; crispyx takes them over all cells, so its result does not depend on the chunk size and equals infercnvpy's when infercnvpy holds every cell in one chunk. Per-gene values (``calculate_gene_values``) are not computed.
+* ``cx.pp.genomic_position_from_gtf``: each gene's ``chromosome``, ``start`` and ``end`` in ``var`` from a GTF file (plain or gzipped, read a block of lines at a time), matched on ``gene_name`` or ``gene_id`` as infercnvpy's ``io.genomic_position_from_gtf`` matches them, without its gtfparse dependency; Ensembl versions are ignored on both sides, a key on several GTF records is left unplaced, ``chr`` is prefixed when the GTF has none and Ensembl's ``MT`` becomes ``chrM``. Only the three columns are added.
+* ``cx.pl.dotplot`` and ``cx.pl.violin`` (``cx.plot_dotplot``, ``cx.plot_violin``): :func:`scanpy.pl.dotplot` and :func:`scanpy.pl.violin` on the listed genes and ``obs`` columns alone, read from the file (the genes' values for every cell on the matrix's fast axis), so every Scanpy option works and memory holds those genes, never ``X``.
+* ``memory_limit_gb`` in ``cx.pp.scrublet``: before each sample is scored, Scanpy's peak for it is estimated from Scrublet's own gene selection (its first steps, run on the sample: 0.7 s of a 32 s run at 10,000 cells), and a sample over the budget raises ``MemoryError`` naming it rather than the job being killed part way. The estimate, 0.5 GB + 60 bytes per non-zero + 40 bytes per entry of the selected genes for the cells and their simulated doublets, was fitted on samples of 2,000-20,000 cells, within 25% of the measured peak (4.6 GB estimated, 4.2-4.5 GB measured, at 10,000 cells and 1,933 selected genes).
+* ``cx.pp.check_data`` without ``perturbation_column``: a file that is not a screen gets the gene and count checks alone. Every file is also checked for copies of a gene made unique with a ``_k`` or ``.k`` suffix (R's ``make.unique``) as well as ``-k``, and for no mitochondrial gene (``MT-`` or ``mt-``) among the names or the symbol column, so that a mitochondrial fraction would be 0 for every cell; the symbol column is detected when ``gene_name_column`` is not given.
+
+**Changed**
+
+* An explicit ``memory_limit_gb`` is the process's limit, as the job's ``--mem`` it stands for: the budgets crispyx sizes from it leave out the memory the process holds when a call starts (Python and the libraries crispyx imports, 0.3-0.4 GB, and any data the caller has loaded), as the detected memory already does. That covers format conversions, the MatrixMarket and text readers' blocks and bands, ``qc_summary``'s in-memory switch, PCA, the NB tests' worker counts and blocks, ``shrink_lfc``'s cache, pseudo-bulk, ``residual_effects``' check, ``batch_process``'s accumulators, ``scrublet`` and ``infercnv``. The limit was taken as the call's own budget, so a run peaked above it by what the process held: ``cx.read_10x_mtx`` at ``memory_limit_gb=1`` peaked at 1.33-1.39 GB on a Mac (40 million non-zeros) and now at 1.01-1.10 GB, the rest being pandas' parser buffers that macOS keeps resident. The cell and gene chunks of the t-test, the Wilcoxon test and pseudo-bulk (``calculate_optimal_chunk_size``, ``calculate_wilcoxon_chunk_size``) still take their share of the limit as given (at most 15%), since a resumable run is identified by its chunk size; memory settings are otherwise not part of a run's identity, so runs resume as before.
+* The Wilcoxon test keeps ``tie_correct=True`` by default; its docstring and :ref:`one-vs-rest` say to pass ``tie_correct=False`` for Scanpy's markers.
+
+**Documentation**
+
+* :doc:`quality_control` gains "Gene-set scores and cell-cycle phase" and "Copy-number profiles", and shows ``cx.pl.violin``, ``cx.pl.dotplot`` and ``check_data`` on a file without perturbations; :ref:`memory-model` gains the new functions, Scrublet's estimate, and what an explicit limit counts. ``basics_2_qc_embedding`` shows the new functions on the bundled screen.
+
 Version 0.2.12
 --------------
 

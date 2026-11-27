@@ -432,28 +432,34 @@ def _detected_available_bytes() -> float:
     return available
 
 
-def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
-    """Resolve the effective memory limit in bytes.
+def _resident_bytes() -> int:
+    """The resident memory of this process, in bytes."""
+    return psutil.Process().memory_info().rss
 
-    If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
-    the system with ``psutil``. Either way the result
-    is capped by what the job will grant when that is known, so a budget can
-    never exceed what the job may actually allocate -- see
-    :func:`_granted_bytes`.
+
+def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
+    """The bytes a call may still allocate, in bytes.
+
+    *memory_limit_gb* is the limit on the whole process, as a job's
+    ``--mem`` is: what the process already holds (the interpreter, imported
+    libraries, the caller's own data) is taken off it, as the detected
+    memory (``None``) already leaves it out. Either way the result is capped
+    by what the job will grant when that is known, so a budget can never
+    exceed what the job may actually allocate -- see :func:`_granted_bytes`.
 
     Parameters
     ----------
     memory_limit_gb
-        Explicit memory limit in gigabytes, or ``None`` for auto-detect.
+        Memory limit of the process in gigabytes, or ``None`` for auto-detect.
 
     Returns
     -------
     float
-        Memory budget in bytes.
+        Memory budget in bytes; 0 when the process already holds the limit.
     """
     if memory_limit_gb is None:
         return _detected_available_bytes()
-    budget = memory_limit_gb * 1e9
+    budget = max(0.0, memory_limit_gb * 1e9 - _resident_bytes())
     granted = _granted_bytes()
     if granted is not None:
         budget = min(budget, granted)

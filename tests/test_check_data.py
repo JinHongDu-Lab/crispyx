@@ -17,7 +17,7 @@ from crispyx.data import normalise_perturbation_labels
 
 def _write(path: Path, labels, *, genes=None, n_counts=True, x=None) -> Path:
     n = len(labels)
-    genes = genes if genes is not None else ["NKX2-5", "GATA4", "TBX5", "HLA-B", "CTRL", "MYH6"]
+    genes = genes if genes is not None else ["NKX2-5", "GATA4", "TBX5", "HLA-B", "CTRL", "MYH6", "MT-CO1"]
     rng = np.random.default_rng(0)
     counts = rng.poisson(2.0, (n, len(genes))).astype(np.float32) if x is None else x
     obs = pd.DataFrame({"perturbation": labels}, index=[f"c{i}" for i in range(n)])
@@ -136,7 +136,7 @@ def test_split_genes_are_reported(tmp_path):
     var.index = ["NKX2-5", "NKX2-5-1", "GATA4", "GATA4-1", "GATA4-2", "MYH6"]
     cx.write_var(path, var)
     warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", verbose=False), "warning")
-    assert any("3 var_names look like var_names_make_unique suffixes" in m and "'NKX2-5-1'" in m for m in warnings)
+    assert any("3 var_names look like copies of other var_names made unique" in m and "'NKX2-5-1'" in m for m in warnings)
     assert not any("_PAR_Y" in m for m in warnings)
 
 
@@ -199,3 +199,33 @@ def test_a_csc_file_is_sampled_by_gene_window(tmp_path, monkeypatch):
     ad.AnnData(sp.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=genes)).write(tmp_path / "csr.h5ad")
     issues = cx.pp.check_data(tmp_path / "csr.h5ad", perturbation_column="perturbation", verbose=False)
     assert any("row sum above" in e for e in _messages(issues, "error"))
+
+
+def test_a_file_without_perturbations_gets_the_gene_and_count_checks(tmp_path):
+    """No perturbation column: no label checks, every gene and count check."""
+    genes = ["GATA4", "GATA4_1", "TBX5", "TBX5.1", "MYH6", "MT-CO1"]
+    x = np.random.default_rng(0).poisson(2.0, (12, len(genes))).astype(np.float32)
+    x[0, 0] = 0.5
+    path = _write(tmp_path / "cohort.h5ad", ["S1", "S2"] * 6, genes=genes, x=x)
+    issues = cx.pp.check_data(path, verbose=False)
+    assert _messages(issues, "error") == []
+    warnings = _messages(issues, "warning")
+    assert any("2 var_names look like copies" in m and "'GATA4_1', 'TBX5.1'" in m for m in warnings)
+    assert any("does not hold integer counts" in m for m in warnings)
+    assert not any("label" in m or "mitochondrial" in m for m in warnings)
+
+
+def test_no_mitochondrial_gene_is_reported(tmp_path):
+    genes = ["ENSG00000136574", "ENSG00000089225", "ENSG00000198804"]
+    path = _write(tmp_path / "x.h5ad", ["a", "b"] * 6, genes=genes)
+    warnings = _messages(cx.pp.check_data(path, verbose=False), "warning")
+    assert any("no mitochondrial gene" in m for m in warnings)
+    # The symbols are in a column of var, found without being named.
+    var = cx.load_var(path)
+    var["gene_symbols"] = ["GATA4", "TBX5", "MT-CO1"]
+    cx.write_var(path, var)
+    warnings = _messages(cx.pp.check_data(path, verbose=False), "warning")
+    assert not any("mitochondrial" in m for m in warnings)
+    var["gene_symbols"] = ["GATA4", "TBX5", "mt-Co1"]  # mouse
+    cx.write_var(path, var)
+    assert not any("mitochondrial" in m for m in _messages(cx.pp.check_data(path, verbose=False), "warning"))

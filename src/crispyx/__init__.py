@@ -83,6 +83,8 @@ from .plotting import (
     plot_qc_summary,
     plot_top_genes_bar,
     plot_umap,
+    plot_dotplot,
+    plot_violin,
     plot_volcano,
     rank_genes_groups_df,
 )
@@ -218,6 +220,8 @@ __all__ = [
     "plot_pca_variance_ratio",
     "plot_pca_loadings",
     "plot_umap",
+    "plot_dotplot",
+    "plot_violin",
     "plot_volcano",
     "plot_ma",
     "plot_top_genes_bar",

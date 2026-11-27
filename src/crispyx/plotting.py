@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Mapping, Sequence
 
 import anndata as ad
 import h5py
@@ -19,7 +19,11 @@ import scipy.sparse as sp
 from .data import (
     AnnData,
     OverlapResult,
+    _open_matrix,
+    _selected_columns,
     iter_matrix_chunks,
+    load_obs,
+    load_var,
     normalize_total_block,
     read_backed,
     resolve_data_path,
@@ -1351,6 +1355,133 @@ def plot_umap(
         return_fig=return_fig,
         **kwargs,
     )
+
+
+def _plot_adata(
+    data: PlotInput, genes: Sequence[str], obs_keys: Sequence[str], *, layer: str | None, gene_symbols: str | None,
+) -> ad.AnnData:
+    """An in-memory AnnData of ``genes`` (``var_names``, or values of
+    ``var[gene_symbols]``) and the ``obs_keys`` columns alone, read from the
+    file: what a Scanpy plot of them reads, the rest of ``X`` left on disk.
+    ``layer``'s values become ``X``."""
+    path = _resolve_path(data)
+    obs, var = load_obs(path), load_var(path)
+    names = pd.Index((var[gene_symbols] if gene_symbols else var.index).astype(str))
+    genes = pd.Index(dict.fromkeys(map(str, genes)), dtype=object)
+    missing = genes.difference(names, sort=False)
+    if len(missing):
+        where = f"var[{gene_symbols!r}]" if gene_symbols else "var_names"
+        raise KeyError(f"not in {where}: {', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}")
+    absent = [key for key in obs_keys if key not in obs.columns]
+    if absent:
+        raise KeyError(f"obs has no column {', '.join(map(repr, absent))}")
+    first = ~names.duplicated()  # a repeated symbol: its first row, as Scanpy takes
+    columns = pd.Series(np.flatnonzero(first), index=names[first])[genes].to_numpy()
+    if len(columns):
+        with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
+            X = _selected_columns(matrix, columns)
+    else:
+        X = sp.csr_matrix((len(obs), 0), dtype=np.float32)
+    return ad.AnnData(X, obs=obs[list(dict.fromkeys(obs_keys))], var=var.iloc[columns])
+
+
+def _in_memory(data: PlotInput) -> bool:
+    return isinstance(data, ad.AnnData) and not data.isbacked
+
+
+def plot_dotplot(
+    data: PlotInput,
+    var_names: str | Sequence[str] | Mapping[str, str | Sequence[str]],
+    groupby: str | Sequence[str],
+    *,
+    layer: str | None = None,
+    gene_symbols: str | None = None,
+    **kwargs,
+):
+    """Dot plot of ``var_names`` by ``groupby`` (:func:`scanpy.pl.dotplot`),
+    reading only those genes and ``obs`` columns from disk.
+
+    A dot's size is the fraction of a group's cells that express the gene,
+    its colour their mean expression. The genes' values for every cell are
+    read on the matrix's fast axis (on CSC, only the gene blocks that hold
+    them), so memory holds those genes, never ``X``.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, a crispyx AnnData or a backed anndata.AnnData
+        (an in-memory AnnData is passed to Scanpy as it is).
+    var_names
+        Genes, or ``{label: genes}`` to bracket groups of genes, as in Scanpy.
+    groupby
+        ``obs`` column(s) of the groups.
+    layer
+        Plot ``layers[layer]`` instead of ``X``.
+    gene_symbols
+        ``var`` column whose values ``var_names`` are, as in Scanpy.
+    **kwargs
+        Passed to :func:`scanpy.pl.dotplot` (``standard_scale``,
+        ``expression_cutoff``, ``show``, ``return_fig`` ...).
+
+    Returns
+    -------
+    What :func:`scanpy.pl.dotplot` returns.
+    """
+    import scanpy as sc
+
+    if _in_memory(data):
+        return sc.pl.dotplot(data, var_names, groupby, layer=layer, gene_symbols=gene_symbols, **kwargs)
+    if isinstance(var_names, Mapping):
+        genes = [g for group in var_names.values() for g in ([group] if isinstance(group, str) else group)]
+    else:
+        genes = [var_names] if isinstance(var_names, str) else list(var_names)
+    keys = [groupby] if isinstance(groupby, str) else list(groupby)
+    adata = _plot_adata(data, genes, keys, layer=layer, gene_symbols=gene_symbols)
+    return sc.pl.dotplot(adata, var_names, groupby, gene_symbols=gene_symbols, **kwargs)
+
+
+def plot_violin(
+    data: PlotInput,
+    keys: str | Sequence[str],
+    groupby: str | None = None,
+    *,
+    layer: str | None = None,
+    **kwargs,
+):
+    """Violin plots of genes or ``obs`` columns (:func:`scanpy.pl.violin`),
+    reading only those genes and columns from disk.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, a crispyx AnnData or a backed anndata.AnnData
+        (an in-memory AnnData is passed to Scanpy as it is).
+    keys
+        ``obs`` columns (e.g. ``n_genes_by_counts``, ``pct_counts_mt``) or
+        genes in ``var_names``; an ``obs`` column wins over a gene of the
+        same name.
+    groupby
+        ``obs`` column to split the violins by.
+    layer
+        Plot ``layers[layer]`` instead of ``X`` for genes.
+    **kwargs
+        Passed to :func:`scanpy.pl.violin` (``stripplot``, ``multi_panel``,
+        ``rotation``, ``show`` ...).
+
+    Returns
+    -------
+    What :func:`scanpy.pl.violin` returns.
+    """
+    import scanpy as sc
+
+    if _in_memory(data):
+        return sc.pl.violin(data, keys, groupby, layer=layer, **kwargs)
+    keys = [keys] if isinstance(keys, str) else list(keys)
+    obs_columns = load_obs(_resolve_path(data)).columns
+    genes = [key for key in keys if key not in obs_columns]
+    obs_keys = [key for key in keys if key in obs_columns] + ([groupby] if groupby is not None else [])
+    adata = _plot_adata(data, genes, obs_keys, layer=layer, gene_symbols=None)
+    return sc.pl.violin(adata, keys, groupby, **kwargs)
 
 
 # =============================================================================

@@ -6,6 +6,12 @@ import pytest
 import scanpy as sc
 import scipy.sparse as sp
 import anndata as ad
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+import crispyx as cx  # noqa: E402
 
 from crispyx import t_test
 from crispyx.plotting import (
@@ -163,4 +169,55 @@ def test_plot_overlap_heatmap_uses_the_given_axes_and_title():
     _, provided = plt.subplots()
     assert plot_overlap_heatmap(_overlap(), ax=provided, title="My Title") is provided
     assert provided.get_title() == "My Title"
+    plt.close("all")
+
+
+def _cohort(tmp_path, fmt: str = "csr"):
+    rng = np.random.default_rng(0)
+    n, g = 300, 40
+    X = np.log1p(rng.poisson(rng.gamma(0.5, 1.0, g), (n, g)) * rng.uniform(0.5, 1.5, (n, 1)))
+    obs = pd.DataFrame({"cluster": pd.Categorical(rng.choice(["a", "b", "c"], n)),
+                        "pct_counts_mt": rng.uniform(0, 20, n)}, index=[f"c{i}" for i in range(n)])
+    var = pd.DataFrame({"symbol": [f"S{j}" for j in range(g)]}, index=[f"g{j}" for j in range(g)])
+    adata = ad.AnnData(sp.csr_matrix(X), obs=obs, var=var)
+    stored = adata.copy()
+    if fmt != "csr":
+        stored.X = X if fmt == "dense" else sp.csc_matrix(X)
+    path = tmp_path / f"cohort_{fmt}.h5ad"
+    stored.write_h5ad(path)
+    return path, adata
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
+def test_plot_data_holds_only_the_listed_genes(tmp_path, fmt):
+    from crispyx.plotting import _plot_adata
+
+    path, adata = _cohort(tmp_path, fmt)
+    got = _plot_adata(path, ["g7", "g2", "g7", "g30"], ["cluster"], layer=None, gene_symbols=None)
+    assert got.var_names.tolist() == ["g7", "g2", "g30"] and got.obs.columns.tolist() == ["cluster"]
+    np.testing.assert_allclose(got.X.toarray(), adata[:, ["g7", "g2", "g30"]].X.toarray())
+    by_symbol = _plot_adata(path, ["S30"], [], layer=None, gene_symbols="symbol")
+    np.testing.assert_allclose(by_symbol.X.toarray(), adata[:, ["g30"]].X.toarray())
+    with pytest.raises(KeyError, match="not in var_names: nope"):
+        _plot_adata(path, ["g1", "nope"], [], layer=None, gene_symbols=None)
+
+
+def test_dotplot_matches_scanpy(tmp_path):
+    path, adata = _cohort(tmp_path, "csc")
+    genes = {"first": ["g1", "g5"], "second": ["g9"]}
+    expected = sc.pl.dotplot(adata, genes, "cluster", standard_scale="var", return_fig=True, show=False)
+    got = cx.pl.dotplot(path, genes, "cluster", standard_scale="var", return_fig=True, show=False)
+    pd.testing.assert_frame_equal(got.dot_size_df, expected.dot_size_df)
+    pd.testing.assert_frame_equal(got.dot_color_df, expected.dot_color_df)
+    by_symbol = cx.pl.dotplot(path, ["S1"], "cluster", gene_symbols="symbol", return_fig=True, show=False)
+    assert by_symbol.dot_size_df.columns.tolist() == ["S1"]
+    plt.close("all")
+
+
+def test_violin_reads_genes_and_obs_columns(tmp_path):
+    path, adata = _cohort(tmp_path)
+    axes = cx.pl.violin(path, ["g3", "pct_counts_mt"], "cluster", show=False, stripplot=False)
+    assert axes is not None
+    with pytest.raises(KeyError, match="not in var_names: nope"):
+        cx.pl.violin(path, ["nope"], show=False)
     plt.close("all")

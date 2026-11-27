@@ -4159,7 +4159,10 @@ def wilcoxon_test(
         values stream more, reducing peak memory at the cost of additional I/O.
     tie_correct
         Whether to apply tie correction to the U statistic. Default True for
-        more accurate p-values when ties are present in the data.
+        more accurate p-values when ties are present in the data. Scanpy's
+        default is False: its markers' scores and order are crispyx's with
+        ``tie_correct=False``, since correcting for the many tied zeros lifts
+        genes that few cells express.
     distribution
         The rank-sum test's null distribution. ``"normal"`` (default) is the
         normal approximation, as in Scanpy. It fails where few cells

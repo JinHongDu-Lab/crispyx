@@ -623,6 +623,7 @@ def scrublet(
     cell_mask: np.ndarray | None = None,
     layer: str | None = None,
     random_state: int = 0,
+    memory_limit_gb: float | None = None,
     inplace: bool = True,
     verbose: int | bool = True,
     **scrublet_kwargs,
@@ -635,6 +636,12 @@ def scrublet(
     is read a chunk at a time on the matrix's fast axis, so a CSC matrix is
     read once per batch. The automatic threshold needs scikit-image:
     ``pip install 'crispyx[scrublet]'``.
+
+    Scanpy's run is not streamed: it z-scores the selected genes of the
+    batch's cells and their simulated doublets densely. Before each batch is
+    scored, its peak is estimated from Scrublet's own gene selection and a
+    batch over ``memory_limit_gb`` raises ``MemoryError``, rather than the
+    job being killed part way.
 
     Parameters
     ----------
@@ -651,6 +658,10 @@ def scrublet(
         Use ``layers[layer]`` instead of ``X``.
     random_state
         Random seed, as in Scanpy.
+    memory_limit_gb
+        Memory limit of the process in GB (a job's ``--mem``); ``None``
+        uses the memory detected as available. A batch whose estimated peak
+        exceeds what is left of it raises ``MemoryError`` before Scanpy runs.
     inplace
         Write ``doublet_score`` and ``predicted_doublet`` to the file's
         ``obs`` and return ``None``; ``False`` returns them.
@@ -677,11 +688,21 @@ def scrublet(
     if batch_key is not None and pd.isna(batches[used]).any():
         raise ValueError(f"obs[{batch_key!r}] has missing values")
     score, called = np.full(len(obs), np.nan), np.zeros(len(obs), dtype=bool)
+    budget = _resolve_memory_limit_bytes(memory_limit_gb)
     with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
         for batch in pd.unique(batches[used]):
             selected = used & (batches == batch)
             rows = np.flatnonzero(selected)
             cells = ad.AnnData(_selected_rows(matrix, selected), obs=pd.DataFrame(index=obs.index[rows]))
+            needed, n_genes = _scrublet_peak_bytes(cells, scrublet_kwargs)
+            if needed > budget:
+                where = "" if batch_key is None else f"{batch_key} {batch!r}: "
+                raise MemoryError(
+                    f"pp.scrublet: {where}{cells.n_obs:,} cells with {n_genes:,} selected genes need about "
+                    f"{needed / 1e9:.1f} GB in scanpy.pp.scrublet, which holds them densely; "
+                    f"{budget / 1e9:.1f} GB is available. Raise memory_limit_gb, or score fewer cells at a "
+                    "time (a finer batch_key, such as the capture lane, since doublets form within one)."
+                )
             sc.pp.scrublet(cells, random_state=random_state, verbose=False, **scrublet_kwargs)
             # A cell Scrublet drops (under 3 genes) has no score and is not called.
             score[rows] = cells.obs["doublet_score"].to_numpy(dtype=np.float64)
@@ -698,6 +719,41 @@ def scrublet(
         return result
     write_obs(path, obs.assign(**result))
     return None
+
+
+#: Peak of :func:`scanpy.pp.scrublet` above the process before it, fitted on
+#: simulated samples of 2,000-20,000 cells (every estimate within 25%): a
+#: fixed part, per stored count (the copies of the counts and their
+#: normalised layers) and per entry of the selected genes held densely for
+#: the observed cells and simulated doublets (float64 copies while
+#: z-scoring, then a sparse copy of the dense result).
+_SCRUBLET_FIXED_BYTES = 0.5e9
+_SCRUBLET_BYTES_PER_NONZERO = 60
+_SCRUBLET_BYTES_PER_DENSE = 40
+
+
+def _scrublet_peak_bytes(cells: ad.AnnData, scrublet_kwargs: dict) -> tuple[float, int]:
+    """Estimated peak of :func:`scanpy.pp.scrublet` on ``cells`` with
+    ``scrublet_kwargs``, and the number of genes it selects: Scrublet's own
+    gene selection (its first steps, run on a copy), since its dense matrices
+    are cells x selected genes."""
+    import scanpy as sc
+
+    probe = cells.copy()
+    sc.pp.filter_genes(probe, min_cells=3)
+    sc.pp.filter_cells(probe, min_genes=3)
+    sc.pp.normalize_total(probe)
+    sc.pp.log1p(probe)
+    sc.pp.highly_variable_genes(probe)
+    n_cells, n_genes = probe.n_obs, int(probe.var["highly_variable"].sum())
+    del probe
+    release_freed_memory()
+    dense = 0
+    if scrublet_kwargs.get("mean_center", True):
+        dense = (1 + scrublet_kwargs.get("sim_doublet_ratio", 2.0)) * n_cells * n_genes
+    nnz = cells.X.nnz if sp.issparse(cells.X) else np.count_nonzero(cells.X)
+    needed = _SCRUBLET_FIXED_BYTES + _SCRUBLET_BYTES_PER_NONZERO * nnz + _SCRUBLET_BYTES_PER_DENSE * dense
+    return needed, n_genes
 
 
 @accepts_in_memory
@@ -2609,10 +2665,14 @@ def _examples(values, k: int = 5) -> str:
     return shown + (", ..." if len(values) > k else "")
 
 
+#: Mitochondrial gene symbols, human (``MT-``) and mouse (``mt-``).
+_MITO_PREFIX = r"^(MT|mt|Mt)-"
+
+
 def check_perturbation_data(
     data: "str | Path | ad.AnnData | AnnData",
     *,
-    perturbation_column: str,
+    perturbation_column: str | None = None,
     control_label: str | None = None,
     gene_name_column: str | None = None,
     n_counts_column: str | None = None,
@@ -2620,13 +2680,13 @@ def check_perturbation_data(
     window_size: int = 256,
     verbose: int | bool = True,
 ) -> list[Issue]:
-    """Check a perturbation screen's file for the mistakes that mislead an
-    analysis without making it fail.
+    """Check a single-cell file, a perturbation screen's or not, for the
+    mistakes that mislead an analysis without making it fail.
 
     Reads ``obs``, ``var`` and ``sample_windows`` evenly spaced blocks of
     ``window_size`` rows of ``X``, never the whole matrix. Each check catches a
-    mistake that has happened in practice when a published screen was
-    prepared:
+    mistake that has happened in practice when a published dataset was
+    prepared. With a ``perturbation_column``, its labels:
 
     * a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP``,
       ``safe-targeting`` ...) left as a perturbation beside the control label,
@@ -2638,9 +2698,17 @@ def check_perturbation_data(
       first hyphen (``NKX2-5`` to ``NKX2``);
     * labels missing from ``var`` (targets not measured; expected for a
       non-coding library, a sign of a renamed gene otherwise);
-    * cells without a label; no cell with the control label;
+    * cells without a label; no cell with the control label.
+
+    In every file, the genes and counts:
+
     * duplicate gene names, gene names that are Ensembl IDs while a symbol
       column exists;
+    * one gene on several rows: ``_PAR_Y`` rows, copies made unique with a
+      ``-k``, ``_k`` or ``.k`` suffix (``var_names_make_unique``, R's
+      ``make.unique``), a symbol repeated in the symbol column;
+    * no mitochondrial gene (``MT-`` / ``mt-``) among the gene names or
+      symbols, so a mitochondrial fraction would be 0 for every cell;
     * ``X`` not holding integer counts, or cells whose row sum exceeds their
       recorded total (``n_counts_column``);
     * inconsistent compressed-sparse pointers (:func:`crispyx.data.check_sparse_layout`).
@@ -2650,12 +2718,15 @@ def check_perturbation_data(
     data
         Path to the h5ad file, or a backed AnnData.
     perturbation_column
-        ``obs`` column with the perturbation labels.
+        ``obs`` column with the perturbation labels; ``None`` (a dataset that
+        is not a screen) skips the label checks.
     control_label
         The control label; inferred as in :func:`crispyx.data.resolve_control_label`
         when omitted (an ambiguous inference is itself an error).
     gene_name_column
-        ``var`` column with gene symbols, if ``var_names`` are not symbols.
+        ``var`` column with gene symbols, if ``var_names`` are not symbols;
+        detected (:func:`crispyx.data.detect_gene_symbol_column`) for the
+        repeated-symbol and mitochondrial checks when omitted.
     n_counts_column
         ``obs`` column with each cell's total count, if any; ``n_counts`` or
         ``total_counts`` is used when present and this is omitted.
@@ -2684,7 +2755,9 @@ def check_perturbation_data(
         gene_name_column = None  # the checks below run as if none were given
 
     # --- labels ---------------------------------------------------------------
-    if perturbation_column not in obs.columns:
+    if perturbation_column is None:
+        labels = None
+    elif perturbation_column not in obs.columns:
         errors.append(f"obs has no column '{perturbation_column}' (columns: {_examples(obs.columns, 8)})")
         labels = None
     else:
@@ -2756,19 +2829,26 @@ def check_perturbation_data(
     if len(par_y):
         warnings_.append(f"{len(par_y)} genes have a _PAR_Y row beside their X row, so their counts are split: "
                          "pp.collapse_genes(by=var_names without the suffix) sums them; " + _examples(par_y))
-    suffixed = var_names[var_names.str.match(r"^.+-\d+$")]
-    made_unique = suffixed[suffixed.str.replace(r"-\d+$", "", regex=True).isin(var_names)]
+    suffixed = var_names[var_names.str.match(r"^.+[-_.]\d+$")]
+    made_unique = suffixed[suffixed.str.replace(r"[-_.]\d+$", "", regex=True).isin(var_names)]
     if len(made_unique):
-        warnings_.append(f"{len(made_unique)} var_names look like var_names_make_unique suffixes of other var_names, "
-                         "so one symbol sits on several rows: pp.collapse_genes(by=...) sums them; "
-                         + _examples(made_unique))
-    if gene_name_column is not None:
-        symbols_all = pd.Index(var[gene_name_column].astype(str))
+        warnings_.append(f"{len(made_unique)} var_names look like copies of other var_names made unique "
+                         "(var_names_make_unique, R's make.unique), so one symbol sits on several rows: "
+                         "pp.collapse_genes(by=...) sums them; " + _examples(made_unique))
+    symbol_column = gene_name_column or detect_gene_symbol_column(path, verbose=False)
+    symbols_all = pd.Index(var[symbol_column].astype(str)) if symbol_column else var_names
+    if symbol_column is not None:
         repeated = symbols_all[symbols_all.duplicated()].unique()
         if len(repeated):
-            warnings_.append(f"{len(repeated)} symbols in '{gene_name_column}' sit on more than one row, so results "
-                             f"by symbol split their counts: pp.collapse_genes(by='{gene_name_column}') sums them; "
+            warnings_.append(f"{len(repeated)} symbols in '{symbol_column}' sit on more than one row, so results "
+                             f"by symbol split their counts: pp.collapse_genes(by='{symbol_column}') sums them; "
                              + _examples(repeated))
+    if len(var_names) and not (symbols_all.str.match(_MITO_PREFIX).any() or var_names.str.match(_MITO_PREFIX).any()):
+        warnings_.append("no mitochondrial gene (MT- or mt- prefix) among the gene names"
+                         + (f" or '{symbol_column}'" if symbol_column else "")
+                         + ": a mitochondrial fraction (calculate_qc_metrics(qc_vars=...)) would be 0 for every "
+                         "cell. Expected for a targeted panel or a nuclei dataset filtered of them; otherwise the "
+                         "symbols are elsewhere (gene_name_column).")
 
     # --- X ----------------------------------------------------------------------
     try:

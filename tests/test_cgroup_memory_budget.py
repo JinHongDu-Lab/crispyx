@@ -23,6 +23,12 @@ from crispyx.data import _conversion_buffer_budget_bytes
 GIB = 1024**3
 
 
+@pytest.fixture(autouse=True)
+def empty_process(monkeypatch):
+    """Explicit limits read as given: the process holds nothing of them."""
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
+
+
 @pytest.fixture
 def cgroup(tmp_path, monkeypatch):
     """A fake cgroup hierarchy: write ``/proc/self/cgroup`` and any files."""
@@ -224,20 +230,26 @@ def test_explicit_limit_larger_than_the_cgroup_is_capped(monkeypatch):
 
 
 def test_conversion_buffer_budget_is_capped_by_the_cgroup(monkeypatch):
-    import crispyx.data as cxd
-
-    monkeypatch.setattr(cxd, "_cgroup_available_bytes", lambda: float(200 * GIB))
+    monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: float(200 * GIB))
     # Half of the requested 400 GB would be 200 GB, over the whole allocation.
     assert _conversion_buffer_budget_bytes(400) == pytest.approx(0.5 * 200 * GIB)
     # Half of a request that fits is unchanged.
     assert _conversion_buffer_budget_bytes(80) == pytest.approx(40e9)
 
 
-def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):
-    import crispyx.data as cxd
-
+def test_explicit_limit_leaves_out_what_the_process_holds(monkeypatch):
+    """memory_limit_gb is the process's limit (a job's --mem): the memory it
+    already holds -- crispyx imported, the caller's data -- is not budget."""
     monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
-    monkeypatch.setattr(cxd, "_cgroup_available_bytes", lambda: None)
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
+    assert _memory._resolve_memory_limit_bytes(1) == pytest.approx(0.6e9)
+    assert _conversion_buffer_budget_bytes(1) == pytest.approx(0.3e9)
+    # A limit the process already exceeds leaves nothing, not a negative budget.
+    assert _memory._resolve_memory_limit_bytes(0.1) == 0
+
+
+def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):
+    monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
     assert _memory._resolve_memory_limit_bytes(170) == pytest.approx(170e9)
     assert _conversion_buffer_budget_bytes(170) == pytest.approx(85e9)
     assert np.isfinite(_memory._resolve_memory_limit_bytes(None))

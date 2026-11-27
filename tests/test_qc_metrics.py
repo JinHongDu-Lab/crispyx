@@ -204,7 +204,35 @@ def test_scrublet_releases_memory_between_samples(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(qc, "release_freed_memory", lambda: calls.append(None))
     cx.pp.scrublet(path, batch_key="sample", verbose=False, **EXACT)
-    assert len(calls) == cx.load_obs(path)["sample"].nunique()
+    # Once after the memory estimate's probe, once after Scanpy's run.
+    assert len(calls) == 2 * cx.load_obs(path)["sample"].nunique()
+
+
+def test_scrublet_refuses_a_sample_over_the_memory_limit(tmp_path, monkeypatch):
+    """The estimate is checked before Scanpy runs, and names the sample."""
+    path, _ = _doublet_data(tmp_path)
+    monkeypatch.setattr(sc.pp, "scrublet", lambda *a, **k: pytest.fail("Scanpy ran"))
+    with pytest.raises(MemoryError, match="sample 'S1': 330 cells .* memory_limit_gb"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=1e-6, verbose=False)
+    assert "doublet_score" not in cx.load_obs(path)
+
+
+def test_scrublet_estimate_counts_the_dense_genes_scrublet_selects(tmp_path):
+    from crispyx.qc import _SCRUBLET_BYTES_PER_DENSE, _scrublet_peak_bytes
+
+    _, adata = _doublet_data(tmp_path)
+    selected = adata.copy()
+    sc.pp.filter_genes(selected, min_cells=3)
+    sc.pp.normalize_total(selected)
+    sc.pp.log1p(selected)
+    sc.pp.highly_variable_genes(selected)
+    full, n_genes = _scrublet_peak_bytes(adata, {})
+    assert n_genes == selected.var["highly_variable"].sum() > 0
+    # mean_center=False keeps Scrublet sparse (truncated SVD): no dense term.
+    sparse_only, _ = _scrublet_peak_bytes(adata, {"mean_center": False})
+    assert full - sparse_only == pytest.approx(_SCRUBLET_BYTES_PER_DENSE * 3 * adata.n_obs * n_genes)
+    one_doublet_each, _ = _scrublet_peak_bytes(adata, {"sim_doublet_ratio": 1.0})
+    assert full - one_doublet_each == pytest.approx(_SCRUBLET_BYTES_PER_DENSE * adata.n_obs * n_genes)
 
 
 @pytest.mark.skipif(

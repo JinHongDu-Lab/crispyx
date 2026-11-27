@@ -143,7 +143,10 @@ Memory model
 crispyx aims for memory you can predict before a run: each step holds a chunk
 of cells or genes rather than the matrix, and where it takes
 ``memory_limit_gb`` (detected from the machine or the job when not given; on
-a Slurm job set it to ``--mem``) it sizes that chunk from it. Some terms still
+a Slurm job set it to ``--mem``) it sizes that chunk from it. The limit is the
+whole process's: what the process holds when a call starts (Python and the
+libraries crispyx imports, 0.3-0.4 GB, and any data the caller has loaded) is
+taken off it, as it is from the detected memory. Some terms still
 grow with the screen. The table says, for each streaming function, what its
 peak grows with beyond the chunk, so a run can be sized from the file's shape.
 
@@ -186,7 +189,21 @@ B batches or strata, k principal components.
    * - ``scrublet``
      - One sample's cells, run through :func:`scanpy.pp.scrublet` in memory,
        which copies them and scales a dense matrix for PCA: Scanpy's peak for
-       that sample, whatever the number of samples.
+       that sample, whatever the number of samples. About 0.5 GB + 60 bytes
+       per non-zero + 40 bytes per entry of the selected genes for the cells
+       and their simulated doublets (fitted on 2,000-20,000 cells, within
+       25%: 4.5 GB at 10,000 cells and 1,900 selected genes).
+     - The check: a sample over the budget raises ``MemoryError`` before
+       Scanpy runs
+   * - ``score_genes``, ``score_genes_cell_cycle``
+     - O(n + g) arrays.
+     - No
+   * - ``infercnv``
+     - A chunk of cells dense over the placed genes (about 32 bytes per
+       cell and gene); a sparse genes x windows weight matrix.
+     - Chunk size
+   * - ``pl.dotplot``, ``pl.violin``
+     - The plotted genes for every cell, sparse; the ``obs`` columns drawn.
      - No
    * - ``aggregate_pseudobulk``
      - P × g sums in a memory-mapped file on disk.
@@ -345,10 +362,25 @@ The peaks above are what crispyx allocates. The C allocator keeps memory a
 process frees for reuse, so resident memory can stay above them;
 ``scrublet`` and the MatrixMarket readers hand it back to the system after
 each sample or band, since each allocates arrays of a new size. On macOS,
-pandas' parser buffers stay resident until the system is short of memory:
-at ``memory_limit_gb=1``, ``read_mtx`` peaked at 0.82 GB on a Linux server
-(40 million non-zeros) and at 1.7-1.9 GB on a Mac with 512 GB of memory
-(100 million).
+pandas' parser buffers (about 0.2 GB) stay resident until the system is
+short of memory, so a run there can exceed a small limit. Peak resident
+memory of the whole process converting 40 million non-zeros:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``memory_limit_gb``
+     - Linux server (``read_mtx``, 0.2.10)
+     - Mac (``read_10x_mtx``)
+   * - 1
+     - 0.82 GB
+     - 1.01-1.10 GB
+   * - 1.5
+     - --
+     - 1.39-1.48 GB
+   * - 2
+     - --
+     - 1.38-1.50 GB
 
 .. _disk-space:
 
