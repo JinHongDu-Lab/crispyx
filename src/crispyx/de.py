@@ -232,8 +232,10 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
 
 
 class _RankOrder(_ResultLayer):
-    """Scanpy's ``order``: :func:`_rank_order` of the statistics, computed for
-    the rows asked for rather than stored."""
+    """Each group's genes in ranked order (:func:`_rank_order` of the
+    statistics: by score against the rest, as Scanpy ranks, by magnitude
+    against a control, where Scanpy still ranks by score), computed for the
+    rows asked for rather than stored."""
 
     def __init__(self, statistics: _ResultLayer, reference: str | None) -> None:
         self.path, self.key = statistics.path, statistics.key
@@ -872,7 +874,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
     written however large the result is.
 
     Arrays are in full matrix order (groups x genes) under
-    ``uns/rank_genes_groups/full``, with Scanpy's ``order`` beside them. This
+    ``uns/rank_genes_groups/full``, with their :func:`_rank_order` beside them. This
     avoids the recarray format, which hits HDF5 header size limits at ~2000+
     groups.
     """

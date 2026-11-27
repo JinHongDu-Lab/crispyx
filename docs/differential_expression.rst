@@ -62,7 +62,10 @@ Scanpy does for cluster markers. It works with ``method="wilcoxon"`` and
 
 Each group's genes are ranked by score, up-regulated first, as Scanpy ranks
 markers; against a control label they are ranked by the score's magnitude,
-since a perturbation's effects either way matter. The Wilcoxon test corrects
+since a perturbation's effects either way matter. Scanpy ranks by score
+against any reference, so a result against a control written with
+``scanpy_format=True`` shows down-regulated genes among the first in Scanpy's
+own plots. The Wilcoxon test corrects
 the p-value for ties by default (``tie_correct=True``) and Scanpy does not;
 with many zeros this matters, and correcting lifts genes that few cells
 express. Pass ``tie_correct=True`` to Scanpy to compare like with like.

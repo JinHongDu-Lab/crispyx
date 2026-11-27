@@ -8,7 +8,7 @@ Version 0.2.12
 
 **Changed**
 
-* ``reference="rest"`` results rank each group's genes by score, up-regulated first, as Scanpy ranks markers (``RankGenesGroupsResult.order``, Scanpy's ``uns["rank_genes_groups"]``, ``cx.pl.rank_genes_groups_df`` and the plots); they were ranked by the score's magnitude, which put down-regulated genes among a cluster's markers. Results against a control label are still ranked by magnitude, since a perturbation's effects either way matter.
+* ``reference="rest"`` results rank each group's genes by score, up-regulated first, as Scanpy ranks markers (``RankGenesGroupsResult.order``, Scanpy's ``uns["rank_genes_groups"]``, ``cx.pl.rank_genes_groups_df`` and the plots); they were ranked by the score's magnitude, which put down-regulated genes among a cluster's markers. Results against a control label are still ranked by magnitude, since a perturbation's effects either way matter; Scanpy ranks those by score too.
 * DE results written by an earlier release are recomputed rather than reused (result layout 6), since a one-vs-rest result written with ``scanpy_format=True`` stores the old order.
 * psutil is a dependency (it was in the ``test`` and ``benchmark`` extras): every function sized from the memory it detects needs it. Without it, crispyx warned and assumed 16 GB (64 GB in some functions); that fallback is removed.
 
