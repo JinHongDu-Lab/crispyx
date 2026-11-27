@@ -1,7 +1,8 @@
 """Statistical utilities for differential expression testing.
 
 This module provides functions for tie correction, p-value adjustment, the
-low-expression and non-estimability masks, and per-group moment sums.
+low-expression and non-estimability masks, per-group moment sums, and the
+order genes are ranked in.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import Literal
 import numpy as np
 import scipy.sparse as sp
 
+from ._grouping import REST
 from ._kernels import _group_moments_csr
 
 
@@ -259,3 +261,13 @@ def _add_group_moments(
         block.indptr, block.indices, block.data, np.asarray(codes, dtype=np.int64),
         sums, sumsq, expr_counts, counts,
     )
+
+
+def _rank_order(statistics: np.ndarray, *, reference: str | None) -> np.ndarray:
+    """Each row's gene positions by descending statistic against the rest
+    (Scanpy's markers: up-regulated first), by descending ``|statistic|``
+    against a control (a perturbation's effects either way); untested
+    (non-finite) genes last, ties in gene order."""
+    key = statistics if reference == REST else np.abs(statistics)
+    key = np.where(np.isfinite(statistics), key, -np.inf)
+    return np.argsort(-key, axis=-1, kind="mergesort")

@@ -83,16 +83,6 @@ UNLABELLED = "\0unlabelled"
 REST = "rest"
 
 
-def rank_order(statistics: np.ndarray, *, reference: str | None) -> np.ndarray:
-    """Each row's gene positions by descending statistic against the rest
-    (Scanpy's markers: up-regulated first), by descending ``|statistic|``
-    against a control (a perturbation's effects either way); untested
-    (non-finite) genes last, ties in gene order."""
-    key = statistics if reference == REST else np.abs(statistics)
-    key = np.where(np.isfinite(statistics), key, -np.inf)
-    return np.argsort(-key, axis=-1, kind="mergesort")
-
-
 def cell_labels(obs: pd.DataFrame, labels: str | pd.Series) -> tuple[pd.Series, str]:
     """Each cell's value, in ``obs`` order (NaN = the cell is not used), and its
     name: ``labels`` is an ``obs`` column, or a ``pd.Series`` indexed by cell

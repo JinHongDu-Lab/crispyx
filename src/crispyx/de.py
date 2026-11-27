@@ -95,8 +95,7 @@ from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import (
-    REST, UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, rank_order,
-    resolve_group_reference_aliases,
+    REST, UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, resolve_group_reference_aliases,
 )
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._irls import ETA_MAX, ETA_MIN
@@ -112,6 +111,7 @@ from ._statistics import (
     _adjust_pvalue_matrix,
     _low_expr_in_both_mask,
     _nonestimable_glm_mask,
+    _rank_order,
 )
 from ._memory import (
     _estimate_max_workers,
@@ -232,7 +232,7 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
 
 
 class _RankOrder(_ResultLayer):
-    """Scanpy's ``order``: :func:`rank_order` of the statistics, computed for
+    """Scanpy's ``order``: :func:`_rank_order` of the statistics, computed for
     the rows asked for rather than stored."""
 
     def __init__(self, statistics: _ResultLayer, reference: str | None) -> None:
@@ -245,7 +245,7 @@ class _RankOrder(_ResultLayer):
         rows, columns = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
         if not _is_row_key(rows):
             return np.asarray(self)[key]
-        order = rank_order(self._statistics[rows], reference=self._reference)
+        order = _rank_order(self._statistics[rows], reference=self._reference)
         return order[(Ellipsis, *columns)] if columns else order
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -905,7 +905,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
             block = {name: handle[key][sl] for name, key in fields.items() if key is not None}
             if "pts_rest" not in block:
                 block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
-            block["order"] = rank_order(block["scores"], reference=params["reference"])
+            block["order"] = _rank_order(block["scores"], reference=params["reference"])
             for name, values in block.items():
                 target = rgg if name == "order" else full
                 if name not in target:

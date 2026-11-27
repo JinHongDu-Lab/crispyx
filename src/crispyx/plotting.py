@@ -24,7 +24,7 @@ from .data import (
     read_backed,
     resolve_data_path,
 )
-from ._grouping import rank_order
+from ._statistics import _rank_order
 from .qc import QualityControlResult
 
 logger = logging.getLogger(__name__)
@@ -320,7 +320,7 @@ def _materialize_rank_genes_groups_from_layers(
 
         for idx in group_indices:
             scores = rows["scores"](idx)
-            order = rank_order(scores, reference=params.get("reference"))
+            order = _rank_order(scores, reference=params.get("reference"))
             if n_genes is not None:
                 order = order[:n_genes]
             name_arrays.append(genes[order].astype(str))
@@ -625,7 +625,8 @@ def plot_top_genes_bar(
     savepath: str | Path | None = None,
 ):
     """Horizontal bar plot of a group's first ``topn`` genes in ``de_df``'s
-    order, which :func:`rank_genes_groups_df` ranks."""
+    order: ``de_df`` must already be ranked, as :func:`rank_genes_groups_df`
+    ranks it."""
     plt = _require_matplotlib()
     if plt is None:
         return None
@@ -645,6 +646,8 @@ def plot_top_genes_bar(
 
     if "group" in de_df.columns:
         de_df = de_df[de_df["group"].astype(str) == str(group)]
+        if de_df.empty:
+            raise KeyError(f"group {group!r} not found in de_df")
     df = de_df.head(topn).iloc[::-1]
     if "logfoldchanges" in df.columns:
         colors = np.where(df["logfoldchanges"].to_numpy() > 0, "tab:red", "tab:blue")
