@@ -78,6 +78,10 @@ def test_de_plotting_functions(small_dataset, tmp_path):
     assert len(ax.patches) == 10
     # the table's ranking by magnitude, down-regulated genes included
     assert [bar.get_width() for bar in ax.patches][::-1] == list(df["scores"][:10])
+    both = rank_genes_groups_df(result.result_path, group=["pert1", "pert2"], n_genes=50)
+    ax = plot_top_genes_bar(de_df=both, group="pert2", topn=10, show=False)
+    pert2 = both[both["group"] == "pert2"]
+    assert [bar.get_width() for bar in ax.patches][::-1] == list(pert2["scores"][:10])
     ax = plot_ma(
         data=small_dataset,
         de_result=result.result_path,

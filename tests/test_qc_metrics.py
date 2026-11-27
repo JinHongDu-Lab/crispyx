@@ -189,7 +189,9 @@ def test_scrublet_matches_scanpy_per_batch(tmp_path, fmt):
     sc.pp.scrublet(expected, batch_key="sample", random_state=0, verbose=False, **kwargs)
     cx.pp.scrublet(path, batch_key="sample", verbose=False, **kwargs)
     got = cx.load_obs(path)
-    assert (~np.isclose(got["doublet_score"], expected.obs["doublet_score"], rtol=1e-6)).sum() <= 2
+    differ = ~np.isclose(got["doublet_score"], expected.obs["doublet_score"], rtol=1e-6)
+    assert differ.sum() <= 2
+    np.testing.assert_allclose(got["doublet_score"][differ], expected.obs["doublet_score"][differ], atol=0.02)
     np.testing.assert_array_equal(got["predicted_doublet"], expected.obs["predicted_doublet"].astype(bool))
 
 

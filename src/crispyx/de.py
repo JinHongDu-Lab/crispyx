@@ -95,7 +95,8 @@ from ._version import __version__
 from ._provenance import KEY as _PROVENANCE_KEY, SCHEMAS, call_fingerprint, reusable, stamp, write_stamp
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from ._grouping import (
-    REST, UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, resolve_group_reference_aliases,
+    REST, UNLABELLED, canonical_call_args, cell_labels, contiguous_ranges, label_strings, rank_order,
+    resolve_group_reference_aliases,
 )
 from ._memory import _resolve_memory_limit_bytes, _resolve_n_jobs, drop_file_cache
 from ._irls import ETA_MAX, ETA_MIN
@@ -230,18 +231,8 @@ class _ResultLayer(np.lib.mixins.NDArrayOperatorsMixin):
         return f"<{type(self).__name__} {self.key} {self.shape} {self.dtype} of {self.path}>"
 
 
-def _rank_order(statistics: np.ndarray, *, reference: str | None) -> np.ndarray:
-    """Each row's gene positions by descending statistic against the rest
-    (Scanpy's markers: up-regulated first), by descending ``|statistic|``
-    against a control (a perturbation's effects either way); untested
-    (non-finite) genes last, ties in gene order."""
-    key = statistics if reference == REST else np.abs(statistics)
-    key = np.where(np.isfinite(statistics), key, -np.inf)
-    return np.argsort(-key, axis=-1, kind="mergesort")
-
-
 class _RankOrder(_ResultLayer):
-    """Scanpy's ``order``: :func:`_rank_order` of the statistics, computed for
+    """Scanpy's ``order``: :func:`rank_order` of the statistics, computed for
     the rows asked for rather than stored."""
 
     def __init__(self, statistics: _ResultLayer, reference: str | None) -> None:
@@ -254,7 +245,7 @@ class _RankOrder(_ResultLayer):
         rows, columns = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
         if not _is_row_key(rows):
             return np.asarray(self)[key]
-        order = _rank_order(self._statistics[rows], reference=self._reference)
+        order = rank_order(self._statistics[rows], reference=self._reference)
         return order[(Ellipsis, *columns)] if columns else order
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -914,7 +905,7 @@ def _write_scanpy_rank_genes_groups(path: Path, *, method: str) -> None:
             block = {name: handle[key][sl] for name, key in fields.items() if key is not None}
             if "pts_rest" not in block:
                 block["pts_rest"] = np.broadcast_to(pts_rest, block["pts"].shape)
-            block["order"] = _rank_order(block["scores"], reference=params["reference"])
+            block["order"] = rank_order(block["scores"], reference=params["reference"])
             for name, values in block.items():
                 target = rgg if name == "order" else full
                 if name not in target:

@@ -24,7 +24,7 @@ from .data import (
     read_backed,
     resolve_data_path,
 )
-from .de import _rank_order
+from ._grouping import rank_order
 from .qc import QualityControlResult
 
 logger = logging.getLogger(__name__)
@@ -320,7 +320,7 @@ def _materialize_rank_genes_groups_from_layers(
 
         for idx in group_indices:
             scores = rows["scores"](idx)
-            order = _rank_order(scores, reference=params.get("reference"))
+            order = rank_order(scores, reference=params.get("reference"))
             if n_genes is not None:
                 order = order[:n_genes]
             name_arrays.append(genes[order].astype(str))
@@ -643,6 +643,8 @@ def plot_top_genes_bar(
     if "scores" not in de_df.columns:
         raise KeyError("scores not found in de_df")
 
+    if "group" in de_df.columns:
+        de_df = de_df[de_df["group"].astype(str) == str(group)]
     df = de_df.head(topn).iloc[::-1]
     if "logfoldchanges" in df.columns:
         colors = np.where(df["logfoldchanges"].to_numpy() > 0, "tab:red", "tab:blue")

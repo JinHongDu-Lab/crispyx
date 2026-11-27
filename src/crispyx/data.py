@@ -5021,6 +5021,7 @@ def _mtx_blocks(handle, name: str, path: Path, dtype: np.dtype, block_entries: i
         elif np.isinf(values).any():
             raise ValueError(f"{name}: {path} has a value that does not fit dtype {dtype}")
         yield frame["row"].to_numpy(), frame["col"].to_numpy(), values
+        del frame, values  # or the block stays while the next is parsed
 
 
 def _spilled_records(path: Path, record_dtype: np.dtype, count: int) -> Iterator[np.ndarray]:
