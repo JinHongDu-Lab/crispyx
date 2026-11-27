@@ -624,7 +624,8 @@ def plot_top_genes_bar(
     show: bool | None = None,
     savepath: str | Path | None = None,
 ):
-    """Horizontal bar plot of top-ranked genes for a group."""
+    """Horizontal bar plot of a group's first ``topn`` genes in ``de_df``'s
+    order, which :func:`rank_genes_groups_df` ranks."""
     plt = _require_matplotlib()
     if plt is None:
         return None
@@ -642,7 +643,7 @@ def plot_top_genes_bar(
     if "scores" not in de_df.columns:
         raise KeyError("scores not found in de_df")
 
-    df = de_df.sort_values("scores", ascending=False).head(topn).iloc[::-1]
+    df = de_df.head(topn).iloc[::-1]
     if "logfoldchanges" in df.columns:
         colors = np.where(df["logfoldchanges"].to_numpy() > 0, "tab:red", "tab:blue")
     else:

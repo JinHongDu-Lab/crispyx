@@ -5177,6 +5177,7 @@ def _read_mtx(
                             order = np.argsort(band_of, kind="stable")
                             records = records[order]
                             bounds = np.searchsorted(band_of[order], np.arange(len(bands) + 1))
+                            del band_of, order
                         else:
                             bounds = np.array([0, records.size])
                         for b in np.flatnonzero(np.diff(bounds)):
@@ -5186,6 +5187,9 @@ def _read_mtx(
                         pbar.update(done_mb - read_mb)
                         evict(((done_mb - read_mb) << 20) + records.nbytes)
                         read_mb = done_mb
+                        # Free this block before the next is parsed, and the
+                        # last one before the bands are written.
+                        del rows, cols, values, cells, genes, stored, records, bounds
                     pbar.update(max(1, path.stat().st_size >> 20) - read_mb)  # a file under 1 MiB
             if n_read != n_entries:
                 raise ValueError(

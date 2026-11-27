@@ -15,7 +15,8 @@ Version 0.2.12
 **Fixed**
 
 * ``cx.pp.scrublet`` held about twice one sample's memory over many samples: the C allocator kept each sample's freed arrays, and the next sample, whose arrays have other sizes, grew past them. It hands freed memory back to the system after each sample (``malloc_trim`` on Linux, ``malloc_zone_pressure_relief`` on macOS), so the peak is one sample's Scanpy run: on 10 samples of 10,000 cells on a Mac, 9.1 GB, where it was 14.5 GB and one sample alone takes 8.7 GB. Scanpy's own run is not streamed, so ``scrublet`` takes no ``memory_limit_gb``.
-* ``cx.read_mtx`` and ``cx.read_10x_mtx`` hand freed memory back after parsing and after each band, so resident memory no longer climbs from band to band (1.55 to 1.81 GB over five bands at ``memory_limit_gb=1`` on a Mac; 1.44 GB in each now). On macOS, pandas' parser buffers still stay resident until the system is short of memory, so a run there can exceed the budget; :ref:`memory-model` gives the measurements.
+* ``cx.read_mtx`` and ``cx.read_10x_mtx`` drop each parsed block before the next and hand freed memory back after parsing and after each band (the last block was held while the bands were written), so resident memory no longer climbs from band to band (1.55 to 1.81 GB over five bands at ``memory_limit_gb=1`` on a Mac; 1.44 GB in each now). On macOS, pandas' parser buffers still stay resident until the system is short of memory, so a run there can exceed the budget; :ref:`memory-model` gives the measurements.
+* ``cx.pl.plot_top_genes_bar`` keeps ``de_df``'s ranking; it re-sorted by score, so against a control it showed no down-regulated genes.
 
 **Documentation**
 

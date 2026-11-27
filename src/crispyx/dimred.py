@@ -80,8 +80,6 @@ def _pca_peak_bytes(
     return 50.0 * rows * n_vars + 32.0 * rows * rows + _PCA_OVERHEAD_BYTES + scores
 
 
-
-
 def _pca_chunk_size(
     n_vars: int,
     n_comps: int = 50,

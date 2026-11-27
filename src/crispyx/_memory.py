@@ -110,10 +110,13 @@ def _allocator_release():
         libc = ctypes.CDLL(None)
     except (OSError, TypeError):  # Windows has no process-wide namespace
         return None
-    for name, args in (("malloc_trim", (0,)), ("malloc_zone_pressure_relief", (None, 0))):
+    for name, argtypes, restype, args in (
+        ("malloc_trim", [ctypes.c_size_t], ctypes.c_int, (0,)),
+        ("malloc_zone_pressure_relief", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_size_t, (None, 0)),
+    ):
         function = getattr(libc, name, None)
         if function is not None:
-            function.restype = ctypes.c_size_t
+            function.argtypes, function.restype = argtypes, restype
             return lambda: function(*args)
     return None
 

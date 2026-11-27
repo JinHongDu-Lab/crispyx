@@ -76,6 +76,8 @@ def test_de_plotting_functions(small_dataset, tmp_path):
     assert ax.get_title() == "Volcano: pert1"
     ax = plot_top_genes_bar(de_df=df, group="pert1", topn=10, show=False)
     assert len(ax.patches) == 10
+    # the table's ranking by magnitude, down-regulated genes included
+    assert [bar.get_width() for bar in ax.patches][::-1] == list(df["scores"][:10])
     ax = plot_ma(
         data=small_dataset,
         de_result=result.result_path,

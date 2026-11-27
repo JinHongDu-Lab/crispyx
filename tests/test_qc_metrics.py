@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import platform
 import sys
 
 import anndata as ad
@@ -204,7 +205,9 @@ def test_scrublet_releases_memory_between_samples(tmp_path, monkeypatch):
     assert len(calls) == cx.load_obs(path)["sample"].nunique()
 
 
-@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="glibc and macOS have a release call")
+@pytest.mark.skipif(
+    sys.platform != "darwin" and platform.libc_ver()[0] != "glibc", reason="glibc and macOS have a release call"
+)
 def test_the_allocator_release_call_is_found():
     from crispyx import _memory
 
