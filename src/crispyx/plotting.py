@@ -1484,6 +1484,121 @@ def plot_violin(
     return sc.pl.violin(adata, keys, groupby, **kwargs)
 
 
+def plot_chromosome_heatmap(
+    data: PlotInput,
+    groupby: str,
+    *,
+    batch=None,
+    batch_key: str | None = None,
+    use_rep: str = "cnv",
+    max_cells: int | None = None,
+    random_state: int = 0,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cmap: str = "bwr",
+    figsize: tuple[float, float] = (16, 10),
+    **kwargs,
+):
+    """Heatmap of copy-number profiles (:func:`crispyx.tl.infercnv`) by
+    group, as :func:`infercnvpy.pl.chromosome_heatmap` draws it.
+
+    Rows are cells sorted by group, with a bar of the groups' colours;
+    columns are windows in genomic order, with each chromosome labelled and
+    bounded by a line. Only ``obsm["X_<use_rep>"]`` (the rows plotted),
+    ``uns`` and ``obs`` are read from the file. Scanpy's heatmap holds the
+    plotted rows densely: plot one batch, or pass ``max_cells``, for a large
+    cohort.
+
+    Parameters
+    ----------
+    data
+        Path to an h5ad file, a crispyx AnnData or an anndata.AnnData with
+        the profiles.
+    groupby
+        ``obs`` column of the groups (e.g. ``"leiden"``).
+    batch, batch_key
+        Plot only the cells whose ``obs[batch_key]`` is ``batch`` (e.g. one
+        sample).
+    use_rep
+        The profiles' key (``key_added`` of :func:`crispyx.tl.infercnv`).
+    max_cells
+        At most this many cells per group, drawn at random
+        (``random_state``); every cell when ``None``.
+    vmin, vmax
+        Colour range, centred at 0; symmetric about 0 by default (the
+        largest absolute value plotted).
+    cmap
+        Diverging colour map.
+    figsize
+        Figure size.
+    **kwargs
+        Passed to :func:`scanpy.pl.heatmap` (``show``, ``save``,
+        ``dendrogram`` ...).
+
+    Returns
+    -------
+    dict of matplotlib Axes
+        What :func:`scanpy.pl.heatmap` returns (``"heatmap_ax"`` ...).
+    """
+    import scanpy as sc
+    from matplotlib.colors import TwoSlopeNorm
+
+    from .cnv import _stored_profiles
+
+    with _stored_profiles(data, use_rep) as (obs, uns, matrix):
+        if groupby not in obs.columns:
+            raise KeyError(f"pl.chromosome_heatmap: obs has no column {groupby!r}")
+        rows = np.arange(len(obs))
+        if batch is not None:
+            if batch_key is None:
+                raise ValueError("pl.chromosome_heatmap: batch needs batch_key")
+            rows = rows[(obs[batch_key] == batch).to_numpy()]
+            if not len(rows):
+                raise ValueError(f"pl.chromosome_heatmap: obs[{batch_key!r}] has no {batch!r}")
+        if max_cells is not None:
+            rng = np.random.default_rng(random_state)
+            members = pd.Series(rows).groupby(obs[groupby].to_numpy()[rows], observed=True).indices.values()
+            rows = rows[np.sort(np.concatenate([
+                rng.choice(m, max_cells, replace=False) if len(m) > max_cells else m for m in members
+            ]))]
+        X = matrix[rows] if len(rows) < matrix.shape[0] else matrix[:]
+    X = sp.csr_matrix(X) if sp.issparse(X) else np.asarray(X)
+    labels = obs[groupby].iloc[rows].astype("category")
+    adata = ad.AnnData(X, obs=pd.DataFrame({groupby: labels.cat.remove_unused_categories()}))
+    colors = _group_colors(data, groupby)
+    if colors is not None and len(colors) == len(labels.cat.categories):
+        used = labels.cat.categories.isin(adata.obs[groupby].cat.categories)
+        adata.uns[f"{groupby}_colors"] = list(np.asarray(colors)[used])
+
+    values = X.data if sp.issparse(X) else X
+    largest = float(np.nanmax(np.abs(values))) if values.size else 0.0
+    if vmax is None:
+        vmax = -vmin if vmin is not None else (largest or 1.0)
+    if vmin is None:
+        vmin = -vmax
+    starts = sorted(((chromosome, int(first)) for chromosome, first in uns["chr_pos"].items()), key=lambda t: t[1])
+    positions = [first for _, first in starts]
+    kwargs.setdefault("show", False)
+    axes = sc.pl.heatmap(
+        adata, var_names=adata.var_names, groupby=groupby, figsize=figsize, cmap=cmap, show_gene_labels=False,
+        var_group_positions=list(zip(positions, positions[1:] + [adata.n_vars])),
+        var_group_labels=[chromosome for chromosome, _ in starts], norm=TwoSlopeNorm(0, vmin=vmin, vmax=vmax),
+        **kwargs,
+    )
+    if axes is not None:
+        axes["heatmap_ax"].vlines(positions[1:], lw=0.6, ymin=0, ymax=adata.n_obs)
+    return axes
+
+
+def _group_colors(data: PlotInput, groupby: str):
+    """``uns["<groupby>_colors"]``, or ``None``."""
+    key = f"{groupby}_colors"
+    if isinstance(data, ad.AnnData) and not data.isbacked:
+        return data.uns.get(key)
+    with h5py.File(_resolve_path(data), "r") as handle:
+        return _decode_strings(handle["uns"][key][()]) if f"uns/{key}" in handle else None
+
+
 # =============================================================================
 # Overlap heatmap (Feature 5)
 # =============================================================================

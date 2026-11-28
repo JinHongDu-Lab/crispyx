@@ -48,6 +48,7 @@ from .plotting import (
     plot_umap,
     plot_dotplot,
     plot_violin,
+    plot_chromosome_heatmap,
     plot_volcano,
     rank_genes_groups as plot_rank_genes_groups,
     rank_genes_groups_df,
@@ -935,6 +936,15 @@ class _ToolsNamespace:
 
         return _infercnv(data, **kwargs)
 
+    def cnv_summary(self, data, groupby, **kwargs):
+        """Each group's mean copy-number profile per chromosome and its CNV score.
+
+        See :func:`crispyx.cnv.cnv_summary`.
+        """
+        from .cnv import cnv_summary as _cnv_summary
+
+        return _cnv_summary(data, groupby, **kwargs)
+
     def batch_process(
         self,
         data: str | Path | ad.AnnData,
@@ -1342,6 +1352,13 @@ class _PlottingNamespace:
         See :func:`crispyx.plotting.plot_violin`.
         """
         return plot_violin(data, keys, groupby, **kwargs)
+
+    def chromosome_heatmap(self, data, groupby, **kwargs):
+        """Heatmap of copy-number profiles by group, reading only those from disk.
+
+        See :func:`crispyx.plotting.plot_chromosome_heatmap`.
+        """
+        return plot_chromosome_heatmap(data, groupby, **kwargs)
 
     def umap(self, data, **kwargs):
         """Plot UMAP embedding."""

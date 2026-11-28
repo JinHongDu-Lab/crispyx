@@ -173,7 +173,7 @@ Copy number
 ~~~~~~~~~~~
 
 .. automodule:: crispyx.cnv
-   :members: genomic_position_from_gtf, infercnv
+   :members: genomic_position_from_gtf, infercnv, cnv_summary
    :show-inheritance:
 
 Plotting

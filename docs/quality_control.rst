@@ -481,13 +481,18 @@ each cell's profile along the genome as infercnvpy does: its expression
 less normal reference cells', averaged over windows of 100 genes in genomic
 order. It needs each gene's ``chromosome``, ``start`` and ``end`` in
 ``var``, which :func:`crispyx.pp.genomic_position_from_gtf` reads from the
-GTF annotation of the genome the reads were aligned to:
+GTF annotation of the genome the reads were aligned to (Ensembl, GENCODE,
+UCSC or human RefSeq names; genes off chr1-22, X and Y are left unplaced):
 
 .. code-block:: python
 
    cx.pp.genomic_position_from_gtf("lognorm.h5ad", "gencode.v44.annotation.gtf.gz")
-   cx.tl.infercnv("lognorm.h5ad", reference_key="cell_type", reference_cat=["T cell", "B cell"])
-   # obsm["X_cnv"]: cells x windows (CSR); uns["cnv"]["chr_pos"]: each chromosome's first window
+   cx.tl.infercnv("lognorm.h5ad", reference_key="cell_type", reference_cat=["T cell", "B cell"],
+                  batch_key="sample_id")
+   # obsm["X_cnv"]: cells x windows (CSR); uns["cnv"]["chr_pos"]: each chromosome's first window;
+   # uns["cnv"]["windows"]: each window's chromosome, first and last gene, start and end
+   cx.tl.cnv_summary("lognorm.h5ad", "leiden", batch_key="sample_id")  # a row per sample and cluster
+   cx.pl.chromosome_heatmap("lognorm.h5ad", "leiden", batch="S1", batch_key="sample_id")
 
 .. list-table::
    :header-rows: 1
@@ -498,7 +503,9 @@ GTF annotation of the genome the reads were aligned to:
    * - Reference
      - The mean of each ``reference_cat`` group; a value between the lowest
        and highest group means counts as no change. Every cell's mean
-       without ``reference_key``.
+       without ``reference_key``. With ``batch_key``, each batch's own
+       reference cells (at least ``min_reference_cells``, 100), as if the
+       batches were run one at a time.
    * - Profile
      - The difference, clipped at ``lfc_clip``, averaged over windows of
        ``window_size`` genes with pyramid weights (every ``step``-th window,
@@ -507,10 +514,22 @@ GTF annotation of the genome the reads were aligned to:
    * - Noise
      - Values within ``dynamic_threshold`` standard deviations of 0 are set
        to 0. infercnvpy takes the standard deviation within each chunk of
-       5,000 cells, crispyx over all cells, so the two agree when every cell
+       5,000 cells, so a sample of more cells gets two thresholds; crispyx
+       takes it over all cells of a batch, so the two agree when every cell
        is in one infercnvpy chunk.
 
 The matrix is read three times, a chunk of cells at a time (the reference
 means, the standard deviation, the profiles); memory holds a chunk densely
 over the placed genes, sized from ``memory_limit_gb``. Read a CSR file: a
-CSC one is read whole for every chunk.
+CSC one is read whole for every chunk. The sums run over the same blocks of
+256 cells whatever the chunk size, so the profiles do not change with
+``chunk_size`` or ``memory_limit_gb``.
+
+:func:`crispyx.tl.cnv_summary` gives a group's cells, its CNV score (the
+mean absolute value over its cells and windows, infercnvpy's
+``tl.cnv_score``) and its mean on each chromosome: averaging a cluster's
+cells removes most of the noise of single profiles.
+:func:`crispyx.pl.chromosome_heatmap` draws infercnvpy's heatmap, cells by
+group against windows by chromosome, reading only the rows it draws;
+``max_cells`` subsamples each group, since Scanpy's heatmap holds them
+densely.

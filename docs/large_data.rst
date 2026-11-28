@@ -205,6 +205,12 @@ B batches or strata, k principal components.
    * - ``pl.dotplot``, ``pl.violin``
      - The plotted genes for every cell, sparse; the ``obs`` columns drawn.
      - No
+   * - ``cnv_summary``
+     - 2,048 cells of the profiles at a time; groups x windows sums.
+     - No
+   * - ``pl.chromosome_heatmap``
+     - The plotted cells x windows, dense (Scanpy's heatmap).
+     - ``max_cells``, ``batch``
    * - ``aggregate_pseudobulk``
      - P × g sums in a memory-mapped file on disk.
      - Chunk size

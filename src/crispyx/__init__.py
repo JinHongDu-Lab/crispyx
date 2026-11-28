@@ -85,6 +85,7 @@ from .plotting import (
     plot_umap,
     plot_dotplot,
     plot_violin,
+    plot_chromosome_heatmap,
     plot_volcano,
     rank_genes_groups_df,
 )
@@ -222,6 +223,7 @@ __all__ = [
     "plot_umap",
     "plot_dotplot",
     "plot_violin",
+    "plot_chromosome_heatmap",
     "plot_volcano",
     "plot_ma",
     "plot_top_genes_bar",
