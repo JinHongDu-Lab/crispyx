@@ -1647,7 +1647,10 @@ def plot_chromosome_heatmap(
         var_group_labels=[chromosome for chromosome, _ in starts], norm=TwoSlopeNorm(0, vmin=vmin, vmax=vmax),
         show=False, **kwargs,
     )
-    axes["heatmap_ax"].vlines(positions[1:], lw=0.6, ymin=0, ymax=adata.n_obs)
+    if kwargs.get("swap_axes"):  # windows on y, cells on x
+        axes["heatmap_ax"].hlines(positions[1:], lw=0.6, xmin=0, xmax=adata.n_obs)
+    else:
+        axes["heatmap_ax"].vlines(positions[1:], lw=0.6, ymin=0, ymax=adata.n_obs)
     figure = axes["heatmap_ax"].figure
     if save is not None:
         figure.savefig(save, bbox_inches="tight")

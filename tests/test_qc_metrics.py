@@ -230,16 +230,17 @@ def test_scrublet_refuses_a_sample_over_the_memory_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(sc.pp, "scrublet", lambda *a, **k: pytest.fail("Scanpy ran"))
     with pytest.raises(MemoryError, match=rf"sample '{largest}': {nnz[largest]:,} stored counts .*checked before any"):
         cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=limit / 1e9, verbose=False)
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
+    monkeypatch.setattr(_memory, "_baseline_bytes", lambda: int(0.4e9))
     with pytest.raises(MemoryError, match=r"^pp.scrublet: memory_limit_gb=0.1 leaves nothing"):
         cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=0.1, verbose=False)
     # On CSC the counts are known once a sample is loaded: checked then.
     path, adata = _doublet_data(tmp_path, "csc")
-    with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells loaded; memory_limit_gb=0.1 leaves nothing"):
+    with pytest.raises(MemoryError, match=r"^pp.scrublet: memory_limit_gb=0.1 leaves nothing"):
         cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=0.1, verbose=False)
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
-    first = adata[(adata.obs["sample"] == "S1").to_numpy()]
-    counts_part = qc._SCRUBLET_FIXED_BYTES + qc._SCRUBLET_BYTES_PER_NONZERO * first.X.nnz
+    monkeypatch.setattr(_memory, "_baseline_bytes", lambda: 0)
+    first = adata[(adata.obs["sample"] == "S1").to_numpy()].X
+    loaded = first.data.nbytes + first.indices.nbytes + first.indptr.nbytes  # as read: CSR
+    counts_part = loaded + qc._SCRUBLET_FIXED_BYTES + qc._SCRUBLET_BYTES_PER_NONZERO * first.nnz
     probe = qc._scrublet_peak_bytes
     monkeypatch.setattr(qc, "_scrublet_peak_bytes", lambda *a: pytest.fail("the gene selection ran"))
     with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells with [\d,]+ stored counts need about"):

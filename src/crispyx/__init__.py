@@ -231,3 +231,9 @@ __all__ = [
     "plot_qc_summary",
     "plot_overlap_heatmap",
 ]
+
+# What an explicit memory_limit_gb leaves out (Python and the libraries just
+# imported), recorded once: see _memory._resolve_memory_limit_bytes.
+from . import _memory  # noqa: E402
+
+_memory._record_import_footprint()

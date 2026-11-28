@@ -437,15 +437,46 @@ def _resident_bytes() -> int:
     return psutil.Process().memory_info().rss
 
 
+#: The process's resident memory once crispyx was imported (Python and the
+#: libraries it imports): what an explicit limit leaves out. Recorded once,
+#: so a budget does not change with what the session holds later -- data
+#: loaded, or memory a call freed that the allocator keeps.
+_import_resident: int | None = None
+
+
+def _record_import_footprint() -> None:
+    global _import_resident
+    _import_resident = _resident_bytes()
+
+
+def _baseline_bytes() -> int:
+    """What an explicit limit leaves out: the process's resident memory when
+    crispyx was imported (now, if it was not recorded)."""
+    return _import_resident if _import_resident is not None else _resident_bytes()
+
+
+def _given_limit_bytes(memory_limit_gb: float | None) -> float:
+    """*memory_limit_gb* in bytes as given, capped by what the job will
+    grant (the detected memory when ``None``): for a size that identifies a
+    result (PCA's method and chunk, a resumable run's chunks), which must not
+    move with the process's own footprint."""
+    if memory_limit_gb is None:
+        return _detected_available_bytes()
+    granted = _granted_bytes()
+    return memory_limit_gb * 1e9 if granted is None else min(memory_limit_gb * 1e9, granted)
+
+
 def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
-    """The bytes a call may still allocate, in bytes.
+    """The bytes a call may allocate, in bytes.
 
     *memory_limit_gb* is the limit on the whole process, as a job's
-    ``--mem`` is: what the process already holds (the interpreter, imported
-    libraries, the caller's own data) is taken off it, as the detected
-    memory (``None``) already leaves it out. Either way the result is capped
-    by what the job will grant when that is known, so a budget can never
-    exceed what the job may actually allocate -- see :func:`_granted_bytes`.
+    ``--mem`` is: what the process held once crispyx was imported (Python
+    and the libraries, :func:`_baseline_bytes`) is taken off it, as the
+    detected memory (``None``) already leaves out what the process holds.
+    Data the caller loads afterwards is not counted. Either way the result
+    is capped by what the job will grant when that is known, so a budget can
+    never exceed what the job may actually allocate -- see
+    :func:`_granted_bytes`.
 
     Parameters
     ----------
@@ -460,20 +491,17 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     Raises
     ------
     MemoryError
-        When the process already holds *memory_limit_gb*: no budget is left,
-        and a call sized from none would read its input once per row or gene.
+        When *memory_limit_gb* is no more than crispyx's own footprint: no
+        budget is left, and a call sized from none would read its input once
+        per row or gene.
     """
     if memory_limit_gb is None:
         return _detected_available_bytes()
-    resident = _resident_bytes()
-    if resident >= memory_limit_gb * 1e9:
+    baseline = _baseline_bytes()
+    if baseline >= memory_limit_gb * 1e9:
         raise MemoryError(
-            f"memory_limit_gb={memory_limit_gb:g} leaves nothing to work with: this process already holds "
-            f"{resident / 1e9:.2f} GB (Python, the libraries and any data loaded). The limit is the whole "
-            "process's; raise it."
+            f"memory_limit_gb={memory_limit_gb:g} leaves nothing to work with: this process held "
+            f"{baseline / 1e9:.2f} GB once crispyx was imported (Python and its libraries). The limit is the "
+            "whole process's; raise it."
         )
-    budget = memory_limit_gb * 1e9 - resident
-    granted = _granted_bytes()
-    if granted is not None:
-        budget = min(budget, granted)
-    return budget
+    return min(memory_limit_gb * 1e9 - baseline, _given_limit_bytes(memory_limit_gb))

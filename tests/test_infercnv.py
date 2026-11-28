@@ -269,6 +269,11 @@ def test_chromosome_heatmap(tmp_path):
         assert sorted(stored.uns["cnv"]["chr_pos"].values())[1:] in lines  # the chromosome boundaries
         assert (tmp_path / "cnv.png").stat().st_size > 0
         plt.close("all")
+    # swap_axes: windows on y, so the chromosome lines are horizontal.
+    axes = cx.pl.chromosome_heatmap(path, "type", swap_axes=True)
+    lines = [sorted(seg[0][1] for seg in c.get_segments()) for c in axes["heatmap_ax"].collections]
+    assert sorted(dict(ad.read_h5ad(path).uns["cnv"]["chr_pos"]).values())[1:] in lines
+    plt.close("all")
     with pytest.raises(ValueError, match="batch needs batch_key"):
         cx.pl.chromosome_heatmap(path, "type", batch="s2")
 

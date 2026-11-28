@@ -555,3 +555,15 @@ def test_show_progress_none_means_no_bar(tmp_path):
     path = _write(tmp_path / "quiet.h5ad", _counts())
     cx.pp.pca(path, n_comps=5, show_progress=None)
     assert ad.read_h5ad(path).obsm["X_pca"].shape == (400, 5)
+
+
+def test_pca_method_and_chunk_take_the_limit_as_given(monkeypatch):
+    """They identify the result, so crispyx's own footprint does not move
+    them: the same file at the same limit gets the same PCA."""
+    from crispyx import _memory
+
+    sizes = []
+    for footprint in (0, int(0.9e9)):
+        monkeypatch.setattr(_memory, "_baseline_bytes", lambda f=footprint: f)
+        sizes.append(_pca_chunk_size(20_000, 50, n_obs_in_memory=0, memory_limit_gb=1))
+    assert sizes[0] == sizes[1]

@@ -643,7 +643,7 @@ def scrublet(
     batch's cells and their simulated doublets densely. With
     ``memory_limit_gb``, or under a job's memory limit (cgroup or Slurm),
     each batch's peak is estimated once its cells are loaded, from Scrublet's
-    own gene selection, and a batch over what is left raises
+    own gene selection, and a batch whose cells and peak exceed the budget raises
     ``MemoryError`` rather than the job being killed part way; on a CSR
     file, every batch's stored counts are checked before any is scored.
 
@@ -760,25 +760,29 @@ def _check_scrublet_counts(matrix, used: np.ndarray, batches: np.ndarray, memory
 
 
 def _check_scrublet_memory(cells: ad.AnnData, scrublet_kwargs: dict, memory_limit_gb, where: str) -> None:
-    """Raise ``MemoryError`` when Scanpy's Scrublet on ``cells`` (loaded)
-    would exceed what is left of the budget. The part from the stored counts
-    is checked first: Scrublet's gene selection, run to count the dense
-    genes, holds less than that part, so it never runs over the budget."""
+    """Raise ``MemoryError`` when the loaded ``cells`` and Scanpy's Scrublet
+    on them would exceed the budget. The part from the stored counts is
+    checked first: Scrublet's gene selection, run to count the dense genes,
+    holds less than that part, so it never runs over the budget."""
     try:
         budget = _resolve_memory_limit_bytes(memory_limit_gb)
     except MemoryError as err:
-        raise MemoryError(f"pp.scrublet: {where}{cells.n_obs:,} cells loaded; {err}") from None
-    nnz = cells.X.nnz if sp.issparse(cells.X) else np.count_nonzero(cells.X)
-    needed = _SCRUBLET_FIXED_BYTES + _SCRUBLET_BYTES_PER_NONZERO * nnz
+        raise MemoryError(f"pp.scrublet: {err}") from None
+    X = cells.X
+    loaded = X.data.nbytes + X.indices.nbytes + X.indptr.nbytes if sp.issparse(X) else X.nbytes
+    nnz = X.nnz if sp.issparse(X) else np.count_nonzero(X)
+    needed = loaded + _SCRUBLET_FIXED_BYTES + _SCRUBLET_BYTES_PER_NONZERO * nnz
     what = f"{cells.n_obs:,} cells with {nnz:,} stored counts"
     if needed <= budget:
-        needed, n_genes = _scrublet_peak_bytes(cells, scrublet_kwargs)
+        peak, n_genes = _scrublet_peak_bytes(cells, scrublet_kwargs)
+        needed = loaded + peak
         what = f"{cells.n_obs:,} cells with {n_genes:,} selected genes"
     if needed > budget:
         raise MemoryError(
             f"pp.scrublet: {where}{what} need about {needed / 1e9:.1f} GB in scanpy.pp.scrublet, which holds the "
-            f"selected genes densely; {budget / 1e9:.1f} GB is left. Raise memory_limit_gb, or score fewer cells "
-            "at a time (a finer batch_key, such as the capture lane, since doublets form within one)."
+            f"selected genes densely, with the cells loaded; {budget / 1e9:.1f} GB is the budget. Raise "
+            "memory_limit_gb, or score fewer cells at a time (a finer batch_key, such as the capture lane, "
+            "since doublets form within one)."
         )
 
 

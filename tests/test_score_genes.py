@@ -100,8 +100,11 @@ def test_no_listed_gene_is_an_error(tmp_path):
 
 def test_a_listed_gene_outside_the_pool_is_an_error(tmp_path):
     path, _ = _lognorm(tmp_path)
-    with pytest.raises(ValueError, match="listed genes must be in gene_pool; not there: g3, g9, g15"):
-        cx.tl.score_genes(path, S_GENES, gene_pool=[f"g{j}" for j in range(0, 800, 2)], verbose=False)
+    pool = [f"g{j}" for j in range(0, 800, 2)]
+    with pytest.raises(ValueError, match="^tl.score_genes: listed genes must be in gene_pool; not there: g3, g9, g15"):
+        cx.tl.score_genes(path, S_GENES, gene_pool=pool, verbose=False)
+    with pytest.raises(ValueError, match="^tl.score_genes_cell_cycle: listed genes must be in gene_pool"):
+        cx.tl.score_genes_cell_cycle(path, s_genes=S_GENES, g2m_genes=S_GENES, gene_pool=pool, verbose=False)
 
 
 def test_raw_is_scored_when_the_file_has_one(tmp_path):

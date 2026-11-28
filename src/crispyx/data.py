@@ -4043,7 +4043,7 @@ def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     """Bytes the CSR<->CSC converters may hold in their output buffers.
 
     Half of the call's budget (:func:`_resolve_memory_limit_bytes`: the
-    limit less what the process holds, capped by what the job will grant);
+    limit less crispyx's import footprint, capped by what the job will grant);
     the other half is headroom for the per-chunk working set.
     """
     return 0.5 * _resolve_memory_limit_bytes(memory_limit_gb)

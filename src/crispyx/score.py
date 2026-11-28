@@ -31,6 +31,7 @@ from .data import (
 
 def _control_genes(
     gene_list, gene_pool, means: pd.Series, *, ctrl_as_ref: bool, ctrl_size: int, n_bins: int, random_state,
+    name: str,
 ) -> pd.Index:
     """Scanpy's reference genes for ``gene_list`` (its ``_score_genes_bins``):
     the pool binned by mean expression, ``ctrl_size`` genes drawn from each bin
@@ -43,14 +44,14 @@ def _control_genes(
     obs_cut = obs_avg.rank(method="min") // n_items
     outside = gene_list.difference(obs_cut.index, sort=False)
     if len(outside):
-        raise ValueError(f"tl.score_genes: listed genes must be in gene_pool; not there: {', '.join(map(str, outside[:5]))}"
+        raise ValueError(f"{name}: listed genes must be in gene_pool; not there: {', '.join(map(str, outside[:5]))}"
                          + (", ..." if len(outside) > 5 else ""))
     keep_ctrl_in_obs_cut = False if ctrl_as_ref else obs_cut.index.isin(gene_list)
     control = pd.Index([], dtype="string")
     for cut in np.unique(obs_cut.loc[gene_list]):
         r_genes = obs_cut[(obs_cut == cut) & ~keep_ctrl_in_obs_cut].index
         if len(r_genes) == 0:
-            _messages.warn("tl.score_genes", f"no control genes for bin {cut}: the gene pool ({len(gene_pool)} genes) is too small")
+            _messages.warn(name, f"no control genes for bin {cut}: the gene pool ({len(gene_pool)} genes) is too small")
         if ctrl_size < len(r_genes):
             r_genes = r_genes.to_series().sample(ctrl_size, random_state=rng).index
         if ctrl_as_ref:
@@ -58,7 +59,7 @@ def _control_genes(
         control = control.union(r_genes)
     if len(control) == 0:
         raise RuntimeError(
-            "tl.score_genes: no control genes found in any bin" + (": try ctrl_as_ref=False" if ctrl_as_ref else "")
+            f"{name}: no control genes found in any bin" + (": try ctrl_as_ref=False" if ctrl_as_ref else "")
         )
     return control
 
@@ -117,7 +118,7 @@ def _gene_set_scores(
         for score_name, (_, ctrl_size) in sets.items():
             control = _control_genes(
                 lists[score_name], pool, means, ctrl_as_ref=ctrl_as_ref, ctrl_size=ctrl_size, n_bins=n_bins,
-                random_state=random_state,
+                random_state=random_state, name=name,
             )
             for genes in (lists[score_name], control):
                 column = np.zeros(n_vars)

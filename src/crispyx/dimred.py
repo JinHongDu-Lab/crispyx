@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     import anndata as AnnData
 
 from ._checkpoint import _create_progress_context
-from ._memory import _resolve_memory_limit_bytes
+from ._memory import _given_limit_bytes
 from .data import (
     _check_results_writable,
     _results_open_elsewhere,
@@ -107,7 +107,9 @@ def _pca_chunk_size(
     """
     if method not in ("auto", *PCA_METHODS):
         raise ValueError(f"method must be 'auto', 'covariance' or 'incremental', got {method!r}")
-    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    # The limit as given, not less crispyx's footprint: the method and chunk
+    # identify the result, which must not move with the process.
+    budget = _given_limit_bytes(memory_limit_gb)
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars
 

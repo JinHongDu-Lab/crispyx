@@ -232,16 +232,22 @@ def test_conversion_buffer_budget_is_capped_by_the_cgroup(monkeypatch):
 
 
 def test_explicit_limit_leaves_out_what_the_process_holds(monkeypatch):
-    """memory_limit_gb is the process's limit (a job's --mem): the memory it
-    already holds -- crispyx imported, the caller's data -- is not budget."""
+    """memory_limit_gb is the process's limit (a job's --mem): what the
+    process held once crispyx was imported is not budget, and the budget
+    does not move with what the session holds later (data, or memory a call
+    freed that the allocator keeps)."""
+    monkeypatch.undo()  # conftest sets crispyx's footprint to 0
     monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
+    monkeypatch.setattr(_memory, "_import_resident", int(0.4e9))
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(5e9))  # the session grew since
     assert _memory._resolve_memory_limit_bytes(1) == pytest.approx(0.6e9)
     assert _conversion_buffer_budget_bytes(1) == pytest.approx(0.3e9)
-    # A limit the process already holds is an error, not a budget of 0 that
-    # would size a conversion to one gene per pass.
-    with pytest.raises(MemoryError, match=r"memory_limit_gb=0.1 leaves nothing to work with: this process already "
-                                          r"holds 0.40 GB"):
+    # Sizes that identify a result take the limit as given.
+    assert _memory._given_limit_bytes(1) == pytest.approx(1e9)
+    # A limit within crispyx's own footprint is an error, not a budget of 0
+    # that would size a conversion to one gene per pass.
+    with pytest.raises(MemoryError, match=r"memory_limit_gb=0.1 leaves nothing to work with: this process held "
+                                          r"0.40 GB once crispyx was imported"):
         _memory._resolve_memory_limit_bytes(0.1)
 
 
