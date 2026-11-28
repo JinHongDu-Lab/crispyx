@@ -1,7 +1,7 @@
 Quality control and dimension reduction
 =======================================
 
-Filtering cells, perturbations and genes, selecting highly variable genes, and embedding cells, all streamed from disk. Normalisation is part of these steps; :doc:`large_data` covers the storage formats they prefer.
+Filtering cells, perturbations and genes, selecting highly variable genes, embedding cells, scoring gene sets and inferring copy number, all streamed from disk. Normalisation is part of these steps; :doc:`large_data` covers the storage formats they prefer.
 
 
 Quality control
@@ -59,6 +59,7 @@ own sample's median, and score doublets one sample at a time:
        | (flags["pct_counts_mt_high"] & (obs["pct_counts_mt"] > 10))
    )
    cx.pp.scrublet("counts.h5ad", batch_key="sample", cell_mask=~bad.to_numpy())
+   cx.pl.violin("counts.h5ad", ["log1p_total_counts", "pct_counts_mt"], groupby="sample")
 
 .. list-table::
    :header-rows: 1
@@ -79,6 +80,12 @@ own sample's median, and score doublets one sample at a time:
      - :func:`scanpy.pp.scrublet` on each ``batch_key`` group read from disk
        in turn, so memory holds one sample. Writes ``doublet_score`` and
        ``predicted_doublet``. Needs ``pip install 'crispyx[scrublet]'``.
+       Scanpy holds a sample's selected genes densely, so a sample whose
+       estimated peak exceeds ``memory_limit_gb`` raises ``MemoryError``
+       before Scanpy runs; split such a sample by capture lane.
+   * - :func:`crispyx.pl.violin`
+     - :func:`scanpy.pl.violin` of ``obs`` columns or genes, reading only
+       those from the file.
 
 Fewer cells, fewer counts
 -------------------------
@@ -137,14 +144,17 @@ Check the file before analysis
 
 :func:`crispyx.pp.check_data` reads ``obs``, ``var`` and a few sampled blocks
 of ``X`` and reports the mistakes that mislead an analysis without making it
-fail: a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP``
-...) left as a perturbation beside the control label, labels that are still
-guide names, labels that differ only by case, symbols truncated at a hyphen,
-targets that name no gene in ``var``, duplicate gene names, genes split over
-several rows (``_PAR_Y`` copies, ``var_names_make_unique`` suffixes, symbols
-on more than one row), ``X`` that does not hold counts, cells whose row sum
-exceeds their recorded total, and inconsistent sparse pointers. Each finding is an ``Issue`` with a level;
-``raise_on_errors`` stops a pipeline on the errors.
+fail. In any file: duplicate gene names, genes split over several rows
+(``_PAR_Y`` copies, copies made unique with a ``-k``, ``_k`` or ``.k``
+suffix, symbols on more than one row), no mitochondrial gene among the names
+(a mitochondrial fraction would then be 0 everywhere), ``X`` that does not
+hold counts, cells whose row sum exceeds their recorded total, and
+inconsistent sparse pointers. With a ``perturbation_column``, its labels too:
+a control synonym (``NTC``, ``non-targeting``, ``scramble``, ``GFP`` ...)
+left as a perturbation beside the control label, labels that are still guide
+names, labels that differ only by case, symbols truncated at a hyphen, and
+targets that name no gene in ``var``. Each finding is an ``Issue`` with a
+level; ``raise_on_errors`` stops a pipeline on the errors.
 
 .. code-block:: python
 
@@ -154,6 +164,8 @@ exceeds their recorded total, and inconsistent sparse pointers. Each finding is 
        control_label="control",
    )
    cx.raise_on_errors(issues)   # ValueError listing the errors, if any
+
+   cx.pp.check_data("data/cohort.h5ad")   # not a screen: the gene and count checks
 
 .. _check-controls:
 
@@ -344,7 +356,13 @@ graph construction that works with on-disk data:
 
 :func:`crispyx.tl.leiden` reads only the graph, never ``X``, and runs
 :func:`scanpy.tl.leiden` with ``flavor="igraph"`` on it (``pip install
-'crispyx[leiden]'``). Markers of the clusters: :ref:`one-vs-rest`.
+'crispyx[leiden]'``). Markers of the clusters: :ref:`one-vs-rest`; a dot plot
+of them reads only the genes it draws (from ``raw`` when the file has one, as
+Scanpy does; ``use_raw=False`` for ``X``):
+
+.. code-block:: python
+
+   cx.pl.dotplot(adata_norm, {"T cells": ["CD3E", "IL7R"], "B cells": ["MS4A1"]}, "leiden")
 
 Plot the embedding:
 
@@ -431,3 +449,98 @@ or given as a path, PCA, neighbors and UMAP write their results into the h5ad
 file. PCA writes ``X_pca`` a chunk at a time, so its memory grows with the
 number of cells only by a CSR file's 8-byte row index. ``copy=True`` instead loads the whole file into memory
 and returns it, as Scanpy's ``copy`` does.
+
+Gene-set scores and cell-cycle phase
+------------------------------------
+
+:func:`crispyx.tl.score_genes` scores each cell on a gene set: its mean
+expression of the set less its mean over reference genes of matched
+expression, drawn from bins of the genes' means (Seurat's method, with
+Scanpy's arguments, defaults and scores). :func:`crispyx.tl.score_genes_cell_cycle`
+scores the S and G2/M genes the same way and assigns ``phase``. Both read
+the log-normalised file twice, whatever the number of sets: the genes'
+means, then each cell's mean over the scored and reference genes (on CSC,
+only the gene blocks that hold them).
+
+.. code-block:: python
+
+   cx.tl.score_genes("lognorm.h5ad", ["HBG1", "HBG2", "GATA1"], score_name="erythroid")
+   cx.tl.score_genes_cell_cycle("lognorm.h5ad", s_genes=s_genes, g2m_genes=g2m_genes)
+   # obs: erythroid, S_score, G2M_score, phase
+
+The reference genes depend on how the genes rank by mean. crispyx sums in
+float64; Scanpy sums float32 data in float32, so there a gene at a bin's
+edge can fall in the next bin, and the reference genes drawn after it
+differ.
+
+In a screen, a perturbation that slows or speeds the cell cycle shifts the
+expression of every cycling gene: compare ``phase`` across perturbations
+(e.g. by pseudo-bulk of the scores) before reading such genes as its
+targets.
+
+Copy-number profiles
+--------------------
+
+Tumour cells carry gains and losses of whole chromosome arms, which shift
+the expression of every gene on them; in a Cas9 knockout screen, a cut can
+lose the chromosome arm it is on in some cells. :func:`crispyx.tl.infercnv` estimates
+each cell's profile along the genome as infercnvpy does: its expression
+less normal reference cells', averaged over windows of 100 genes in genomic
+order. It needs each gene's ``chromosome``, ``start`` and ``end`` in
+``var``, which :func:`crispyx.pp.genomic_position_from_gtf` reads from the
+GTF annotation of the genome the reads were aligned to (Ensembl, GENCODE,
+UCSC or human RefSeq names; genes off chr1-22, X and Y are left unplaced):
+
+.. code-block:: python
+
+   cx.pp.genomic_position_from_gtf("lognorm.h5ad", "gencode.v44.annotation.gtf.gz")
+   cx.tl.infercnv("lognorm.h5ad", reference_key="cell_type", reference_cat=["T cell", "B cell"],
+                  batch_key="sample_id")
+   # obsm["X_cnv"]: cells x windows (CSR); uns["cnv"]["chr_pos"]: each chromosome's first window;
+   # uns["cnv"]["windows"]: each window's chromosome, first and last gene, start and end
+   cx.tl.cnv_summary("lognorm.h5ad", "leiden", batch_key="sample_id")  # a row per sample and cluster
+   cx.pl.chromosome_heatmap("lognorm.h5ad", "leiden", batch="S1", batch_key="sample_id")
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Step
+     - What crispyx does
+   * - Reference
+     - The mean of each ``reference_cat`` group; a value between the lowest
+       and highest group means counts as no change. Every cell's mean
+       without ``reference_key``. With ``batch_key``, each batch's own
+       reference cells (at least ``min_reference_cells``, 100), as if the
+       batches were run one at a time.
+   * - Profile
+     - The difference, clipped at ``lfc_clip``, averaged over windows of
+       ``window_size`` genes with pyramid weights (every ``step``-th window,
+       each ``chr*`` chromosome on its own, the sex chromosomes left out),
+       then centred on the cell's median window.
+   * - Noise
+     - Values within ``dynamic_threshold`` standard deviations of 0 are set
+       to 0. infercnvpy takes the standard deviation within each chunk of
+       5,000 cells, so a sample of more cells gets two thresholds; crispyx
+       takes it over all cells of a batch, so the two agree when every cell
+       is in one infercnvpy chunk.
+
+The matrix is read twice, a chunk of cells at a time: for the reference
+means, then for the profiles, which go to a scratch file (4 bytes per cell
+and window) while their standard deviation is taken and are thresholded as
+they are read back. Memory holds a chunk densely over the placed genes,
+sized from ``memory_limit_gb``. Read a CSR file: a CSC one is read whole
+for every chunk. The sums run over the same blocks of
+256 cells whatever the chunk size, so the profiles do not change with
+``chunk_size`` or ``memory_limit_gb``.
+
+:func:`crispyx.tl.cnv_summary` gives a group's cells, its CNV score (the
+mean absolute value over its cells and windows, infercnvpy's
+``tl.cnv_score``) and its mean on each chromosome: averaging a cluster's
+cells removes most of the noise of single profiles. In a screen,
+``groupby`` set to the perturbation column shows which guides' cells lost
+or gained an arm.
+:func:`crispyx.pl.chromosome_heatmap` draws infercnvpy's heatmap, cells by
+group against windows by chromosome, reading only the rows it draws;
+``max_cells`` subsamples each group, since Scanpy's heatmap holds them
+densely.

@@ -28,7 +28,7 @@ import scipy.sparse as sp
 
 from . import _messages
 from ._memory import (
-    _EvictEvery, _cgroup_available_bytes, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
+    _EvictEvery, _detected_available_bytes, _is_ram_backed, _page_cache_is_charged,
     _resolve_memory_limit_bytes, _resolve_n_jobs, release_freed_memory,
 )
 from ._checkpoint import _create_progress_context, run_fingerprint
@@ -891,6 +891,34 @@ def resolve_data_path(
         raise FileNotFoundError(f"Data file not found: {result}")
     
     return result
+
+
+def _check_results_writable(path: Path, scratch: Path, name: str, alternative: str) -> None:
+    """Fail before a call's passes, not after them, when its results could
+    not be written to ``path``: HDF5 opens a file for writing only if no
+    other handle has it open -- in this process, or, with file locking on
+    (HDF5's default), another -- and the results' ``scratch`` file goes
+    beside it. ``alternative`` says how to get the results in memory."""
+    if not _os.access(path, _os.W_OK):
+        raise PermissionError(f"{path} is not writable, so {name} could not store its results; {alternative}.")
+    try:
+        h5py.File(path, "r+").close()
+    except OSError as err:
+        raise _results_open_elsewhere(path, err, name, alternative) from err
+    try:
+        scratch.touch()
+        scratch.unlink()
+    except OSError as err:
+        raise PermissionError(
+            f"{name} cannot create its scratch file {scratch} beside {path} ({err}); {alternative}."
+        ) from err
+
+
+def _results_open_elsewhere(path: Path, err: OSError, name: str, alternative: str) -> OSError:
+    return OSError(
+        f"{path} is open elsewhere (another AnnData object or process holds it), so {name} could not "
+        f"write its results ({err}); close it and rerun, or {alternative}."
+    )
 
 
 def resolve_path_to_update(
@@ -1963,6 +1991,46 @@ def _open_matrix(path: Path, key: str) -> Iterator[Any]:
     with h5py.File(path, "r") as handle:
         elem = handle[key]
         yield sparse_dataset(elem) if isinstance(elem, h5py.Group) else elem
+
+
+def _expression_source(path: Path, *, use_raw: bool | None, layer: str | None, name: str) -> tuple[str, pd.DataFrame]:
+    """The matrix Scanpy's ``use_raw`` and ``layer`` select, as Scanpy
+    selects it, and its ``var``: ``layers[layer]``; else ``raw`` when the
+    file has one and ``use_raw`` is not ``False``; else ``X``."""
+    with h5py.File(path, "r") as handle:
+        has_raw = "raw" in handle and "X" in handle["raw"]
+        if layer is not None and use_raw:
+            raise ValueError(f"{name}: pass use_raw=True or layer, not both")
+        if use_raw and not has_raw:
+            raise ValueError(f"{name}: use_raw=True, but {path} has no raw")
+        if layer is None and has_raw and use_raw is not False:
+            return "raw/X", read_elem(handle["raw/var"])
+    return ("X" if layer is None else f"layers/{layer}"), load_var(path)
+
+
+def _selected_columns(matrix, columns: np.ndarray) -> sp.csr_matrix:
+    """Every row of the backed ``matrix`` at ``columns`` (in that order), as
+    CSR, read on its fast axis: a CSR or dense matrix a row chunk at a time
+    keeping those columns, a CSC one only in the column blocks that hold
+    one. Memory: the result and one chunk."""
+    columns = np.asarray(columns, dtype=np.int64)
+    n_obs, n_vars = matrix.shape
+    if _detect_backed_sparse_format(matrix) != "csc":
+        chunks = iter_matrix_chunks(
+            None, axis=0, matrix=matrix, chunk_size=calculate_optimal_chunk_size(n_obs, n_vars), convert_to_dense=False,
+        )
+        return sp.vstack([sp.csr_matrix(block)[:, columns] for _, block in chunks], format="csr")
+    held = np.unique(columns)
+    selected = np.zeros(n_vars, dtype=bool)
+    selected[held] = True
+    parts = [
+        sp.csc_matrix(block)[:, selected[slc]]
+        for slc, block in iter_matrix_chunks(
+            None, axis=1, matrix=matrix, chunk_size=calculate_optimal_gene_chunk_size(n_obs, n_vars),
+            convert_to_dense=False, selected=selected,
+        )
+    ]
+    return sp.hstack(parts, format="csc")[:, np.searchsorted(held, columns)].tocsr()
 
 
 def _segment_blocks(segment: _RowSegment, chunk_size: int) -> Iterator[Any]:
@@ -3974,21 +4042,11 @@ def collapse_genes(
 def _conversion_buffer_budget_bytes(memory_limit_gb: float | None) -> float:
     """Bytes the CSR<->CSC converters may hold in their output buffers.
 
-    Half of ``memory_limit_gb`` (or of the memory ``psutil`` reports as
-    available when it is ``None``); the other half is headroom for the
-    per-chunk working set and the caller's own arrays.
-
-    Capped by what the process's cgroup will still grant, so a
-    ``memory_limit_gb`` larger than the job's remaining allowance cannot size
-    these buffers past what the job may actually allocate.
+    Half of the call's budget (:func:`_resolve_memory_limit_bytes`: the
+    limit less crispyx's import footprint, capped by what the job will grant);
+    the other half is headroom for the per-chunk working set.
     """
-    if memory_limit_gb is None:
-        memory_limit_gb = _detected_available_bytes() / 1e9
-    budget = 0.5 * float(memory_limit_gb) * 1e9
-    cgroup_available = _cgroup_available_bytes()
-    if cgroup_available is not None:
-        budget = min(budget, 0.5 * cgroup_available)
-    return budget
+    return 0.5 * _resolve_memory_limit_bytes(memory_limit_gb)
 
 
 def _contiguous_bands(
@@ -4702,14 +4760,14 @@ def _is_float(text: str) -> bool:
     return True
 
 
-def _append_sparse_block(h5: h5py.File, block: sp.spmatrix) -> None:
-    """Append ``block`` to the compressed-sparse ``X`` of the open h5ad
-    ``h5`` along its compressed axis, creating ``X`` from the first block."""
-    if "X" in h5:
-        sparse_dataset(h5["X"]).append(block)
+def _append_sparse_block(h5: h5py.File, block: sp.spmatrix, key: str = "X") -> None:
+    """Append ``block`` to the compressed-sparse matrix at ``key`` of the open
+    h5ad ``h5`` along its compressed axis, creating it from the first block."""
+    if key in h5:
+        sparse_dataset(h5[key]).append(block)
     else:
         block.indptr = block.indptr.astype(np.int64)  # room for over 2**31 non-zeros
-        write_elem(h5, "X", block)
+        write_elem(h5, key, block)
 
 
 def read_text(

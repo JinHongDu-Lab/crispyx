@@ -35,6 +35,16 @@ def pytest_sessionstart(session):  # pragma: no cover - test harness setup
     process_executor._check_system_limits = _check_system_limits_safe
 
 
+@pytest.fixture(autouse=True)
+def _empty_process(monkeypatch):
+    """An explicit memory_limit_gb reads as the budget it gives: tests pass
+    tiny limits to force banded and on-disk paths, which crispyx's import
+    footprint (0.3-0.4 GB) would exceed. Tests of that term set it."""
+    from crispyx import _memory
+
+    monkeypatch.setattr(_memory, "_baseline_bytes", lambda: 0)
+
+
 @pytest.fixture
 def pydeseq2_helper():
     """Look up one of PyDESeq2's GLM helpers by name (skipping the test

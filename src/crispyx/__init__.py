@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import os
 
+import psutil as _psutil
+
+# What the process holds before crispyx's imports, so that their growth --
+# crispyx's footprint, which an explicit memory_limit_gb leaves out -- is
+# measured without data or libraries the caller loaded first.
+_resident_before_import = _psutil.Process().memory_info().rss
+
 # ---------------------------------------------------------------------------
 # OpenMP conflict guard — must precede any Numba import
 # ---------------------------------------------------------------------------
@@ -83,6 +90,9 @@ from .plotting import (
     plot_qc_summary,
     plot_top_genes_bar,
     plot_umap,
+    plot_dotplot,
+    plot_violin,
+    plot_chromosome_heatmap,
     plot_volcano,
     rank_genes_groups_df,
 )
@@ -218,6 +228,9 @@ __all__ = [
     "plot_pca_variance_ratio",
     "plot_pca_loadings",
     "plot_umap",
+    "plot_dotplot",
+    "plot_violin",
+    "plot_chromosome_heatmap",
     "plot_volcano",
     "plot_ma",
     "plot_top_genes_bar",
@@ -225,3 +238,9 @@ __all__ = [
     "plot_qc_summary",
     "plot_overlap_heatmap",
 ]
+
+# What an explicit memory_limit_gb leaves out (crispyx and the libraries it
+# imports), recorded once: see _memory._resolve_memory_limit_bytes.
+from . import _memory  # noqa: E402
+
+_memory._record_import_footprint(_resident_before_import)

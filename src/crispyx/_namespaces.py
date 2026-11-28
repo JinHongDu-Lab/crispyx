@@ -46,6 +46,9 @@ from .plotting import (
     plot_qc_summary,
     plot_top_genes_bar,
     plot_umap,
+    plot_dotplot,
+    plot_violin,
+    plot_chromosome_heatmap,
     plot_volcano,
     rank_genes_groups as plot_rank_genes_groups,
     rank_genes_groups_df,
@@ -249,6 +252,15 @@ class _PreprocessingNamespace:
         See :func:`crispyx.qc.scrublet`.
         """
         return scrublet(data, **kwargs)
+
+    def genomic_position_from_gtf(self, data, gtf_file, **kwargs):
+        """Each gene's chromosome, start and end from a GTF file, into ``var``.
+
+        See :func:`crispyx.cnv.genomic_position_from_gtf`.
+        """
+        from .cnv import genomic_position_from_gtf as _genomic_position_from_gtf
+
+        return _genomic_position_from_gtf(data, gtf_file, **kwargs)
 
     def check_data(self, data, **kwargs):
         """Check a screen's file for labels, genes and counts that would
@@ -897,6 +909,42 @@ class _ToolsNamespace:
 
         return _leiden(data, resolution, **kwargs)
 
+    def score_genes(self, data, gene_list, **kwargs):
+        """Score each cell on a gene set against matched reference genes.
+
+        See :func:`crispyx.score.score_genes`.
+        """
+        from .score import score_genes as _score_genes
+
+        return _score_genes(data, gene_list, **kwargs)
+
+    def score_genes_cell_cycle(self, data, **kwargs):
+        """S and G2/M scores and the cell-cycle phase of each cell.
+
+        See :func:`crispyx.score.score_genes_cell_cycle`.
+        """
+        from .score import score_genes_cell_cycle as _score_genes_cell_cycle
+
+        return _score_genes_cell_cycle(data, **kwargs)
+
+    def infercnv(self, data, **kwargs):
+        """Copy-number profiles of cells from expression along the genome.
+
+        See :func:`crispyx.cnv.infercnv`.
+        """
+        from .cnv import infercnv as _infercnv
+
+        return _infercnv(data, **kwargs)
+
+    def cnv_summary(self, data, groupby, **kwargs):
+        """Each group's mean copy-number profile per chromosome and its CNV score.
+
+        See :func:`crispyx.cnv.cnv_summary`.
+        """
+        from .cnv import cnv_summary as _cnv_summary
+
+        return _cnv_summary(data, groupby, **kwargs)
+
     def batch_process(
         self,
         data: str | Path | ad.AnnData,
@@ -1290,6 +1338,27 @@ class _PlottingNamespace:
     def pca_loadings(self, data, **kwargs):
         """Plot PCA loadings."""
         return plot_pca_loadings(data, **kwargs)
+
+    def dotplot(self, data, var_names, groupby, **kwargs):
+        """Dot plot of genes by group, reading only those genes from disk.
+
+        See :func:`crispyx.plotting.plot_dotplot`.
+        """
+        return plot_dotplot(data, var_names, groupby, **kwargs)
+
+    def violin(self, data, keys, groupby=None, **kwargs):
+        """Violin plots of genes or obs columns, reading only those from disk.
+
+        See :func:`crispyx.plotting.plot_violin`.
+        """
+        return plot_violin(data, keys, groupby, **kwargs)
+
+    def chromosome_heatmap(self, data, groupby, **kwargs):
+        """Heatmap of copy-number profiles by group, reading only those from disk.
+
+        See :func:`crispyx.plotting.plot_chromosome_heatmap`.
+        """
+        return plot_chromosome_heatmap(data, groupby, **kwargs)
 
     def umap(self, data, **kwargs):
         """Plot UMAP embedding."""

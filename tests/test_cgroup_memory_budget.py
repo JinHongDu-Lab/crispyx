@@ -224,20 +224,45 @@ def test_explicit_limit_larger_than_the_cgroup_is_capped(monkeypatch):
 
 
 def test_conversion_buffer_budget_is_capped_by_the_cgroup(monkeypatch):
-    import crispyx.data as cxd
-
-    monkeypatch.setattr(cxd, "_cgroup_available_bytes", lambda: float(200 * GIB))
+    monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: float(200 * GIB))
     # Half of the requested 400 GB would be 200 GB, over the whole allocation.
     assert _conversion_buffer_budget_bytes(400) == pytest.approx(0.5 * 200 * GIB)
     # Half of a request that fits is unchanged.
     assert _conversion_buffer_budget_bytes(80) == pytest.approx(40e9)
 
 
-def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):
-    import crispyx.data as cxd
-
+def test_explicit_limit_leaves_out_what_the_process_holds(monkeypatch):
+    """memory_limit_gb is the process's limit (a job's --mem): what importing
+    crispyx added is not budget, and the budget does not move with what the
+    session holds later (data, or memory a call freed that the allocator
+    keeps)."""
+    monkeypatch.undo()  # conftest sets crispyx's footprint to 0
     monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
-    monkeypatch.setattr(cxd, "_cgroup_available_bytes", lambda: None)
+    monkeypatch.setattr(_memory, "_import_footprint", int(0.4e9))
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(5e9))  # the session grew since
+    assert _memory._resolve_memory_limit_bytes(1) == pytest.approx(0.6e9)
+    assert _conversion_buffer_budget_bytes(1) == pytest.approx(0.3e9)
+    # Sizes that identify a result take the limit as given.
+    assert _memory._given_limit_bytes(1) == pytest.approx(1e9)
+    # A limit within crispyx's own footprint is an error, not a budget of 0
+    # that would size a conversion to one gene per pass.
+    with pytest.raises(MemoryError, match=r"memory_limit_gb=0.1 leaves nothing to work with: importing crispyx "
+                                          r"and its libraries took 0.40 GB of it"):
+        _memory._resolve_memory_limit_bytes(0.1)
+
+
+def test_the_import_footprint_leaves_out_what_was_loaded_before(monkeypatch):
+    """Only the growth across crispyx's import is its footprint: data the
+    caller loaded before importing it is not."""
+    monkeypatch.undo()
+    monkeypatch.setattr(_memory, "_import_footprint", _memory._import_footprint)  # restored after the test
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(12.4e9))
+    _memory._record_import_footprint(int(12e9))  # 12 GB loaded, then crispyx imported
+    assert _memory._baseline_bytes() == pytest.approx(0.4e9)
+
+
+def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):
+    monkeypatch.setattr(_memory, "_cgroup_available_bytes", lambda: None)
     assert _memory._resolve_memory_limit_bytes(170) == pytest.approx(170e9)
     assert _conversion_buffer_budget_bytes(170) == pytest.approx(85e9)
     assert np.isfinite(_memory._resolve_memory_limit_bytes(None))

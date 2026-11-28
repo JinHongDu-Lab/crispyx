@@ -68,7 +68,8 @@ against any reference, so a result against a control written with
 own plots. The Wilcoxon test corrects
 the p-value for ties by default (``tie_correct=True``) and Scanpy does not;
 with many zeros this matters, and correcting lifts genes that few cells
-express. Pass ``tie_correct=True`` to Scanpy to compare like with like.
+express. Pass ``tie_correct=False`` for Scanpy's markers, or
+``tie_correct=True`` to Scanpy to compare like with like.
 
 The Wilcoxon test ranks all cells once per gene, which gives every group's
 statistic at once, so it costs no more for 50 clusters than for 2. Cells of

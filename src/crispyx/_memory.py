@@ -432,11 +432,49 @@ def _detected_available_bytes() -> float:
     return available
 
 
-def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
-    """Resolve the effective memory limit in bytes.
+def _resident_bytes() -> int:
+    """The resident memory of this process, in bytes."""
+    return psutil.Process().memory_info().rss
 
-    If *memory_limit_gb* is provided, convert it to bytes. Otherwise query
-    the system with ``psutil``. Either way the result
+
+#: What importing crispyx added to the process's resident memory (crispyx and
+#: the libraries it imports, measured across its import, so not data or
+#: libraries the caller loaded first): what an explicit limit leaves out.
+#: Recorded once, so a budget does not change with what the session holds
+#: later -- data loaded, or memory a call freed that the allocator keeps.
+_import_footprint: int = 0
+
+
+def _record_import_footprint(resident_before: int) -> None:
+    global _import_footprint
+    _import_footprint = max(0, _resident_bytes() - resident_before)
+
+
+def _baseline_bytes() -> int:
+    """What an explicit limit leaves out: crispyx's import footprint."""
+    return _import_footprint
+
+
+def _given_limit_bytes(memory_limit_gb: float | None) -> float:
+    """*memory_limit_gb* in bytes as given, capped by what the job will
+    grant (the detected memory when ``None``): for a size that identifies a
+    result (PCA's method and chunk, a resumable run's chunks), which must not
+    move with crispyx's footprint. Under a cgroup the cap is its headroom,
+    so such a size stays put only where the job has the limit free."""
+    if memory_limit_gb is None:
+        return _detected_available_bytes()
+    granted = _granted_bytes()
+    return memory_limit_gb * 1e9 if granted is None else min(memory_limit_gb * 1e9, granted)
+
+
+def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
+    """The bytes a call may allocate, in bytes.
+
+    *memory_limit_gb* is the limit on the whole process, as a job's
+    ``--mem`` is: what importing crispyx added (crispyx and the libraries it
+    imports, :func:`_baseline_bytes`) is taken off it, as the detected
+    memory (``None``) already leaves out what the process holds. Data the
+    caller loads, and libraries imported before crispyx, are not counted. Either way the result
     is capped by what the job will grant when that is known, so a budget can
     never exceed what the job may actually allocate -- see
     :func:`_granted_bytes`.
@@ -444,17 +482,26 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     Parameters
     ----------
     memory_limit_gb
-        Explicit memory limit in gigabytes, or ``None`` for auto-detect.
+        Memory limit of the process in gigabytes, or ``None`` for auto-detect.
 
     Returns
     -------
     float
         Memory budget in bytes.
+
+    Raises
+    ------
+    MemoryError
+        When *memory_limit_gb* is no more than crispyx's import footprint: no
+        budget is left, and a call sized from none would read its input once
+        per row or gene.
     """
     if memory_limit_gb is None:
         return _detected_available_bytes()
-    budget = memory_limit_gb * 1e9
-    granted = _granted_bytes()
-    if granted is not None:
-        budget = min(budget, granted)
-    return budget
+    baseline = _baseline_bytes()
+    if baseline >= memory_limit_gb * 1e9:
+        raise MemoryError(
+            f"memory_limit_gb={memory_limit_gb:g} leaves nothing to work with: importing crispyx and its "
+            f"libraries took {baseline / 1e9:.2f} GB of it. The limit is the whole process's; raise it."
+        )
+    return min(memory_limit_gb * 1e9 - baseline, _given_limit_bytes(memory_limit_gb))

@@ -944,7 +944,7 @@ def test_scanned_weight_layer_is_written_last_per_gene_chunk(tmp_path, monkeypat
                                   "/layers/mean_weight_sum", "/layers/n_weight_sum"}
 
 
-def test_auto_chunk_size_is_capped_by_group_accumulators(tmp_path):
+def test_auto_chunk_size_is_capped_by_group_accumulators(tmp_path, monkeypatch):
     """With n_groups groups the per-chunk accumulators are (n_groups, width)
     float64 arrays; the auto chunk_size must keep them within the budget."""
     path, *_ = _write_data(tmp_path, sparse=True)

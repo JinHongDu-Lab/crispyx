@@ -42,6 +42,12 @@ without materializing the full matrix.
   the controls?
 - Memory-efficient highly variable genes (also per sample, batch_key), PCA,
   KNN graph and Leiden clustering on backed AnnData
+- Gene-set and cell-cycle scores (cx.tl.score_genes, Scanpy's scores) and
+  copy-number profiles along the genome (cx.tl.infercnv, infercnvpy's method,
+  per sample with batch_key; gene positions from a GTF with
+  cx.pp.genomic_position_from_gtf; per-group means with cx.tl.cnv_summary;
+  cx.pl.chromosome_heatmap), streamed; dot and violin plots that read only
+  the genes drawn
 - Scanpy-compatible API: cx.pp, cx.pb, cx.tl, cx.pl namespaces
 - HPC support: resume/checkpoint, configurable memory_limit_gb, Docker and
   Singularity images

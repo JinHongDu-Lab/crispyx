@@ -5,7 +5,7 @@ crispyx exposes a Scanpy-style API through four namespace singletons:
 
 * ``cx.pp`` — Preprocessing (QC, normalisation, HVG selection, PCA, neighbours, format conversion)
 * ``cx.pb`` — Pseudo-bulk aggregation
-* ``cx.tl`` — Tools (differential expression, LFC shrinkage, overlap analysis)
+* ``cx.tl`` — Tools (differential expression, LFC shrinkage, overlap analysis, clusters, gene-set scores, copy number)
 * ``cx.pl`` — Plotting
 
 Most functions also accept file paths or backed AnnData objects directly.
@@ -160,6 +160,20 @@ Dimension reduction
 .. automodule:: crispyx.dimred
    :members:
    :undoc-members:
+   :show-inheritance:
+
+Gene-set scores
+~~~~~~~~~~~~~~~
+
+.. automodule:: crispyx.score
+   :members: score_genes, score_genes_cell_cycle
+   :show-inheritance:
+
+Copy number
+~~~~~~~~~~~
+
+.. automodule:: crispyx.cnv
+   :members: genomic_position_from_gtf, infercnv, cnv_summary
    :show-inheritance:
 
 Plotting
