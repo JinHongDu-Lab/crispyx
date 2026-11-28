@@ -193,13 +193,14 @@ def test_plot_data_holds_only_the_listed_genes(tmp_path, fmt):
     from crispyx.plotting import _plot_adata
 
     path, adata = _cohort(tmp_path, fmt)
-    got = _plot_adata(path, ["g7", "g2", "g7", "g30"], ["cluster"], layer=None, gene_symbols=None)
+    kw = dict(use_raw=None, layer=None, dendrogram=None, name="pl.test")
+    got = _plot_adata(path, ["g7", "g2", "g7", "g30"], ["cluster"], gene_symbols=None, **kw)
     assert got.var_names.tolist() == ["g7", "g2", "g30"] and got.obs.columns.tolist() == ["cluster"]
     np.testing.assert_allclose(got.X.toarray(), adata[:, ["g7", "g2", "g30"]].X.toarray())
-    by_symbol = _plot_adata(path, ["S30"], [], layer=None, gene_symbols="symbol")
+    by_symbol = _plot_adata(path, ["S30"], [], gene_symbols="symbol", **kw)
     np.testing.assert_allclose(by_symbol.X.toarray(), adata[:, ["g30"]].X.toarray())
     with pytest.raises(KeyError, match="not in var_names: nope"):
-        _plot_adata(path, ["g1", "nope"], [], layer=None, gene_symbols=None)
+        _plot_adata(path, ["g1", "nope"], [], gene_symbols=None, **kw)
 
 
 def test_dotplot_matches_scanpy(tmp_path):
@@ -220,4 +221,53 @@ def test_violin_reads_genes_and_obs_columns(tmp_path):
     assert axes is not None
     with pytest.raises(KeyError, match="not in var_names: nope"):
         cx.pl.violin(path, ["nope"], show=False)
+    plt.close("all")
+
+
+def _processed(tmp_path):
+    """A file as Scanpy leaves it: log-normalised values in raw, scaled X,
+    the clusters' colours and a stored dendrogram and PCA."""
+    path, adata = _cohort(tmp_path)
+    adata.raw = adata
+    sc.pp.scale(adata)
+    adata.uns["cluster_colors"] = ["#111111", "#222222", "#333333"]
+    sc.pp.pca(adata, n_comps=5)
+    adata.write_h5ad(path)
+    return path, adata
+
+
+def test_plots_read_raw_and_the_files_colours_as_scanpy(tmp_path):
+    """use_raw=None plots raw when the file has one, as Scanpy does; the
+    groups' colours and a dendrogram from X_pca come from the file."""
+    path, adata = _processed(tmp_path)
+    for use_raw in (None, False):
+        expected = sc.pl.dotplot(adata, ["g1", "g5"], "cluster", use_raw=use_raw, return_fig=True, show=False)
+        got = cx.pl.dotplot(path, ["g1", "g5"], "cluster", use_raw=use_raw, return_fig=True, show=False)
+        pd.testing.assert_frame_equal(got.dot_color_df, expected.dot_color_df)
+    expected = sc.pl.dotplot(adata.copy(), ["g1", "g5"], "cluster", dendrogram=True, return_fig=True, show=False)
+    got = cx.pl.dotplot(path, ["g1", "g5"], "cluster", dendrogram=True, return_fig=True, show=False)
+    assert got.categories_order == expected.categories_order
+    with pytest.raises(ValueError, match="use_raw=True or layer, not both"):
+        cx.pl.dotplot(path, ["g1"], "cluster", use_raw=True, layer="x", show=False)
+    axes = cx.pl.violin(path, ["g3"], "cluster", show=False, stripplot=False)
+    colours = [matplotlib.colors.to_hex(c.get_facecolor()[0]) for c in axes.collections[:3]]
+    assert colours == adata.uns["cluster_colors"]
+    plt.close("all")
+
+
+def test_dendrogram_from_the_files_pca_above_50_genes(tmp_path):
+    rng = np.random.default_rng(1)
+    n, g = 300, 80
+    X = np.log1p(rng.poisson(rng.gamma(0.5, 1.0, g), (n, g)) * rng.uniform(0.5, 1.5, (n, 1)))
+    obs = pd.DataFrame({"cluster": pd.Categorical(rng.choice(list("abcde"), n))}, index=[f"c{i}" for i in range(n)])
+    adata = ad.AnnData(sp.csr_matrix(X), obs=obs, var=pd.DataFrame(index=[f"g{j}" for j in range(g)]))
+    path = tmp_path / "wide.h5ad"
+    adata.write_h5ad(path)
+    with pytest.raises(ValueError, match=r"dendrogram=True needs the file's obsm\['X_pca'\]"):
+        cx.pl.dotplot(path, ["g1"], "cluster", dendrogram=True, show=False)
+    sc.pp.pca(adata, n_comps=10)
+    adata.write_h5ad(path)
+    expected = sc.pl.dotplot(adata.copy(), ["g1", "g2"], "cluster", dendrogram=True, return_fig=True, show=False)
+    got = cx.pl.dotplot(path, ["g1", "g2"], "cluster", dendrogram=True, return_fig=True, show=False)
+    assert got.categories_order == expected.categories_order
     plt.close("all")

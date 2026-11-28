@@ -15,10 +15,12 @@ import h5py
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from anndata.io import read_elem
 
 from .data import (
     AnnData,
     OverlapResult,
+    _expression_source,
     _open_matrix,
     _selected_columns,
     iter_matrix_chunks,
@@ -1358,31 +1360,70 @@ def plot_umap(
 
 
 def _plot_adata(
-    data: PlotInput, genes: Sequence[str], obs_keys: Sequence[str], *, layer: str | None, gene_symbols: str | None,
+    data: PlotInput, genes: Sequence[str], obs_keys: Sequence[str], *, use_raw: bool | None, layer: str | None,
+    gene_symbols: str | None, dendrogram: Sequence[str] | None, name: str,
 ) -> ad.AnnData:
     """An in-memory AnnData of ``genes`` (``var_names``, or values of
     ``var[gene_symbols]``) and the ``obs_keys`` columns alone, read from the
     file: what a Scanpy plot of them reads, the rest of ``X`` left on disk.
-    ``layer``'s values become ``X``."""
+    The genes come from the matrix Scanpy would plot (``raw`` when the file
+    has one, unless ``use_raw=False`` or ``layer``), and the file's colours
+    of ``obs_keys`` and stored dendrograms come along, so Scanpy draws what
+    it would draw from the file. ``dendrogram`` (the groupby columns): the
+    groups' dendrogram is computed as Scanpy would on the file when none is
+    stored, since on the listed genes alone it would differ."""
     path = _resolve_path(data)
-    obs, var = load_obs(path), load_var(path)
+    obs = load_obs(path)
+    key, var = _expression_source(path, use_raw=use_raw, layer=layer, name=name)
     names = pd.Index((var[gene_symbols] if gene_symbols else var.index).astype(str))
     genes = pd.Index(dict.fromkeys(map(str, genes)), dtype=object)
     missing = genes.difference(names, sort=False)
     if len(missing):
         where = f"var[{gene_symbols!r}]" if gene_symbols else "var_names"
         raise KeyError(f"not in {where}: {', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}")
-    absent = [key for key in obs_keys if key not in obs.columns]
+    absent = [k for k in obs_keys if k not in obs.columns]
     if absent:
         raise KeyError(f"obs has no column {', '.join(map(repr, absent))}")
     first = ~names.duplicated()  # a repeated symbol: its first row, as Scanpy takes
     columns = pd.Series(np.flatnonzero(first), index=names[first])[genes].to_numpy()
     if len(columns):
-        with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
+        with _open_matrix(path, key) as matrix:
             X = _selected_columns(matrix, columns)
     else:
         X = sp.csr_matrix((len(obs), 0), dtype=np.float32)
-    return ad.AnnData(X, obs=obs[list(dict.fromkeys(obs_keys))], var=var.iloc[columns])
+    adata = ad.AnnData(X, obs=obs[list(dict.fromkeys(obs_keys))], var=var.iloc[columns])
+    with h5py.File(path, "r") as handle:
+        uns = handle.get("uns", {})
+        for entry in [f"{k}_colors" for k in obs_keys] + [k for k in uns if k.startswith("dendrogram_")]:
+            if entry in uns:
+                adata.uns[entry] = read_elem(uns[entry])
+        pca = np.asarray(read_elem(handle["obsm/X_pca"])) if dendrogram and "obsm/X_pca" in handle else None
+    if dendrogram:
+        _file_dendrogram(path, adata, list(dendrogram), pca, name)
+    return adata
+
+
+def _file_dendrogram(path: Path, adata: ad.AnnData, groupby: list[str], pca, name: str) -> None:
+    """``uns["dendrogram_<groupby>"]`` as :func:`scanpy.tl.dendrogram` with
+    its defaults computes it on the file (as Scanpy's plots do when none is
+    stored): on ``X`` for up to 50 genes, else on ``X_pca``."""
+    import scanpy as sc
+
+    key = f"dendrogram_{'_'.join(groupby)}"
+    if key in adata.uns:
+        return
+    n_vars = load_var(path).shape[0]
+    if n_vars <= sc.settings.N_PCS:
+        with _open_matrix(path, "X") as matrix:
+            helper = ad.AnnData(_selected_columns(matrix, np.arange(n_vars)).toarray(), obs=adata.obs[groupby])
+        sc.tl.dendrogram(helper, groupby, key_added=key)
+    elif pca is not None:
+        helper = ad.AnnData(obs=adata.obs[groupby], obsm={"X_pca": pca})
+        sc.tl.dendrogram(helper, groupby, use_rep="X_pca", key_added=key)
+    else:
+        raise ValueError(f"{name}: dendrogram=True needs the file's obsm['X_pca'] (pp.pca) or a stored "
+                         f"uns[{key!r}] (sc.tl.dendrogram)")
+    adata.uns[key] = helper.uns[key]
 
 
 def _in_memory(data: PlotInput) -> bool:
@@ -1394,6 +1435,7 @@ def plot_dotplot(
     var_names: str | Sequence[str] | Mapping[str, str | Sequence[str]],
     groupby: str | Sequence[str],
     *,
+    use_raw: bool | None = None,
     layer: str | None = None,
     gene_symbols: str | None = None,
     **kwargs,
@@ -1415,6 +1457,9 @@ def plot_dotplot(
         Genes, or ``{label: genes}`` to bracket groups of genes, as in Scanpy.
     groupby
         ``obs`` column(s) of the groups.
+    use_raw
+        Plot ``raw``; ``None`` (Scanpy's default) plots it when the file has
+        one and no ``layer`` is given.
     layer
         Plot ``layers[layer]`` instead of ``X``.
     gene_symbols
@@ -1430,13 +1475,15 @@ def plot_dotplot(
     import scanpy as sc
 
     if _in_memory(data):
-        return sc.pl.dotplot(data, var_names, groupby, layer=layer, gene_symbols=gene_symbols, **kwargs)
+        return sc.pl.dotplot(data, var_names, groupby, use_raw=use_raw, layer=layer, gene_symbols=gene_symbols,
+                             **kwargs)
     if isinstance(var_names, Mapping):
         genes = [g for group in var_names.values() for g in ([group] if isinstance(group, str) else group)]
     else:
         genes = [var_names] if isinstance(var_names, str) else list(var_names)
     keys = [groupby] if isinstance(groupby, str) else list(groupby)
-    adata = _plot_adata(data, genes, keys, layer=layer, gene_symbols=gene_symbols)
+    adata = _plot_adata(data, genes, keys, use_raw=use_raw, layer=layer, gene_symbols=gene_symbols,
+                        dendrogram=keys if kwargs.get("dendrogram") is True else None, name="pl.dotplot")
     return sc.pl.dotplot(adata, var_names, groupby, gene_symbols=gene_symbols, **kwargs)
 
 
@@ -1445,6 +1492,7 @@ def plot_violin(
     keys: str | Sequence[str],
     groupby: str | None = None,
     *,
+    use_raw: bool | None = None,
     layer: str | None = None,
     **kwargs,
 ):
@@ -1462,6 +1510,9 @@ def plot_violin(
         same name.
     groupby
         ``obs`` column to split the violins by.
+    use_raw
+        Plot genes from ``raw``; ``None`` (Scanpy's default) does when the
+        file has one and no ``layer`` is given.
     layer
         Plot ``layers[layer]`` instead of ``X`` for genes.
     **kwargs
@@ -1475,12 +1526,13 @@ def plot_violin(
     import scanpy as sc
 
     if _in_memory(data):
-        return sc.pl.violin(data, keys, groupby, layer=layer, **kwargs)
+        return sc.pl.violin(data, keys, groupby, use_raw=use_raw, layer=layer, **kwargs)
     keys = [keys] if isinstance(keys, str) else list(keys)
     obs_columns = load_obs(_resolve_path(data)).columns
     genes = [key for key in keys if key not in obs_columns]
     obs_keys = [key for key in keys if key in obs_columns] + ([groupby] if groupby is not None else [])
-    adata = _plot_adata(data, genes, obs_keys, layer=layer, gene_symbols=None)
+    adata = _plot_adata(data, genes, obs_keys, use_raw=use_raw, layer=layer, gene_symbols=None, dendrogram=None,
+                        name="pl.violin")
     return sc.pl.violin(adata, keys, groupby, **kwargs)
 
 

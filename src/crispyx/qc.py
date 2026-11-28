@@ -644,7 +644,8 @@ def scrublet(
     ``memory_limit_gb``, or under a job's memory limit (cgroup or Slurm),
     each batch's peak is estimated once its cells are loaded, from Scrublet's
     own gene selection, and a batch over what is left raises
-    ``MemoryError`` rather than the job being killed part way.
+    ``MemoryError`` rather than the job being killed part way; on a CSR
+    file, every batch's stored counts are checked before any is scored.
 
     Parameters
     ----------
@@ -696,6 +697,8 @@ def scrublet(
     # free or compress memory for Scanpy: no check.
     check = memory_limit_gb is not None or _granted_bytes() is not None
     with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
+        if check and _detect_backed_sparse_format(matrix) == "csr":
+            _check_scrublet_counts(matrix, used, batches, memory_limit_gb, batch_key)
         for batch in pd.unique(batches[used]):
             selected = used & (batches == batch)
             rows = np.flatnonzero(selected)
@@ -731,6 +734,29 @@ def scrublet(
 _SCRUBLET_FIXED_BYTES = 0.5e9
 _SCRUBLET_BYTES_PER_NONZERO = 60
 _SCRUBLET_BYTES_PER_DENSE = 40
+
+
+def _check_scrublet_counts(matrix, used: np.ndarray, batches: np.ndarray, memory_limit_gb, batch_key) -> None:
+    """Before any batch is scored, so a late one does not discard the
+    earlier ones' runs: each batch's stored counts, from a CSR matrix's
+    ``indptr``, against the budget, as the counts' part of its peak plus
+    the batch's cells loaded (about 12 bytes per stored count)."""
+    row_nnz = np.diff(matrix.group["indptr"][:])
+    try:
+        budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    except MemoryError as err:
+        raise MemoryError(f"pp.scrublet: {err}") from None
+    for batch in pd.unique(batches[used]):
+        nnz = int(row_nnz[used & (batches == batch)].sum())
+        needed = _SCRUBLET_FIXED_BYTES + (_SCRUBLET_BYTES_PER_NONZERO + 12) * nnz
+        if needed > budget:
+            where = "" if batch_key is None else f"{batch_key} {batch!r}: "
+            raise MemoryError(
+                f"pp.scrublet: {where}{nnz:,} stored counts need about {needed / 1e9:.1f} GB in "
+                f"scanpy.pp.scrublet and their loading; {budget / 1e9:.1f} GB is left (checked before any batch is "
+                "scored). Raise memory_limit_gb, or score fewer cells at a time (a finer batch_key, such as the "
+                "capture lane, since doublets form within one)."
+            )
 
 
 def _check_scrublet_memory(cells: ad.AnnData, scrublet_kwargs: dict, memory_limit_gb, where: str) -> None:

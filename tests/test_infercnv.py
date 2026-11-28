@@ -97,6 +97,9 @@ def test_profiles_match_infercnvpy(tmp_path, kwargs):
     chr_pos, expected = _reference_infercnv(adata, **kwargs)
     uns, got = cx.tl.infercnv(path, inplace=False, chunk_size=73, verbose=False, **kwargs)
     assert uns["chr_pos"] == chr_pos and list(chr_pos) == ["chr1", "chr2", "chr3", "chr10"]
+    one = cx.tl.infercnv(path, inplace=False, verbose=False, exclude_chromosomes="chrX", **kwargs)[0]
+    assert "chrX" not in one["chr_pos"] and one["chr_pos"] == _reference_infercnv(
+        adata, exclude_chromosomes=("chrX",), **kwargs)[0]
     np.testing.assert_allclose(got.toarray(), expected, atol=1e-6)
     assert got.nnz == np.count_nonzero(expected)
 

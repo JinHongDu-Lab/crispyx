@@ -222,8 +222,19 @@ def test_scrublet_refuses_a_sample_over_the_memory_limit(tmp_path, monkeypatch):
     from crispyx import _memory, qc
 
     path, adata = _doublet_data(tmp_path)
+    # A late sample over the budget on its counts alone is refused before
+    # any sample is scored (CSR: counted from indptr).
+    nnz = {k: int(adata[(adata.obs["sample"] == k).to_numpy()].X.nnz) for k in adata.obs["sample"].unique()}
+    largest = max(nnz, key=nnz.get)
+    limit = qc._SCRUBLET_FIXED_BYTES + (qc._SCRUBLET_BYTES_PER_NONZERO + 12) * (nnz[largest] - 1)
     monkeypatch.setattr(sc.pp, "scrublet", lambda *a, **k: pytest.fail("Scanpy ran"))
+    with pytest.raises(MemoryError, match=rf"sample '{largest}': {nnz[largest]:,} stored counts .*checked before any"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=limit / 1e9, verbose=False)
     monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
+    with pytest.raises(MemoryError, match=r"^pp.scrublet: memory_limit_gb=0.1 leaves nothing"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=0.1, verbose=False)
+    # On CSC the counts are known once a sample is loaded: checked then.
+    path, adata = _doublet_data(tmp_path, "csc")
     with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells loaded; memory_limit_gb=0.1 leaves nothing"):
         cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=0.1, verbose=False)
     monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)

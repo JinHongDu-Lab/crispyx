@@ -1993,6 +1993,21 @@ def _open_matrix(path: Path, key: str) -> Iterator[Any]:
         yield sparse_dataset(elem) if isinstance(elem, h5py.Group) else elem
 
 
+def _expression_source(path: Path, *, use_raw: bool | None, layer: str | None, name: str) -> tuple[str, pd.DataFrame]:
+    """The matrix Scanpy's ``use_raw`` and ``layer`` select, as Scanpy
+    selects it, and its ``var``: ``layers[layer]``; else ``raw`` when the
+    file has one and ``use_raw`` is not ``False``; else ``X``."""
+    with h5py.File(path, "r") as handle:
+        has_raw = "raw" in handle and "X" in handle["raw"]
+        if layer is not None and use_raw:
+            raise ValueError(f"{name}: pass use_raw=True or layer, not both")
+        if use_raw and not has_raw:
+            raise ValueError(f"{name}: use_raw=True, but {path} has no raw")
+        if layer is None and has_raw and use_raw is not False:
+            return "raw/X", read_elem(handle["raw/var"])
+    return ("X" if layer is None else f"layers/{layer}"), load_var(path)
+
+
 def _selected_columns(matrix, columns: np.ndarray) -> sp.csr_matrix:
     """Every row of the backed ``matrix`` at ``columns`` (in that order), as
     CSR, read on its fast axis: a CSR or dense matrix a row chunk at a time

@@ -2404,7 +2404,9 @@ def nb_glm_test(
         # IRLS runs its gene batches (~100 MB of work arrays each) on the
         # workers' threads, which number the cores asked for in all.
         irls_threads_mb = requested_n_jobs * 200
-        base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + irls_threads_mb + 1000
+        # The process's own memory (Python, the libraries) is already off
+        # the budget (_resolve_memory_limit_bytes), so it is not added here.
+        base_memory_mb = control_matrix.nnz * 12 / 1e6 + largest_group_mb + irls_threads_mb
         usable_mb = budget_gb * 1000 * 0.8 - base_memory_mb  # 20% headroom
         # Dataset-size-aware caps
         full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9

@@ -16,13 +16,13 @@ from ._checkpoint import _create_progress_context
 from .data import (
     AnnData,
     _detect_backed_sparse_format,
+    _expression_source,
+    _open_matrix,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
     chunk_starts,
     iter_matrix_chunks,
     load_obs,
-    load_var,
-    read_backed,
     resolve_data_path,
     resolve_path_to_update,
     write_obs,
@@ -65,14 +65,15 @@ def _control_genes(
 
 def _gene_set_scores(
     data, sets: dict[str, tuple[Sequence[str], int]], *, ctrl_as_ref: bool, gene_pool, n_bins: int, random_state,
-    layer: str | None, chunk_size: int | None, name: str, verbose: int | bool, inplace: bool,
+    use_raw: bool | None, layer: str | None, chunk_size: int | None, name: str, verbose: int | bool, inplace: bool,
 ) -> tuple[Path, pd.DataFrame]:
     """Scores of every ``{score_name: (gene_list, ctrl_size)}`` in two passes
     over the matrix, whatever the number of sets: the genes' means, then each
     cell's mean over every set's genes and reference genes."""
     path = resolve_path_to_update(data, "obs") if inplace else resolve_data_path(data)
     _messages.print_reading(verbose, name, path)
-    var_names = pd.Index(load_var(path).index.astype(str))
+    key, var = _expression_source(path, use_raw=use_raw, layer=layer, name=name)
+    var_names = pd.Index(var.index.astype(str))
     if var_names.has_duplicates:
         raise ValueError(f"{name}: var_names are not unique; pp.collapse_genes or var_names_make_unique first")
     pool = var_names.astype("string") if gene_pool is None else pd.Index(gene_pool, dtype="string").intersection(var_names)
@@ -90,9 +91,7 @@ def _gene_set_scores(
             raise ValueError(f"{name}: no gene of {score_name!r} is in var_names")
         lists[score_name] = genes
 
-    backed = read_backed(path)
-    try:
-        matrix = backed.X if layer is None else backed.layers[layer]
+    with _open_matrix(path, key) as matrix:
         n_obs, n_vars = matrix.shape
         by_gene = _detect_backed_sparse_format(matrix) == "csc"
         if chunk_size is None:
@@ -102,7 +101,7 @@ def _gene_set_scores(
             n_chunks = len(chunk_starts(n_vars if by_gene else n_obs, chunk_size, selected=selected))
             with _create_progress_context(n_chunks, label, verbose, unit="chunk") as bar:
                 for slc, block in iter_matrix_chunks(
-                    backed, axis=int(by_gene), matrix=matrix, chunk_size=chunk_size, convert_to_dense=False,
+                    None, axis=int(by_gene), matrix=matrix, chunk_size=chunk_size, convert_to_dense=False,
                     selected=selected,
                 ):
                     bar.update(1)
@@ -131,8 +130,6 @@ def _gene_set_scores(
         cell_means = np.zeros((n_obs, weights.shape[1]))
         for (cells, genes), block in blocks("cell means", selected):
             cell_means[cells] += block @ weights[genes]
-    finally:
-        backed.file.close()
     scores = pd.DataFrame(cell_means[:, 0::2] - cell_means[:, 1::2], columns=columns, index=load_obs(path).index)
     return path, scores
 
@@ -147,6 +144,7 @@ def score_genes(
     n_bins: int = 25,
     score_name: str = "score",
     random_state: int | None = 0,
+    use_raw: bool | None = None,
     layer: str | None = None,
     chunk_size: int | None = None,
     inplace: bool = True,
@@ -191,6 +189,9 @@ def score_genes(
     random_state
         Seed of the draw, as in Scanpy (which seeds NumPy's global state;
         crispyx leaves it untouched).
+    use_raw
+        Score ``raw`` (Scanpy's default when the file has one) instead of
+        ``X``; ``None`` uses ``raw`` when there is one and no ``layer``.
     layer
         Use ``layers[layer]`` instead of ``X``.
     chunk_size
@@ -209,8 +210,8 @@ def score_genes(
     """
     path, scores = _gene_set_scores(
         data, {score_name: (gene_list, ctrl_size)}, ctrl_as_ref=ctrl_as_ref, gene_pool=gene_pool, n_bins=n_bins,
-        random_state=random_state, layer=layer, chunk_size=chunk_size, name="tl.score_genes", verbose=verbose,
-        inplace=inplace,
+        random_state=random_state, use_raw=use_raw, layer=layer, chunk_size=chunk_size, name="tl.score_genes",
+        verbose=verbose, inplace=inplace,
     )
     _messages.print_done(verbose, "tl.score_genes", f"obs[{score_name!r}] for {len(scores):,} cells")
     if not inplace:
@@ -228,6 +229,7 @@ def score_genes_cell_cycle(
     gene_pool: Sequence[str] | None = None,
     n_bins: int = 25,
     random_state: int | None = 0,
+    use_raw: bool | None = None,
     layer: str | None = None,
     chunk_size: int | None = None,
     inplace: bool = True,
@@ -249,7 +251,7 @@ def score_genes_cell_cycle(
         AnnData / backed anndata.AnnData (``inplace=False`` only).
     s_genes, g2m_genes
         Genes of the S and G2/M phases (e.g. Tirosh et al.'s lists).
-    ctrl_as_ref, gene_pool, n_bins, random_state, layer, chunk_size, verbose
+    ctrl_as_ref, gene_pool, n_bins, random_state, use_raw, layer, chunk_size, verbose
         As in :func:`score_genes`.
     inplace
         Write ``S_score``, ``G2M_score`` and ``phase`` to the file's ``obs``
@@ -264,8 +266,8 @@ def score_genes_cell_cycle(
     ctrl_size = min(len(s_genes), len(g2m_genes))
     path, scores = _gene_set_scores(
         data, {"S_score": (s_genes, ctrl_size), "G2M_score": (g2m_genes, ctrl_size)}, ctrl_as_ref=ctrl_as_ref,
-        gene_pool=gene_pool, n_bins=n_bins, random_state=random_state, layer=layer, chunk_size=chunk_size,
-        name="tl.score_genes_cell_cycle", verbose=verbose, inplace=inplace,
+        gene_pool=gene_pool, n_bins=n_bins, random_state=random_state, use_raw=use_raw, layer=layer,
+        chunk_size=chunk_size, name="tl.score_genes_cell_cycle", verbose=verbose, inplace=inplace,
     )
     phase = pd.Series("S", index=scores.index)
     phase[scores["G2M_score"] > scores["S_score"]] = "G2M"

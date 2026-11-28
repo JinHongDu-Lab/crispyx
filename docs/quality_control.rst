@@ -357,7 +357,8 @@ graph construction that works with on-disk data:
 :func:`crispyx.tl.leiden` reads only the graph, never ``X``, and runs
 :func:`scanpy.tl.leiden` with ``flavor="igraph"`` on it (``pip install
 'crispyx[leiden]'``). Markers of the clusters: :ref:`one-vs-rest`; a dot plot
-of them reads only the genes it draws:
+of them reads only the genes it draws (from ``raw`` when the file has one, as
+Scanpy does; ``use_raw=False`` for ``X``):
 
 .. code-block:: python
 

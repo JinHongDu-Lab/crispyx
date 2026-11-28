@@ -102,3 +102,20 @@ def test_a_listed_gene_outside_the_pool_is_an_error(tmp_path):
     path, _ = _lognorm(tmp_path)
     with pytest.raises(ValueError, match="listed genes must be in gene_pool; not there: g3, g9, g15"):
         cx.tl.score_genes(path, S_GENES, gene_pool=[f"g{j}" for j in range(0, 800, 2)], verbose=False)
+
+
+def test_raw_is_scored_when_the_file_has_one(tmp_path):
+    """Scanpy scores raw by default (use_raw=None) when there is one; a file
+    as Scanpy leaves it (raw log-normalised, X scaled) gives its scores."""
+    path, adata = _lognorm(tmp_path)
+    adata.raw = adata
+    adata.X = adata.X.toarray() * 2.0 - 1.0  # X no longer the log-normalised values
+    adata.write_h5ad(path)
+    expected = adata.copy()
+    sc.tl.score_genes(expected, S_GENES, ctrl_size=30, random_state=3)
+    got = cx.tl.score_genes(path, S_GENES, ctrl_size=30, random_state=3, inplace=False, verbose=False)
+    np.testing.assert_allclose(got.to_numpy(), expected.obs["score"].to_numpy(), atol=1e-12)
+    on_x = adata.copy()
+    sc.tl.score_genes(on_x, S_GENES, ctrl_size=30, random_state=3, use_raw=False)
+    got = cx.tl.score_genes(path, S_GENES, ctrl_size=30, random_state=3, use_raw=False, inplace=False, verbose=False)
+    np.testing.assert_allclose(got.to_numpy(), on_x.obs["score"].to_numpy(), atol=1e-12)

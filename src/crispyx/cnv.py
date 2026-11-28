@@ -323,7 +323,7 @@ def infercnv(
         Set values within this many standard deviations (of all profiles of
         the batch) of 0 to 0; ``None`` keeps them.
     exclude_chromosomes
-        Chromosomes left out (by default the sex chromosomes).
+        Chromosome(s) left out (by default the sex chromosomes).
     layer
         Use ``layers[layer]`` instead of ``X``.
     key_added
@@ -366,6 +366,8 @@ def infercnv(
         _messages.vprint(verbose, name, f"{int(unplaced.sum()):,} genes without a position are left out")
     keep = ~unplaced
     if exclude_chromosomes is not None:
+        if isinstance(exclude_chromosomes, str):
+            exclude_chromosomes = [exclude_chromosomes]
         keep &= ~var["chromosome"].isin(exclude_chromosomes)
     positioned = var.loc[keep, ["chromosome", "start", "end"]]
     if positioned[["start", "end"]].isna().any(axis=None):
