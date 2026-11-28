@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+import tempfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
@@ -20,11 +21,15 @@ from anndata.io import read_elem, sparse_dataset, write_elem
 
 from . import _messages
 from ._checkpoint import _create_progress_context
-from ._memory import _resolve_memory_limit_bytes
+from ._disk import warn_if_disk_space_low
+from ._memory import _EvictEvery, _resolve_memory_limit_bytes
 from .data import (
     AnnData,
     _append_sparse_block,
+    _check_results_writable,
     _close_wrappers_on,
+    _results_open_elsewhere,
+    _scratch_root,
     iter_matrix_chunks,
     load_obs,
     load_var,
@@ -57,13 +62,16 @@ def _gtf_genes(gtf_file: str | Path) -> pd.DataFrame:
     ``chromosome`` (``chr1`` ...), ``start``, ``end``, ``gene_id`` and
     ``gene_name`` (RefSeq's ``gene`` attribute when there is no
     ``gene_name``; NA when a record has neither)."""
+    # No comment character: it would also cut a record at a '#' inside an
+    # attribute ("protein #2"). Header lines have one field, so no feature,
+    # and the feature == "gene" filter drops them.
     reader = pd.read_csv(
-        gtf_file, sep="\t", header=None, comment="#", usecols=[0, 2, 3, 4, 8],
-        names=["chromosome", "feature", "start", "end", "attributes"], dtype=str, quoting=csv.QUOTE_NONE,
-        chunksize=_GTF_BLOCK_LINES,
+        gtf_file, sep="\t", header=None, names=range(9), usecols=[0, 2, 3, 4, 8], dtype=str,
+        quoting=csv.QUOTE_NONE, chunksize=_GTF_BLOCK_LINES,
     )
     parts = []
     for block in reader:
+        block = block.set_axis(["chromosome", "feature", "start", "end", "attributes"], axis=1)
         block = block[block["feature"] == "gene"]
         chromosome = _primary_chromosomes(block["chromosome"])
         block = block[chromosome.notna()]
@@ -267,18 +275,23 @@ def infercnv(
     reference group a batch lacks is left out of that batch's range.
 
     Memory holds a chunk of cells densely over the placed genes, never
-    ``X``: the reference means take one pass over the matrix, the standard
-    deviation a second, and the profiles a third, which writes them a chunk
-    at a time. infercnvpy takes the standard deviation within each chunk of
-    5,000 cells, so its threshold, and which values it zeroes, change with
-    ``chunksize`` and the order of the cells; crispyx takes it over all
-    cells of a batch, and equals infercnvpy when every cell is in one of
-    its chunks (on float32 data infercnvpy computes in float32 and crispyx
-    in float64: values agree to about 1e-6, and a value that close to the
-    threshold can be zeroed by one and not the other). The sums are taken over the same blocks of 256 cells
-    whatever the chunk size, so the profiles are the same for any
-    ``chunk_size`` or ``memory_limit_gb``. A CSC file is read whole for
-    every chunk of cells: convert it first (:func:`crispyx.pp.convert_to_csr`).
+    ``X``, which is read twice: for the reference means, then for the
+    profiles, written with ``dynamic_threshold`` to a scratch file (4 bytes
+    per cell and window; in the temporary directory when it is on disk with
+    room, else beside the input) while their standard deviation is taken,
+    and thresholded as they are read back. infercnvpy takes the standard
+    deviation within each chunk of 5,000 cells, so its threshold, and which
+    values it zeroes, change with ``chunksize`` and the order of the cells;
+    crispyx takes it over all cells of a batch, and equals infercnvpy when
+    every cell is in one of its chunks (on float32 data infercnvpy computes
+    in float32 and crispyx in float64: values agree to about 1e-6, and a
+    value that close to the threshold can be zeroed by one and not the
+    other). The sums are taken over the same blocks of 256 cells whatever
+    the chunk size, so the profiles are the same for any ``chunk_size`` or
+    ``memory_limit_gb``. A CSC file is read whole for every chunk of cells:
+    convert it first (:func:`crispyx.pp.convert_to_csr`). With ``inplace``,
+    a file that could not be written (open elsewhere, read-only) is an error
+    before the passes.
 
     Parameters
     ----------
@@ -374,6 +387,11 @@ def infercnv(
     n_batches = len(batches)
 
     scratch = path.with_name(f".{path.name}.X_{key_added}.{os.getpid()}.partial")
+    alternative = "pass inplace=False to get them in memory"
+    if inplace:  # before the passes, not after them
+        _close_wrappers_on(path)
+        _check_results_writable(path, scratch, name, alternative)
+    unthresholded = None
     parts = []
     try:
         backed = read_backed(path)
@@ -457,33 +475,61 @@ def infercnv(
                 smoothed = (smooth_t @ x.T).T
                 return smoothed - np.median(smoothed, axis=1, keepdims=True)
 
-            threshold = None
-            if dynamic_threshold is not None:
-                # The standard deviation of every profile value of a batch:
-                # the blocks' means and sums of squares combined (Chan et al.).
+            n_chunks = -(-n_obs // chunk_size)
+            if dynamic_threshold is None:
+                finished = (profiles(x, batch[slc]) for slc, x in blocks("profiles"))
+            else:
+                # The profiles go to a scratch file as they are computed, with
+                # the standard deviation of every value of a batch (the
+                # blocks' means and sums of squares combined, Chan et al.);
+                # the threshold is then applied to them as read back, rather
+                # than reading X and smoothing again.
+                size = 4.0 * n_obs * len(windows)
+                where = _scratch_root(size, path.parent)
+                warn_if_disk_space_low(size, where, context=f"{name} profiles before the threshold")
+                handle, unthresholded = tempfile.mkstemp(prefix=".cx_infercnv_", suffix=".h5", dir=where)
+                os.close(handle)
+                unthresholded = Path(unthresholded)
+                evict = _EvictEvery(unthresholded)
                 count, mean, m2 = np.zeros(n_batches), np.zeros(n_batches), np.zeros(n_batches)
-                for slc, x in blocks("spread"):
-                    codes = batch[slc]
-                    values = profiles(x, codes)
-                    for part in sum_blocks(slc):
-                        for k in np.unique(codes[part]):
-                            v = values[part][codes[part] == k]
-                            n, m = v.size, v.mean()
-                            delta = m - mean[k]
-                            mean[k] += delta * n / (count[k] + n)
-                            m2[k] += ((v - m) ** 2).sum() + delta ** 2 * count[k] * n / (count[k] + n)
-                            count[k] += n
+                with h5py.File(unthresholded, "w") as store:
+                    stored = store.create_dataset(
+                        "profiles", shape=(n_obs, len(windows)), dtype=np.float32,
+                        chunks=(min(chunk_size, n_obs), len(windows)),
+                    )
+                    for slc, x in blocks("profiles"):
+                        codes = batch[slc]
+                        values = profiles(x, codes)
+                        stored[slc] = values
+                        evict(values.size * 4)
+                        for part in sum_blocks(slc):
+                            for k in np.unique(codes[part]):
+                                v = values[part][codes[part] == k]
+                                n, m = v.size, v.mean()
+                                delta = m - mean[k]
+                                mean[k] += delta * n / (count[k] + n)
+                                m2[k] += ((v - m) ** 2).sum() + delta ** 2 * count[k] * n / (count[k] + n)
+                                count[k] += n
                 threshold = dynamic_threshold * np.sqrt(m2 / count)
+
+                def read_back():
+                    with h5py.File(unthresholded, "r") as store, \
+                            _create_progress_context(n_chunks, "threshold", verbose, unit="chunk") as bar:
+                        for start in range(0, n_obs, chunk_size):
+                            slc = slice(start, min(start + chunk_size, n_obs))
+                            values = store["profiles"][slc]
+                            evict(values.nbytes)
+                            bar.update(1)
+                            values[np.abs(values) < threshold[batch[slc]][:, None]] = 0
+                            yield values
+
+                finished = read_back()
 
             # Profiles go to a scratch file beside the input, copied in once
             # complete: a run killed part way leaves the file as it was.
             with h5py.File(scratch, "w") if inplace else nullcontext() as out:
-                for slc, x in blocks("profiles"):
-                    codes = batch[slc]
-                    values = profiles(x, codes)
-                    if threshold is not None:
-                        values[np.abs(values) < threshold[codes][:, None]] = 0
-                    block = sp.csr_matrix(values.astype(np.float32))
+                for values in finished:
+                    block = sp.csr_matrix(values.astype(np.float32, copy=False))
                     if inplace:
                         _append_sparse_block(out, block, f"X_{key_added}")
                     else:
@@ -495,7 +541,11 @@ def infercnv(
         if not inplace:
             return uns, sp.vstack(parts, format="csr")
         _close_wrappers_on(path)
-        with h5py.File(path, "r+") as dst, h5py.File(scratch, "r") as tmp:
+        try:
+            dst = h5py.File(path, "r+")
+        except OSError as err:
+            raise _results_open_elsewhere(path, err, name, alternative) from err
+        with dst, h5py.File(scratch, "r") as tmp:
             obsm = dst.require_group("obsm")
             if f"X_{key_added}" in obsm:
                 del obsm[f"X_{key_added}"]
@@ -506,6 +556,8 @@ def infercnv(
             write_elem(group, key_added, uns)
     finally:
         scratch.unlink(missing_ok=True)
+        if unthresholded is not None:
+            unthresholded.unlink(missing_ok=True)
     return None
 
 

@@ -893,6 +893,34 @@ def resolve_data_path(
     return result
 
 
+def _check_results_writable(path: Path, scratch: Path, name: str, alternative: str) -> None:
+    """Fail before a call's passes, not after them, when its results could
+    not be written to ``path``: HDF5 opens a file for writing only if no
+    other handle has it open -- in this process, or, with file locking on
+    (HDF5's default), another -- and the results' ``scratch`` file goes
+    beside it. ``alternative`` says how to get the results in memory."""
+    if not _os.access(path, _os.W_OK):
+        raise PermissionError(f"{path} is not writable, so {name} could not store its results; {alternative}.")
+    try:
+        h5py.File(path, "r+").close()
+    except OSError as err:
+        raise _results_open_elsewhere(path, err, name, alternative) from err
+    try:
+        scratch.touch()
+        scratch.unlink()
+    except OSError as err:
+        raise PermissionError(
+            f"{name} cannot create its scratch file {scratch} beside {path} ({err}); {alternative}."
+        ) from err
+
+
+def _results_open_elsewhere(path: Path, err: OSError, name: str, alternative: str) -> OSError:
+    return OSError(
+        f"{path} is open elsewhere (another AnnData object or process holds it), so {name} could not "
+        f"write its results ({err}); close it and rerun, or {alternative}."
+    )
+
+
 def resolve_path_to_update(
     data: str | Path | "AnnData" | ad.AnnData, table: str, *, has_inplace: bool = True,
 ) -> Path:

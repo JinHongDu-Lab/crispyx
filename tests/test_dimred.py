@@ -502,9 +502,6 @@ def test_recorded_chunk_is_capped_by_the_cells():
 def test_returned_scores_do_not_steer_the_method(monkeypatch):
     """Both methods hold the same scores, so they must not tip auto to the
     slower, approximate one."""
-    from crispyx import _memory
-
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)  # the budget is the limit
     assert _pca_chunk_size(2_000, 50, n_obs_in_memory=2_000_000, memory_limit_gb=1)[1] == "covariance"
 
 

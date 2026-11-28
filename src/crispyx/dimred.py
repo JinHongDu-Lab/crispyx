@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 from ._checkpoint import _create_progress_context
 from ._memory import _resolve_memory_limit_bytes
 from .data import (
+    _check_results_writable,
+    _results_open_elsewhere,
     iter_matrix_chunks,
     load_obs,
     resolve_path_to_update,
@@ -309,31 +311,11 @@ def _pca_scratch_path(path) -> Path:
 
 
 def _check_writable(path) -> None:
-    """Fail before the passes, not after them, when the results could not be
-    written: HDF5 opens a file for writing only if no other handle has it open
-    -- in this process, or, with file locking on (HDF5's default), another."""
-    if not os.access(path, os.W_OK):
-        raise PermissionError(f"{path} is not writable, so PCA could not store its results; pass copy=True to get them in memory.")
-    try:
-        h5py.File(path, "r+").close()
-    except OSError as err:
-        raise _open_elsewhere(path, err) from err
-    scratch = _pca_scratch_path(path)
-    try:  # the scores' scratch file goes beside the output
-        scratch.touch()
-        scratch.unlink()
-    except OSError as err:
-        raise PermissionError(
-            f"PCA cannot create its scratch file {scratch} beside {path} ({err}); "
-            "pass copy=True to get the results in memory."
-        ) from err
+    _check_results_writable(path, _pca_scratch_path(path), "PCA", "pass copy=True to get them in memory")
 
 
 def _open_elsewhere(path, err: OSError) -> OSError:
-    return OSError(
-        f"{path} is open elsewhere (another AnnData object or process holds it), so PCA could not "
-        f"write its results ({err}); close it and rerun, or pass copy=True to get them in memory."
-    )
+    return _results_open_elsewhere(path, err, "PCA", "pass copy=True to get them in memory")
 
 
 def _open_x(f: h5py.File):

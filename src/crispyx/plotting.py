@@ -1497,6 +1497,8 @@ def plot_chromosome_heatmap(
     vmax: float | None = None,
     cmap: str = "bwr",
     figsize: tuple[float, float] = (16, 10),
+    show: bool = False,
+    save: str | Path | None = None,
     **kwargs,
 ):
     """Heatmap of copy-number profiles (:func:`crispyx.tl.infercnv`) by
@@ -1504,7 +1506,7 @@ def plot_chromosome_heatmap(
 
     Rows are cells sorted by group, with a bar of the groups' colours;
     columns are windows in genomic order, with each chromosome labelled and
-    bounded by a line. Only ``obsm["X_<use_rep>"]`` (the rows plotted),
+    bounded by a line. Cells without a group (NA) are left out. Only ``obsm["X_<use_rep>"]`` (the rows plotted),
     ``uns`` and ``obs`` are read from the file. Scanpy's heatmap holds the
     plotted rows densely: plot one batch, or pass ``max_cells``, for a large
     cohort.
@@ -1531,15 +1533,21 @@ def plot_chromosome_heatmap(
         Diverging colour map.
     figsize
         Figure size.
+    show
+        Show the figure and return ``None``.
+    save
+        Write the figure to this file.
     **kwargs
-        Passed to :func:`scanpy.pl.heatmap` (``show``, ``save``,
-        ``dendrogram`` ...).
+        Passed to :func:`scanpy.pl.heatmap` (``dendrogram``,
+        ``swap_axes`` ...).
 
     Returns
     -------
-    dict of matplotlib Axes
-        What :func:`scanpy.pl.heatmap` returns (``"heatmap_ax"`` ...).
+    dict of matplotlib Axes or None
+        What :func:`scanpy.pl.heatmap` returns (``"heatmap_ax"`` ...), unless
+        ``show``.
     """
+    import matplotlib.pyplot as plt
     import scanpy as sc
     from matplotlib.colors import TwoSlopeNorm
 
@@ -1555,6 +1563,7 @@ def plot_chromosome_heatmap(
             rows = rows[(obs[batch_key] == batch).to_numpy()]
             if not len(rows):
                 raise ValueError(f"pl.chromosome_heatmap: obs[{batch_key!r}] has no {batch!r}")
+        rows = rows[obs[groupby].notna().to_numpy()[rows]]
         if max_cells is not None:
             rng = np.random.default_rng(random_state)
             members = pd.Series(rows).groupby(obs[groupby].to_numpy()[rows], observed=True).indices.values()
@@ -1578,15 +1587,21 @@ def plot_chromosome_heatmap(
         vmin = -vmax
     starts = sorted(((chromosome, int(first)) for chromosome, first in uns["chr_pos"].items()), key=lambda t: t[1])
     positions = [first for _, first in starts]
-    kwargs.setdefault("show", False)
+    # Scanpy shows or saves inside its call, before the chromosome lines are
+    # drawn: both are done here, after them.
     axes = sc.pl.heatmap(
         adata, var_names=adata.var_names, groupby=groupby, figsize=figsize, cmap=cmap, show_gene_labels=False,
         var_group_positions=list(zip(positions, positions[1:] + [adata.n_vars])),
         var_group_labels=[chromosome for chromosome, _ in starts], norm=TwoSlopeNorm(0, vmin=vmin, vmax=vmax),
-        **kwargs,
+        show=False, **kwargs,
     )
-    if axes is not None:
-        axes["heatmap_ax"].vlines(positions[1:], lw=0.6, ymin=0, ymax=adata.n_obs)
+    axes["heatmap_ax"].vlines(positions[1:], lw=0.6, ymin=0, ymax=adata.n_obs)
+    figure = axes["heatmap_ax"].figure
+    if save is not None:
+        figure.savefig(save, bbox_inches="tight")
+    if show:
+        plt.show()
+        return None
     return axes
 
 

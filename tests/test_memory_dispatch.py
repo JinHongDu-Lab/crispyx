@@ -34,11 +34,8 @@ _IDS = [d[0] for d in DATASETS]
 
 
 @pytest.mark.parametrize("limit_gb", [0.5, 128])
-def test_explicit_memory_limit_is_used_as_given(limit_gb, monkeypatch):
-    """Less what the process holds, here nothing (see test_cgroup_memory_budget)."""
-    from crispyx import _memory
-
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
+def test_explicit_memory_limit_is_used_as_given(limit_gb):
+    """Less what the process holds, here nothing (conftest; see test_cgroup_memory_budget)."""
     assert _resolve_memory_limit_bytes(limit_gb) == limit_gb * 1e9
 
 

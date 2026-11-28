@@ -200,7 +200,8 @@ B batches or strata, k principal components.
      - No
    * - ``infercnv``
      - A chunk of cells dense over the placed genes (about 32 bytes per
-       cell and gene); a sparse genes x windows weight matrix.
+       cell and gene); a sparse genes x windows weight matrix. On disk, the
+       profiles before the threshold (4 bytes per cell and window).
      - Chunk size
    * - ``pl.dotplot``, ``pl.violin``
      - The plotted genes for every cell, sparse; the ``obs`` columns drawn.

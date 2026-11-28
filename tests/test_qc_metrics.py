@@ -203,17 +203,39 @@ def test_scrublet_releases_memory_between_samples(tmp_path, monkeypatch):
     path, _ = _doublet_data(tmp_path)
     calls = []
     monkeypatch.setattr(qc, "release_freed_memory", lambda: calls.append(None))
-    cx.pp.scrublet(path, batch_key="sample", verbose=False, **EXACT)
+    n_samples = cx.load_obs(path)["sample"].nunique()
+    cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=1000, verbose=False, **EXACT)
     # Once after the memory estimate's probe, once after Scanpy's run.
-    assert len(calls) == 2 * cx.load_obs(path)["sample"].nunique()
+    assert len(calls) == 2 * n_samples
+    # No limit given and none detected: no estimate, so no probe.
+    calls.clear()
+    monkeypatch.setattr(qc, "_granted_bytes", lambda: None)
+    monkeypatch.setattr(qc, "_scrublet_peak_bytes", lambda *a: pytest.fail("estimated without a limit"))
+    cx.pp.scrublet(path, batch_key="sample", inplace=False, verbose=False, **EXACT)
+    assert len(calls) == n_samples
 
 
 def test_scrublet_refuses_a_sample_over_the_memory_limit(tmp_path, monkeypatch):
-    """The estimate is checked before Scanpy runs, and names the sample."""
-    path, _ = _doublet_data(tmp_path)
+    """The estimate is checked once the sample is loaded, before Scanpy runs,
+    and names the sample; the stored counts' part first, so a sample over the
+    budget on it alone is refused before Scrublet's gene selection runs."""
+    from crispyx import _memory, qc
+
+    path, adata = _doublet_data(tmp_path)
     monkeypatch.setattr(sc.pp, "scrublet", lambda *a, **k: pytest.fail("Scanpy ran"))
-    with pytest.raises(MemoryError, match="sample 'S1': 330 cells .* memory_limit_gb"):
-        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=1e-6, verbose=False)
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
+    with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells loaded; memory_limit_gb=0.1 leaves nothing"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=0.1, verbose=False)
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
+    first = adata[(adata.obs["sample"] == "S1").to_numpy()]
+    counts_part = qc._SCRUBLET_FIXED_BYTES + qc._SCRUBLET_BYTES_PER_NONZERO * first.X.nnz
+    probe = qc._scrublet_peak_bytes
+    monkeypatch.setattr(qc, "_scrublet_peak_bytes", lambda *a: pytest.fail("the gene selection ran"))
+    with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells with [\d,]+ stored counts need about"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=(counts_part - 1) / 1e9, verbose=False)
+    monkeypatch.setattr(qc, "_scrublet_peak_bytes", probe)
+    with pytest.raises(MemoryError, match=r"sample 'S1': 330 cells with [\d,]+ selected genes need about"):
+        cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=(counts_part + 1) / 1e9, verbose=False)
     assert "doublet_score" not in cx.load_obs(path)
 
 

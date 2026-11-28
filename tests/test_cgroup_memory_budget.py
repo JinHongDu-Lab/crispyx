@@ -23,12 +23,6 @@ from crispyx.data import _conversion_buffer_budget_bytes
 GIB = 1024**3
 
 
-@pytest.fixture(autouse=True)
-def empty_process(monkeypatch):
-    """Explicit limits read as given: the process holds nothing of them."""
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
-
-
 @pytest.fixture
 def cgroup(tmp_path, monkeypatch):
     """A fake cgroup hierarchy: write ``/proc/self/cgroup`` and any files."""
@@ -244,8 +238,11 @@ def test_explicit_limit_leaves_out_what_the_process_holds(monkeypatch):
     monkeypatch.setattr(_memory, "_resident_bytes", lambda: int(0.4e9))
     assert _memory._resolve_memory_limit_bytes(1) == pytest.approx(0.6e9)
     assert _conversion_buffer_budget_bytes(1) == pytest.approx(0.3e9)
-    # A limit the process already exceeds leaves nothing, not a negative budget.
-    assert _memory._resolve_memory_limit_bytes(0.1) == 0
+    # A limit the process already holds is an error, not a budget of 0 that
+    # would size a conversion to one gene per pass.
+    with pytest.raises(MemoryError, match=r"memory_limit_gb=0.1 leaves nothing to work with: this process already "
+                                          r"holds 0.40 GB"):
+        _memory._resolve_memory_limit_bytes(0.1)
 
 
 def test_no_cgroup_leaves_every_budget_untouched(monkeypatch):

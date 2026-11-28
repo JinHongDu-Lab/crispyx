@@ -370,9 +370,6 @@ def test_the_cell_block_is_shared_between_the_threads(tmp_path, monkeypatch):
     """Every thread fits a block at once, so a thread's block is its share
     of the tenth of the budget, not the whole tenth n_threads times over."""
     import crispyx.de as de
-    from crispyx import _memory
-
-    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)  # the budget is the limit
     _screen(tmp_path / "s.h5ad", n_ctrl=200, n_pert=2, n_genes=60)
     seen: list[int] = []
     real = de._fit_offset_group

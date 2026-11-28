@@ -133,6 +133,12 @@ def test_split_genes_are_reported(tmp_path):
                                           verbose=False), "warning")
     assert any("1 genes have a _PAR_Y row" in m for m in warnings)
     assert any("2 symbols in 'symbol' sit on more than one row" in m and "'A', 'C'" in m for m in warnings)
+    # Genes without a symbol are not repeats of one another.
+    var["symbol"] = ["A", None, "B", None, "C", "E"]
+    cx.write_var(path, var)
+    warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", gene_name_column="symbol",
+                                          verbose=False), "warning")
+    assert not any("sit on more than one row" in m for m in warnings)
     var.index = ["NKX2-5", "NKX2-5-1", "GATA4", "GATA4-1", "GATA4-2", "MYH6"]
     cx.write_var(path, var)
     warnings = _messages(cx.pp.check_data(path, perturbation_column="perturbation", verbose=False), "warning")

@@ -472,11 +472,17 @@ float64; Scanpy sums float32 data in float32, so there a gene at a bin's
 edge can fall in the next bin, and the reference genes drawn after it
 differ.
 
+In a screen, a perturbation that slows or speeds the cell cycle shifts the
+expression of every cycling gene: compare ``phase`` across perturbations
+(e.g. by pseudo-bulk of the scores) before reading such genes as its
+targets.
+
 Copy-number profiles
 --------------------
 
 Tumour cells carry gains and losses of whole chromosome arms, which shift
-the expression of every gene on them. :func:`crispyx.tl.infercnv` estimates
+the expression of every gene on them; in a Cas9 knockout screen, a cut can
+lose the chromosome arm it is on in some cells. :func:`crispyx.tl.infercnv` estimates
 each cell's profile along the genome as infercnvpy does: its expression
 less normal reference cells', averaged over windows of 100 genes in genomic
 order. It needs each gene's ``chromosome``, ``start`` and ``end`` in
@@ -518,17 +524,21 @@ UCSC or human RefSeq names; genes off chr1-22, X and Y are left unplaced):
        takes it over all cells of a batch, so the two agree when every cell
        is in one infercnvpy chunk.
 
-The matrix is read three times, a chunk of cells at a time (the reference
-means, the standard deviation, the profiles); memory holds a chunk densely
-over the placed genes, sized from ``memory_limit_gb``. Read a CSR file: a
-CSC one is read whole for every chunk. The sums run over the same blocks of
+The matrix is read twice, a chunk of cells at a time: for the reference
+means, then for the profiles, which go to a scratch file (4 bytes per cell
+and window) while their standard deviation is taken and are thresholded as
+they are read back. Memory holds a chunk densely over the placed genes,
+sized from ``memory_limit_gb``. Read a CSR file: a CSC one is read whole
+for every chunk. The sums run over the same blocks of
 256 cells whatever the chunk size, so the profiles do not change with
 ``chunk_size`` or ``memory_limit_gb``.
 
 :func:`crispyx.tl.cnv_summary` gives a group's cells, its CNV score (the
 mean absolute value over its cells and windows, infercnvpy's
 ``tl.cnv_score``) and its mean on each chromosome: averaging a cluster's
-cells removes most of the noise of single profiles.
+cells removes most of the noise of single profiles. In a screen,
+``groupby`` set to the perturbation column shows which guides' cells lost
+or gained an arm.
 :func:`crispyx.pl.chromosome_heatmap` draws infercnvpy's heatmap, cells by
 group against windows by chromosome, reading only the rows it draws;
 ``max_cells`` subsamples each group, since Scanpy's heatmap holds them

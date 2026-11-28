@@ -19,7 +19,9 @@ import scipy.sparse as sp
 from anndata.io import write_elem
 
 from . import _messages
-from ._memory import _EvictEvery, _resolve_memory_limit_bytes, drop_file_cache, release_freed_memory
+from ._memory import (
+    _EvictEvery, _granted_bytes, _resolve_memory_limit_bytes, drop_file_cache, release_freed_memory,
+)
 from ._checkpoint import _create_progress_context
 from ._disk import estimate_bytes, warn_if_disk_space_low
 from .data import (
@@ -638,10 +640,11 @@ def scrublet(
     ``pip install 'crispyx[scrublet]'``.
 
     Scanpy's run is not streamed: it z-scores the selected genes of the
-    batch's cells and their simulated doublets densely. Before each batch is
-    scored, its peak is estimated from Scrublet's own gene selection and a
-    batch over ``memory_limit_gb`` raises ``MemoryError``, rather than the
-    job being killed part way.
+    batch's cells and their simulated doublets densely. With
+    ``memory_limit_gb``, or under a job's memory limit (cgroup or Slurm),
+    each batch's peak is estimated once its cells are loaded, from Scrublet's
+    own gene selection, and a batch over what is left raises
+    ``MemoryError`` rather than the job being killed part way.
 
     Parameters
     ----------
@@ -659,9 +662,10 @@ def scrublet(
     random_state
         Random seed, as in Scanpy.
     memory_limit_gb
-        Memory limit of the process in GB (a job's ``--mem``); ``None``
-        uses the memory detected as available. A batch whose estimated peak
-        exceeds what is left of it raises ``MemoryError`` before Scanpy runs.
+        Memory limit of the process in GB (a job's ``--mem``): a batch whose
+        estimated peak exceeds what is left of it raises ``MemoryError``
+        before Scanpy runs. ``None`` checks against a job's limit when one
+        is detected, and otherwise not at all.
     inplace
         Write ``doublet_score`` and ``predicted_doublet`` to the file's
         ``obs`` and return ``None``; ``False`` returns them.
@@ -688,20 +692,17 @@ def scrublet(
     if batch_key is not None and pd.isna(batches[used]).any():
         raise ValueError(f"obs[{batch_key!r}] has missing values")
     score, called = np.full(len(obs), np.nan), np.zeros(len(obs), dtype=bool)
-    budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    # Without a limit given or a job's limit detected, the system may still
+    # free or compress memory for Scanpy: no check.
+    check = memory_limit_gb is not None or _granted_bytes() is not None
     with _open_matrix(path, "X" if layer is None else f"layers/{layer}") as matrix:
         for batch in pd.unique(batches[used]):
             selected = used & (batches == batch)
             rows = np.flatnonzero(selected)
             cells = ad.AnnData(_selected_rows(matrix, selected), obs=pd.DataFrame(index=obs.index[rows]))
-            needed, n_genes = _scrublet_peak_bytes(cells, scrublet_kwargs)
-            if needed > budget:
-                where = "" if batch_key is None else f"{batch_key} {batch!r}: "
-                raise MemoryError(
-                    f"pp.scrublet: {where}{cells.n_obs:,} cells with {n_genes:,} selected genes need about "
-                    f"{needed / 1e9:.1f} GB in scanpy.pp.scrublet, which holds them densely; "
-                    f"{budget / 1e9:.1f} GB is available. Raise memory_limit_gb, or score fewer cells at a "
-                    "time (a finer batch_key, such as the capture lane, since doublets form within one)."
+            if check:
+                _check_scrublet_memory(
+                    cells, scrublet_kwargs, memory_limit_gb, "" if batch_key is None else f"{batch_key} {batch!r}: ",
                 )
             sc.pp.scrublet(cells, random_state=random_state, verbose=False, **scrublet_kwargs)
             # A cell Scrublet drops (under 3 genes) has no score and is not called.
@@ -730,6 +731,29 @@ def scrublet(
 _SCRUBLET_FIXED_BYTES = 0.5e9
 _SCRUBLET_BYTES_PER_NONZERO = 60
 _SCRUBLET_BYTES_PER_DENSE = 40
+
+
+def _check_scrublet_memory(cells: ad.AnnData, scrublet_kwargs: dict, memory_limit_gb, where: str) -> None:
+    """Raise ``MemoryError`` when Scanpy's Scrublet on ``cells`` (loaded)
+    would exceed what is left of the budget. The part from the stored counts
+    is checked first: Scrublet's gene selection, run to count the dense
+    genes, holds less than that part, so it never runs over the budget."""
+    try:
+        budget = _resolve_memory_limit_bytes(memory_limit_gb)
+    except MemoryError as err:
+        raise MemoryError(f"pp.scrublet: {where}{cells.n_obs:,} cells loaded; {err}") from None
+    nnz = cells.X.nnz if sp.issparse(cells.X) else np.count_nonzero(cells.X)
+    needed = _SCRUBLET_FIXED_BYTES + _SCRUBLET_BYTES_PER_NONZERO * nnz
+    what = f"{cells.n_obs:,} cells with {nnz:,} stored counts"
+    if needed <= budget:
+        needed, n_genes = _scrublet_peak_bytes(cells, scrublet_kwargs)
+        what = f"{cells.n_obs:,} cells with {n_genes:,} selected genes"
+    if needed > budget:
+        raise MemoryError(
+            f"pp.scrublet: {where}{what} need about {needed / 1e9:.1f} GB in scanpy.pp.scrublet, which holds the "
+            f"selected genes densely; {budget / 1e9:.1f} GB is left. Raise memory_limit_gb, or score fewer cells "
+            "at a time (a finer batch_key, such as the capture lane, since doublets form within one)."
+        )
 
 
 def _scrublet_peak_bytes(cells: ad.AnnData, scrublet_kwargs: dict) -> tuple[float, int]:
@@ -2836,7 +2860,8 @@ def check_perturbation_data(
                          "(var_names_make_unique, R's make.unique), so one symbol sits on several rows: "
                          "pp.collapse_genes(by=...) sums them; " + _examples(made_unique))
     symbol_column = gene_name_column or detect_gene_symbol_column(path, verbose=False)
-    symbols_all = pd.Index(var[symbol_column].astype(str)) if symbol_column else var_names
+    # A gene without a symbol (NA) is not a repeat of another.
+    symbols_all = pd.Index(var[symbol_column].dropna().astype(str)) if symbol_column else var_names
     if symbol_column is not None:
         repeated = symbols_all[symbols_all.duplicated()].unique()
         if len(repeated):

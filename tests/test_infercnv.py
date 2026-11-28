@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+from pathlib import Path
 import re
 
 import anndata as ad
@@ -115,6 +116,29 @@ def test_profiles_are_written_to_the_file(tmp_path):
     pd.testing.assert_frame_equal(stored.uns["cnv"]["windows"].reset_index(drop=True),
                                   cx.tl.infercnv(path, reference_key="type", reference_cat=["T", "B"], inplace=False,
                                                  verbose=False)[0]["windows"])
+
+
+def test_the_file_is_checked_before_the_passes_and_scratch_is_removed(tmp_path, monkeypatch):
+    """A file open elsewhere is an error before any pass; the profiles kept
+    for the threshold go to the scratch root and are removed after the run."""
+    import h5py
+    from crispyx import cnv
+
+    path, _ = _tumour(tmp_path)
+    monkeypatch.setattr(cnv, "read_backed", lambda *a: pytest.fail("a pass ran"))
+    with h5py.File(path, "r"):
+        with pytest.raises(OSError, match="open elsewhere.*inplace=False"):
+            cx.tl.infercnv(path, verbose=False)
+    monkeypatch.undo()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(cnv, "_scratch_root", lambda size, fallback: scratch)
+    created = []
+    real = cnv.tempfile.mkstemp
+    monkeypatch.setattr(cnv.tempfile, "mkstemp", lambda **kw: created.append(real(**kw)) or created[-1])
+    cx.tl.infercnv(path, verbose=False)
+    assert len(created) == 1 and Path(created[0][1]).parent == scratch and not list(scratch.iterdir())
+    assert not list(tmp_path.glob(".*partial"))
 
 
 def test_windows_table(tmp_path):
@@ -231,6 +255,17 @@ def test_chromosome_heatmap(tmp_path):
     groups = axes["groupby_ax"].images[0].cmap.colors
     assert [matplotlib.colors.to_hex(c) for c in groups] == ["#00ff00", "#0000ff"]
     plt.close("all")
+    # Saved with the chromosome lines; cells without a group are left out,
+    # with or without max_cells.
+    stored = ad.read_h5ad(path)
+    stored.obs["type"] = stored.obs["type"].astype(object).where(stored.obs["type"] != "B")
+    for max_cells in (None, 1000):
+        axes = cx.pl.chromosome_heatmap(stored, "type", max_cells=max_cells, save=tmp_path / "cnv.png")
+        assert axes["heatmap_ax"].images[0].get_array().shape[0] == 250
+        lines = [sorted(seg[0][0] for seg in c.get_segments()) for c in axes["heatmap_ax"].collections]
+        assert sorted(stored.uns["cnv"]["chr_pos"].values())[1:] in lines  # the chromosome boundaries
+        assert (tmp_path / "cnv.png").stat().st_size > 0
+        plt.close("all")
     with pytest.raises(ValueError, match="batch needs batch_key"):
         cx.pl.chromosome_heatmap(path, "type", batch="s2")
 
@@ -283,10 +318,11 @@ REFSEQ = """\
 #gtf-version 2.2
 NC_000001.11\tBestRefSeq\tgene\t11874\t14409\t.\t+\t.\tgene_id "DDX11L1"; transcript_id ""; db_xref "GeneID:100287102"; gbkey "Gene"; gene "DDX11L1"; gene_biotype "transcribed_pseudogene";
 NC_000001.11\tBestRefSeq\texon\t11874\t12227\t.\t+\t.\tgene_id "DDX11L1"; transcript_id "NR_046018.2"; gene "DDX11L1";
-NC_000023.11\tBestRefSeq\tgene\t5000\t6000\t.\t+\t.\tgene_id "DUP"; transcript_id ""; gene "DUP";
+NC_000023.11\tBestRefSeq\tgene\t5000\t6000\t.\t+\t.\tgene_id "DUP"; transcript_id ""; description "copy #1"; gene "DUP";
 NC_000024.10\tBestRefSeq\tgene\t7000\t8000\t.\t+\t.\tgene_id "DUP_1"; transcript_id ""; gene "DUP";
 NT_187361.1\tBestRefSeq\tgene\t10\t20\t.\t+\t.\tgene_id "ALT"; transcript_id ""; gene "ALT";
 NC_012920.1\tRefSeq\tgene\t3307\t4262\t.\t+\t.\tgene_id "ND1"; transcript_id ""; gene "ND1";
+###
 """
 
 

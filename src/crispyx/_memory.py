@@ -455,11 +455,24 @@ def _resolve_memory_limit_bytes(memory_limit_gb: float | None) -> float:
     Returns
     -------
     float
-        Memory budget in bytes; 0 when the process already holds the limit.
+        Memory budget in bytes.
+
+    Raises
+    ------
+    MemoryError
+        When the process already holds *memory_limit_gb*: no budget is left,
+        and a call sized from none would read its input once per row or gene.
     """
     if memory_limit_gb is None:
         return _detected_available_bytes()
-    budget = max(0.0, memory_limit_gb * 1e9 - _resident_bytes())
+    resident = _resident_bytes()
+    if resident >= memory_limit_gb * 1e9:
+        raise MemoryError(
+            f"memory_limit_gb={memory_limit_gb:g} leaves nothing to work with: this process already holds "
+            f"{resident / 1e9:.2f} GB (Python, the libraries and any data loaded). The limit is the whole "
+            "process's; raise it."
+        )
+    budget = memory_limit_gb * 1e9 - resident
     granted = _granted_bytes()
     if granted is not None:
         budget = min(budget, granted)

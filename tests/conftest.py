@@ -35,6 +35,17 @@ def pytest_sessionstart(session):  # pragma: no cover - test harness setup
     process_executor._check_system_limits = _check_system_limits_safe
 
 
+@pytest.fixture(autouse=True)
+def _empty_process(monkeypatch):
+    """An explicit memory_limit_gb reads as the budget it gives: tests pass
+    tiny limits to force banded and on-disk paths, and pytest's own resident
+    memory (about 1 GB, varying with test order) would exceed them. Tests of
+    the resident-memory term set it themselves."""
+    from crispyx import _memory
+
+    monkeypatch.setattr(_memory, "_resident_bytes", lambda: 0)
+
+
 @pytest.fixture
 def pydeseq2_helper():
     """Look up one of PyDESeq2's GLM helpers by name (skipping the test
