@@ -108,7 +108,7 @@ def _pca_chunk_size(
     if method not in ("auto", *PCA_METHODS):
         raise ValueError(f"method must be 'auto', 'covariance' or 'incremental', got {method!r}")
     # The limit as given, not less crispyx's footprint: the method and chunk
-    # identify the result, which must not move with the process.
+    # identify the result (the same wherever the job has the limit free).
     budget = _given_limit_bytes(memory_limit_gb)
     usable = _PCA_BUDGET_FRACTION * budget
     covariance_bytes = 8.0 * n_vars * n_vars

@@ -1579,8 +1579,8 @@ def plot_chromosome_heatmap(
         At most this many cells per group, drawn at random
         (``random_state``); every cell when ``None``.
     vmin, vmax
-        Colour range, centred at 0; symmetric about 0 by default (the
-        largest absolute value plotted).
+        Colour range, centred at 0 when it spans 0; symmetric about 0 by
+        default (the largest absolute value plotted).
     cmap
         Diverging colour map.
     figsize
@@ -1601,7 +1601,7 @@ def plot_chromosome_heatmap(
     """
     import matplotlib.pyplot as plt
     import scanpy as sc
-    from matplotlib.colors import TwoSlopeNorm
+    from matplotlib.colors import Normalize, TwoSlopeNorm
 
     from .cnv import _stored_profiles
 
@@ -1637,6 +1637,9 @@ def plot_chromosome_heatmap(
         vmax = -vmin if vmin is not None else (largest or 1.0)
     if vmin is None:
         vmin = -vmax
+    # Centred at 0 when the range spans it (gains and losses); a range on one
+    # side of 0 (gains only) is drawn as it is.
+    norm = TwoSlopeNorm(0, vmin=vmin, vmax=vmax) if vmin < 0 < vmax else Normalize(vmin=vmin, vmax=vmax)
     starts = sorted(((chromosome, int(first)) for chromosome, first in uns["chr_pos"].items()), key=lambda t: t[1])
     positions = [first for _, first in starts]
     # Scanpy shows or saves inside its call, before the chromosome lines are
@@ -1644,7 +1647,7 @@ def plot_chromosome_heatmap(
     axes = sc.pl.heatmap(
         adata, var_names=adata.var_names, groupby=groupby, figsize=figsize, cmap=cmap, show_gene_labels=False,
         var_group_positions=list(zip(positions, positions[1:] + [adata.n_vars])),
-        var_group_labels=[chromosome for chromosome, _ in starts], norm=TwoSlopeNorm(0, vmin=vmin, vmax=vmax),
+        var_group_labels=[chromosome for chromosome, _ in starts], norm=norm,
         show=False, **kwargs,
     )
     if kwargs.get("swap_axes"):  # windows on y, cells on x

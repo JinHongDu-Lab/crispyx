@@ -251,6 +251,19 @@ def test_scrublet_refuses_a_sample_over_the_memory_limit(tmp_path, monkeypatch):
     assert "doublet_score" not in cx.load_obs(path)
 
 
+def test_scrublet_takes_each_budget_before_loading_the_sample(tmp_path, monkeypatch):
+    """The detected headroom already leaves out a loaded sample, and the
+    estimate counts it: the budget is taken first, so it is not counted twice."""
+    from crispyx import qc
+
+    path, _ = _doublet_data(tmp_path, "csc")
+    order, load = [], qc._selected_rows
+    monkeypatch.setattr(qc, "_scrublet_budget", lambda limit: order.append("budget") or 1e12)
+    monkeypatch.setattr(qc, "_selected_rows", lambda *a: order.append("load") or load(*a))
+    cx.pp.scrublet(path, batch_key="sample", memory_limit_gb=8, inplace=False, verbose=False, **EXACT)
+    assert order == ["budget", "load"] * 2
+
+
 def test_scrublet_estimate_counts_the_dense_genes_scrublet_selects(tmp_path):
     from crispyx.qc import _SCRUBLET_BYTES_PER_DENSE, _scrublet_peak_bytes
 

@@ -702,10 +702,13 @@ def scrublet(
         for batch in pd.unique(batches[used]):
             selected = used & (batches == batch)
             rows = np.flatnonzero(selected)
+            # Taken before the cells are loaded: the detected headroom would
+            # already leave them out, and the estimate counts them.
+            budget = _scrublet_budget(memory_limit_gb) if check else None
             cells = ad.AnnData(_selected_rows(matrix, selected), obs=pd.DataFrame(index=obs.index[rows]))
             if check:
                 _check_scrublet_memory(
-                    cells, scrublet_kwargs, memory_limit_gb, "" if batch_key is None else f"{batch_key} {batch!r}: ",
+                    cells, scrublet_kwargs, budget, "" if batch_key is None else f"{batch_key} {batch!r}: ",
                 )
             sc.pp.scrublet(cells, random_state=random_state, verbose=False, **scrublet_kwargs)
             # A cell Scrublet drops (under 3 genes) has no score and is not called.
@@ -742,10 +745,7 @@ def _check_scrublet_counts(matrix, used: np.ndarray, batches: np.ndarray, memory
     ``indptr``, against the budget, as the counts' part of its peak plus
     the batch's cells loaded (about 12 bytes per stored count)."""
     row_nnz = np.diff(matrix.group["indptr"][:])
-    try:
-        budget = _resolve_memory_limit_bytes(memory_limit_gb)
-    except MemoryError as err:
-        raise MemoryError(f"pp.scrublet: {err}") from None
+    budget = _scrublet_budget(memory_limit_gb)
     for batch in pd.unique(batches[used]):
         nnz = int(row_nnz[used & (batches == batch)].sum())
         needed = _SCRUBLET_FIXED_BYTES + (_SCRUBLET_BYTES_PER_NONZERO + 12) * nnz
@@ -759,15 +759,19 @@ def _check_scrublet_counts(matrix, used: np.ndarray, batches: np.ndarray, memory
             )
 
 
-def _check_scrublet_memory(cells: ad.AnnData, scrublet_kwargs: dict, memory_limit_gb, where: str) -> None:
-    """Raise ``MemoryError`` when the loaded ``cells`` and Scanpy's Scrublet
-    on them would exceed the budget. The part from the stored counts is
-    checked first: Scrublet's gene selection, run to count the dense genes,
-    holds less than that part, so it never runs over the budget."""
+def _scrublet_budget(memory_limit_gb) -> float:
     try:
-        budget = _resolve_memory_limit_bytes(memory_limit_gb)
+        return _resolve_memory_limit_bytes(memory_limit_gb)
     except MemoryError as err:
         raise MemoryError(f"pp.scrublet: {err}") from None
+
+
+def _check_scrublet_memory(cells: ad.AnnData, scrublet_kwargs: dict, budget: float, where: str) -> None:
+    """Raise ``MemoryError`` when the loaded ``cells`` and Scanpy's Scrublet
+    on them would exceed ``budget`` (taken before they were loaded). The
+    part from the stored counts is checked first: Scrublet's gene
+    selection, run to count the dense genes, holds less than that part, so
+    it never runs over the budget."""
     X = cells.X
     loaded = X.data.nbytes + X.indices.nbytes + X.indptr.nbytes if sp.issparse(X) else X.nbytes
     nnz = X.nnz if sp.issparse(X) else np.count_nonzero(X)

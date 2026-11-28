@@ -144,10 +144,10 @@ crispyx aims for memory you can predict before a run: each step holds a chunk
 of cells or genes rather than the matrix, and where it takes
 ``memory_limit_gb`` (detected from the machine or the job when not given; on
 a Slurm job set it to ``--mem``) it sizes that chunk from it. The limit is the
-whole process's: what the process held once crispyx was imported (Python and
-its libraries, 0.3-0.4 GB) is taken off it, recorded once so that a budget
-does not move with the session. Data you load yourself is not counted: leave
-room for it. Sizes that identify a result (PCA's method and chunk, a
+whole process's: what importing crispyx added (crispyx and the libraries it
+imports, 0.3-0.4 GB) is taken off it, measured once so that a budget does not
+move with the session. Data you load yourself is not counted: leave room for
+it. Sizes that identify a result (PCA's method and chunk, a
 resumable run's chunks) take the limit as given. Some terms still
 grow with the screen. The table says, for each streaming function, what its
 peak grows with beyond the chunk, so a run can be sized from the file's shape.

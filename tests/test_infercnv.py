@@ -269,6 +269,10 @@ def test_chromosome_heatmap(tmp_path):
         assert sorted(stored.uns["cnv"]["chr_pos"].values())[1:] in lines  # the chromosome boundaries
         assert (tmp_path / "cnv.png").stat().st_size > 0
         plt.close("all")
+    # A range on one side of 0 (gains only) is drawn as it is.
+    axes = cx.pl.chromosome_heatmap(path, "type", vmin=0, vmax=0.3)
+    assert (axes["heatmap_ax"].images[0].norm.vmin, axes["heatmap_ax"].images[0].norm.vmax) == (0, 0.3)
+    plt.close("all")
     # swap_axes: windows on y, so the chromosome lines are horizontal.
     axes = cx.pl.chromosome_heatmap(path, "type", swap_axes=True)
     lines = [sorted(seg[0][1] for seg in c.get_segments()) for c in axes["heatmap_ax"].collections]

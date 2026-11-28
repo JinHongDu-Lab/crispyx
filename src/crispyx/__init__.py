@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import os
 
+import psutil as _psutil
+
+# What the process holds before crispyx's imports, so that their growth --
+# crispyx's footprint, which an explicit memory_limit_gb leaves out -- is
+# measured without data or libraries the caller loaded first.
+_resident_before_import = _psutil.Process().memory_info().rss
+
 # ---------------------------------------------------------------------------
 # OpenMP conflict guard — must precede any Numba import
 # ---------------------------------------------------------------------------
@@ -232,8 +239,8 @@ __all__ = [
     "plot_overlap_heatmap",
 ]
 
-# What an explicit memory_limit_gb leaves out (Python and the libraries just
-# imported), recorded once: see _memory._resolve_memory_limit_bytes.
+# What an explicit memory_limit_gb leaves out (crispyx and the libraries it
+# imports), recorded once: see _memory._resolve_memory_limit_bytes.
 from . import _memory  # noqa: E402
 
-_memory._record_import_footprint()
+_memory._record_import_footprint(_resident_before_import)
